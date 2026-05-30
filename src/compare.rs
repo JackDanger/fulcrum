@@ -715,12 +715,22 @@ pub struct Comparison {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellVerdict {
     /// The lead tool beats the runner-up by more than the noise floor.
-    Win { tool: String },
-    /// The top tools are within the noise floor — no honest winner.
+    /// `contested` is false when the only reason it "won" is that every OTHER
+    /// tool in the cell errored/produced wrong bytes — a win BY DEFAULT, which a
+    /// fair report must not silently fold into "won on speed".
+    Win { tool: String, contested: bool },
+    /// The top tools are within the noise floor — no honest winner. Also used to
+    /// downgrade a win measured with too FEW samples (N<3) — a "best-of-1/2" is
+    /// indistinguishable from noise.
     Tie { tools: Vec<String> },
     /// No valid (correct-bytes, non-errored) cell.
     NoData,
 }
+
+/// The minimum best-of-N sample count for a result to be eligible to be called
+/// a WIN. Below this, a margin is statistically indistinguishable from noise, so
+/// a win is downgraded to a tie (and the report says why). hole #5.
+pub const MIN_SAMPLES_FOR_WIN: usize = 3;
 
 impl Comparison {
     /// Find the winner (lowest startup-subtracted wall among VALID cells) for a
@@ -751,6 +761,13 @@ impl Comparison {
     /// the honest scope + the claim audit consume, so a "win" can never rest on
     /// a within-spread gap.
     pub fn decide(&self, corpus: &str, threads: ThreadCell) -> CellVerdict {
+        // Count ALL tools that attempted this cell vs the valid ones, so a win
+        // can be flagged as "by default" when the competition failed.
+        let attempted = self
+            .cells
+            .iter()
+            .filter(|c| c.corpus == corpus && c.threads == threads)
+            .count();
         let mut v: Vec<&Cell> = self
             .cells
             .iter()
@@ -760,11 +777,29 @@ impl Comparison {
         let Some(best) = v.first() else {
             return CellVerdict::NoData;
         };
+        // A win is "contested" only if at least one OTHER tool also produced a
+        // valid (correct-bytes) result. A lone survivor among ≥2 attempters won
+        // BY DEFAULT (the rest errored/were wrong) — true, but not a speed win.
+        let contested = v.len() >= 2;
+        let win_by_default = v.len() == 1 && attempted >= 2;
+
         let Some(second) = v.get(1) else {
+            // Uncontested: only one valid tool. Eligible as a win, but mark it
+            // contested=false when others attempted and failed (win by default).
             return CellVerdict::Win {
                 tool: best.tool.clone(),
+                contested: !win_by_default && attempted == 1,
             };
         };
+
+        // hole #5: too few samples → a margin is noise; downgrade to a tie of the
+        // top two (the report explains the under-sampling).
+        if self.samples < MIN_SAMPLES_FOR_WIN {
+            return CellVerdict::Tie {
+                tools: vec![best.tool.clone(), second.tool.clone()],
+            };
+        }
+
         let margin = second.wall_minus_startup.as_secs_f64()
             / best.wall_minus_startup.as_secs_f64().max(1e-9)
             - 1.0;
@@ -775,15 +810,14 @@ impl Comparison {
         if margin > noise {
             CellVerdict::Win {
                 tool: best.tool.clone(),
+                contested,
             }
         } else {
             // Everyone within the noise floor of the leader is tied.
             let lead = best.wall_minus_startup.as_secs_f64();
             let tied: Vec<String> = v
                 .iter()
-                .filter(|c| {
-                    c.wall_minus_startup.as_secs_f64() / lead.max(1e-9) - 1.0 <= noise
-                })
+                .filter(|c| c.wall_minus_startup.as_secs_f64() / lead.max(1e-9) - 1.0 <= noise)
                 .map(|c| c.tool.clone())
                 .collect();
             CellVerdict::Tie { tools: tied }
@@ -854,7 +888,7 @@ impl Comparison {
                 continue;
             }
             match self.decide(&corpus, threads) {
-                CellVerdict::Win { tool } if tool == self.subject => {
+                CellVerdict::Win { tool, contested } if tool == self.subject => {
                     // Margin over the runner-up (for the human label).
                     let m = self
                         .winner(&corpus, threads)
@@ -866,9 +900,13 @@ impl Comparison {
                             }
                         })
                         .unwrap_or_default();
-                    wins.push(format!("{cell_label} ({m})"));
+                    // A win where every rival failed is a win BY DEFAULT — label
+                    // it so an "all cells won" verdict can't quietly rest on rival
+                    // crashes.
+                    let suffix = if contested { "" } else { " BY DEFAULT — rivals failed/wrong" };
+                    wins.push(format!("{cell_label} ({m}{suffix})"));
                 }
-                CellVerdict::Win { tool: w } => {
+                CellVerdict::Win { tool: w, .. } => {
                     let win_cell = self
                         .cells
                         .iter()
@@ -1366,10 +1404,20 @@ pub fn render(cmp: &Comparison) -> String {
 
     // hole #5: contention banner.
     if let Some(w) = &cmp.guard_warning {
-        s.push_str(&format!("  [CONTENTION] {w}\n\n"));
+        s.push_str(&format!("  [CONTENTION] {w}\n"));
     } else {
-        s.push_str("  [CONTENTION] box looks quiet (load below threshold) — best-of-N trusted.\n\n");
+        s.push_str("  [CONTENTION] box looks quiet (load below threshold) — best-of-N trusted.\n");
     }
+    // hole #5: under-sampling banner — below MIN_SAMPLES_FOR_WIN no cell can be
+    // called a win (every close call is a tie), so the matrix shows ~tie~ only.
+    if cmp.samples < MIN_SAMPLES_FOR_WIN {
+        s.push_str(&format!(
+            "  [UNDER-SAMPLED] best-of-{} is below the n>={} a WIN requires — all results are reported as\n  \
+             TIES (a best-of-{} margin is indistinguishable from noise). Raise --samples for win/lose verdicts.\n",
+            cmp.samples, MIN_SAMPLES_FOR_WIN, cmp.samples
+        ));
+    }
+    s.push('\n');
 
     // hole #1: binary-probe + startup banner.
     s.push_str("  BINARY PROBE (native vs interpreter-wrapped; per-invocation startup):\n");
@@ -1410,7 +1458,13 @@ pub fn render(cmp: &Comparison) -> String {
             // ~TIE~ for a within-noise leader cluster (so the eye can't read a
             // noise gap as a win).
             let mark = match &verdict {
-                CellVerdict::Win { tool } if tool == &c.tool && c.valid() => "◀ WINNER",
+                CellVerdict::Win { tool, contested } if tool == &c.tool && c.valid() => {
+                    if *contested {
+                        "◀ WINNER"
+                    } else {
+                        "◀ by-default"
+                    }
+                }
                 CellVerdict::Tie { tools } if tools.contains(&c.tool) && c.valid() => "~tie~",
                 _ => "",
             };
@@ -1522,6 +1576,85 @@ mod tests {
     }
 
     #[test]
+    fn too_few_samples_downgrades_a_win_to_a_tie() {
+        // A clear 50% margin, but only 2 samples → below MIN_SAMPLES_FOR_WIN, so
+        // decide() must NOT call it a win (it's indistinguishable from noise at
+        // n=2). hole #5: best-of-2 is not a win.
+        let mk = |tool: &str, ms: u64| Cell {
+            tool: tool.to_string(),
+            corpus: "c".to_string(),
+            corpus_kind: "k".to_string(),
+            threads: ThreadCell::Fixed(1),
+            wall: Duration::from_millis(ms),
+            wall_minus_startup: Duration::from_millis(ms),
+            best_wall: Duration::from_millis(ms),
+            digest: sha256(b"ref"),
+            correct: true,
+            spread: 0.0,
+            mbps: 1.0,
+            plain_bytes: 1_000_000,
+            errored: false,
+        };
+        let cmp = Comparison {
+            subject: "tool-a".to_string(),
+            probes: BTreeMap::new(),
+            cells: vec![mk("tool-a", 100), mk("tool-b", 150)],
+            guard_warning: None,
+            samples: 2, // < MIN_SAMPLES_FOR_WIN
+            refused: false,
+        };
+        assert!(
+            matches!(cmp.decide("c", ThreadCell::Fixed(1)), CellVerdict::Tie { .. }),
+            "a 50% margin at n=2 must be a TIE, not a win"
+        );
+        // Same data at n=3 IS a win.
+        let cmp3 = Comparison { samples: 3, ..cmp.clone() };
+        assert!(matches!(
+            cmp3.decide("c", ThreadCell::Fixed(1)),
+            CellVerdict::Win { contested: true, .. }
+        ));
+    }
+
+    #[test]
+    fn lone_survivor_is_a_win_by_default_not_a_speed_win() {
+        // tool-a is correct; tool-b errored. tool-a "wins" the cell, but BY
+        // DEFAULT (contested=false) — the report must not fold this into a speed
+        // win.
+        let mk = |tool: &str, correct: bool, errored: bool| Cell {
+            tool: tool.to_string(),
+            corpus: "c".to_string(),
+            corpus_kind: "k".to_string(),
+            threads: ThreadCell::Fixed(1),
+            wall: Duration::from_millis(100),
+            wall_minus_startup: Duration::from_millis(100),
+            best_wall: Duration::from_millis(100),
+            digest: if correct { sha256(b"ref") } else { [0u8; 32] },
+            correct,
+            spread: 0.0,
+            mbps: 1.0,
+            plain_bytes: 1_000_000,
+            errored,
+        };
+        let cmp = Comparison {
+            subject: "tool-a".to_string(),
+            probes: BTreeMap::new(),
+            cells: vec![mk("tool-a", true, false), mk("tool-b", false, true)],
+            guard_warning: None,
+            samples: 5,
+            refused: false,
+        };
+        assert_eq!(
+            cmp.decide("c", ThreadCell::Fixed(1)),
+            CellVerdict::Win {
+                tool: "tool-a".to_string(),
+                contested: false,
+            }
+        );
+        // The scope must SAY "by default".
+        assert!(cmp.scope_line().contains("BY DEFAULT"));
+    }
+
+    #[test]
     fn contention_guard_flags_busy_box() {
         // A guard with a synthetic high load over few CPUs must report busy +
         // a warning; a quiet one must not.
@@ -1598,7 +1731,8 @@ mod tests {
         assert_eq!(
             cmp2.decide("c", ThreadCell::Fixed(1)),
             CellVerdict::Win {
-                tool: "tool-a".to_string()
+                tool: "tool-a".to_string(),
+                contested: true,
             }
         );
     }

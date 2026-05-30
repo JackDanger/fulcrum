@@ -227,7 +227,7 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
         // Noise-aware decision: a within-spread lead is a TIE, not a win — so a
         // "fastest" claim can't rest on noise.
         match cmp.decide(&corpus, threads) {
-            CellVerdict::Win { tool } if tool == claim.subject => {
+            CellVerdict::Win { tool, contested } if tool == claim.subject => {
                 let m = cmp
                     .winner(&corpus, threads)
                     .map(|(_, margin)| {
@@ -238,9 +238,14 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
                         }
                     })
                     .unwrap_or_default();
-                won.push(format!("{cell_label} ({m})"));
+                let suffix = if contested {
+                    ""
+                } else {
+                    " BY DEFAULT (rivals failed/wrong)"
+                };
+                won.push(format!("{cell_label} ({m}{suffix})"));
             }
-            CellVerdict::Win { tool: w } => {
+            CellVerdict::Win { tool: w, .. } => {
                 let win_cell = cmp
                     .cells
                     .iter()
