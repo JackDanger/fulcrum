@@ -457,6 +457,7 @@ mod tests {
             correct,
             spread: 0.0,
             mbps: 1.0,
+            plain_bytes: 1_000_000,
             errored,
         }
     }

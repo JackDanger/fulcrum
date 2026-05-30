@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "FAIR cross-tool comparison spec for `fulcrum compare` / `fulcrum audit`.",
+    "Everything is GENERIC: name your tools tool-a/tool-b/... and point each at a",
+    "real binary on PATH. NO competitor product name belongs in this file — the",
+    "harness only needs the binary + an argv template.",
+    "",
+    "Placeholders substituted per run:  {input}  {output}  {threads}",
+    "  - {input}   the corpus file path",
+    "  - {output}  a temp output path (only when \"output\":\"file\")",
+    "  - {threads} the concrete thread count for the cell (or use thread_arg/auto_arg)",
+    "",
+    "How the five benchmark-inflation holes are closed BY CONSTRUCTION:",
+    "  #1 each tool's binary is probed (native vs interpreter-shim) and its",
+    "     per-invocation startup is measured and SUBTRACTED. version_arg names the",
+    "     cheap startup probe ('--version' default; '' means run bare).",
+    "  #2 give each tool its DOCUMENTED BEST config: thread_arg is the per-N flag",
+    "     spelling (e.g. '-T{n}'), auto_arg is the all-cores/auto flag (e.g. '-T0').",
+    "  #3 every run's output sha256 is checked against the reference decoder below;",
+    "     a mismatch DISQUALIFIES the cell (fast-but-wrong never wins).",
+    "  #4 list multiple corpora (different 'kind's) and thread cells; the report",
+    "     gives the HONEST SCOPE across the whole matrix, not one cell.",
+    "  #5 runs are interleaved best-of-N with a contention + data-quality guard."
+  ],
+  "subject": "tool-a",
+  "reference": { "bin": "gzip", "argv": ["-dc", "{input}"] },
+  "tools": [
+    {
+      "name": "tool-a",
+      "bin": "gzip",
+      "argv": ["-dc", "{input}"],
+      "thread_arg": null,
+      "auto_arg": null,
+      "version_arg": "--version"
+    },
+    {
+      "name": "tool-b",
+      "bin": "zstd",
+      "argv": ["-dcq", "{input}"],
+      "thread_arg": "-T{n}",
+      "auto_arg": "-T0",
+      "version_arg": "--version"
+    }
+  ],
+  "corpora": [
+    { "name": "text", "kind": "compressible",   "path": "/tmp/fc_text.gz", "plain_bytes": 67108969 },
+    { "name": "rand", "kind": "incompressible", "path": "/tmp/fc_rand.gz", "plain_bytes": 33554432 }
+  ],
+  "threads": ["T1", "T4", "auto"]
+}

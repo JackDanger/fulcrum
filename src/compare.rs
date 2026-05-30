@@ -617,6 +617,9 @@ pub struct Cell {
     pub spread: f64,
     /// Throughput on decompressed bytes using the startup-subtracted wall.
     pub mbps: f64,
+    /// Decompressed bytes for this corpus (for the MB/s recompute after startup
+    /// subtraction).
+    pub plain_bytes: u64,
     /// Did this tool/cell error out (nonzero exit / spawn failure)?
     pub errored: bool,
 }
@@ -1017,11 +1020,15 @@ pub fn run_comparison(
             }
             for t in tools {
                 let outs = &samples[&t.name];
-                let cell = summarize_cell(t, corpus, threads, outs, &probes[&t.name], cfg);
+                let cell = summarize_cell(t, corpus, threads, outs);
                 cells.push(cell);
             }
         }
     }
+
+    // hole #1, robustly: subtract per-invocation startup with a cross-tool
+    // sanity bound so a contaminated probe can't zero out real work.
+    apply_startup_subtraction(&mut cells, &probes);
 
     Comparison {
         subject: subject.to_string(),
@@ -1029,6 +1036,46 @@ pub fn run_comparison(
         cells,
         guard_warning,
         samples: cfg.samples,
+    }
+}
+
+/// Subtract each tool's measured startup from its cell walls — but CLAMP the
+/// subtraction so a contaminated startup probe (one whose `--version`/bare run
+/// actually performed work, e.g. a shim that always decodes) cannot drive a
+/// real decode wall to ~0 and fake a tie/win.
+///
+/// The bound: startup is a per-process FIXED cost, so it cannot plausibly exceed
+/// the FASTEST decode wall observed across ALL tools on the smallest corpus. We
+/// take the global minimum raw cell wall `w_min`, and clamp each tool's
+/// subtracted startup to at most `0.9 * w_min`. A probe reporting more than that
+/// is treated as untrustworthy and only the bounded amount is removed — never
+/// enough to invert a large real margin.
+fn apply_startup_subtraction(cells: &mut [Cell], probes: &BTreeMap<String, BinaryProbe>) {
+    // Smallest valid raw decode wall across the matrix (the tightest fixed-cost
+    // ceiling). Cells currently hold RAW medians in `wall_minus_startup`.
+    let w_min = cells
+        .iter()
+        .filter(|c| c.valid())
+        .map(|c| c.wall_minus_startup.as_secs_f64())
+        .fold(f64::INFINITY, f64::min);
+    let cap = if w_min.is_finite() {
+        Duration::from_secs_f64(0.9 * w_min)
+    } else {
+        Duration::ZERO
+    };
+    for c in cells.iter_mut() {
+        let raw = c.wall_minus_startup; // currently the raw median
+        let startup = probes
+            .get(&c.tool)
+            .map(|p| p.startup.min(cap))
+            .unwrap_or(Duration::ZERO);
+        c.wall_minus_startup = raw.saturating_sub(startup);
+        let secs = c.wall_minus_startup.as_secs_f64();
+        c.mbps = if secs > 0.0 {
+            c.plain_bytes as f64 / 1e6 / secs
+        } else {
+            0.0
+        };
     }
 }
 
@@ -1097,14 +1144,7 @@ fn run_once(
 
 /// Fold a tool's interleaved samples for one cell into a [`Cell`], applying the
 /// correctness check (hole #3) and the startup subtraction (hole #1).
-fn summarize_cell(
-    spec: &ToolSpec,
-    corpus: &Corpus,
-    threads: ThreadCell,
-    outs: &[RunOutcome],
-    probe: &BinaryProbe,
-    _cfg: &RunCfg,
-) -> Cell {
+fn summarize_cell(spec: &ToolSpec, corpus: &Corpus, threads: ThreadCell, outs: &[RunOutcome]) -> Cell {
     let mut walls: Vec<Duration> = outs.iter().filter(|o| o.ok).map(|o| o.wall).collect();
     let errored = walls.is_empty();
     walls.sort();
@@ -1131,9 +1171,11 @@ fn summarize_cell(
     let all_agree = ok_digests.iter().all(|d| *d == digest);
     let correct = !errored && all_agree && digest == corpus.reference;
 
-    // hole #1: subtract the per-invocation startup so the comparison is of the
-    // actual work, not the process/interpreter spin-up tax.
-    let wall_minus_startup = median.saturating_sub(probe.startup);
+    // hole #1: the per-invocation startup is subtracted in a cross-tool post-
+    // pass (see `apply_startup_subtraction`) so a CONTAMINATED probe (one whose
+    // bare/`--version` run actually did work) can't over-subtract. Here we store
+    // the RAW median; the post-pass fills the corrected `wall_minus_startup`.
+    let wall_minus_startup = median;
     let secs = wall_minus_startup.as_secs_f64();
     let mbps = if secs > 0.0 {
         corpus.plain_bytes as f64 / 1e6 / secs
@@ -1153,6 +1195,7 @@ fn summarize_cell(
         correct,
         spread,
         mbps,
+        plain_bytes: corpus.plain_bytes,
         errored,
     }
 }
@@ -1350,6 +1393,7 @@ mod tests {
             correct: true,
             spread,
             mbps: 1.0,
+            plain_bytes: 1_000_000,
             errored: false,
         };
         let cmp = Comparison {
@@ -1400,6 +1444,7 @@ mod tests {
             correct,
             spread: 0.0,
             mbps: 1.0,
+            plain_bytes: 1_000_000,
             errored: false,
         };
         let cmp = Comparison {
