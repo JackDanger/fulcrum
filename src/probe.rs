@@ -60,30 +60,89 @@ use std::time::Instant;
 struct TraceSink {
     out: Mutex<BufWriter<File>>,
     epoch: Instant,
+    /// When `Some(base_ns)`, timestamps are emitted as ABSOLUTE microseconds
+    /// on the CLOCK_MONOTONIC timeline (epoch reading at sink-open), so they
+    /// line up with `perf record -k CLOCK_MONOTONIC` PEBS sample timestamps —
+    /// the join key the per-region hardware-counter correlator
+    /// ([`crate::region_hw`]) uses. `None` (default) keeps the original
+    /// since-epoch relative µs, which needs no extra clock and is all the
+    /// trace-only critical-path layer requires.
+    mono_base_ns: Option<u64>,
 }
 
 static SINK: OnceLock<Option<TraceSink>> = OnceLock::new();
+
+/// Read CLOCK_MONOTONIC in nanoseconds. Linux-only; returns `None` elsewhere
+/// (the absolute-timestamp mode is for perf correlation, which is Linux-only
+/// anyway, so non-Linux simply never enables it).
+#[cfg(target_os = "linux")]
+fn clock_monotonic_ns() -> Option<u64> {
+    // SAFETY: `timespec` is POD; `clock_gettime` only writes through the ptr.
+    unsafe {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) == 0 {
+            let ts = ts.assume_init();
+            Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clock_monotonic_ns() -> Option<u64> {
+    None
+}
 
 fn sink() -> Option<&'static TraceSink> {
     SINK.get_or_init(|| {
         let path = std::env::var_os("FULCRUM_TRACE")?;
         let file = File::create(&path).ok()?;
         let mut w = BufWriter::new(file);
+        // Opt into absolute CLOCK_MONOTONIC timestamps for perf/PEBS
+        // correlation when FULCRUM_TRACE_CLOCK=monotonic (and the clock is
+        // available). Default: relative since-epoch µs.
+        let mono_base_ns = match std::env::var("FULCRUM_TRACE_CLOCK").ok().as_deref() {
+            Some("monotonic") => clock_monotonic_ns(),
+            _ => None,
+        };
         // Chrome-trace JSON array format: the analyzer's loader tolerates an
         // unclosed array, so we open `[` and stream objects, never needing to
         // write the closing `]` (which also makes it crash-tolerant).
         let _ = w.write_all(b"[\n");
+        // Emit a metadata marker carrying the clock base so the correlator can
+        // recover the CLOCK_MONOTONIC offset deterministically from the trace
+        // alone (no out-of-band bookkeeping).
+        if let Some(base) = mono_base_ns {
+            let _ = w.write_all(
+                format!(
+                    "{{\"name\":\"fulcrum.clock_base\",\"ph\":\"M\",\"ts\":0,\"pid\":1,\"tid\":0,\
+                     \"args\":{{\"clock\":\"monotonic\",\"base_ns\":{base}}}}},\n"
+                )
+                .as_bytes(),
+            );
+        }
         Some(TraceSink {
             out: Mutex::new(w),
             epoch: Instant::now(),
+            mono_base_ns,
         })
     })
     .as_ref()
 }
 
-/// Microseconds (fractional) since the trace epoch.
+/// Microseconds for a trace event. In the default (relative) mode this is µs
+/// since the trace epoch; in `FULCRUM_TRACE_CLOCK=monotonic` mode it is
+/// ABSOLUTE CLOCK_MONOTONIC µs so the value is directly comparable to a
+/// `perf -k CLOCK_MONOTONIC` sample timestamp.
 fn now_us(s: &TraceSink) -> f64 {
-    s.epoch.elapsed().as_nanos() as f64 / 1000.0
+    match s.mono_base_ns {
+        Some(_) => clock_monotonic_ns()
+            .map(|ns| ns as f64 / 1000.0)
+            // Fallback to relative if a later read fails (keeps the trace valid).
+            .unwrap_or_else(|| s.epoch.elapsed().as_nanos() as f64 / 1000.0),
+        None => s.epoch.elapsed().as_nanos() as f64 / 1000.0,
+    }
 }
 
 /// A stable per-thread numeric id for the trace (Chrome-trace wants a `tid`).
