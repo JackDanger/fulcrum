@@ -14,6 +14,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches VERSION and sync Cargo.toml
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          TAG=${GITHUB_REF#refs/tags/v}
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "ERROR: VERSION file ($VERSION) does not match pushed tag ($TAG)"
+            echo "Use 'make release' to tag from VERSION, or update VERSION to match the tag."
+            exit 1
+          fi
+          perl -i -pe "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" Cargo.toml
+          echo "Publishing version $VERSION"
+
       - name: Verify tests pass
         run: cargo test
 
