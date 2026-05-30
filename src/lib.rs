@@ -23,8 +23,12 @@
 pub mod config;
 pub mod coz;
 pub mod critpath;
+pub mod estimate;
 pub mod mech;
+pub mod microbench;
 pub mod probe;
 pub mod rank;
+pub mod region_hw;
 pub mod trace;
 pub mod validate;
+pub mod xtool;

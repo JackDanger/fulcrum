@@ -32,6 +32,13 @@ serde_json = "1"
 # dlsym-resolved, so a coz-enabled binary still runs normally outside `coz run`.
 coz = { version = "0.1", optional = true }
 
+# CLOCK_MONOTONIC for absolute trace timestamps, so probe spans line up with
+# `perf record -k CLOCK_MONOTONIC` PEBS samples in the per-region HW correlator
+# (region_hw.rs). Linux-only; on other targets the absolute mode no-ops and
+# this dependency is absent.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 
