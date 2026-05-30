@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target
+
+# Cargo lock is committed for the binary (see below); nothing to ignore here
+# for libraries. Keeping it tracked makes `cargo install` reproducible.
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Profiler artifacts produced by the examples / workflow
+*.coz
+perf.data
+perf.data.old
+/tmp/fulcrum_*.json
+fulcrum_*.json
+fulcrum_report.txt
+fulcrum_topdown.txt

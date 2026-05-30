@@ -1,0 +1,38 @@
+{
+  "//": "FULCRUM profile config. Pass with `fulcrum rank ... --config this.json`.",
+  "//progress_point": "The throughput marker you call probe::progress(name) with. Its visit-rate is the program's 'work done' signal.",
+  "progress_point": "work_done",
+
+  "//regions": "The candidate optimization targets. `name` MUST match what you pass to probe::scope(name). `source` ranges fold Coz line-experiments into the region (match by file basename + line range). `functions` are substrings used to (a) attribute perf-report cycles for the mechanism and (b) map critical-path span labels back to the region.",
+  "regions": [
+    {
+      "name": "parse",
+      "source": [{ "file": "worker.rs", "lo": 40, "hi": 120 }],
+      "functions": ["parse", "decode_header"]
+    },
+    {
+      "name": "transform",
+      "source": [{ "file": "worker.rs", "lo": 121, "hi": 300 }],
+      "functions": ["transform", "apply_kernel"]
+    },
+    {
+      "name": "compress",
+      "source": [{ "file": "worker.rs", "lo": 301, "hi": 380 }],
+      "functions": ["compress", "encode"]
+    },
+    {
+      "name": "emit",
+      "source": [{ "file": "consumer.rs", "lo": 1, "hi": 90 }],
+      "functions": ["emit", "flush_output"]
+    }
+  ],
+
+  "//ground_truth": "Optional self-checks (see `fulcrum validate`). The Coz-based checks (known_non_lever / known_levers) need a profile.coz. The cp_* checks run from the trace alone.",
+  "ground_truth": {
+    "known_non_lever": "emit",
+    "known_levers": ["transform"],
+    "cp_top_region": "transform",
+    "cp_offpath_region": "emit",
+    "cp_offpath_max": 0.05
+  }
+}

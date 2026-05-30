@@ -1,0 +1,45 @@
+[package]
+name = "fulcrum"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Causal-mechanistic pipeline profiler: finds the highest-leverage region to optimize by measuring wall-elasticity (Coz-style virtual speedup) fused with critical-path reconstruction and perf/PEBS mechanism attribution, self-validated against known ground truth."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JackDanger/fulcrum"
+readme = "README.md"
+keywords = ["profiler", "performance", "coz", "critical-path", "perf"]
+categories = ["development-tools::profiling", "command-line-utilities"]
+
+[lib]
+name = "fulcrum"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fulcrum"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable Coz causal-profiling counters in the `probe` module. With this off
+# there is no `coz` dependency at all and the probe's Coz hooks compile to
+# nothing; the Chrome-trace timeline backend is always available regardless.
+coz = ["dep:coz"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Optional: only pulled in under `--features coz`. Coz's runtime is
+# dlsym-resolved, so a coz-enabled binary still runs normally outside `coz run`.
+coz = { version = "0.1", optional = true }
+
+[profile.release]
+opt-level = 3
+
+# A profile that keeps production-faithful optimization (lto + opt3) but
+# retains line tables so Coz/perf can attribute samples to source lines.
+# Build profiling binaries with: `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+lto = "fat"
+debug = 1
+strip = false
