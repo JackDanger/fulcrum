@@ -64,11 +64,15 @@ impl FuncBucket {
         if has("inflate")
             || has("huff")
             || has("decode")
-            || has("decompress_block")
+            || has("decompress") // e.g. `*_decompress_bmi2`, generic decompress entry
+            || has("deflate_block")
             || has("readdynamic")
             || has("readhuffman")
             || has("getbits")
             || has("read_bits")
+            || has("loop_block") // a tool's decode inner loop
+            || has("decode_len_dist") // length/distance decode
+            || has("build_decode_table") // decode-table build (part of decode)
         {
             FuncBucket::Decode
         } else if has("memcpy")

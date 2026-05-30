@@ -4,9 +4,9 @@
 //! change's wall delta by multiplying a region's ACCESS COUNTS (from
 //! [`crate::region_hw`]) by the PER-OPERATION COST of the primitive that change
 //! swaps in. That second factor has to be *measured on the target CPU*, not
-//! guessed — a u8-vs-u16 element store, a backward marker scan, a journal
-//! replay, a Huffman LUT lookup all have costs that depend on this core's
-//! caches and ports. This module is the measurement side: a tiny, pinned,
+//! guessed — a narrow-vs-wide element store, a backward scan, a side-journal
+//! replay, a table lookup all have costs that depend on this core's caches and
+//! ports. This module is the measurement side: a tiny, pinned,
 //! RDTSC-based harness that reports **ns/op, cycles/op, and bytes/cycle** for a
 //! closure, with explicit working-set control so a primitive can be measured
 //! both L1-hot and DRAM-cold.
@@ -49,13 +49,15 @@ pub fn black_box<T>(x: T) -> T {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc_serialized() -> u64 {
-    use std::arch::x86_64::{__rdtscp, _lfence, _mm_lfence};
+    use std::arch::x86_64::{__rdtscp, _mm_lfence};
     let mut aux = 0u32;
     // SAFETY: rdtscp/lfence are unprivileged and always available on x86_64.
     unsafe {
         _mm_lfence();
         let t = __rdtscp(&mut aux);
-        _lfence();
+        // rdtscp serializes against prior insns; fence after so later insns
+        // don't begin before the timestamp is sampled.
+        _mm_lfence();
         t
     }
 }

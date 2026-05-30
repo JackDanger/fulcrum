@@ -139,24 +139,80 @@ fulcrum rank /tmp/fulcrum_tl.json /tmp/profile.coz /tmp/fulcrum_report.txt \
 - **Best fit: in-order streaming pipelines.** The critical-path layer assumes an in-order consumer gates the wall — the worker-pool-with-ordered-output shape. Without that, on-path attribution is less precise.
 - **Mechanism is function-level**, not per-span. Enough to say "this region is DRAM-bound vs branch-bound," but won't split a function shared across two regions.
 
+## Heavy mode: per-region hardware truth + predict-before-build
+
+The three layers above answer *where* the lever is. Four heavier capabilities
+answer it with hardware counters and let you PREDICT a change's wall delta
+before you build it — so a lever stops being a flimsy hypothesis:
+
+**1. Per-region hardware counters** (`region_hw.rs`, `fulcrum region-hw`).
+Replaces the run-level TMA headline with PER-REGION truth: L1/L2/L3/DRAM hit
+rates, a `dram_bound` proxy, modeled load-latency, IPC, branch-MPKI, and a
+coarse stall split — for each named region. It joins PEBS `perf mem` samples to
+regions by **CLOCK_MONOTONIC timestamp window** (so it survives `lto=fat`
+inlining that smears a function/`ip` join), and **reconciles** against the v1
+run-level TMA: the per-region load-mem-bound must not exceed run backend-bound
+(a load-only proxy is a *lower bound* on backend stalls), and a large gap is
+reported as "the backend stall is store/port/execution-bound, not load-latency"
+— a real lever refinement. Capture both under `-k CLOCK_MONOTONIC`:
+
+```bash
+FULCRUM_TRACE=/tmp/tl.json FULCRUM_TRACE_CLOCK=monotonic <bin> <args>      # absolute-clock trace
+perf mem record -k CLOCK_MONOTONIC -o /tmp/mem.data -- <bin> <args>
+perf script -i /tmp/mem.data -F time,data_src > /tmp/mem.txt
+fulcrum region-hw /tmp/tl.json /tmp/mem.txt --config c.json --topdown /tmp/td.txt
+```
+
+**2. Primitive microbench harness** (`microbench.rs`). A pinned, RDTSCP-timed,
+dependency-free harness reporting **cyc/op, ns/op, bytes/cycle** for a closure
+with explicit working-set control (measure a primitive L1-hot AND DRAM-cold).
+The per-op costs fold into capability 3. (criterion reports wall ns; this
+reports *cycles*, which is what the estimator multiplies — and runs inside the
+target's own binary on the perf box.)
+
+**3. Counterfactual cost estimator** (`estimate.rs`). Predicts a structural
+change's wall delta = a region's measured **access counts** × a primitive's
+**measured per-op cost** × the region's **on-critical-path share** (the FULCRUM
+invariant: only on-path time moves the wall). Validated by a postdiction gate
+(`tests/estimator_postdiction.rs`) that reproduces three KNOWN outcomes — a
+catastrophic regression, a flat (no-win) change, and a real small win — anchored
+to MEASURED aggregate cycles. Honest about its limits: the cycle-multiply model
+catches signs and catastrophes reliably but under-predicts inner-loop wins (it
+doesn't model pipeline/branch stalls) and DRAM-bandwidth contention; for a
+bandwidth-bound cell it tells you to use a throughput model instead.
+
+**4. Cross-tool region accounting** (`xtool.rs`, `fulcrum xtool`). Folds
+`perf stat --topdown` + `perf report` for several tools into one comparable
+accounting on the same input, so "what fast looks like" is data: TMA shape +
+cycle% per function bucket (decode/copy/window/alloc), normalized so SHAPE is
+comparable across tools running at different throughput, with a focused "where
+the tool under test differs" diff against each alternative.
+
 ## How it's organized
 
 ```
 src/
-  probe.rs      instrumentation library (scope + progress; trace & coz backends)
+  probe.rs      instrumentation library (scope + progress; trace & coz backends;
+                FULCRUM_TRACE_CLOCK=monotonic for perf-correlatable timestamps)
   trace.rs      Chrome-trace JSON ingestion + B/E span pairing
   critpath.rs   consumer-anchored critical-path reconstruction (layer 2)
   coz.rs        profile.coz parsing → per-region wall-elasticity curves (layer 1)
   mech.rs       perf TMA / report parsing → per-function mechanism (layer 3)
-  rank.rs       fuse the three layers → ranked lever list
+  region_hw.rs  PER-REGION hardware counters: PEBS-by-timestamp join + reconcile
+  microbench.rs pinned RDTSCP primitive microbench harness (cyc/op, B/cyc)
+  estimate.rs   counterfactual wall-delta estimator (access-counts × per-op cost)
+  xtool.rs      cross-tool region accounting (TMA + bucket shape, comparable)
+  rank.rs       fuse the layers → ranked lever list
   validate.rs   the trust gate: re-derive known ground truth
   config.rs     declarative per-pipeline config (regions, progress point, ground truth)
-  main.rs       the fulcrum CLI
+  main.rs       the fulcrum CLI (critpath/coz-parse/mech-report/rank/region-hw/xtool/validate/plan)
 examples/
   toy_pipeline.rs        ~150-line self-contained demo pipeline
   profile.example.json   annotated config template
 tests/
-  analyzer.rs   end-to-end tests over a synthetic trace
+  analyzer.rs              end-to-end tests over a synthetic trace
+  region_hw.rs             per-region PEBS join correctness
+  estimator_postdiction.rs the trust gate for capability 3 (postdict known outcomes)
 ```
 
 ## License

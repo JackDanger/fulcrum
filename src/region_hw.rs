@@ -3,12 +3,12 @@
 //!
 //! The v1 mechanism layer ([`crate::mech`]) reports ONE top-down breakdown for
 //! the whole run and a function-level cycles%/DRAM% table. That answers "is the
-//! program memory-bound?" but not "is the **bootstrap region** memory-bound
-//! while the **clean-inflate region** is branch-bound?" — which is the
-//! question a per-region lever recommendation needs. This module attributes
-//! hardware events to the SAME named regions FULCRUM already ranks, by joining
-//! each PEBS sample's timestamp into the region whose `[ts_start, ts_end)`
-//! span window contains it.
+//! program memory-bound?" but not "is the **first stage** memory-bound while
+//! the **inner-loop stage** is branch-bound?" — which is the question a
+//! per-region lever recommendation needs. This module attributes hardware
+//! events to the SAME named regions FULCRUM already ranks, by joining each PEBS
+//! sample's timestamp into the region whose `[ts_start, ts_end)` span window
+//! contains it.
 //!
 //! ## The join
 //!
@@ -31,7 +31,7 @@
 //!
 //! ## Why timestamp-window join (not function-level)
 //!
-//! Under `lto=fat`, bootstrap/clean/absorb inline into overlapping address
+//! Under `lto=fat`, adjacent pipeline stages inline into overlapping address
 //! ranges, so a function/`ip` join smears them (exactly the v1 caveat). The
 //! span TIME WINDOWS do not smear: a region's wall-clock interval is unique to
 //! that region's execution regardless of inlining. The cost is that two
@@ -43,10 +43,10 @@
 //!
 //! ## Honest limits
 //!
-//! * PEBS mem-loads sample LOADS only (not stores); a store-heavy region (the
-//!   marker ring writes) shows fewer samples — reported as low `sample_count`,
-//!   not as "no memory traffic". Pair with `perf stat` store counters when it
-//!   matters.
+//! * PEBS mem-loads sample LOADS only (not stores); a store-heavy region (one
+//!   dominated by ring/buffer writes) shows fewer samples — reported as low
+//!   `sample_count`, not as "no memory traffic". Pair with `perf stat` store
+//!   counters when it matters.
 //! * The top-down split here is a *proxy* from the sampled tiers + branch-miss
 //!   rate, not the architectural TMA formula. We reconcile it against the v1
 //!   run-level TMA in [`reconcile`]; a per-region split that contradicts the
@@ -404,13 +404,56 @@ pub fn parse_perf_stat_intervals(text: &str, start_mono_us: f64) -> Vec<CounterI
     out
 }
 
+/// Coalesce a set of (possibly overlapping) intervals into a sorted disjoint
+/// union. Input need not be sorted.
+fn union_intervals(intervals: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut v: Vec<(f64, f64)> = intervals.iter().copied().filter(|(a, b)| b > a).collect();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        if let Some(last) = out.last_mut() {
+            if a <= last.1 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+/// Total length of a disjoint interval set.
+fn total_len(union: &[(f64, f64)]) -> f64 {
+    union.iter().map(|(a, b)| (b - a).max(0.0)).sum()
+}
+
+/// Overlapped length between two DISJOINT interval sets (both pre-unioned).
+fn overlap_len(a: &[(f64, f64)], b: &[(f64, f64)]) -> f64 {
+    let mut i = 0;
+    let mut j = 0;
+    let mut ov = 0.0;
+    while i < a.len() && j < b.len() {
+        let lo = a[i].0.max(b[j].0);
+        let hi = a[i].1.min(b[j].1);
+        if hi > lo {
+            ov += hi - lo;
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    ov
+}
+
 /// Build per-region hardware rollups by joining PEBS samples + counter
 /// intervals into the trace's region spans.
 ///
 /// `region_funcs`: for each region name, the span-name substrings that mark its
-/// spans in the trace (the FULCRUM probe writes spans named `fulcrum.bootstrap`
-/// etc.; pass `[("bootstrap", ["bootstrap"]), …]`). A span is attributed to a
-/// region if its name contains any of the region's substrings.
+/// spans in the trace (e.g. the FULCRUM probe writes spans named
+/// `fulcrum.<region>`; pass `[("stage_a", ["stage_a"]), …]`). A span is
+/// attributed to a region if its name contains any of the region's substrings.
 pub fn rollup(
     events: &[Event],
     mem: &[MemSample],
@@ -429,8 +472,11 @@ pub fn rollup(
         })
         .collect();
 
-    // Precompute per-region span windows (merged across threads). Keep them as
-    // intervals for the binary-search-free overlap tests below.
+    // Per-region span windows, kept RAW (one entry per span, across all worker
+    // threads) for the sample-containment test, AND as a coalesced UNION for
+    // the wall/concurrency math. In a parallel pipeline the SAME region runs on
+    // many worker threads at once, so the raw per-span durations sum to many ×
+    // the real wall — the wall must be the union length, not the sum.
     let region_windows: Vec<Vec<(f64, f64)>> = region_funcs
         .iter()
         .map(|(_, subs)| {
@@ -443,24 +489,24 @@ pub fn rollup(
             w
         })
         .collect();
+    let region_union: Vec<Vec<(f64, f64)>> =
+        region_windows.iter().map(|w| union_intervals(w)).collect();
 
-    // Region wall + concurrency. Concurrency = fraction of a region's wall that
-    // overlaps ANY other region's window.
-    for (ri, windows) in region_windows.iter().enumerate() {
-        let mut wall = 0.0;
-        let mut overlap = 0.0;
-        for &(a, b) in windows {
-            wall += (b - a).max(0.0);
-            for (rj, other) in region_windows.iter().enumerate() {
-                if rj == ri {
-                    continue;
-                }
-                for &(c, d) in other {
-                    let ov = (b.min(d) - a.max(c)).max(0.0);
-                    overlap += ov;
-                }
+    // Region wall (= union length) + concurrency (= fraction of this region's
+    // union that overlaps ANY OTHER region's union — true cross-region smear,
+    // not same-region multi-thread overlap).
+    for ri in 0..region_union.len() {
+        let wall = total_len(&region_union[ri]);
+        // Cross-region overlap: union this region's intervals against every
+        // other region's union and measure the overlapped length.
+        let mut others: Vec<(f64, f64)> = Vec::new();
+        for (rj, u) in region_union.iter().enumerate() {
+            if rj != ri {
+                others.extend_from_slice(u);
             }
         }
+        let others = union_intervals(&others);
+        let overlap = overlap_len(&region_union[ri], &others);
         hw[ri].wall_us = wall;
         hw[ri].concurrency = if wall > 0.0 {
             (overlap / wall).min(1.0)
@@ -483,17 +529,15 @@ pub fn rollup(
     }
 
     // Attribute counter intervals to regions in proportion to the region's
-    // wall-overlap with the interval window.
+    // wall-overlap with the interval window. Use the per-region UNION (not the
+    // raw per-thread sum) so a region running on N threads is weighted by its
+    // real wall-overlap with the interval, not N× it.
     for iv in intervals {
-        let iv_a = iv.ts_us - iv.dur_us;
-        let iv_b = iv.ts_us;
-        // Overlap of each region with this interval.
-        let mut ov: Vec<f64> = vec![0.0; region_windows.len()];
+        let iv_win = [(iv.ts_us - iv.dur_us, iv.ts_us)];
+        let mut ov: Vec<f64> = vec![0.0; region_union.len()];
         let mut total = 0.0;
-        for (ri, windows) in region_windows.iter().enumerate() {
-            for &(a, b) in windows {
-                ov[ri] += (b.min(iv_b) - a.max(iv_a)).max(0.0);
-            }
+        for (ri, u) in region_union.iter().enumerate() {
+            ov[ri] = overlap_len(u, &iv_win);
             total += ov[ri];
         }
         if total <= 0.0 {
@@ -543,19 +587,36 @@ pub fn reconcile(rows: &[RegionHw], run_backend_pct: f64, run_badspec_pct: f64) 
     }
     let pred_backend = w_mem * 100.0;
     let pred_badspec = w_branch * 100.0;
-    // Tolerance is generous: the per-region proxy is heuristic; we only need it
-    // to land in the same ballpark, not match the architectural formula.
-    let backend_ok = (pred_backend - run_backend_pct).abs() <= 20.0 || run_backend_pct == 0.0;
-    let badspec_ok = (pred_badspec - run_badspec_pct).abs() <= 15.0 || run_badspec_pct == 0.0;
+    // The per-region `mem_bound` proxy is built from PEBS mem-LOAD tiers only.
+    // Load-miss latency is just ONE component of TMA backend-bound — stores,
+    // store-buffer fills, port contention and execution latency also count and
+    // are INVISIBLE to a load-tier histogram. So the physically-correct relation
+    // is a BOUND, not an equality: per-region load-mem-bound ≤ run backend-bound
+    // (+ a little slack for sampling noise). Likewise branch-bound from MPKI is a
+    // lower bound on bad-speculation (which also includes machine clears).
+    // "Consistent" therefore means the per-region proxy does not EXCEED the
+    // run-level bound; sitting below it is expected and indicates the backend
+    // stall is store/port/execution-bound rather than load-latency-bound — a
+    // useful refinement, not a contradiction.
+    let backend_ok = pred_backend <= run_backend_pct + 10.0 || run_backend_pct == 0.0;
+    let badspec_ok = pred_badspec <= run_badspec_pct + 8.0 || run_badspec_pct == 0.0;
+    let gap = (run_backend_pct - pred_backend).max(0.0);
     lines.push(format!(
-        "reconcile vs run-level TMA: per-region mem-bound (wall-weighted) {pred_backend:.0}% \
-         vs run backend-bound {run_backend_pct:.0}%  [{}]",
-        if backend_ok { "OK" } else { "DIVERGES" }
+        "reconcile vs run-level TMA: per-region load-mem-bound (wall-weighted) {pred_backend:.0}% \
+         ≤ run backend-bound {run_backend_pct:.0}%  [{}]",
+        if backend_ok { "CONSISTENT (load-miss ≤ backend)" } else { "DIVERGES (exceeds backend)" }
     ));
+    if backend_ok && gap > 15.0 {
+        lines.push(format!(
+            "  → {gap:.0}pp of backend-bound is NOT load-latency (loads are mostly L1): the \
+             backend stall is STORE-buffer / port / execution-bound — refines the lever toward \
+             store+compute, away from prefetch."
+        ));
+    }
     lines.push(format!(
         "reconcile vs run-level TMA: per-region branch-bound (wall-weighted) {pred_badspec:.0}% \
-         vs run bad-speculation {run_badspec_pct:.0}%  [{}]",
-        if badspec_ok { "OK" } else { "DIVERGES" }
+         ≤ run bad-speculation {run_badspec_pct:.0}%  [{}]",
+        if badspec_ok { "CONSISTENT (MPKI-bound ≤ bad-spec)" } else { "DIVERGES" }
     ));
     (lines, backend_ok && badspec_ok)
 }
@@ -626,6 +687,31 @@ pub fn render(rows: &[RegionHw]) -> String {
                 st.core_bound * 100.0,
             ));
         }
+        if r.mem_samples == 0 && r.wall_us > 0.0 {
+            s.push_str(&format!(
+                "  {:<14} '- 0 mem-load samples: STORE-dominated region (PEBS mem-loads sample\n  \
+                 {:<14}    loads only) or a tiny window — not 'no memory traffic'.\n",
+                "", ""
+            ));
+        }
+    }
+    // Honest caveat: high cross-region concurrency means the time-window join is
+    // smeared (regions run on different threads in the same wall window).
+    let smeared: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.concurrency > 0.5 && r.wall_us > 0.0)
+        .map(|r| r.region.as_str())
+        .collect();
+    if !smeared.is_empty() {
+        s.push_str(&format!(
+            "\n  ! HIGH CROSS-REGION CONCURRENCY ({}): these regions run CONCURRENTLY on\n  \
+             different worker threads, so a PEBS sample in their shared wall window is charged\n  \
+             to the first by region order — the tier SHAPE is still indicative (it reflects the\n  \
+             dominant region in the window) but per-region SEPARATION is approximate. For exact\n  \
+             separation, capture with single-threaded (-p 1) decode, or use per-thread perf\n  \
+             record bound to one worker.\n",
+            smeared.join(", ")
+        ));
     }
     s
 }

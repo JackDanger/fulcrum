@@ -22,7 +22,7 @@
 //!   plan --bin <path> [...]          print a coz/perf workflow for your binary
 
 use fulcrum::config::Config;
-use fulcrum::{coz, critpath, mech, rank, trace, validate};
+use fulcrum::{coz, critpath, mech, rank, region_hw, trace, validate, xtool};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -35,6 +35,8 @@ USAGE:\n\
   fulcrum coz-parse <profile.coz> [--config profile.json]\n\
   fulcrum mech-report <perf_report.txt>\n\
   fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
+  fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
+  fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
@@ -463,6 +465,132 @@ fn cmd_plan(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// region-hw: join PEBS mem-load samples (+ optional perf-stat intervals) into
+/// the trace's region windows → a PER-REGION hardware table. The region→span
+/// substrings come from the config's region `functions` (so it speaks in your
+/// regions). Reconciles against a run-level `--topdown` if supplied.
+fn cmd_region_hw(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let (Some(trace_path), Some(mem_path)) = (pos.first(), pos.get(1)) else {
+        eprintln!(
+            "region-hw needs <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv]\n  \
+             [--config c.json] [--topdown td.txt]\n\n  \
+             Capture on Linux:\n    \
+             FULCRUM_TRACE=/tmp/tl.json FULCRUM_TRACE_CLOCK=monotonic <bin> <args>\n    \
+             perf mem record -k CLOCK_MONOTONIC -o /tmp/mem.data -- <bin> <args>\n    \
+             perf script -i /tmp/mem.data -F time,data_src > /tmp/mem.txt\n    \
+             fulcrum region-hw /tmp/tl.json /tmp/mem.txt --config c.json"
+        );
+        return usage();
+    };
+    let cfg = load_config(args);
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: trace: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if region_hw::clock_base_ns(&events).is_none() {
+        eprintln!(
+            "fulcrum: WARNING — trace has no `fulcrum.clock_base` marker; it was likely\n  \
+             written WITHOUT FULCRUM_TRACE_CLOCK=monotonic, so its timestamps are NOT on\n  \
+             the CLOCK_MONOTONIC timeline and the PEBS join will be GARBAGE. Re-capture\n  \
+             the trace in monotonic mode."
+        );
+    }
+    let mem_text = std::fs::read_to_string(mem_path).unwrap_or_default();
+    let mem = region_hw::parse_perf_script_mem(&mem_text);
+    let intervals = pos
+        .get(2)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| region_hw::parse_perf_stat_intervals(&t, 0.0))
+        .unwrap_or_default();
+    // region → its function/span substrings, from the config.
+    let region_funcs: Vec<(String, Vec<String>)> = cfg
+        .regions
+        .iter()
+        .map(|r| {
+            let mut subs = r.functions.clone();
+            subs.push(r.name.clone());
+            (r.name.clone(), subs)
+        })
+        .collect();
+    let rows = region_hw::rollup(&events, &mem, &intervals, &region_funcs);
+    eprintln!(
+        "region-hw: {} PEBS samples, {} counter intervals, {} regions",
+        mem.len(),
+        intervals.len(),
+        rows.len()
+    );
+    print!("{}", region_hw::render(&rows));
+    // Reconcile against the run-level TMA if a --topdown capture was given.
+    if let Some(td_path) = flag(args, "--topdown") {
+        if let Ok(text) = std::fs::read_to_string(td_path) {
+            let td = mech::parse_topdown(&text);
+            let (lines, ok) = region_hw::reconcile(&rows, td.backend_bound, td.bad_speculation);
+            println!("\n========  PER-REGION ↔ RUN-LEVEL TMA RECONCILIATION  ========");
+            for l in &lines {
+                println!("  {l}");
+            }
+            println!(
+                "  verdict: {}",
+                if ok {
+                    "per-region rolls up to run-level TMA — consistent"
+                } else {
+                    "per-region DIVERGES from run-level TMA — investigate"
+                }
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// xtool: fold per-tool `perf stat --topdown` + `perf report` captures into one
+/// comparable cross-tool accounting on the same input. Args are triples:
+///   --input <name> --tool <name>:<topdown.txt>:<report.txt>[:<mbps>]  (repeatable)
+fn cmd_xtool(args: &[String]) -> ExitCode {
+    let input = flag(args, "--input").unwrap_or("input").to_string();
+    let mut profiles = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--tool" {
+            if let Some(spec) = args.get(i + 1) {
+                let parts: Vec<&str> = spec.split(':').collect();
+                if parts.len() >= 3 {
+                    let tool = parts[0];
+                    let td = std::fs::read_to_string(parts[1]).unwrap_or_default();
+                    let rep = std::fs::read_to_string(parts[2]).unwrap_or_default();
+                    let mbps = parts.get(3).and_then(|s| s.parse::<f64>().ok());
+                    profiles.push(xtool::ToolProfile::from_captures(
+                        tool, &input, &td, &rep, mbps,
+                    ));
+                } else {
+                    eprintln!("fulcrum: --tool spec must be name:topdown.txt:report.txt[:mbps]");
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if profiles.is_empty() {
+        eprintln!(
+            "xtool needs at least one --tool name:topdown.txt:report.txt[:mbps] (and --input <name>)"
+        );
+        return usage();
+    }
+    print!("{}", xtool::render_comparison(&input, &profiles));
+    // Per-tool top functions for drill-down.
+    for p in &profiles {
+        println!("\n  {} top functions (cycles%):", p.tool);
+        for (name, pct) in p.top_funcs.iter().take(8) {
+            println!("    {pct:>6.2}%  {name}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
@@ -474,6 +602,8 @@ fn main() -> ExitCode {
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),
+        "region-hw" => cmd_region_hw(rest),
+        "xtool" => cmd_xtool(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
         "help" | "--help" | "-h" => {

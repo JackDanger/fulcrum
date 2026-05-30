@@ -1,11 +1,11 @@
 //! Counterfactual cost estimator — PREDICT a structural change's wall delta
 //! BEFORE building it.
 //!
-//! This is the capability that would have stopped two multi-hour falsified
-//! levers: it combines a region's **access counts** ([`crate::region_hw`] +
-//! the trace) with the **measured per-operation cost** of the primitive a
-//! change swaps in ([`crate::microbench`]) into a grounded arithmetic
-//! prediction of the wall move — not a hunch.
+//! This is the capability that would have stopped multi-hour falsified levers
+//! before any code was written: it combines a region's **access counts**
+//! ([`crate::region_hw`] + the trace) with the **measured per-operation cost**
+//! of the primitive a change swaps in ([`crate::microbench`]) into a grounded
+//! arithmetic prediction of the wall move — not a hunch.
 //!
 //! ## The model
 //!
@@ -20,7 +20,7 @@
 //!   2. the region's **on-critical-path share** — the FULCRUM invariant that
 //!      only time on the consumer's critical path moves the wall. A change to a
 //!      fully-overlapped off-path region predicts ≈0, exactly as the v1 layer
-//!      found for the 212 ms absorb copy.
+//!      found for a 200+ ms fully-overlapped copy.
 //!
 //! Formally, for a region R with baseline wall `wall_R` (its on-path
 //! contribution) and a set of deltas:
@@ -38,20 +38,21 @@
 //!
 //! ## Why this catches the known failures (the validation gate)
 //!
-//! * **u8 + journal** swapped a u16 masked-ring store (cheap, ~1 cyc, in-L1)
-//!   for a u8 store PLUS a journal append PLUS a later journal-replay pass over
-//!   ~21M entries / ~296 MB that is a fresh cache-cold streaming read. The
-//!   estimator multiplies 21M replay ops by the *measured* DRAM-streaming
+//! * **per-element side-journal** swaps a wide masked-ring store (cheap, ~1 cyc,
+//!   in-L1) for a narrow store PLUS a journal append PLUS a later journal-replay
+//!   pass over ~21M entries / ~296 MB that is a fresh cache-cold streaming read.
+//!   The estimator multiplies 21M replay ops by the *measured* DRAM-streaming
 //!   cost — a large positive (slowdown) term the eye misses but the arithmetic
-//!   cannot. PLUS it accounts for the lost ISA-L clean-tail fast path as
-//!   re-added slow-path cycles. Net: a big positive %, NOT a win.
-//! * **incompressible flat** isn't a per-op change at all — it's that the
-//!   region's on-path share is already ≈ its serial share (no parallel slack to
-//!   recover). Modeled as a change with ~0 movable on-path share ⇒ ≈0 predicted
+//!   cannot. PLUS it accounts for the lost clean-tail fast path as re-added
+//!   slow-path cycles. Net: a big positive %, NOT a win.
+//! * **memcpy-bound flat** isn't a per-op change at all — it's that the region's
+//!   on-path share is already ≈ its serial share (no parallel slack to recover).
+//!   Modeled as a change with ~0 movable on-path share ⇒ ≈0 predicted
 //!   improvement, matching "it just doesn't parallelize."
-//! * **inline match-copy** removed per-iteration yield-check / bounds overhead
-//!   on the hot copy: a modest negative cyc/op delta over the copy count, on a
-//!   high-on-path region ⇒ a few-percent speedup, matching the measured +5%.
+//! * **inner-loop instruction-reduction** removed per-iteration yield-check /
+//!   bounds overhead on the hot copy: a modest negative cyc/op delta over the
+//!   op count, on a high-on-path region ⇒ a few-percent speedup, matching the
+//!   measured win.
 
 use crate::critpath::CritPath;
 use crate::microbench::BenchResult;
@@ -61,7 +62,7 @@ use crate::config::Config;
 /// One per-operation cost change inside a region.
 #[derive(Debug, Clone)]
 pub struct Delta {
-    /// Human label (e.g. "marker-ring store: u16→u8").
+    /// Human label (e.g. "ring store: wide→narrow").
     pub what: String,
     /// Baseline op count per UNIT OF WORK (one decoded run / one full decode,
     /// consistent with how `wall_cycles` below is scoped).
@@ -69,12 +70,13 @@ pub struct Delta {
     /// Baseline cycles per op (measured by a microbench, or known).
     pub cyc_from: f64,
     /// Op count after the change (often == count_from; differs when the change
-    /// adds/removes operations, e.g. a journal that appends a 2nd op per byte).
+    /// adds/removes operations, e.g. a side-journal that appends a 2nd op per
+    /// element).
     pub count_to: f64,
     /// Cycles per op after the change (measured candidate primitive).
     pub cyc_to: f64,
     /// One-time NEW cycles the change introduces per unit of work that have no
-    /// baseline counterpart (e.g. a whole journal-replay pass). Defaults 0.
+    /// baseline counterpart (e.g. a whole side-journal replay pass). Defaults 0.
     pub new_cycles: f64,
 }
 
@@ -137,9 +139,9 @@ pub struct RegionBaseline {
     /// sanity-bound a delta (you can't remove more cycles than the region has).
     /// `None` to skip the bound.
     pub region_cycles_per_unit: Option<f64>,
-    /// Units of work per run (e.g. number of decoded chunks), so per-unit cycle
-    /// deltas scale to the whole run. Default 1.0 if the deltas are already
-    /// whole-run counts.
+    /// Units of work per run (e.g. number of processed chunks), so per-unit
+    /// cycle deltas scale to the whole run. Default 1.0 if the deltas are
+    /// already whole-run counts.
     pub units_per_run: f64,
 }
 
@@ -214,7 +216,8 @@ pub fn estimate(change: &str, base: &RegionBaseline, deltas: &[Delta]) -> Estima
     // common case — the change stays within the region's existing on-path
     // character — by scaling both directions by on_path_share, and let the
     // caller raise on_path_share→1.0 for a change that serializes a previously
-    // overlapped region (see the journal postdiction, which does exactly that).
+    // overlapped region (see the side-journal postdiction, which does exactly
+    // that).
     let predicted_wall_frac = raw_wall_frac * base.on_path_share;
 
     let confidence = build_confidence(base, deltas, raw_wall_frac, predicted_wall_frac);
@@ -245,8 +248,8 @@ fn build_confidence(
         notes.push("no region cycle budget supplied — speedup is NOT bounded by region size (may over-claim)".to_string());
     }
     // Flag deltas whose op count is large and whose cost came from a cold tier
-    // (the journal-replay trap): those dominate and need the most trustworthy
-    // microbench.
+    // (the side-journal-replay trap): those dominate and need the most
+    // trustworthy microbench.
     let big = deltas
         .iter()
         .filter(|d| d.delta_cycles().abs() > 0.3 * raw.abs().max(1.0))
