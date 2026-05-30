@@ -188,6 +188,57 @@ cycle% per function bucket (decode/copy/window/alloc), normalized so SHAPE is
 comparable across tools running at different throughput, with a focused "where
 the tool under test differs" diff against each alternative.
 
+## Fair cross-tool comparison + claim audit: do NOT over-claim "fastest"
+
+The accounting above explains *why* a tool is fast. Three more commands stop a
+speed comparison from LYING — the five classic ways a cross-tool benchmark
+inflates a "we're the fastest" claim are made impossible **by construction**:
+
+**`fulcrum compare --spec tools.json`** (`compare.rs`). Runs N tools over a
+(corpus × thread-count) matrix and prints an HONEST win/lose/tie table:
+
+1. **Interpreter-wrapped competitor + startup tax** — it RESOLVES each tool's
+   real binary, sniffs it (native ELF/Mach-O vs a `#!python`/`sh` shim) and
+   WARNS, then MEASURES per-invocation startup (a `--version` run) and
+   SUBTRACTS it with a sanity clamp, so a pip-wheel shim's interpreter spin-up
+   can't masquerade as decode time.
+2. **Naive uniform flag** — each tool runs its DOCUMENTED BEST config (a
+   per-tool auto/thread-flag spelling), so it's auto-vs-auto, not an arbitrary
+   `-P N`.
+3. **No correctness check** — every run's output sha256 is verified against a
+   reference decoder; a mismatch DISQUALIFIES the cell. Speed over wrong bytes
+   is never a win.
+4. **Single cherry-picked cell** — it sweeps the whole matrix and reports the
+   HONEST SCOPE ("wins T1 incompressible; LOSES compressible by 1.4×; ties
+   T8") with an anti-over-claim verdict, never one cell.
+5. **best-of-N under contention** — runs are INTERLEAVED best-of-N with a
+   load-average + per-cell-spread guard that FLAGS or (with
+   `--strict-contention`) REFUSES a dirty box; a within-noise margin is a TIE,
+   not a win; below n=3 every result is a tie (a best-of-1/2 is noise); a win
+   where every rival crashed is labelled "BY DEFAULT", not a speed win.
+
+**`fulcrum audit --spec tools.json --claim "..."`** (`audit.rs`). Bakes the
+adversarial audit in: it parses a stated claim's scope ("fastest at every
+thread count on compressible") and reports **SURVIVES / NARROWS-TO-SCOPE /
+FALSE** against the fair matrix, citing which of the five holes changed the
+picture. A human can no longer accidentally publish "fastest everywhere" when
+the tool loses T8 or emits wrong bytes — the audit exits nonzero so CI gates it.
+
+**`fulcrum mech-caps`** (`mech_arch.rs`). The HW-counter layers (PEBS, TMA,
+RDTSCP cycles) are x86/Linux-precise; this detects the (arch, OS) and reports
+each capability **FULL / DEGRADED / UNAVAILABLE** — so on Apple-silicon /
+aarch64-linux it never prints x86-only numbers, and instead names the right
+API (Arm SPE, `xctrace`) or honestly degrades to the cross-platform wall +
+critical-path layers.
+
+```bash
+# generic spec — no competitor names; placeholders {input}/{threads}/{output}
+fulcrum compare --spec examples/compare.example.json --samples 9
+fulcrum audit   --spec examples/compare.example.json \
+  --claim "tool-a is the fastest decoder at every thread count, every situation"
+fulcrum mech-caps
+```
+
 ## How it's organized
 
 ```
@@ -200,19 +251,28 @@ src/
   mech.rs       perf TMA / report parsing → per-function mechanism (layer 3)
   region_hw.rs  PER-REGION hardware counters: PEBS-by-timestamp join + reconcile
   microbench.rs pinned RDTSCP primitive microbench harness (cyc/op, B/cyc)
-  estimate.rs   counterfactual wall-delta estimator (access-counts × per-op cost)
+  estimate.rs   counterfactual wall-delta estimator (signed confidence bracket)
   xtool.rs      cross-tool region accounting (TMA + bucket shape, comparable)
+  compare.rs    FAIR cross-tool benchmark: matrix sweep, output-sha256 verify,
+                interpreter-shim + startup detection, interleaved best-of-N,
+                noise-aware win/tie, in-tree SHA-256 (closes the 5 holes)
+  compare_cli.rs generic --spec JSON (tools + corpora) + reference-digest build
+  audit.rs      claim-validator: SURVIVES / NARROWS-TO-SCOPE / FALSE
+  mech_arch.rs  cross-arch HW-counter capability (FULL/DEGRADED/UNAVAILABLE)
   rank.rs       fuse the layers → ranked lever list
   validate.rs   the trust gate: re-derive known ground truth
   config.rs     declarative per-pipeline config (regions, progress point, ground truth)
-  main.rs       the fulcrum CLI (critpath/coz-parse/mech-report/rank/region-hw/xtool/validate/plan)
+  main.rs       the fulcrum CLI (… + compare / audit / mech-caps)
 examples/
   toy_pipeline.rs        ~150-line self-contained demo pipeline
   profile.example.json   annotated config template
+  compare.example.json   generic fair-compare spec (no competitor names)
 tests/
   analyzer.rs              end-to-end tests over a synthetic trace
   region_hw.rs             per-region PEBS join correctness
   estimator_postdiction.rs the trust gate for capability 3 (postdict known outcomes)
+  fair_compare.rs          e2e trust test: wrong-bytes disqualified, shim flagged,
+                           hang killed at timeout, real win survives
 ```
 
 ## License
