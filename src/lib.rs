@@ -20,11 +20,14 @@
 //! See the bundled `examples/toy_pipeline.rs` for an end-to-end, dependency-
 //! free demonstration.
 
+pub mod audit;
+pub mod compare;
 pub mod config;
 pub mod coz;
 pub mod critpath;
 pub mod estimate;
 pub mod mech;
+pub mod mech_arch;
 pub mod microbench;
 pub mod probe;
 pub mod rank;
