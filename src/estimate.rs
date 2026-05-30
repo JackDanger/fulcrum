@@ -167,8 +167,140 @@ pub struct Estimate {
 
 impl Estimate {
     /// Predicted wall move as a percentage with sign (negative = faster).
+    ///
+    /// DEPRECATED as a headline: a bare point estimate reads as more precise
+    /// than this model is. Prefer [`Estimate::bracket`] — the cycle-multiply
+    /// model reliably gets the SIGN and ORDER OF MAGNITUDE but UNDER-predicts
+    /// magnitude (it omits DRAM-bandwidth contention and pipeline/branch
+    /// serialization), so the honest output is a sign + a confidence bracket,
+    /// not a single number.
     pub fn predicted_pct(&self) -> f64 {
         self.predicted_wall_frac * 100.0
+    }
+
+    /// The honest output: a SIGN + an order-of-magnitude CONFIDENCE BRACKET
+    /// `[lo_pct, hi_pct]` (both signed, lo ≤ hi). This is what should be quoted,
+    /// never the bare point.
+    ///
+    /// Rationale, grounded in the postdiction record (`tests/estimator_*`):
+    /// the cycle-multiply point estimate is a LOWER BOUND on magnitude for two
+    /// classes of change the model does not term:
+    ///   * **bandwidth-bound** work — the model charges per-op latency, but a
+    ///     streaming pass that saturates DRAM bandwidth costs MORE wall than the
+    ///     latency sum once it contends with other cores; and
+    ///   * **inner-loop pipeline/branch** effects — removing a per-iteration
+    ///     branch/dependency unblocks more retire slots than the raw cycle delta.
+    /// So we widen the point into a bracket whose magnitude spans
+    /// `[point, point × K]` (K = the modeling-uncertainty factor below),
+    /// preserving the sign. A near-zero point (an off-path / non-lever change)
+    /// stays a tight bracket around zero — the model is CONFIDENT about
+    /// non-levers, which is its most-validated regime.
+    pub fn bracket(&self) -> ConfidenceBracket {
+        let point = self.predicted_wall_frac;
+        let mag = point.abs();
+        // Non-lever regime: a tiny predicted move is trustworthy AS small (the
+        // on-path cap is the validated part). Keep the bracket tight.
+        if mag < 0.01 {
+            return ConfidenceBracket {
+                sign: Sign::of(point),
+                lo_frac: point - 0.005,
+                hi_frac: point + 0.005,
+                order: "≈0 (non-lever): bracket is tight around zero — the on-path cap is the model's most-validated output".to_string(),
+            };
+        }
+        // The modeling-uncertainty factor: the point is a lower bound on
+        // magnitude; the upper bound inflates it. We use 2.5× as a generic
+        // order-of-magnitude span (the n=3 cross-tool study found ~1.3–2.2×
+        // mispredictions on memory-bound cells), and round to an order label.
+        const K: f64 = 2.5;
+        // The bracket spans the same sign from |point| to K·|point|.
+        let (lo_mag, hi_mag) = (mag, mag * K);
+        let (lo_frac, hi_frac) = if point < 0.0 {
+            // speedup: more-negative is the bigger effect → hi(=less negative)
+            // is the conservative end. Keep lo ≤ hi numerically.
+            (-hi_mag, -lo_mag)
+        } else {
+            (lo_mag, hi_mag)
+        };
+        ConfidenceBracket {
+            sign: Sign::of(point),
+            lo_frac,
+            hi_frac,
+            order: order_label(mag),
+        }
+    }
+}
+
+/// The sign of a predicted wall move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sign {
+    /// Predicted SPEEDUP (wall down).
+    Speedup,
+    /// Predicted SLOWDOWN (wall up).
+    Slowdown,
+    /// Predicted ≈ no change.
+    Flat,
+}
+
+impl Sign {
+    fn of(frac: f64) -> Sign {
+        if frac < -0.005 {
+            Sign::Speedup
+        } else if frac > 0.005 {
+            Sign::Slowdown
+        } else {
+            Sign::Flat
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Sign::Speedup => "SPEEDUP",
+            Sign::Slowdown => "SLOWDOWN",
+            Sign::Flat => "FLAT",
+        }
+    }
+}
+
+/// An order-of-magnitude confidence bracket for a predicted wall move. Both
+/// bounds are SIGNED fractions of total wall (negative = faster), `lo ≤ hi`.
+#[derive(Debug, Clone)]
+pub struct ConfidenceBracket {
+    pub sign: Sign,
+    pub lo_frac: f64,
+    pub hi_frac: f64,
+    /// A human order-of-magnitude label ("a few %", "~10%", "tens of %").
+    pub order: String,
+}
+
+impl ConfidenceBracket {
+    /// The bracket as a signed percentage pair `[lo, hi]`.
+    pub fn pct(&self) -> (f64, f64) {
+        (self.lo_frac * 100.0, self.hi_frac * 100.0)
+    }
+    /// One-line honest summary: sign + order + the bracket.
+    pub fn summary(&self) -> String {
+        let (lo, hi) = self.pct();
+        format!(
+            "{} — {} (confidence bracket [{:+.1}%, {:+.1}%])",
+            self.sign.label(),
+            self.order,
+            lo,
+            hi
+        )
+    }
+}
+
+/// Coarse order-of-magnitude label for a wall-fraction magnitude.
+fn order_label(mag: f64) -> String {
+    let p = mag * 100.0;
+    if p < 3.0 {
+        "a few % at most".to_string()
+    } else if p < 12.0 {
+        "~single-digit-to-10%".to_string()
+    } else if p < 40.0 {
+        "tens of %".to_string()
+    } else {
+        "order-of-half-the-wall or more (catastrophic)".to_string()
     }
 }
 
@@ -290,31 +422,113 @@ pub fn cyc_of(results: &[BenchResult], name_substr: &str) -> Option<f64> {
         .map(|r| r.cycles_per_op())
 }
 
-/// Render a set of estimates as a report.
+/// Render a set of estimates as a report. The HEADLINE is the SIGN + an
+/// order-of-magnitude CONFIDENCE BRACKET — never a bare point estimate, which
+/// would read as more precise than this cycle-multiply model is.
 pub fn render(estimates: &[Estimate]) -> String {
     let mut s = String::new();
     s.push_str("\n========  COUNTERFACTUAL WALL-DELTA PREDICTIONS  ========\n");
     s.push_str(
-        "predicted_wall% = (Σ delta-cycles × units / region-clock / total-wall) × on-path-share.\n\
-         Negative = predicted SPEEDUP. Grounded in measured access counts × measured per-op cost.\n\n",
+        "This model reliably gets the SIGN and ORDER OF MAGNITUDE; it UNDER-predicts magnitude on\n\
+         memory-bandwidth-bound and inner-loop pipeline changes (no DRAM-contention / serialization\n\
+         term). So the headline is a SIGNED CONFIDENCE BRACKET, not a point. The point estimate\n\
+         (Σ delta-cycles × units / region-clock / total-wall × on-path-share) is the LOWER bound on\n\
+         magnitude; the bracket's upper end carries the modeling uncertainty.\n\n",
     );
     for e in estimates {
+        let b = e.bracket();
         s.push_str(&format!(
-            "  CHANGE: {}\n  region: {}   PREDICTED WALL: {:+.1}%   (raw {:+.1}% before on-path cap)\n",
+            "  CHANGE: {}\n  region: {}\n  >>> PREDICTION: {}\n",
             e.change,
             e.region,
+            b.summary(),
+        ));
+        s.push_str(&format!(
+            "      point estimate (lower-bound magnitude): {:+.1}%   (raw {:+.1}% before on-path cap)\n",
             e.predicted_pct(),
             e.raw_wall_frac * 100.0,
         ));
         s.push_str(&format!(
-            "    run delta: {:+.3} Gcyc  →  {:+.4} s\n",
+            "      run delta: {:+.3} Gcyc  →  {:+.4} s\n",
             e.run_delta_cycles / 1e9,
             e.run_delta_wall_s
         ));
         for (what, dc) in &e.breakdown {
             s.push_str(&format!("      {:<44} {:+.3} Gcyc\n", what, dc / 1e9));
         }
-        s.push_str(&format!("    confidence: {}\n\n", e.confidence));
+        s.push_str(&format!("      grounding: {}\n\n", e.confidence));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(on_path: f64) -> RegionBaseline {
+        RegionBaseline {
+            region: "r".into(),
+            total_wall_s: 1.0,
+            on_path_share: on_path,
+            cycles_per_s: 1e9,
+            region_cycles_per_unit: None,
+            units_per_run: 1.0,
+        }
+    }
+
+    #[test]
+    fn bracket_preserves_sign_and_brackets_the_point() {
+        // A speedup change: removing 50M ops at 3 cyc on a fully-on-path region.
+        let e = estimate(
+            "remove per-iter branch",
+            &base(1.0),
+            &[Delta::removed("branch", 50e6, 3.0)],
+        );
+        let b = e.bracket();
+        assert_eq!(b.sign, Sign::Speedup);
+        let (lo, hi) = b.pct();
+        // The point estimate must lie inside [lo, hi], and both must be negative
+        // (a speedup), with lo (more negative) ≤ hi.
+        assert!(lo <= hi);
+        assert!(hi <= 0.0 && lo < 0.0);
+        let point = e.predicted_pct();
+        assert!(
+            point >= lo - 1e-6 && point <= hi + 1e-6,
+            "point {point} must lie within bracket [{lo},{hi}]"
+        );
+        // The model UNDER-predicts magnitude: |lo| (the big end) must exceed the
+        // point magnitude.
+        assert!(lo.abs() >= point.abs());
+    }
+
+    #[test]
+    fn non_lever_bracket_is_tight_around_zero() {
+        // A change on a region with ~zero on-path share predicts ≈0 and the
+        // bracket must stay tight around zero (the model's most-validated case).
+        let e = estimate(
+            "speed an off-path copy",
+            &base(0.001),
+            &[Delta::removed("copy", 200e6, 1.0)],
+        );
+        let b = e.bracket();
+        let (lo, hi) = b.pct();
+        assert!(hi - lo <= 2.0, "non-lever bracket should be tight, got [{lo},{hi}]");
+        assert!(b.order.contains("non-lever") || matches!(b.sign, Sign::Flat));
+    }
+
+    #[test]
+    fn slowdown_bracket_is_positive() {
+        // A big added streaming pass: a slowdown. Bracket must be positive and
+        // bracket the point from below.
+        let e = estimate(
+            "add side-journal replay",
+            &base(1.0),
+            &[Delta::added("replay 21M cold", 21e6, 30.0)],
+        );
+        let b = e.bracket();
+        assert_eq!(b.sign, Sign::Slowdown);
+        let (lo, hi) = b.pct();
+        assert!(lo > 0.0 && hi >= lo);
+        assert!(e.predicted_pct() <= hi + 1e-6 && e.predicted_pct() >= lo - 1e-6);
+    }
 }
