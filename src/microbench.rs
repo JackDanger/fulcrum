@@ -49,13 +49,15 @@ pub fn black_box<T>(x: T) -> T {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc_serialized() -> u64 {
-    use std::arch::x86_64::{__rdtscp, _lfence, _mm_lfence};
+    use std::arch::x86_64::{__rdtscp, _mm_lfence};
     let mut aux = 0u32;
     // SAFETY: rdtscp/lfence are unprivileged and always available on x86_64.
     unsafe {
         _mm_lfence();
         let t = __rdtscp(&mut aux);
-        _lfence();
+        // rdtscp serializes against prior insns; fence after so later insns
+        // don't begin before the timestamp is sampled.
+        _mm_lfence();
         t
     }
 }
