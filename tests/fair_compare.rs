@@ -200,6 +200,77 @@ fn fast_but_wrong_is_disqualified_and_python_is_flagged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tool that HANGS must be killed at the timeout and recorded errored —
+/// without hanging the whole sweep. Validates the real (kill-based) timeout.
+#[test]
+fn a_hanging_tool_is_killed_at_timeout_not_hung() {
+    if !have("sh") {
+        eprintln!("skipping: no `sh` on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("fulcrum_fair_compare_timeout_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = dir.join("payload.bin");
+    std::fs::write(&payload, b"hello world").unwrap();
+    let reference = compare::sha256(b"hello world");
+
+    let good = write_exec(&dir, "good.sh", "#!/bin/sh\ncat \"$1\"\n");
+    // A tool that sleeps far longer than the timeout (would hang the sweep).
+    let hang = write_exec(&dir, "hang.sh", "#!/bin/sh\nsleep 30\ncat \"$1\"\n");
+
+    let tools = vec![
+        ToolSpec {
+            name: "tool-good".into(),
+            bin: good.display().to_string(),
+            argv: vec!["{input}".into()],
+            thread_arg: None,
+            auto_threads_arg: None,
+            writes_to: OutputMode::Stdout,
+            version_arg: "".into(),
+        },
+        ToolSpec {
+            name: "tool-hang".into(),
+            bin: hang.display().to_string(),
+            argv: vec!["{input}".into()],
+            thread_arg: None,
+            auto_threads_arg: None,
+            writes_to: OutputMode::Stdout,
+            version_arg: "".into(),
+        },
+    ];
+    let corpora = vec![Corpus {
+        name: "payload".into(),
+        kind: "binary".into(),
+        path: payload,
+        plain_bytes: 11,
+        reference,
+    }];
+    // A SHORT timeout so the hanging tool is killed fast; the whole test must
+    // finish in a couple seconds, proving the sweep was not hung.
+    let cfg = RunCfg {
+        samples: 1,
+        startup_samples: 1,
+        strict_contention: false,
+        timeout: Duration::from_millis(300),
+        tmp_dir: dir.clone(),
+    };
+    let t0 = std::time::Instant::now();
+    let cmp = compare::run_comparison("tool-good", &tools, &corpora, &[ThreadCell::Fixed(1)], &cfg);
+    let elapsed = t0.elapsed();
+    // The sweep must NOT have waited for the 30s sleep.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "sweep took {elapsed:?} — the hanging tool was not killed at the timeout"
+    );
+    let hang_cell = cmp.cells.iter().find(|c| c.tool == "tool-hang").unwrap();
+    assert!(hang_cell.errored, "the hanging tool must be recorded errored");
+    assert!(!hang_cell.valid());
+    let good_cell = cmp.cells.iter().find(|c| c.tool == "tool-good").unwrap();
+    assert!(good_cell.valid(), "the good tool must still produce a valid cell");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A correct tool that genuinely wins (above the noise floor) should SURVIVE an
 /// honest scoped claim — the harness must not be so conservative it rejects real
 /// wins. Uses a deliberately-slowed shim vs a fast one so the margin is large.

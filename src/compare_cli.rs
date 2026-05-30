@@ -201,10 +201,10 @@ fn run_reference(
     }
     let o = cmd.output()?;
     if !o.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("reference decoder exited nonzero: {:?}", o.status),
-        ));
+        return Err(std::io::Error::other(format!(
+            "reference decoder exited nonzero: {:?}",
+            o.status
+        )));
     }
     let bytes = match (output_mode, &out_path) {
         ("stdout", _) => o.stdout,

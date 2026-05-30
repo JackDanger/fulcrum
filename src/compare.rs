@@ -38,6 +38,65 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// Send SIGKILL to a whole process group (negative pid). Declared directly so we
+/// don't add a libc dependency on non-Linux targets just for the timeout kill.
+/// SAFETY: `kill(2)` with a valid pgid and SIGKILL is always safe to call.
+#[cfg(unix)]
+unsafe fn libc_kill_group(pgid: i32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    // Negative pid → deliver to the entire process group.
+    kill(-pgid, SIGKILL);
+}
+
+/// Hard cap for the per-invocation STARTUP probe. A genuine process/interpreter
+/// start is well under this; a tool that takes longer on its version/bare run is
+/// pathological and must not be allowed to hang the whole comparison.
+const STARTUP_PROBE_CAP: Duration = Duration::from_secs(3);
+
+/// Run a binary with one arg, discarding output, killed at `cap` (process-group
+/// kill on Unix so wrappers/grandchildren die too). Used by the startup probe so
+/// a tool with no fast `--version` can't hang the comparison. Returns nothing —
+/// the caller only times the wall.
+fn run_bounded(bin: &Path, arg: &str, cap: Duration) {
+    let mut cmd = Command::new(bin);
+    if !arg.is_empty() {
+        cmd.arg(arg);
+    }
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let Ok(mut child) = cmd.spawn() else { return };
+    #[cfg(unix)]
+    let pgid = child.id() as i32;
+    let t0 = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if t0.elapsed() > cap {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc_kill_group(pgid);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 // ───────────────────────────── tool specification ──────────────────────────────
 
 /// How to drive ONE tool generically. Argv templates use placeholders that the
@@ -335,11 +394,11 @@ pub fn probe_binary(spec: &ToolSpec, startup_samples: usize) -> BinaryProbe {
         let t0 = Instant::now();
         // Run the version probe; ignore status. We only want the process
         // spin-up + interpreter-init wall, which is the per-invocation tax.
-        let _ = Command::new(&path)
-            .arg(&spec.version_arg)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // BOUND it: a real startup is sub-second, so cap the probe (e.g. a tool
+        // with no fast --version, or one that hangs on a bare run, must not hang
+        // the whole comparison). A capped probe yields a clamped-large startup,
+        // which the cross-tool subtraction bound then handles safely.
+        run_bounded(&path, &spec.version_arg, STARTUP_PROBE_CAP);
         walls.push(t0.elapsed());
     }
     walls.sort();
@@ -534,6 +593,9 @@ impl Sha256 {
         out
     }
 
+    // The SHA-256 round schedule is clearest with explicit indices (it mirrors
+    // FIPS 180-4); the range-loop lint is a false positive on crypto.
+    #[allow(clippy::needless_range_loop)]
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
@@ -640,6 +702,9 @@ pub struct Comparison {
     pub cells: Vec<Cell>,
     pub guard_warning: Option<String>,
     pub samples: usize,
+    /// True when `strict_contention` was set AND the box was busy, so the sweep
+    /// was REFUSED (no cells measured). hole #5's "refuse dirty runs" limb.
+    pub refused: bool,
 }
 
 /// The outcome at one (corpus, thread) cell, AFTER the noise check. A win is
@@ -668,7 +733,7 @@ impl Comparison {
             .iter()
             .filter(|c| c.corpus == corpus && c.threads == threads && c.valid())
             .collect();
-        v.sort_by(|a, b| a.wall_minus_startup.cmp(&b.wall_minus_startup));
+        v.sort_by_key(|c| c.wall_minus_startup);
         let best = v.first()?;
         let margin = if let Some(second) = v.get(1) {
             second.wall_minus_startup.as_secs_f64() / best.wall_minus_startup.as_secs_f64().max(1e-9)
@@ -691,7 +756,7 @@ impl Comparison {
             .iter()
             .filter(|c| c.corpus == corpus && c.threads == threads && c.valid())
             .collect();
-        v.sort_by(|a, b| a.wall_minus_startup.cmp(&b.wall_minus_startup));
+        v.sort_by_key(|c| c.wall_minus_startup);
         let Some(best) = v.first() else {
             return CellVerdict::NoData;
         };
@@ -1005,9 +1070,30 @@ pub fn run_comparison(
     let guard = ContentionGuard::new(cfg.strict_contention);
     let guard_warning = guard.warning();
 
+    // hole #5, refusal limb: if strict AND the box is busy, REFUSE to measure —
+    // a dirty best-of-N is worse than no number. (The warning still explains why.)
+    if cfg.strict_contention && guard.box_is_busy() == Some(true) {
+        return Comparison {
+            subject: subject.to_string(),
+            probes,
+            cells: Vec::new(),
+            guard_warning,
+            samples: cfg.samples,
+            refused: true,
+        };
+    }
+
     let mut cells = Vec::new();
     for corpus in corpora {
         for &threads in thread_cells {
+            // Cold-cache fairness: one UNTIMED warmup invocation per tool before
+            // the timed samples, so the first-listed tool doesn't eat the cold
+            // page-cache read while later tools in the round read warm. (Without
+            // this, interleaving still leaves a systematic first-tool penalty on
+            // the very first round.)
+            for t in tools {
+                let _ = run_once(t, &probes[&t.name].path, corpus, threads, cfg);
+            }
             // hole #5: INTERLEAVED best-of-N. Round-robin so background drift hits
             // all tools equally rather than penalizing whoever ran during a spike.
             let mut samples: BTreeMap<String, Vec<RunOutcome>> = BTreeMap::new();
@@ -1036,6 +1122,7 @@ pub fn run_comparison(
         cells,
         guard_warning,
         samples: cfg.samples,
+        refused: false,
     }
 }
 
@@ -1116,29 +1203,79 @@ fn run_once(
     } else {
         cmd.stdout(std::process::Stdio::null());
     }
+    // Put the child in its OWN process group so a timeout can kill the WHOLE
+    // tree (e.g. a shell wrapper's `sleep`/grandchild), which also closes the
+    // inherited stdout fd so the drain thread unblocks. Without this, killing
+    // only the direct child leaves a grandchild holding the pipe open and the
+    // reader (and the sweep) hangs for the grandchild's full duration.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let t0 = Instant::now();
-    let result = cmd.output();
-    let wall = t0.elapsed();
-
-    let (digest, ok) = match result {
-        Ok(o) => {
-            let bytes = match (spec.writes_to, &out_path) {
-                (OutputMode::Stdout, _) => o.stdout,
-                (OutputMode::File, Some(p)) => std::fs::read(p).unwrap_or_default(),
-                (OutputMode::File, None) => Vec::new(),
-            };
-            let d = sha256(&bytes);
-            (d, o.status.success())
-        }
-        Err(_) => ([0u8; 32], false),
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return RunOutcome { wall: t0.elapsed(), digest: [0u8; 32], ok: false },
     };
+    #[cfg(unix)]
+    let pgid = child.id() as i32; // == pgid since process_group(0)
+
+    // Drain stdout on a thread so a large output can't deadlock the pipe while
+    // we poll for the timeout. (Without a concurrent reader, a child that fills
+    // the pipe buffer blocks, and so would a wait().)
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    // Poll for completion until the timeout; KILL a hung child (the real
+    // timeout, not just a post-hoc wall flag — a pathological tool can't hang
+    // the whole sweep).
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if t0.elapsed() > cfg.timeout {
+                    // Kill the whole process group so wrappers + grandchildren
+                    // (and their hold on the stdout pipe) die too.
+                    #[cfg(unix)]
+                    unsafe {
+                        libc_kill_group(pgid);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => break None,
+        }
+    };
+    let wall = t0.elapsed();
+    // On a clean exit, join the drain thread for the bytes. On a timeout we
+    // still join, but the group-kill above closed the pipe so it returns
+    // promptly (no unbounded hang); the bytes are irrelevant for a killed run.
+    let stdout_bytes = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    let bytes = match (spec.writes_to, &out_path) {
+        (OutputMode::Stdout, _) => stdout_bytes,
+        (OutputMode::File, Some(p)) => std::fs::read(p).unwrap_or_default(),
+        (OutputMode::File, None) => Vec::new(),
+    };
+    let digest = sha256(&bytes);
+    let ok = !timed_out && status.map(|s| s.success()).unwrap_or(false);
+
     if let Some(p) = &out_path {
         let _ = std::fs::remove_file(p);
     }
-    // A run that blew the timeout is recorded as not-ok (we don't kill mid-run
-    // here — Command::output waits — but a too-slow run is flagged by wall).
-    let ok = ok && wall <= cfg.timeout;
     RunOutcome { wall, digest, ok }
 }
 
@@ -1212,6 +1349,14 @@ fn sanitize(s: &str) -> String {
 pub fn render(cmp: &Comparison) -> String {
     let mut s = String::new();
     s.push_str("\n========  FAIR CROSS-TOOL COMPARISON  ========\n");
+    if cmp.refused {
+        s.push_str(&format!(
+            "  REFUSED — strict-contention is on and the box is busy:\n  {}\n  \
+             No cells were measured; a dirty best-of-N is worse than no number. Quiet the box and re-run.\n",
+            cmp.guard_warning.as_deref().unwrap_or("(contended)")
+        ));
+        return s;
+    }
     s.push_str(&format!(
         "subject: {}   tools: {}   best-of-{} INTERLEAVED   (walls are startup-SUBTRACTED)\n\n",
         cmp.subject,
@@ -1377,6 +1522,36 @@ mod tests {
     }
 
     #[test]
+    fn contention_guard_flags_busy_box() {
+        // A guard with a synthetic high load over few CPUs must report busy +
+        // a warning; a quiet one must not.
+        let busy = ContentionGuard {
+            load1_start: Some(7.0),
+            ncpu: 8,
+            strict: false,
+            busy_ratio: 0.5,
+        };
+        assert_eq!(busy.box_is_busy(), Some(true));
+        assert!(busy.warning().unwrap().contains("contended"));
+        let quiet = ContentionGuard {
+            load1_start: Some(0.5),
+            ncpu: 8,
+            strict: false,
+            busy_ratio: 0.5,
+        };
+        assert_eq!(quiet.box_is_busy(), Some(false));
+        assert!(quiet.warning().is_none());
+        // Unknown loadavg → an honest "cannot verify" warning, never silent OK.
+        let unknown = ContentionGuard {
+            load1_start: None,
+            ncpu: 8,
+            strict: false,
+            busy_ratio: 0.5,
+        };
+        assert!(unknown.warning().unwrap().contains("unavailable"));
+    }
+
+    #[test]
     fn within_noise_margin_is_a_tie_not_a_win() {
         // Two tools 100ms vs 103ms (3% apart) but each with 20% spread: the gap
         // is well inside the noise floor, so decide() must return a TIE, never a
@@ -1402,6 +1577,7 @@ mod tests {
             cells: vec![mk("tool-a", 100, 0.20), mk("tool-b", 103, 0.18)],
             guard_warning: None,
             samples: 5,
+            refused: false,
         };
         match cmp.decide("c", ThreadCell::Fixed(1)) {
             CellVerdict::Tie { tools } => {
@@ -1417,6 +1593,7 @@ mod tests {
             cells: vec![mk("tool-a", 100, 0.03), mk("tool-b", 150, 0.03)],
             guard_warning: None,
             samples: 5,
+            refused: false,
         };
         assert_eq!(
             cmp2.decide("c", ThreadCell::Fixed(1)),
@@ -1456,6 +1633,7 @@ mod tests {
             ],
             guard_warning: None,
             samples: 5,
+            refused: false,
         };
         // The fast-but-wrong tool must NOT win; the correct one does.
         let (w, _) = cmp.winner("c", ThreadCell::Fixed(1)).unwrap();

@@ -86,10 +86,10 @@ impl Claim {
         let kind = {
             let mut best: Option<String> = None;
             for k in all_kinds {
-                if p.contains(&k.to_ascii_lowercase()) {
-                    if best.as_ref().map(|b| k.len() > b.len()).unwrap_or(true) {
-                        best = Some(k.clone());
-                    }
+                if p.contains(&k.to_ascii_lowercase())
+                    && best.as_ref().map(|b| k.len() > b.len()).unwrap_or(true)
+                {
+                    best = Some(k.clone());
                 }
             }
             best
@@ -469,6 +469,7 @@ mod tests {
             cells,
             guard_warning: None,
             samples: 5,
+            refused: false,
         }
     }
 
