@@ -4,7 +4,7 @@ TRACE := /tmp/fulcrum_toy.json
 
 .DEFAULT_GOAL := test
 
-.PHONY: test check-unit check-pipeline check-robustness demo build clean help
+.PHONY: test check-unit check-pipeline check-robustness demo build release clean help
 
 # ── run everything ────────────────────────────────────────────────────────────
 
@@ -83,6 +83,29 @@ demo: build
 	@printf '\n'
 	$(BIN) validate $(TRACE)
 
+# ── release: VERSION → Cargo.toml → commit → tag → push ──────────────────────
+#
+# Edit VERSION, then run `make release`. It syncs the version into Cargo.toml,
+# runs the full test suite, commits, tags, and pushes. GHA picks up the tag
+# and publishes to crates.io.
+
+release: test
+	@git diff --quiet && git diff --staged --quiet \
+	    || { printf '\033[1;31m  working tree is dirty — commit or stash first\033[0m\n'; exit 1; }
+	@version=$$(cat VERSION | tr -d '[:space:]') && \
+	git tag | grep -q "^v$$version$$" \
+	    && { printf '\033[1;31m  v%s is already tagged\033[0m\n' "$$version"; exit 1; } \
+	    || true
+	@version=$$(cat VERSION | tr -d '[:space:]') && \
+	printf '\n\033[1;34m══ releasing v%s ═══════════════════════════════════════════════\033[0m\n\n' "$$version" && \
+	perl -i -pe "s/^version = \"[^\"]*\"/version = \"$$version\"/" Cargo.toml && \
+	cargo metadata --no-deps --format-version 1 > /dev/null && \
+	git add VERSION Cargo.toml Cargo.lock && \
+	git diff --cached --quiet || git commit -m "Release v$$version" && \
+	git tag "v$$version" && \
+	git push && git push --tags && \
+	printf '\n\033[1;32m  v%s tagged and pushed — GHA will publish to crates.io\033[0m\n\n' "$$version"
+
 # ── plumbing ──────────────────────────────────────────────────────────────────
 
 build:
@@ -101,4 +124,6 @@ help:
 	@printf '  make check-robustness   same assertions at 2 and 8 workers\n'
 	@printf '  make demo               full analysis output, pretty-printed\n'
 	@printf '  make build              cargo build --release --examples\n'
-	@printf '  make clean              remove traces and build artifacts\n\n'
+	@printf '  make release            sync VERSION → Cargo.toml, tag, push\n'
+	@printf '  make clean              remove traces and build artifacts\n'
+	@printf '\nTo release: edit VERSION, then run make release\n\n'
