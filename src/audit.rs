@@ -80,11 +80,20 @@ impl Claim {
         let p = phrase.to_ascii_lowercase();
         // A specific thread token?
         let thread = parse_thread_token(&p);
-        // A corpus-kind token present in the phrase?
-        let kind = all_kinds
-            .iter()
-            .find(|k| p.contains(&k.to_ascii_lowercase()))
-            .cloned();
+        // A corpus-kind token present in the phrase. Match the LONGEST kind so
+        // "incompressible" wins over its own substring "compressible" (a real
+        // mis-parse that otherwise inverts the claim's scope).
+        let kind = {
+            let mut best: Option<String> = None;
+            for k in all_kinds {
+                if p.contains(&k.to_ascii_lowercase()) {
+                    if best.as_ref().map(|b| k.len() > b.len()).unwrap_or(true) {
+                        best = Some(k.clone());
+                    }
+                }
+            }
+            best
+        };
         let every_thread =
             p.contains("every thread") || p.contains("all thread") || p.contains("each thread");
         let every = p.contains("every") && (p.contains("situation") || p.contains("everywhere"));
@@ -174,6 +183,9 @@ pub struct AuditResult {
     pub verdict: Verdict,
     /// Cells in the asserted scope the subject WON (corrected, correct-bytes).
     pub won: Vec<String>,
+    /// Cells in the asserted scope the subject TIED (within measurement noise) —
+    /// parity, NOT a win.
+    pub tied: Vec<String>,
     /// Cells in the asserted scope the subject LOST, with by-how-much.
     pub lost: Vec<String>,
     /// Cells in the asserted scope the subject was DISQUALIFIED on (wrong/err).
@@ -188,8 +200,10 @@ pub struct AuditResult {
 /// produced by the fair harness (so the five holes are already handled); this
 /// step checks the CLAIM'S SCOPE against the verified-win cells.
 pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
+    use crate::compare::CellVerdict;
     let mut won = Vec::new();
     let mut lost = Vec::new();
+    let mut tied = Vec::new();
     let mut disq = Vec::new();
 
     // Walk every measured cell inside the claim's asserted scope.
@@ -210,16 +224,23 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
             ));
             continue;
         }
-        match cmp.winner(&corpus, threads) {
-            Some((w, margin)) if w == claim.subject => {
-                let m = if margin.is_finite() {
-                    format!("+{:.0}%", margin * 100.0)
-                } else {
-                    "uncontested".to_string()
-                };
+        // Noise-aware decision: a within-spread lead is a TIE, not a win — so a
+        // "fastest" claim can't rest on noise.
+        match cmp.decide(&corpus, threads) {
+            CellVerdict::Win { tool } if tool == claim.subject => {
+                let m = cmp
+                    .winner(&corpus, threads)
+                    .map(|(_, margin)| {
+                        if margin.is_finite() {
+                            format!("+{:.0}%", margin * 100.0)
+                        } else {
+                            "uncontested".to_string()
+                        }
+                    })
+                    .unwrap_or_default();
                 won.push(format!("{cell_label} ({m})"));
             }
-            Some((w, _)) => {
+            CellVerdict::Win { tool: w } => {
                 let win_cell = cmp
                     .cells
                     .iter()
@@ -232,19 +253,36 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
                     .unwrap_or(1.0);
                 lost.push(format!("{cell_label} (loses to {w} by {behind:.2}×)"));
             }
-            None => {}
+            CellVerdict::Tie { tools } => {
+                let others: Vec<&str> = tools
+                    .iter()
+                    .filter(|t| *t != &claim.subject)
+                    .map(|s| s.as_str())
+                    .collect();
+                if tools.contains(&claim.subject) {
+                    tied.push(format!("{cell_label} (parity vs {})", others.join("/")));
+                } else {
+                    lost.push(format!("{cell_label} (outside the tie band)"));
+                }
+            }
+            CellVerdict::NoData => {}
         }
     }
 
-    // Decide the verdict.
+    // Decide the verdict. A "fastest" claim requires a WIN above noise; ties and
+    // losses both fail it (a tie is parity, not "fastest").
     let verdict = if !disq.is_empty() {
         // Wrong/missing bytes anywhere in scope → the claim cannot stand as a
         // performance claim (speed over wrong bytes is not a win).
         Verdict::False
-    } else if lost.is_empty() && !won.is_empty() {
+    } else if lost.is_empty() && tied.is_empty() && !won.is_empty() {
         Verdict::Survives
-    } else if won.is_empty() {
+    } else if won.is_empty() && tied.is_empty() {
         Verdict::False
+    } else if won.is_empty() && !tied.is_empty() {
+        // Only parity (within noise), no clean win anywhere in scope: a
+        // "fastest" claim is an over-claim; the honest statement is "at parity".
+        Verdict::NarrowsToScope
     } else {
         Verdict::NarrowsToScope
     };
@@ -257,13 +295,26 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
             claim.scope.describe(),
             won.len()
         ),
-        Verdict::NarrowsToScope => format!(
-            "{} is NOT '{}'. The TRUE claim is scoped to: WINS [{}]; it LOSES [{}].",
-            claim.subject,
-            claim.scope.describe(),
-            won.join(", "),
-            lost.join(", ")
-        ),
+        Verdict::NarrowsToScope => {
+            if won.is_empty() && !tied.is_empty() {
+                format!(
+                    "{} is NOT '{}' — every scoped cell is a TIE (within measurement noise): [{}]. \
+                     The honest statement is 'at PARITY', not 'fastest'.",
+                    claim.subject,
+                    claim.scope.describe(),
+                    tied.join(", ")
+                )
+            } else {
+                format!(
+                    "{} is NOT '{}'. The TRUE claim is scoped to: WINS [{}]; TIES [{}]; it LOSES [{}].",
+                    claim.subject,
+                    claim.scope.describe(),
+                    if won.is_empty() { "none".into() } else { won.join(", ") },
+                    if tied.is_empty() { "none".into() } else { tied.join(", ") },
+                    if lost.is_empty() { "none".into() } else { lost.join(", ") }
+                )
+            }
+        }
         Verdict::False => {
             if !disq.is_empty() {
                 format!(
@@ -322,9 +373,10 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
         claim.scope,
         ClaimScope::EveryCell | ClaimScope::EveryThread | ClaimScope::EveryThreadOnKind(_)
     );
-    if !lost.is_empty() && multi_cell_scope {
+    if (!lost.is_empty() || !tied.is_empty()) && multi_cell_scope {
         holes.push(
-            "#4 full situation-matrix sweep exposed cells the broad claim ignored".to_string(),
+            "#4 full situation-matrix sweep exposed cells (loss/tie) the broad claim ignored"
+                .to_string(),
         );
     }
     if let Some(w) = &cmp.guard_warning {
@@ -337,6 +389,7 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
         claim,
         verdict,
         won,
+        tied,
         lost,
         disqualified: disq,
         corrected,
@@ -355,6 +408,9 @@ pub fn render(a: &AuditResult) -> String {
     s.push_str(&format!("  {}\n", a.corrected));
     if !a.won.is_empty() {
         s.push_str(&format!("\n  scoped WINS  : {}\n", a.won.join(", ")));
+    }
+    if !a.tied.is_empty() {
+        s.push_str(&format!("  scoped TIES  : {}  (parity, within noise — NOT wins)\n", a.tied.join(", ")));
     }
     if !a.lost.is_empty() {
         s.push_str(&format!("  scoped LOSES : {}\n", a.lost.join(", ")));
@@ -431,6 +487,21 @@ mod tests {
             ClaimScope::SingleCell {
                 kind: "compressible".to_string(),
                 threads: ThreadCell::Fixed(8)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_prefers_longest_kind_substring() {
+        // "incompressible" must NOT be mis-parsed as "compressible" (its own
+        // substring) — that would invert the claim's asserted corpus kind.
+        let kinds = vec!["compressible".to_string(), "incompressible".to_string()];
+        let c = Claim::parse("subject", "fastest on incompressible at T1", &kinds);
+        assert_eq!(
+            c.scope,
+            ClaimScope::SingleCell {
+                kind: "incompressible".to_string(),
+                threads: ThreadCell::Fixed(1)
             }
         );
     }

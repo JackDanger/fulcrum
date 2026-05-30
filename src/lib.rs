@@ -22,6 +22,7 @@
 
 pub mod audit;
 pub mod compare;
+pub mod compare_cli;
 pub mod config;
 pub mod coz;
 pub mod critpath;

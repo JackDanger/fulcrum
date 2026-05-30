@@ -22,9 +22,13 @@
 //!   plan --bin <path> [...]          print a coz/perf workflow for your binary
 
 use fulcrum::config::Config;
-use fulcrum::{coz, critpath, mech, rank, region_hw, trace, validate, xtool};
+use fulcrum::{
+    audit, compare, compare_cli, coz, critpath, mech, mech_arch, rank, region_hw, trace, validate,
+    xtool,
+};
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn usage() -> ExitCode {
     eprintln!(
@@ -37,13 +41,24 @@ USAGE:\n\
   fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
   fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
+  fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
+  fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
+  fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
 `fulcrum::probe` writes one when FULCRUM_TRACE=/path.json is set). profile.coz\n\
 is produced by running your instrumented binary under `coz run`. With no\n\
---config, a built-in demo config (matching examples/toy_pipeline.rs) is used.\n"
+--config, a built-in demo config (matching examples/toy_pipeline.rs) is used.\n\
+\n\
+compare/audit run a FAIR cross-tool benchmark from a generic --spec JSON\n\
+(no competitor names baked in): it verifies every output's sha256 vs a\n\
+reference, detects interpreter-wrapped binaries + subtracts per-invocation\n\
+startup, uses each tool's documented best config, interleaves best-of-N with\n\
+contention detection, and sweeps corpus x thread cells — then `audit` checks\n\
+a stated claim against that matrix (SURVIVES / NARROWS-TO-SCOPE / FALSE).\n\
+mech-caps reports this host's HW-counter availability (never x86-only on arm).\n"
     );
     ExitCode::from(2)
 }
@@ -591,6 +606,111 @@ fn cmd_xtool(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Build a [`compare::RunCfg`] from the shared flags.
+fn run_cfg(args: &[String]) -> compare::RunCfg {
+    let samples = flag(args, "--samples")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5usize)
+        .max(1);
+    let startup_samples = flag(args, "--startup-samples")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5usize)
+        .max(1);
+    let timeout = flag(args, "--timeout-s")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120));
+    compare::RunCfg {
+        samples,
+        startup_samples,
+        strict_contention: args.iter().any(|a| a == "--strict-contention"),
+        timeout,
+        tmp_dir: std::env::temp_dir(),
+    }
+}
+
+/// Load a compare spec + build its corpora (computing reference digests). On any
+/// error prints it and returns `None`.
+fn load_spec_and_corpora(
+    args: &[String],
+) -> Option<(compare_cli::CompareSpec, Vec<compare::Corpus>)> {
+    let spec_path = flag(args, "--spec")?;
+    let spec = match compare_cli::CompareSpec::load(Path::new(spec_path)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fulcrum: --spec {spec_path}: {e}");
+            return None;
+        }
+    };
+    let corpora = match spec.build_corpora() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return None;
+        }
+    };
+    Some((spec, corpora))
+}
+
+/// compare: run the fair cross-tool benchmark and print the honest scoped table.
+fn cmd_compare(args: &[String]) -> ExitCode {
+    if flag(args, "--spec").is_none() {
+        eprintln!("compare needs --spec compare.json  (a generic tools+corpora spec)");
+        return usage();
+    }
+    let Some((spec, corpora)) = load_spec_and_corpora(args) else {
+        return ExitCode::FAILURE;
+    };
+    let cfg = run_cfg(args);
+    let tools = spec.tool_specs();
+    let cells = spec.thread_cells();
+    let cmp = compare::run_comparison(&spec.subject, &tools, &corpora, &cells, &cfg);
+    print!("{}", compare::render(&cmp));
+    ExitCode::SUCCESS
+}
+
+/// audit: run the fair comparison, then validate a STATED claim against it.
+fn cmd_audit(args: &[String]) -> ExitCode {
+    let (Some(_), Some(claim_text)) = (flag(args, "--spec"), flag(args, "--claim")) else {
+        eprintln!("audit needs --spec compare.json --claim \"<stated perf claim>\"");
+        return usage();
+    };
+    let claim_text = claim_text.to_string();
+    let Some((spec, corpora)) = load_spec_and_corpora(args) else {
+        return ExitCode::FAILURE;
+    };
+    let cfg = run_cfg(args);
+    let tools = spec.tool_specs();
+    let cells = spec.thread_cells();
+    let cmp = compare::run_comparison(&spec.subject, &tools, &corpora, &cells, &cfg);
+
+    // The fair matrix the audit reasons over (printed so the verdict is auditable).
+    print!("{}", compare::render(&cmp));
+
+    let kinds: Vec<String> = {
+        let mut k: Vec<String> = corpora.iter().map(|c| c.kind.clone()).collect();
+        k.sort();
+        k.dedup();
+        k
+    };
+    let claim = audit::Claim::parse(&spec.subject, &claim_text, &kinds);
+    let result = audit::audit(claim, &cmp);
+    print!("{}", audit::render(&result));
+    match result.verdict {
+        audit::Verdict::Survives => ExitCode::SUCCESS,
+        // A narrowed or false claim is an over-claim caught: nonzero exit so CI
+        // can gate on "this claim does not stand as stated".
+        _ => ExitCode::FAILURE,
+    }
+}
+
+/// mech-caps: report this host's cross-arch HW-counter availability.
+fn cmd_mech_caps(_args: &[String]) -> ExitCode {
+    let caps = mech_arch::MechCaps::detect();
+    print!("{}", mech_arch::render(&caps));
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
@@ -604,6 +724,9 @@ fn main() -> ExitCode {
         "rank" => cmd_rank(rest),
         "region-hw" => cmd_region_hw(rest),
         "xtool" => cmd_xtool(rest),
+        "compare" => cmd_compare(rest),
+        "audit" => cmd_audit(rest),
+        "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
         "help" | "--help" | "-h" => {

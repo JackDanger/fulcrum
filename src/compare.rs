@@ -639,10 +639,26 @@ pub struct Comparison {
     pub samples: usize,
 }
 
+/// The outcome at one (corpus, thread) cell, AFTER the noise check. A win is
+/// only declared when the margin over the runner-up clears the measurement
+/// noise floor — otherwise it's a TIE, because calling a within-spread gap a
+/// "win" is the same over-claim the harness exists to prevent (a sixth guard,
+/// reinforcing holes #4/#5: a robust scope cannot rest on noise).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellVerdict {
+    /// The lead tool beats the runner-up by more than the noise floor.
+    Win { tool: String },
+    /// The top tools are within the noise floor — no honest winner.
+    Tie { tools: Vec<String> },
+    /// No valid (correct-bytes, non-errored) cell.
+    NoData,
+}
+
 impl Comparison {
     /// Find the winner (lowest startup-subtracted wall among VALID cells) for a
     /// (corpus, thread-cell). Returns the winning tool + its margin over the
-    /// runner-up. `None` if no valid cell.
+    /// runner-up. `None` if no valid cell. (Margin-only; for the noise-aware
+    /// decision use [`Comparison::decide`].)
     pub fn winner(&self, corpus: &str, threads: ThreadCell) -> Option<(String, f64)> {
         let mut v: Vec<&Cell> = self
             .cells
@@ -658,6 +674,52 @@ impl Comparison {
             f64::INFINITY // uncontested
         };
         Some((best.tool.clone(), margin))
+    }
+
+    /// The NOISE-AWARE decision for a cell: declare a [`CellVerdict::Win`] only
+    /// when the lead's margin over the runner-up exceeds the noise floor (the
+    /// larger of the two tools' sample spreads, with a small ~2% epsilon for
+    /// timer granularity). Otherwise it's a [`CellVerdict::Tie`]. This is what
+    /// the honest scope + the claim audit consume, so a "win" can never rest on
+    /// a within-spread gap.
+    pub fn decide(&self, corpus: &str, threads: ThreadCell) -> CellVerdict {
+        let mut v: Vec<&Cell> = self
+            .cells
+            .iter()
+            .filter(|c| c.corpus == corpus && c.threads == threads && c.valid())
+            .collect();
+        v.sort_by(|a, b| a.wall_minus_startup.cmp(&b.wall_minus_startup));
+        let Some(best) = v.first() else {
+            return CellVerdict::NoData;
+        };
+        let Some(second) = v.get(1) else {
+            return CellVerdict::Win {
+                tool: best.tool.clone(),
+            };
+        };
+        let margin = second.wall_minus_startup.as_secs_f64()
+            / best.wall_minus_startup.as_secs_f64().max(1e-9)
+            - 1.0;
+        // Noise floor: the worse of the two tools' spreads, floored at 2% to
+        // cover timer/scheduler granularity even when a single best-of-N sample
+        // looked artificially tight.
+        let noise = best.spread.max(second.spread).max(0.02);
+        if margin > noise {
+            CellVerdict::Win {
+                tool: best.tool.clone(),
+            }
+        } else {
+            // Everyone within the noise floor of the leader is tied.
+            let lead = best.wall_minus_startup.as_secs_f64();
+            let tied: Vec<String> = v
+                .iter()
+                .filter(|c| {
+                    c.wall_minus_startup.as_secs_f64() / lead.max(1e-9) - 1.0 <= noise
+                })
+                .map(|c| c.tool.clone())
+                .collect();
+            CellVerdict::Tie { tools: tied }
+        }
     }
 
     /// All (corpus, thread) keys present, in a stable order.
@@ -676,11 +738,40 @@ impl Comparison {
     /// subject wins, which it loses, and by how much — never one cherry-picked
     /// cell. Returns one human paragraph.
     pub fn scope_line(&self) -> String {
+        let (wins, losses, ties, disq) = self.subject_breakdown();
+        let mut out = String::new();
+        out.push_str("HONEST SCOPE for ");
+        out.push_str(&self.subject);
+        out.push_str(":\n");
+        out.push_str(&format!(
+            "  WINS  : {}\n",
+            if wins.is_empty() { "(none)".into() } else { wins.join(", ") }
+        ));
+        out.push_str(&format!(
+            "  TIES  : {}\n",
+            if ties.is_empty() { "(none)".into() } else { ties.join(", ") }
+        ));
+        out.push_str(&format!(
+            "  LOSES : {}\n",
+            if losses.is_empty() { "(none)".into() } else { losses.join(", ") }
+        ));
+        if !disq.is_empty() {
+            out.push_str(&format!("  DISQUALIFIED: {}\n", disq.join(", ")));
+        }
+        // The anti-overclaim verdict.
+        out.push_str(&self.overclaim_verdict(&wins, &losses, &ties, &disq));
+        out
+    }
+
+    /// Categorize EVERY scoped cell for the subject into (wins, losses, ties,
+    /// disqualified), using the noise-aware [`Comparison::decide`]. Shared by the
+    /// scope line and the audit so they cannot disagree.
+    pub fn subject_breakdown(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         let mut wins = Vec::new();
         let mut losses = Vec::new();
+        let mut ties = Vec::new();
         let mut disq = Vec::new();
         for (corpus, kind, threads) in self.cells_keys() {
-            // The subject's own cell.
             let subj = self
                 .cells
                 .iter()
@@ -694,17 +785,22 @@ impl Comparison {
                 ));
                 continue;
             }
-            match self.winner(&corpus, threads) {
-                Some((w, margin)) if w == self.subject => {
-                    let m = if margin.is_finite() {
-                        format!("+{:.0}%", margin * 100.0)
-                    } else {
-                        "uncontested".to_string()
-                    };
+            match self.decide(&corpus, threads) {
+                CellVerdict::Win { tool } if tool == self.subject => {
+                    // Margin over the runner-up (for the human label).
+                    let m = self
+                        .winner(&corpus, threads)
+                        .map(|(_, margin)| {
+                            if margin.is_finite() {
+                                format!("+{:.0}%", margin * 100.0)
+                            } else {
+                                "uncontested".to_string()
+                            }
+                        })
+                        .unwrap_or_default();
                     wins.push(format!("{cell_label} ({m})"));
                 }
-                Some((w, _)) => {
-                    // How far behind is the subject vs the winner?
+                CellVerdict::Win { tool: w } => {
                     let win_cell = self
                         .cells
                         .iter()
@@ -717,50 +813,98 @@ impl Comparison {
                         .unwrap_or(1.0);
                     losses.push(format!("{cell_label} (loses to {w} by {behind:.2}×)"));
                 }
-                None => {}
+                CellVerdict::Tie { tools } if tools.contains(&self.subject) => {
+                    let others: Vec<&str> = tools
+                        .iter()
+                        .filter(|t| *t != &self.subject)
+                        .map(|s| s.as_str())
+                        .collect();
+                    ties.push(format!("{cell_label} (within noise vs {})", others.join("/")));
+                }
+                CellVerdict::Tie { .. } => {
+                    // Subject not in the tie set → it's slower than the tied
+                    // leaders; count as a loss.
+                    losses.push(format!("{cell_label} (outside the tie band)"));
+                }
+                CellVerdict::NoData => {}
             }
         }
-        let mut out = String::new();
-        out.push_str("HONEST SCOPE for ");
-        out.push_str(&self.subject);
-        out.push_str(":\n");
-        out.push_str(&format!(
-            "  WINS  : {}\n",
-            if wins.is_empty() { "(none)".into() } else { wins.join(", ") }
-        ));
-        out.push_str(&format!(
-            "  LOSES : {}\n",
-            if losses.is_empty() { "(none)".into() } else { losses.join(", ") }
-        ));
-        if !disq.is_empty() {
-            out.push_str(&format!("  DISQUALIFIED: {}\n", disq.join(", ")));
-        }
-        // The anti-overclaim verdict.
-        out.push_str(&self.overclaim_verdict(&wins, &losses, &disq));
-        out
+        (wins, losses, ties, disq)
     }
 
-    fn overclaim_verdict(&self, wins: &[String], losses: &[String], disq: &[String]) -> String {
+    fn overclaim_verdict(
+        &self,
+        wins: &[String],
+        losses: &[String],
+        ties: &[String],
+        disq: &[String],
+    ) -> String {
         if !disq.is_empty() {
             return format!(
                 "  VERDICT: NO blanket claim possible — subject produced wrong/no output in {} cell(s).\n",
                 disq.len()
             );
         }
-        if losses.is_empty() && !wins.is_empty() {
+        if !losses.is_empty() {
+            return format!(
+                "  VERDICT: MIXED — subject wins {} cell(s), TIES {}, and LOSES {} — a 'fastest at every \
+                 thread/situation' claim is an OVER-CLAIM; the honest claim is scoped to the WINS list above \
+                 (and TIES are NOT wins — within measurement noise).\n",
+                wins.len(),
+                ties.len(),
+                losses.len()
+            );
+        }
+        if wins.is_empty() && !ties.is_empty() {
+            return format!(
+                "  VERDICT: NO win — subject only TIES (within noise) in {} cell(s) and wins none. \
+                 A 'fastest' claim is NOT supported; the honest statement is 'at parity'.\n",
+                ties.len()
+            );
+        }
+        // Reached only when there are no losses and no ties.
+        if !wins.is_empty() {
             format!(
-                "  VERDICT: subject wins ALL {} measured cells — a 'fastest everywhere measured' claim is supported \
-                 ONLY within this matrix (corpora × thread cells actually run).\n",
+                "  VERDICT: subject wins ALL {} measured cells with margins ABOVE the noise floor — a \
+                 'fastest everywhere measured' claim is supported ONLY within this matrix (corpora × \
+                 thread cells actually run).\n",
                 wins.len()
             )
-        } else if wins.is_empty() {
+        } else {
             "  VERDICT: subject wins NO cell — any 'fastest' claim is FALSE.\n".to_string()
+        }
+    }
+
+    /// Flag cells whose sample spread exceeds a noise threshold — a SECOND limb
+    /// of hole #5: even on a nominally-quiet box (loadavg low), a high
+    /// per-cell spread means the timing is dirty and any close call is noise.
+    /// Returns the count of dirty cells + the worst spread, with a verdict.
+    pub fn dirty_data_warning(&self, threshold: f64) -> String {
+        let dirty: Vec<&Cell> = self
+            .cells
+            .iter()
+            .filter(|c| c.valid() && c.spread > threshold)
+            .collect();
+        let worst = self
+            .cells
+            .iter()
+            .filter(|c| c.valid())
+            .map(|c| c.spread)
+            .fold(0.0_f64, f64::max);
+        if dirty.is_empty() {
+            format!(
+                "  [DATA QUALITY] all cells spread <= {:.0}% — timings are crisp.",
+                threshold * 100.0
+            )
         } else {
             format!(
-                "  VERDICT: MIXED — subject wins {} cell(s) and LOSES {} — a 'fastest at every \
-                 thread/situation' claim is an OVER-CLAIM; the honest claim is scoped to the WINS list above.\n",
-                wins.len(),
-                losses.len()
+                "  [DATA QUALITY] {} of {} valid cells have spread > {:.0}% (worst {:.0}%) — the box is \
+                 JITTERY; close calls are reported as TIES, not wins. Re-run pinned to performance cores \
+                 (taskset/`-c`), quiet background load, and raise --samples for a crisp matrix.",
+                dirty.len(),
+                self.cells.iter().filter(|c| c.valid()).count(),
+                threshold * 100.0,
+                worst * 100.0
             )
         }
     }
@@ -1068,13 +1212,20 @@ pub fn render(cmp: &Comparison) -> String {
     ));
     s.push_str(&format!("  {}\n", "-".repeat(92)));
     for (corpus, kind, threads) in cmp.cells_keys() {
-        let winner = cmp.winner(&corpus, threads).map(|(w, _)| w);
+        let verdict = cmp.decide(&corpus, threads);
         for c in cmp
             .cells
             .iter()
             .filter(|c| c.corpus == corpus && c.threads == threads)
         {
-            let is_win = winner.as_deref() == Some(c.tool.as_str()) && c.valid();
+            // Noise-aware mark: ◀ WINNER only for a margin above the noise floor;
+            // ~TIE~ for a within-noise leader cluster (so the eye can't read a
+            // noise gap as a win).
+            let mark = match &verdict {
+                CellVerdict::Win { tool } if tool == &c.tool && c.valid() => "◀ WINNER",
+                CellVerdict::Tie { tools } if tools.contains(&c.tool) && c.valid() => "~tie~",
+                _ => "",
+            };
             s.push_str(&format!(
                 "  {:<14} {:<16} {:<6} {:>10.1} {:>9.0} {:>6.0}% {:>6}  {}\n",
                 c.tool,
@@ -1090,11 +1241,15 @@ pub fn render(cmp: &Comparison) -> String {
                 } else {
                     "ok"
                 },
-                if is_win { "◀ WINNER" } else { "" }
+                mark
             ));
         }
         s.push('\n');
     }
+
+    // hole #5 (second limb): per-cell data-quality / jitter check.
+    s.push_str(&cmp.dirty_data_warning(0.15));
+    s.push_str("\n\n");
 
     // hole #4: the honest scope + anti-overclaim verdict.
     s.push_str(&cmp.scope_line());
@@ -1176,6 +1331,55 @@ mod tests {
         assert_eq!(argv, vec!["-dc", "/tmp/x.gz", "-p4"]);
         let argv_auto = spec.build_argv(input, None, ThreadCell::Auto);
         assert_eq!(argv_auto, vec!["-dc", "/tmp/x.gz", "-p0"]);
+    }
+
+    #[test]
+    fn within_noise_margin_is_a_tie_not_a_win() {
+        // Two tools 100ms vs 103ms (3% apart) but each with 20% spread: the gap
+        // is well inside the noise floor, so decide() must return a TIE, never a
+        // win. (This is the sixth guard: a 'win' can't rest on noise.)
+        let mk = |tool: &str, ms: u64, spread: f64| Cell {
+            tool: tool.to_string(),
+            corpus: "c".to_string(),
+            corpus_kind: "compressible".to_string(),
+            threads: ThreadCell::Fixed(1),
+            wall: Duration::from_millis(ms),
+            wall_minus_startup: Duration::from_millis(ms),
+            best_wall: Duration::from_millis(ms),
+            digest: sha256(b"ref"),
+            correct: true,
+            spread,
+            mbps: 1.0,
+            errored: false,
+        };
+        let cmp = Comparison {
+            subject: "tool-a".to_string(),
+            probes: BTreeMap::new(),
+            cells: vec![mk("tool-a", 100, 0.20), mk("tool-b", 103, 0.18)],
+            guard_warning: None,
+            samples: 5,
+        };
+        match cmp.decide("c", ThreadCell::Fixed(1)) {
+            CellVerdict::Tie { tools } => {
+                assert!(tools.contains(&"tool-a".to_string()));
+                assert!(tools.contains(&"tool-b".to_string()));
+            }
+            other => panic!("expected Tie within noise, got {other:?}"),
+        }
+        // And a margin ABOVE the noise floor IS a win.
+        let cmp2 = Comparison {
+            subject: "tool-a".to_string(),
+            probes: BTreeMap::new(),
+            cells: vec![mk("tool-a", 100, 0.03), mk("tool-b", 150, 0.03)],
+            guard_warning: None,
+            samples: 5,
+        };
+        assert_eq!(
+            cmp2.decide("c", ThreadCell::Fixed(1)),
+            CellVerdict::Win {
+                tool: "tool-a".to_string()
+            }
+        );
     }
 
     #[test]
