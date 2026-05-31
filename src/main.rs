@@ -24,7 +24,7 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, compare, compare_cli, coz, coz_jsonl, critpath, flow, mech, mech_arch, rank, region_hw,
-    sweep, trace, validate, xtool,
+    sweep, trace, validate, vs, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -183,6 +183,29 @@ fn cmd_flow(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
+/// Side-by-side per-span comparison: which code A burns more time in / gates the
+/// wall more than the same-named span in B.
+fn cmd_vs(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let (Some(a), Some(b)) = (pos.first(), pos.get(1)) else {
+        eprintln!("usage: fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]");
+        return ExitCode::FAILURE;
+    };
+    let labels = flag(args, "--labels").unwrap_or("gzippy,rapidgzip");
+    let (al, bl) = labels.split_once(',').unwrap_or(("gzippy", "rapidgzip"));
+    let cfg = load_config(args);
+    let mut preferred = preferred_blockers(&cfg);
+    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
+    match vs::compare(al, Path::new(a), bl, Path::new(b), &preferred) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_flow(r: &flow::FlowReport) {
@@ -937,6 +960,7 @@ fn main() -> ExitCode {
     match sub.as_str() {
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
+        "vs" => cmd_vs(rest),
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),

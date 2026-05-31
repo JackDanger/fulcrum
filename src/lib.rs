@@ -38,4 +38,5 @@ pub mod region_hw;
 pub mod sweep;
 pub mod trace;
 pub mod validate;
+pub mod vs;
 pub mod xtool;
