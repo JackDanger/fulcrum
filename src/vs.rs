@@ -51,10 +51,19 @@ fn analyze_one(path: &Path, preferred: &[String]) -> std::io::Result<ToolView> {
     // caused them.
     let cp = critpath::analyze(&events, f64::INFINITY, preferred);
     for entry in &cp.entries {
-        let name = entry.label.strip_prefix("blocked-on:").unwrap_or(&entry.label);
-        by_name.entry(name.to_string()).or_default().wall_critical_us += entry.on_path_us;
+        let name = entry
+            .label
+            .strip_prefix("blocked-on:")
+            .unwrap_or(&entry.label);
+        by_name
+            .entry(name.to_string())
+            .or_default()
+            .wall_critical_us += entry.on_path_us;
     }
-    Ok(ToolView { wall_us: wall, by_name })
+    Ok(ToolView {
+        wall_us: wall,
+        by_name,
+    })
 }
 
 /// Print the side-by-side comparison. `a`/`b` are (label, trace-path); `a` is the
@@ -73,7 +82,11 @@ pub fn compare(
         "VS  {a_label}={:.1}ms  {b_label}={:.1}ms  (wall)   ratio {:.2}×",
         a.wall_us / 1000.0,
         b.wall_us / 1000.0,
-        if b.wall_us > 0.0 { a.wall_us / b.wall_us } else { 0.0 },
+        if b.wall_us > 0.0 {
+            a.wall_us / b.wall_us
+        } else {
+            0.0
+        },
     );
     println!(
         "  per span: BUSY ms (Σ all threads) and [wall-critical ms].  Δbusy = {a_label}−{b_label}.",
@@ -159,18 +172,24 @@ mod tests {
     fn diff_surfaces_the_slower_region() {
         // tool A spends 200us in worker.decode_chunk; tool B spends 80us. The
         // diff must rank decode_chunk top with a +120us Δbusy.
-        let a = write_trace("a", &[
-            ("worker.decode_chunk", "B", 0.0, 2),
-            ("worker.decode_chunk", "E", 200.0, 2),
-            ("post_process.apply_window", "B", 0.0, 1),
-            ("post_process.apply_window", "E", 20.0, 1),
-        ]);
-        let b = write_trace("b", &[
-            ("worker.decode_chunk", "B", 0.0, 2),
-            ("worker.decode_chunk", "E", 80.0, 2),
-            ("post_process.apply_window", "B", 0.0, 1),
-            ("post_process.apply_window", "E", 20.0, 1),
-        ]);
+        let a = write_trace(
+            "a",
+            &[
+                ("worker.decode_chunk", "B", 0.0, 2),
+                ("worker.decode_chunk", "E", 200.0, 2),
+                ("post_process.apply_window", "B", 0.0, 1),
+                ("post_process.apply_window", "E", 20.0, 1),
+            ],
+        );
+        let b = write_trace(
+            "b",
+            &[
+                ("worker.decode_chunk", "B", 0.0, 2),
+                ("worker.decode_chunk", "E", 80.0, 2),
+                ("post_process.apply_window", "B", 0.0, 1),
+                ("post_process.apply_window", "E", 20.0, 1),
+            ],
+        );
         // Just assert analyze_one computes the busy split; compare() prints.
         let va = analyze_one(&a, &[]).unwrap();
         let vb = analyze_one(&b, &[]).unwrap();

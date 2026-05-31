@@ -214,7 +214,9 @@ pub fn analyze_flow(events: &[Event], preferred_blockers: &[String]) -> FlowRepo
             Some(stage) if !stage.starts_with('·') => {
                 *busy.entry(stage).or_default() += s.dur;
                 tids.entry(stage).or_default().insert((s.pid, s.tid));
-                let w = win.entry(stage).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+                let w = win
+                    .entry(stage)
+                    .or_insert((f64::INFINITY, f64::NEG_INFINITY));
                 w.0 = w.0.min(s.ts_start);
                 w.1 = w.1.max(s.ts_end);
             }

@@ -123,7 +123,9 @@ fn arg_bool(args: &serde_json::Value, key: &str) -> Option<bool> {
     }
 }
 fn arg_str(args: &serde_json::Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Build the causal report from a raw event stream.

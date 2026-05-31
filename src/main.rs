@@ -23,8 +23,8 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, causal, compare, compare_cli, coz, coz_jsonl, critpath, flow, mech, mech_arch, rank,
-    region_hw, sweep, trace, validate, vs, xtool,
+    audit, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, flow, mech, mech_arch,
+    rank, region_hw, sweep, trace, validate, vs, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -46,6 +46,7 @@ USAGE:\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P]\n\
+  fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
@@ -346,7 +347,11 @@ fn print_causal(r: &causal::CausalReport, timeline_n: usize, static_fraction: f6
         };
         // Stall marker: a window-absent chunk that started before its
         // predecessor published is the visible serial-chain stall.
-        let stall = if c.window_present == Some(false) { " ⟂absent" } else { "" };
+        let stall = if c.window_present == Some(false) {
+            " ⟂absent"
+        } else {
+            ""
+        };
         println!(
             "  {:>4} {:>14} {:>6} {:>4} {:>11} {:>12} {:>11}{}",
             i,
@@ -363,7 +368,10 @@ fn print_causal(r: &causal::CausalReport, timeline_n: usize, static_fraction: f6
         );
     }
     if r.chunks.len() > shown {
-        println!("  … {} more chunks (use --timeline N to widen)", r.chunks.len() - shown);
+        println!(
+            "  … {} more chunks (use --timeline N to widen)",
+            r.chunks.len() - shown
+        );
     }
 
     // ── 4. Data-model tax ─────────────────────────────────────────────────
@@ -403,7 +411,11 @@ fn print_causal(r: &causal::CausalReport, timeline_n: usize, static_fraction: f6
         println!(
             "  TOTAL tax (3 passes)          : {:>9}  = {:.1}% of wall",
             fmt_us(total),
-            if r.wall_us > 0.0 { 100.0 * total / r.wall_us } else { 0.0 }
+            if r.wall_us > 0.0 {
+                100.0 * total / r.wall_us
+            } else {
+                0.0
+            }
         );
         // Bytes-moved framing: window-absent moves its buffer ~3× vs ~1×.
         let mb = t.total_marker_bytes as f64 / (1024.0 * 1024.0);
@@ -425,6 +437,144 @@ fn short_site(s: &str) -> &str {
         "consumer_marker" => "c.mrk",
         other => other,
     }
+}
+
+/// `fulcrum consumer <trace.json> [trace2.json ...]`
+///
+/// The CONSUMER-SPAN DECOMPOSITION view. For each trace (one per thread-count),
+/// computes EXCLUSIVE per-span self-time on the in-order consumer thread via a
+/// proper B/E stack (no nested same-name double-count — the bug that made
+/// `combine_crc` look like 62 ms), classifies each span as WAIT / COMPUTE /
+/// OUTPUT / IDLE, forms an explicit IDLE-GAP = span − Σ busy, and ASSERTS
+/// busy + idle == span (surfacing any reconciliation miss rather than hiding
+/// it). Pass several traces to get the per-thread-count table side by side.
+fn cmd_consumer(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    if pos.is_empty() {
+        eprintln!("usage: fulcrum consumer <trace.json> [trace2.json ...]");
+        return ExitCode::FAILURE;
+    }
+    let mut any_unreconciled = false;
+    for path in &pos {
+        let events = match trace::load_events(Path::new(path)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = consumer::analyze(&events);
+        if !report.reconcile.reconciled {
+            any_unreconciled = true;
+        }
+        print_consumer(path, &report);
+    }
+    if any_unreconciled {
+        // A reconciliation miss means the B/E pairing is unsound and every
+        // number is suspect — fail loudly so it can't be trusted silently.
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
+    let tlabel = r
+        .parallelization
+        .map(|p| format!("T{p}"))
+        .unwrap_or_else(|| "T?".to_string());
+    println!("\n========  CONSUMER DECOMPOSITION  {tlabel}  ({path})  ========");
+    println!(
+        "wall            : {:.1}ms   consumer tid {}/{}   consumer-span {:.1}ms",
+        r.wall_us / 1000.0,
+        r.consumer.0,
+        r.consumer.1,
+        r.consumer_span_us / 1000.0,
+    );
+
+    // ── Per-class roll-up (the headline) ──────────────────────────────────
+    let span = r.consumer_span_us.max(1.0);
+    let pct = |x: f64| 100.0 * x / span;
+    let get = |k: &str| *r.by_class.get(k).unwrap_or(&0.0);
+    println!("\n  CLASS      self-time     %span   meaning");
+    let classes = [
+        (
+            "OUTPUT",
+            "materialize decompressed bytes to the writer (floor)",
+        ),
+        (
+            "WAIT",
+            "blocked on a producer (decode-wait / fetch / prefetch)",
+        ),
+        (
+            "COMPUTE",
+            "consumer's own serial CPU (narrow / resolve / crc)",
+        ),
+        ("IDLE", "loop-umbrella self-time: un-instrumented gap"),
+        (
+            "UNKNOWN",
+            "un-classified span names (add to consumer::classify)",
+        ),
+    ];
+    for (k, meaning) in classes {
+        let v = get(k);
+        if k == "UNKNOWN" && v < 1.0 {
+            continue;
+        }
+        let bar_w = (pct(v) / 4.0).round() as usize;
+        println!(
+            "  {:<9} {:>9.1}ms  {:>6.1}%   {}  {}",
+            k,
+            v / 1000.0,
+            pct(v),
+            "█".repeat(bar_w.min(25)),
+            meaning,
+        );
+    }
+    let busy = get("WAIT") + get("COMPUTE") + get("OUTPUT") + get("UNKNOWN");
+    println!(
+        "  {:<9} {:>9.1}ms  {:>6.1}%   (WAIT+COMPUTE+OUTPUT+UNKNOWN)",
+        "Σ busy",
+        busy / 1000.0,
+        pct(busy)
+    );
+
+    // ── Per-span detail (exclusive self-time, classified) ─────────────────
+    println!("\n  per-span exclusive self-time (the double-count-free decomposition):");
+    println!(
+        "  {:<34} {:>8} {:>9} {:>9} {:>6}  class",
+        "span", "count", "self", "incl", "%span"
+    );
+    for s in &r.spans {
+        if s.self_us < 5.0 && s.class != consumer::Class::Output {
+            // hide sub-5µs noise from the detail (still in the class totals)
+            continue;
+        }
+        println!(
+            "  {:<34} {:>8} {:>9} {:>9} {:>5.1}%  {}",
+            s.name,
+            s.count,
+            trace::fmt_us(s.self_us),
+            trace::fmt_us(s.incl_us),
+            pct(s.self_us),
+            s.class.label(),
+        );
+    }
+
+    // ── Reconciliation self-test (the anti-phantom guarantee) ─────────────
+    let rc = &r.reconcile;
+    println!(
+        "\n  RECONCILE  span {:.1}ms  =  busy {:.1}ms  +  idle {:.1}ms   (residual {:.3}µs)  [{}]",
+        rc.span_us / 1000.0,
+        rc.busy_us / 1000.0,
+        rc.idle_us / 1000.0,
+        rc.residual_us,
+        if rc.reconciled {
+            "OK — B/E pairing sound, every span counted once"
+        } else {
+            "FAIL — unmatched begin/end; numbers above are SUSPECT"
+        },
+    );
 }
 
 /// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
@@ -499,7 +649,11 @@ fn print_flow(r: &flow::FlowReport) {
         "  {:<36} {:>8.1}ms  ({:.0}% of wall classified onto the critical path)",
         "Σ wall-critical",
         wc_sum / 1000.0,
-        if r.wall_us > 0.0 { 100.0 * wc_sum / r.wall_us } else { 0.0 },
+        if r.wall_us > 0.0 {
+            100.0 * wc_sum / r.wall_us
+        } else {
+            0.0
+        },
     );
     if !r.unclassified.is_empty() {
         let total: f64 = r.unclassified.iter().map(|(_, d)| d).sum();
@@ -1203,6 +1357,7 @@ fn main() -> ExitCode {
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
+        "consumer" => cmd_consumer(rest),
         "vs" => cmd_vs(rest),
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
