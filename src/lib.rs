@@ -21,6 +21,7 @@
 //! free demonstration.
 
 pub mod audit;
+pub mod causal;
 pub mod compare;
 pub mod compare_cli;
 pub mod config;
