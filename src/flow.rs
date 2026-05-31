@@ -99,8 +99,6 @@ pub fn classify(name: &str) -> Option<&'static str> {
         "2·worker bootstrap (window-absent)"
     } else if n == "worker.isal_stream_inflate" || n == "worker.absorb_isal_tail" {
         "3·worker ISA-L (clean tail)"
-    } else if n.starts_with("worker.scan") || n == "worker.seed_first" {
-        "4·worker block-find"
     } else if n == "consumer.wait_replaced_markers"
         || n == "consumer.publish_windows"
         || n.starts_with("consumer.window_")
@@ -133,9 +131,18 @@ pub fn classify(name: &str) -> Option<&'static str> {
         || n == "drive"
         || n == "pool.run_task"
         || n == "worker.decode_chunk"
+        || n.starts_with("worker.scan")
+        || n == "worker.seed_first"
     {
         // Umbrella / lock-held markers: not a stage. Excluded so blame lands on
-        // the INNER decode phases (bootstrap vs ISA-L), not the task wrapper.
+        // the INNER LEAF decode phases (block_body/bootstrap = window-absent;
+        // isal = clean tail), not the wrapper. `worker.scan_candidate` /
+        // `worker.scan_run` / `worker.seed_first` WRAP a full candidate decode
+        // (all 39 chunks take the slow path), so crediting them as a
+        // "block-find" stage double-counts the enclosed decode and manufactures
+        // a phantom block-finder bottleneck. The pure find_blocks scan is cheap
+        // (failed candidates waste ~2.6KB total) — the cost inside is the
+        // productive decode.
         "·umbrella"
     } else {
         return None;
@@ -148,7 +155,6 @@ const STAGE_ORDER: &[&str] = &[
     "1·dispatch (upstream)",
     "2·worker bootstrap (window-absent)",
     "3·worker ISA-L (clean tail)",
-    "4·worker block-find",
     "5·consumer resolve (markers/window)",
     "6·consumer write (output)",
 ];
@@ -167,10 +173,9 @@ const STAGE_ORDER: &[&str] = &[
 /// block-find included the honest answer is scan=156ms, bootstrap=27ms — and
 /// the latter reconciles the FastBootstrap TIE.)
 pub const INNER_DECODE_BLOCKERS: &[&str] = &[
-    "worker.scan_candidate",
-    "worker.scan_run",
     "worker.bootstrap",
     "worker.block_body",
+    "worker.block_header",
     "worker.isal_stream_inflate",
     "worker.absorb_isal_tail",
 ];
