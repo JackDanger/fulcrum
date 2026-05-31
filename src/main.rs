@@ -23,8 +23,8 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, compare, compare_cli, coz, critpath, mech, mech_arch, rank, region_hw, sweep, trace,
-    validate, xtool,
+    audit, compare, compare_cli, coz, coz_jsonl, critpath, mech, mech_arch, rank, region_hw, sweep,
+    trace, validate, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -652,6 +652,42 @@ fn load_spec_and_corpora(
     Some((spec, corpora))
 }
 
+/// coz-jsonl: ingest modern coz `profile.jsonl` (one or more, for stability)
+/// and print per-region causal impact, folded by source filename. Pass the
+/// jsonl from SEVERAL repeated coz runs — a single run is underpowered.
+fn cmd_coz_jsonl(args: &[String]) -> ExitCode {
+    let paths: Vec<&Path> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(Path::new)
+        .collect();
+    if paths.is_empty() {
+        eprintln!("coz-jsonl needs >=1 profile.jsonl (pass several repeated runs for stability)");
+        return ExitCode::FAILURE;
+    }
+    // Fold each `path/to/file.rs:line` into its filename (the region proxy);
+    // line-level coz is too noisy to trust, file-level is the robust unit.
+    let fold = |sel: &str| -> String {
+        let no_line = sel.rsplit_once(':').map(|(f, _)| f).unwrap_or(sel);
+        no_line.rsplit('/').next().unwrap_or(no_line).to_string()
+    };
+    match coz_jsonl::aggregate(&paths, fold) {
+        Ok(rows) => {
+            println!("\n=====  COZ CAUSAL IMPACT (per region, {} run(s))  =====", paths.len());
+            println!("{:>10}  {:<32} {:>10} {:>6}", "impact", "region (file)", "base ch/s", "n_exp");
+            println!("  speeding a region 1% moves throughput ~impact%. Trust high n_exp; ignore tiny-n rows.");
+            for r in rows.iter().take(15) {
+                println!("{:>10.3}  {:<32} {:>10.1} {:>6}", r.impact, r.key, r.base_rate, r.n_exp);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coz-jsonl failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// sweep: exhaustive thread-count causal sweep. Two phases:
 ///   fulcrum sweep capture --spec s.json --out DIR   (run on the perf box)
 ///   fulcrum sweep mine DIR [--config region.json]   (offline, re-runnable)
@@ -781,6 +817,7 @@ fn main() -> ExitCode {
         "xtool" => cmd_xtool(rest),
         "compare" => cmd_compare(rest),
         "sweep" => cmd_sweep(rest),
+        "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
