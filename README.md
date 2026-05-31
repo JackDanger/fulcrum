@@ -239,6 +239,45 @@ fulcrum audit   --spec examples/compare.example.json \
 fulcrum mech-caps
 ```
 
+## Exhaustive thread-count sweep (`fulcrum sweep`)
+
+The other commands profile one operating point. `sweep` answers "why does
+tool A stop scaling where tool B keeps going" across the WHOLE thread-count
+curve in a single capture, for several tools at once — so a scaling cliff is
+data, not a guess. Capture once, mine forever:
+
+```bash
+# On the perf box (where the binaries live): run the (tool × T × sink) matrix,
+# interleaved best-of-N, sha-verify all tools agree, one trace per cell.
+fulcrum sweep capture --spec sweep.json --out /tmp/run
+
+# Anywhere, any number of times: scaling decomposition (speedup, parallel
+# efficiency, cross-tool ratio, sink-write tax) + consumer-anchored
+# critical-path region share per T for the reference tool.
+fulcrum sweep mine /tmp/run --config region.json
+```
+
+Two sinks (`/dev/null` and a real file) are captured so the tmpfs page-cache
+write tax is separated from real decode scaling — a confound that, read from a
+single sink, sends you optimizing the wrong thing. `efficiency = speedup /
+T`; a region whose critical-path share RISES with T is a scaling blocker.
+
+## Modern Coz profiles (`fulcrum coz-jsonl`)
+
+Recent `coz` emits `profile.jsonl` by default; its `--legacy-format` `.coz`
+(what `coz-parse`/`rank` read) aborts on modern Rust DWARF. `coz-jsonl` reads
+the jsonl directly and aggregates **across several runs** with an
+experiment-count confidence — because a single coz run is underpowered (a
+cheap line read 0.87 impact in one run, 0.18 across three):
+
+```bash
+fulcrum coz-jsonl run1.jsonl run2.jsonl run3.jsonl   # per-region causal impact
+```
+
+Operational gotchas baked into the module docs: build the profiled binary
+with `-C dwarf-version=4` and `debug=line-tables-only` (else coz aborts
+parsing DWARF-5), and always pass repeated runs — trust high-`n_exp` rows.
+
 ## How it's organized
 
 ```
