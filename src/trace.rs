@@ -74,6 +74,14 @@ impl Span {
             || self.name == "lock.wait"
             || self.name == "pool.pick.wait"
             || self.name == "consumer.wait"
+            // A blocking receive on a channel/future is a wait even when its
+            // name doesn't follow the wait.* convention — the consumer sits
+            // idle here until a producer delivers. Recognized explicitly so a
+            // pipeline whose dominant stall is a `recv`/`rx_recv` block is
+            // attributed to its producer, not miscounted as consumer busy-work.
+            || self.name.contains("rx_recv")
+            || self.name.ends_with(".recv")
+            || self.name.ends_with("_recv_block")
     }
 }
 
@@ -175,5 +183,41 @@ pub fn fmt_us(us: f64) -> String {
         format!("{:.2}us", us)
     } else {
         format!("{:.0}ns", us * 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span_named(name: &str) -> Span {
+        Span {
+            name: name.to_string(),
+            parent: String::new(),
+            pid: 1,
+            tid: 1,
+            ts_start: 0.0,
+            ts_end: 1.0,
+            dur: 1.0,
+            args: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn is_wait_recognizes_conventional_and_recv_names() {
+        // Conventional wait.* / *.wait names.
+        assert!(span_named("wait.block_fetcher_get").is_wait());
+        assert!(span_named("pool.pick.wait").is_wait());
+        assert!(span_named("consumer.wait").is_wait());
+        // Blocking receives that don't follow the convention (the gzippy
+        // dominant stall) must still be recognized as waits, else they are
+        // miscounted as consumer busy-work and hide what gates the wall.
+        assert!(span_named("ttp.rx_recv_block").is_wait());
+        assert!(span_named("future.recv").is_wait());
+        assert!(span_named("chan_recv_block").is_wait());
+        // Real work spans are NOT waits.
+        assert!(!span_named("worker.bootstrap").is_wait());
+        assert!(!span_named("worker.isal_stream_inflate").is_wait());
+        assert!(!span_named("consumer.write_data").is_wait());
     }
 }

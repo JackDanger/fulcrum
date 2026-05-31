@@ -130,7 +130,11 @@ fn pick_blocker<'a>(
     preferred: &[String],
 ) -> Option<&'a (&'a Span, f64)> {
     // `cands` is already overlap-descending, so the FIRST preferred match is
-    // the largest-overlap preferred span.
+    // the largest-overlap preferred span — the long pole of the awaited item
+    // (its dominant phase has the most overlap with the wait). Blame lands on
+    // the most specific preferred phase by EXCLUDING umbrella/wrapper spans
+    // from the preferred set (a config choice), so we never need a fragile
+    // enclosure-descent that depends on exact span-boundary timestamps.
     if let Some(c) = cands
         .iter()
         .find(|(s, _)| preferred.iter().any(|p| p == &s.name))
@@ -162,47 +166,97 @@ pub fn analyze(
     let mut blocked_by: HashMap<String, (f64, usize, f64)> = HashMap::new();
     let mut heavy: Vec<HeavyChunk> = Vec::new();
 
-    for s in &spans {
-        if (s.pid, s.tid) != consumer {
+    // INNERMOST-SPAN ATTRIBUTION of the consumer timeline. Consumer spans can
+    // NEST (e.g. a `try_take_prefetched` wrapper that contains the
+    // `rx_recv_block` wait it performs). Counting every consumer span's FULL
+    // duration double-counts that nesting and makes "consumer busy" exceed the
+    // wall — the illusion that you're busy in a parent whose cost is really
+    // its child's wait. Instead, sweep the consumer timeline and credit each
+    // slice to the single INNERMOST span covering it, so self-work and waits
+    // partition disjointly and sum to the consumer's wall-coverage (<= wall).
+    // (For non-nested consumers — e.g. the toy's sibling consumer.wait /
+    // consumer.emit — this is identical to full-duration counting, so the
+    // trustworthy ground truth is preserved.)
+    let cons: Vec<&Span> = spans
+        .iter()
+        .filter(|s| {
+            (s.pid, s.tid) == consumer
+                && !s.name.starts_with("lock.held")
+                && s.name != "consumer.iter" // umbrella: let children be credited
+        })
+        .collect();
+    // Each wait span's blocker, computed ONCE over its FULL extent (a wait is
+    // gated by the dominant producer of the awaited item — not by whatever
+    // overlaps one sliced instant of it).
+    let blocker_of: Vec<String> = cons
+        .iter()
+        .map(|s| {
+            if !s.is_wait() {
+                return String::new();
+            }
+            let cands = overlapping_workers(&spans, consumer, s.ts_start, s.ts_end);
+            match pick_blocker(&cands, preferred_blockers) {
+                Some((blocker, _)) => format!("blocked-on:{}", blocker.name),
+                None => "blocked-on:<unknown>".to_string(),
+            }
+        })
+        .collect();
+    let mut bounds: Vec<f64> = Vec::with_capacity(cons.len() * 2);
+    for s in &cons {
+        bounds.push(s.ts_start);
+        bounds.push(s.ts_end);
+    }
+    bounds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    bounds.dedup();
+    for w in bounds.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let dur = b - a;
+        if dur <= 0.0 {
             continue;
         }
+        let mid = a + dur * 0.5;
+        // Innermost = latest-starting span covering the midpoint (ties → shortest).
+        let inner = cons
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.ts_start <= mid && s.ts_end >= mid)
+            .max_by(|(_, x), (_, y)| {
+                x.ts_start
+                    .partial_cmp(&y.ts_start)
+                    .unwrap()
+                    .then(y.ts_end.partial_cmp(&x.ts_end).unwrap())
+            });
+        let Some((idx, s)) = inner else { continue };
         if s.is_wait() {
-            wait += s.dur;
-            // Attribute this wait to the worker span producing the awaited
-            // item during the wait window.
-            let cands = overlapping_workers(&spans, consumer, s.ts_start, s.ts_end);
-            let label = match pick_blocker(&cands, preferred_blockers) {
-                Some((blocker, _ov)) => {
-                    if blocker.dur >= heavy_threshold_us {
-                        heavy.push(HeavyChunk {
-                            blocker_span: blocker.name.clone(),
-                            chunk_id: blocker
-                                .arg_u64("chunk_id")
-                                .or_else(|| s.arg_u64("chunk_id")),
-                            wait_us: s.dur,
-                            blocker_dur_us: blocker.dur,
-                        });
-                    }
-                    format!("blocked-on:{}", blocker.name)
-                }
-                None => "blocked-on:<unknown>".to_string(),
-            };
-            let e = blocked_by.entry(label).or_insert((0.0, 0, 0.0));
-            e.0 += s.dur;
+            wait += dur;
+            let e = blocked_by.entry(blocker_of[idx].clone()).or_insert((0.0, 0, 0.0));
+            e.0 += dur;
             e.1 += 1;
-            e.2 = e.2.max(s.dur);
-        } else if !s.name.starts_with("lock.held") {
-            // Consumer self-work. Bucket by name; skip the umbrella
-            // `consumer.iter` span (if used) so its children are credited and
-            // we don't double-count nested consumer spans.
-            if s.name == "consumer.iter" {
-                continue;
-            }
-            busy += s.dur;
+            e.2 = e.2.max(dur);
+        } else {
+            busy += dur;
             let e = self_by_name.entry(s.name.clone()).or_insert((0.0, 0, 0.0));
-            e.0 += s.dur;
+            e.0 += dur;
             e.1 += 1;
-            e.2 = e.2.max(s.dur);
+            e.2 = e.2.max(dur);
+        }
+    }
+    // Heavy long-pole detection iterates FULL wait spans (a diagnostic list,
+    // not summed into the wall) so a single big stall is reported whole.
+    for s in &cons {
+        if !s.is_wait() {
+            continue;
+        }
+        let cands = overlapping_workers(&spans, consumer, s.ts_start, s.ts_end);
+        if let Some((blocker, _)) = pick_blocker(&cands, preferred_blockers) {
+            if blocker.dur >= heavy_threshold_us {
+                heavy.push(HeavyChunk {
+                    blocker_span: blocker.name.clone(),
+                    chunk_id: blocker.arg_u64("chunk_id").or_else(|| s.arg_u64("chunk_id")),
+                    wait_us: s.dur,
+                    blocker_dur_us: blocker.dur,
+                });
+            }
         }
     }
 

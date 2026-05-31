@@ -33,6 +33,7 @@ pub mod microbench;
 pub mod probe;
 pub mod rank;
 pub mod region_hw;
+pub mod sweep;
 pub mod trace;
 pub mod validate;
 pub mod xtool;
