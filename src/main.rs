@@ -24,7 +24,7 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, compare, compare_cli, coz, coz_jsonl, critpath, flow, mech, mech_arch, rank, region_hw,
-    sweep, trace, validate, vs, xtool,
+    sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -40,6 +40,8 @@ USAGE:\n\
   fulcrum mech-report <perf_report.txt>\n\
   fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
   fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
+  fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]\n\
+  fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels a,b] [--config c.json]\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
@@ -201,6 +203,55 @@ fn cmd_vs(args: &[String]) -> ExitCode {
     preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
     match vs::compare(al, Path::new(a), bl, Path::new(b), &preferred) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels a,b]`
+///
+/// Per-thread-count cross-tool divergence report: for each T, the per-role
+/// (dispatch/decode/resolve/consumer-wait/write) gzippy-vs-rapidgzip busy +
+/// wall-critical breakdown, RANKED by the wall-critical divergence, with a
+/// top-line LEVER per T and a cross-T scaling matrix — so a reader names the
+/// necessary gzippy change without opening gzippy's source.
+fn cmd_vs_sweep(args: &[String]) -> ExitCode {
+    let labels = flag(args, "--labels").unwrap_or("gzippy,rapidgzip");
+    let (al, bl) = labels.split_once(',').unwrap_or(("gzippy", "rapidgzip"));
+    // Collect every `--at` spec (repeatable).
+    let mut specs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--at" {
+            if let Some(v) = args.get(i + 1) {
+                specs.push(v.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if specs.is_empty() {
+        eprintln!(
+            "usage: fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels gzippy,rapidgzip] [--config c.json]\n  \
+             (repeat --at per thread count; both traces must share the parallel-SM span vocabulary)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let inputs = match vs_sweep::parse_inputs(&specs) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = load_config(args);
+    let mut preferred = preferred_blockers(&cfg);
+    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
+    match vs_sweep::run(al, bl, &inputs, &preferred) {
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fulcrum: {e}");
             ExitCode::FAILURE
@@ -961,6 +1012,7 @@ fn main() -> ExitCode {
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
         "vs" => cmd_vs(rest),
+        "vs-sweep" => cmd_vs_sweep(rest),
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),

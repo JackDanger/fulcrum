@@ -39,4 +39,5 @@ pub mod sweep;
 pub mod trace;
 pub mod validate;
 pub mod vs;
+pub mod vs_sweep;
 pub mod xtool;
