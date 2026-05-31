@@ -28,6 +28,7 @@ pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
 pub mod estimate;
+pub mod flow;
 pub mod mech;
 pub mod mech_arch;
 pub mod microbench;

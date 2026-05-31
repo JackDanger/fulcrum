@@ -23,8 +23,8 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, compare, compare_cli, coz, coz_jsonl, critpath, mech, mech_arch, rank, region_hw, sweep,
-    trace, validate, xtool,
+    audit, compare, compare_cli, coz, coz_jsonl, critpath, flow, mech, mech_arch, rank, region_hw,
+    sweep, trace, validate, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -130,6 +130,123 @@ fn cmd_critpath(args: &[String]) -> ExitCode {
     let cp = critpath::analyze(&events, heavy_ms * 1000.0, &preferred_blockers(&cfg));
     print_critpath(&cp);
     ExitCode::SUCCESS
+}
+
+/// `fulcrum flow <trace.json> [--whatif STAGE:FACTOR]`
+///
+/// Multi-stage pipeline flow: per stage, WALL-CRITICAL vs TOTAL-BUSY (the gap
+/// is overlapped SLACK), with SERIAL / STARVED flags so single-thread
+/// bottlenecks are visible without guessing.
+fn cmd_flow(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(trace_path) = pos.first() else {
+        return usage();
+    };
+    let cfg = load_config(args);
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Prefer the inner decode phases (bootstrap vs ISA-L) as wait blockers so
+    // consumer stall is attributed to the real phase, not the task umbrella.
+    let mut preferred = preferred_blockers(&cfg);
+    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
+    let report = flow::analyze_flow(&events, &preferred);
+    print_flow(&report);
+    if let Some(spec) = flag(args, "--whatif") {
+        // STAGE-substring:FACTOR  e.g.  decode:2  or  "consumer write:1e9"
+        if let Some((needle, fac)) = spec.rsplit_once(':') {
+            let factor: f64 = fac.parse().unwrap_or(1.0);
+            match report
+                .stages
+                .iter()
+                .find(|s| s.name.contains(needle))
+                .map(|s| s.name)
+            {
+                Some(name) => {
+                    if let Some((w, saved)) = flow::whatif(&report, name, factor) {
+                        println!("\n  what-if: {name} ×{factor} faster");
+                        println!(
+                            "    wall {:.1}ms → {:.1}ms  (saves {:.1}ms, {:.1}%)  [critical-path upper bound]",
+                            report.wall_us / 1000.0,
+                            w / 1000.0,
+                            saved / 1000.0,
+                            if report.wall_us > 0.0 { 100.0 * saved / report.wall_us } else { 0.0 },
+                        );
+                    }
+                }
+                None => eprintln!("  what-if: no stage matching '{needle}'"),
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_flow(r: &flow::FlowReport) {
+    println!(
+        "FLOW  wall={:.1}ms   (WALL-CRITICAL = on the in-order consumer path; SLACK = busy off the wall)",
+        r.wall_us / 1000.0
+    );
+    println!(
+        "  {:<36} {:>9} {:>9} {:>9} {:>4} {:>6}  flags",
+        "stage", "wall-crit", "busy", "slack", "thr", "occ%"
+    );
+    let max_crit = r
+        .stages
+        .iter()
+        .map(|s| s.wall_critical_us)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    for s in &r.stages {
+        let bar_w = ((s.wall_critical_us / max_crit) * 24.0).round() as usize;
+        let bar: String = "█".repeat(bar_w);
+        let mut flags = String::new();
+        if s.serial {
+            flags.push_str("⚠SERIAL ");
+        }
+        if s.starved {
+            flags.push_str("⚠STARVED ");
+        }
+        // Wall-dead: this stage holds < 3% of the wall on the critical path, so
+        // speeding it cannot move the wall meaningfully — no matter how much CPU
+        // (busy) it burns. Keyed on wall-critical SHARE, not busy/critical ratio
+        // (a stage can be huge-slack AND a top wall lever — e.g. bootstrap).
+        if r.wall_us > 0.0 && s.wall_critical_us < 0.03 * r.wall_us {
+            flags.push_str("≈wall-dead ");
+        }
+        println!(
+            "  {:<36} {:>8.1}ms {:>8.1}ms {:>8.1}ms {:>4} {:>5.0}%  {} {}",
+            s.name,
+            s.wall_critical_us / 1000.0,
+            s.total_busy_us / 1000.0,
+            s.slack_us() / 1000.0,
+            s.threads,
+            s.occupancy * 100.0,
+            flags.trim_end(),
+            bar,
+        );
+    }
+    let wc_sum: f64 = r.stages.iter().map(|s| s.wall_critical_us).sum();
+    println!(
+        "  {:<36} {:>8.1}ms  ({:.0}% of wall classified onto the critical path)",
+        "Σ wall-critical",
+        wc_sum / 1000.0,
+        if r.wall_us > 0.0 { 100.0 * wc_sum / r.wall_us } else { 0.0 },
+    );
+    if !r.unclassified.is_empty() {
+        let total: f64 = r.unclassified.iter().map(|(_, d)| d).sum();
+        println!(
+            "  ⚠ UNCLASSIFIED spans ({:.1}ms busy across {} names) — add to flow::classify:",
+            total / 1000.0,
+            r.unclassified.len()
+        );
+        for (name, d) in r.unclassified.iter().take(8) {
+            println!("      {:<40} {:.1}ms", name, d / 1000.0);
+        }
+    }
 }
 
 fn print_critpath(cp: &critpath::CritPath) {
@@ -819,6 +936,7 @@ fn main() -> ExitCode {
     let rest = &args[1..];
     match sub.as_str() {
         "critpath" => cmd_critpath(rest),
+        "flow" => cmd_flow(rest),
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),
