@@ -152,6 +152,65 @@ fn label_region_maps_blocked_on_spans() {
     assert_eq!(cfg.label_region("unrelated.span"), None);
 }
 
+/// Emit one raw Chrome-trace event so a test can build NESTED spans (B/E in
+/// the right order, which the all-in-one `span` helper can't express).
+fn raw(buf: &mut String, name: &str, ph: &str, tid: u64, ts: f64) {
+    buf.push_str(&format!(
+        "{{\"name\":\"{name}\",\"ph\":\"{ph}\",\"ts\":{ts:.3},\"pid\":1,\"tid\":{tid}}},\n"
+    ));
+}
+
+/// Regression test for the consumer-span double-count bug: a consumer wrapper
+/// span (`consumer.try_take_prefetched`) that ENCLOSES the wait it performs
+/// (`ttp.rx_recv_block`). Summing both full durations would report consumer
+/// busy+wait ≈ 2× the real time and make a wrapper look like a lever when its
+/// cost is really the nested wait. Innermost-span attribution must make
+/// busy + wait partition disjointly to ≈ the consumer's covered time.
+#[test]
+fn nested_consumer_spans_do_not_double_count() {
+    let mut buf = String::from("[\n");
+    // Worker (tid 1) decodes the awaited item across [100, 900].
+    span(&mut buf, "worker.bootstrap", 1, 100.0, 900.0);
+    // Consumer (tid 9): outer try_take wrapper [0,1000] enclosing the
+    // rx_recv_block WAIT [50,950]; only [0,50]+[950,1000] = 100us is real
+    // wrapper self-work, the inner 900us is a wait on the worker.
+    raw(&mut buf, "consumer.try_take_prefetched", "B", 9, 0.0);
+    raw(&mut buf, "ttp.rx_recv_block", "B", 9, 50.0);
+    raw(&mut buf, "ttp.rx_recv_block", "E", 9, 950.0);
+    raw(&mut buf, "consumer.try_take_prefetched", "E", 9, 1000.0);
+    let mut f = tempfile();
+    f.write_all(buf.as_bytes()).unwrap();
+    let events = trace::load_events(f.path()).unwrap();
+    let preferred = vec!["worker.bootstrap".to_string()];
+    let cp = critpath::analyze(&events, 30_000.0, &preferred);
+
+    // The consumer's accounted time must not exceed the wall (the bug made it
+    // ~2×). Allow a tiny epsilon for float boundary handling.
+    assert!(
+        cp.consumer_busy_us + cp.consumer_wait_us <= cp.wall_us + 1.0,
+        "busy {} + wait {} must partition to <= wall {} (no double-count)",
+        cp.consumer_busy_us,
+        cp.consumer_wait_us,
+        cp.wall_us
+    );
+    // The nested 900us wait dominates; the wrapper self-work is the ~100us
+    // remainder, not the whole 1000us.
+    assert!(
+        cp.consumer_wait_us > cp.consumer_busy_us,
+        "the nested wait ({}) should dominate the wrapper self-work ({})",
+        cp.consumer_wait_us,
+        cp.consumer_busy_us
+    );
+    // The wait is attributed to the worker that produced the awaited item.
+    assert!(
+        cp.entries
+            .iter()
+            .any(|e| e.label == "blocked-on:worker.bootstrap" && e.fraction > 0.5),
+        "the wait must be blamed on worker.bootstrap, got {:?}",
+        cp.entries.iter().map(|e| (&e.label, e.fraction)).collect::<Vec<_>>()
+    );
+}
+
 // ---- a minimal tempfile helper (no dev-dependency) ----------------------
 
 struct TempPath(std::path::PathBuf, std::fs::File);

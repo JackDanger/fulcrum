@@ -23,8 +23,8 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, compare, compare_cli, coz, critpath, mech, mech_arch, rank, region_hw, trace, validate,
-    xtool,
+    audit, compare, compare_cli, coz, critpath, mech, mech_arch, rank, region_hw, sweep, trace,
+    validate, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -652,6 +652,61 @@ fn load_spec_and_corpora(
     Some((spec, corpora))
 }
 
+/// sweep: exhaustive thread-count causal sweep. Two phases:
+///   fulcrum sweep capture --spec s.json --out DIR   (run on the perf box)
+///   fulcrum sweep mine DIR [--config region.json]   (offline, re-runnable)
+fn cmd_sweep(args: &[String]) -> ExitCode {
+    let Some(phase) = args.first().map(|s| s.as_str()) else {
+        eprintln!(
+            "sweep needs a phase: 'capture' or 'mine'\n  \
+             fulcrum sweep capture --spec s.json --out DIR\n  \
+             fulcrum sweep mine DIR [--config region.json]"
+        );
+        return usage();
+    };
+    let rest = &args[1..];
+    match phase {
+        "capture" => {
+            let (Some(spec_path), Some(out)) = (flag(rest, "--spec"), flag(rest, "--out")) else {
+                eprintln!("sweep capture needs --spec s.json --out DIR");
+                return ExitCode::FAILURE;
+            };
+            let spec = match sweep::SweepSpec::load(Path::new(spec_path)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("sweep: bad spec {spec_path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match sweep::capture(&spec, Path::new(out)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("sweep capture failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "mine" => {
+            let Some(dir) = rest.iter().find(|a| !a.starts_with("--")) else {
+                eprintln!("sweep mine needs the captured DIR");
+                return ExitCode::FAILURE;
+            };
+            let cfg = flag(rest, "--config").map(Path::new);
+            match sweep::mine(Path::new(dir), cfg) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("sweep mine failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!("sweep: unknown phase '{other}' (expected 'capture' or 'mine')");
+            usage()
+        }
+    }
+}
+
 /// compare: run the fair cross-tool benchmark and print the honest scoped table.
 fn cmd_compare(args: &[String]) -> ExitCode {
     if flag(args, "--spec").is_none() {
@@ -725,6 +780,7 @@ fn main() -> ExitCode {
         "region-hw" => cmd_region_hw(rest),
         "xtool" => cmd_xtool(rest),
         "compare" => cmd_compare(rest),
+        "sweep" => cmd_sweep(rest),
         "audit" => cmd_audit(rest),
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
