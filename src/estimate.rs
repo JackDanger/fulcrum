@@ -54,10 +54,10 @@
 //!   op count, on a high-on-path region ⇒ a few-percent speedup, matching the
 //!   measured win.
 
+use crate::config::Config;
 use crate::critpath::CritPath;
 use crate::microbench::BenchResult;
 use crate::rank;
-use crate::config::Config;
 
 /// One per-operation cost change inside a region.
 #[derive(Debug, Clone)]
@@ -366,15 +366,13 @@ pub fn estimate(change: &str, base: &RegionBaseline, deltas: &[Delta]) -> Estima
     }
 }
 
-fn build_confidence(
-    base: &RegionBaseline,
-    deltas: &[Delta],
-    raw: f64,
-    capped: f64,
-) -> String {
+fn build_confidence(base: &RegionBaseline, deltas: &[Delta], raw: f64, capped: f64) -> String {
     let mut notes = Vec::new();
     if base.on_path_share < 0.05 {
-        notes.push("region barely on the critical path — wall move is heavily capped (likely a non-lever)".to_string());
+        notes.push(
+            "region barely on the critical path — wall move is heavily capped (likely a non-lever)"
+                .to_string(),
+        );
     }
     if base.region_cycles_per_unit.is_none() {
         notes.push("no region cycle budget supplied — speedup is NOT bounded by region size (may over-claim)".to_string());
@@ -512,7 +510,10 @@ mod tests {
         );
         let b = e.bracket();
         let (lo, hi) = b.pct();
-        assert!(hi - lo <= 2.0, "non-lever bracket should be tight, got [{lo},{hi}]");
+        assert!(
+            hi - lo <= 2.0,
+            "non-lever bracket should be tight, got [{lo},{hi}]"
+        );
         assert!(b.order.contains("non-lever") || matches!(b.sign, Sign::Flat));
     }
 

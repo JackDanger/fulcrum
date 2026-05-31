@@ -207,7 +207,10 @@ fn nested_consumer_spans_do_not_double_count() {
             .iter()
             .any(|e| e.label == "blocked-on:worker.bootstrap" && e.fraction > 0.5),
         "the wait must be blamed on worker.bootstrap, got {:?}",
-        cp.entries.iter().map(|e| (&e.label, e.fraction)).collect::<Vec<_>>()
+        cp.entries
+            .iter()
+            .map(|e| (&e.label, e.fraction))
+            .collect::<Vec<_>>()
     );
 }
 

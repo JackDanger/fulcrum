@@ -72,7 +72,8 @@ impl FuncBucket {
             || has("read_bits")
             || has("loop_block") // a tool's decode inner loop
             || has("decode_len_dist") // length/distance decode
-            || has("build_decode_table") // decode-table build (part of decode)
+            || has("build_decode_table")
+        // decode-table build (part of decode)
         {
             FuncBucket::Decode
         } else if has("memcpy")
@@ -180,7 +181,16 @@ pub fn render_comparison(input: &str, profiles: &[ToolProfile]) -> String {
     );
     s.push_str(&format!(
         "  {:<12} {:>8} {:>9} {:>8} {:>8} {:>9} | {:>7} {:>6} {:>7} {:>7}\n",
-        "tool", "MB/s", "retiring", "backend", "frontend", "bad-spec", "decode", "copy", "window", "alloc"
+        "tool",
+        "MB/s",
+        "retiring",
+        "backend",
+        "frontend",
+        "bad-spec",
+        "decode",
+        "copy",
+        "window",
+        "alloc"
     ));
     s.push_str(&format!("  {}\n", "-".repeat(96)));
     for p in profiles {

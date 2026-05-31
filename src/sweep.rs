@@ -98,7 +98,13 @@ impl SweepSpec {
     }
 }
 
-fn time_run(spec: &ToolSpec, input: &Path, t: ThreadCell, sink: &Path, trace_env: Option<(&str, &Path)>) -> f64 {
+fn time_run(
+    spec: &ToolSpec,
+    input: &Path,
+    t: ThreadCell,
+    sink: &Path,
+    trace_env: Option<(&str, &Path)>,
+) -> f64 {
     let argv = spec.build_argv(input, None, t);
     let bin = spec.resolve().unwrap_or_else(|| PathBuf::from(&spec.bin));
     let out = fs::File::create(sink).ok();
@@ -178,7 +184,11 @@ pub fn capture(spec: &SweepSpec, out_dir: &Path) -> std::io::Result<()> {
                 }
             }
         }
-        eprintln!("## correctness: all tools agree at {} (sha {:.16})", t0.label(), crate::compare::hex32(&refs));
+        eprintln!(
+            "## correctness: all tools agree at {} (sha {:.16})",
+            t0.label(),
+            crate::compare::hex32(&refs)
+        );
     }
 
     let wall_path = out_dir.join("wall.csv");
@@ -219,7 +229,10 @@ pub fn capture(spec: &SweepSpec, out_dir: &Path) -> std::io::Result<()> {
         "reference": ref_name,
         "tools": spec.tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
     });
-    fs::write(out_dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap())?;
+    fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )?;
     eprintln!("CAPTURE DONE -> {}", out_dir.display());
     Ok(())
 }
@@ -251,7 +264,11 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     let reference = meta["reference"].as_str().unwrap_or("").to_string();
     let tools: Vec<String> = meta["tools"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // (tool, T, sink) -> samples
@@ -263,7 +280,9 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
             continue;
         }
         if let (Ok(t), Ok(s)) = (f[1].parse::<usize>(), f[4].parse::<f64>()) {
-            wall.entry((f[0].to_string(), t, f[2].to_string())).or_default().push(s);
+            wall.entry((f[0].to_string(), t, f[2].to_string()))
+                .or_default()
+                .push(s);
         }
     }
     let mut threads: Vec<usize> = wall.keys().map(|k| k.1).collect();
@@ -272,7 +291,11 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     let bestmin = |tool: &str, t: usize, sink: &str| -> Option<f64> {
         // Accept either "file" (the capture command's label) or "tmpfs"
         // (older captures) for the real-sink column.
-        let keys: &[&str] = if sink == "file" { &["file", "tmpfs"] } else { &[sink] };
+        let keys: &[&str] = if sink == "file" {
+            &["file", "tmpfs"]
+        } else {
+            &[sink]
+        };
         keys.iter()
             .find_map(|k| wall.get(&(tool.to_string(), t, k.to_string())))
             .and_then(|v| stat(v.clone()))
@@ -316,13 +339,16 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
 
     // ---- critical-path region share per T (reference tool) ----
     let cfg = config.and_then(|p| Config::load(p).ok());
-    println!("\n{}", "=".repeat(100));
-    println!("CRITICAL-PATH region share per T (reference '{reference}', consumer-anchored, de-nested) — what GATES the wall");
-    println!("{}", "=".repeat(100));
     let mut per_t: BTreeMap<usize, BTreeMap<String, f64>> = BTreeMap::new();
     let mut allregions: std::collections::BTreeSet<String> = Default::default();
+    // (wall_us, consumer_busy_us, consumer_wait_us) per T — the scaling-cliff signal.
+    let mut cliff: BTreeMap<usize, (f64, f64, f64)> = BTreeMap::new();
+    // (n_heavy_blockers, max_single_wait_us, sum_heavy_wait_us) per T — straggler signal.
+    let mut straggler: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     for &t in &threads {
-        let tp = out_dir.join("traces").join(format!("{reference}_T{t}.json"));
+        let tp = out_dir
+            .join("traces")
+            .join(format!("{reference}_T{t}.json"));
         if !tp.exists() {
             continue;
         }
@@ -331,6 +357,18 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
             Err(_) => continue,
         };
         let cp = critpath::analyze(&events, 5000.0, &[]);
+        // Straggler signature: how much of the consumer's wait is concentrated
+        // in a few HEAVY long-pole blockers (the in-order consumer stalling on
+        // the slowest next chunk) vs spread evenly. n_heavy + max single wait.
+        let n_heavy = cp.heavy_chunks.len();
+        let max_heavy_us = cp
+            .heavy_chunks
+            .iter()
+            .map(|h| h.wait_us)
+            .fold(0.0_f64, f64::max);
+        let sum_heavy_us: f64 = cp.heavy_chunks.iter().map(|h| h.wait_us).sum();
+        straggler.insert(t, (n_heavy, max_heavy_us, sum_heavy_us));
+        cliff.insert(t, (cp.wall_us, cp.consumer_busy_us, cp.consumer_wait_us));
         let mut regions: BTreeMap<String, f64> = BTreeMap::new();
         for e in &cp.entries {
             // Map the raw critpath label to a config region when possible,
@@ -346,14 +384,76 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
         }
         per_t.insert(t, regions);
     }
+
+    // ---- SCALING CLIFF diagnostic: is the in-order consumer the serial floor? ----
+    // The Amdahl signature of a scaling cliff: the consumer's own BUSY time
+    // (its un-parallelizable serial work — write/resolve/crc) is ~constant in
+    // ms as T rises, so it becomes a growing FRACTION of the (shrinking) wall.
+    // When busy-fraction climbs with T, the consumer serial chain — not worker
+    // throughput — is what caps scaling.
+    println!("\n{}", "=".repeat(100));
+    println!(
+        "SCALING CLIFF — consumer serial fraction vs T (reference '{reference}'; traced wall)"
+    );
+    println!("{}", "=".repeat(100));
+    println!(
+        "{:>4} | {:>10} {:>12} {:>12} | {:>10} {:>10} | {:>7} {:>10} {:>10}",
+        "T",
+        "wall(ms)",
+        "cons_busy ms",
+        "cons_wait ms",
+        "busy/wall",
+        "wait/wall",
+        "n_heavy",
+        "max_heavy",
+        "heavy/wait"
+    );
+    for (&t, &(wall, busy, wait)) in &cliff {
+        let (nh, maxh, sumh) = straggler.get(&t).copied().unwrap_or((0, 0.0, 0.0));
+        println!(
+            "{:>4} | {:>10.1} {:>12.1} {:>12.1} | {:>9.0}% {:>9.0}% | {:>7} {:>10.1} {:>10}%",
+            t,
+            wall / 1000.0,
+            busy / 1000.0,
+            wait / 1000.0,
+            if wall > 0.0 { 100.0 * busy / wall } else { 0.0 },
+            if wall > 0.0 { 100.0 * wait / wall } else { 0.0 },
+            nh,
+            maxh / 1000.0,
+            if wait > 0.0 {
+                (100.0 * sumh / wait) as i64
+            } else {
+                0
+            },
+        );
+    }
+    println!(
+        "\ncolumns: n_heavy = # long-pole blockers (>5ms) the consumer stalled on; max_heavy ms =\n\
+         biggest single stall; heavy/wait%% = share of consumer wait in those few heavy stalls.\n\
+         cons_busy ~constant ms while busy/wall RISES with T => in-order CONSUMER serial work is the\n\
+         floor. cons_wait dominating => starved on producers; if heavy/wait%% is high & n_heavy small,\n\
+         it's STRAGGLER-bound (in-order wait on the slowest next chunk) => split heavy chunks / cut\n\
+         per-chunk decode-latency variance, NOT raise throughput."
+    );
+
     // show regions that ever exceed 5% on-path
     let mut show: Vec<String> = allregions
         .into_iter()
-        .filter(|r| per_t.values().any(|m| m.get(r).copied().unwrap_or(0.0) >= 5.0))
+        .filter(|r| {
+            per_t
+                .values()
+                .any(|m| m.get(r).copied().unwrap_or(0.0) >= 5.0)
+        })
         .collect();
     show.sort_by(|a, b| {
-        let ma = per_t.values().map(|m| m.get(a).copied().unwrap_or(0.0)).fold(0.0, f64::max);
-        let mb = per_t.values().map(|m| m.get(b).copied().unwrap_or(0.0)).fold(0.0, f64::max);
+        let ma = per_t
+            .values()
+            .map(|m| m.get(a).copied().unwrap_or(0.0))
+            .fold(0.0, f64::max);
+        let mb = per_t
+            .values()
+            .map(|m| m.get(b).copied().unwrap_or(0.0))
+            .fold(0.0, f64::max);
         mb.partial_cmp(&ma).unwrap()
     });
     print!("{:32} ", "region");
@@ -398,9 +498,11 @@ mod tests {
         assert_eq!(spec.tools[0].trace_env.as_deref(), Some("GZIPPY_TIMELINE"));
         assert!(spec.tools[1].trace_env.is_none());
         // build_argv substitutes input + thread flag.
-        let argv = spec.tools[0]
-            .spec()
-            .build_argv(std::path::Path::new("in.gz"), None, ThreadCell::Fixed(4));
+        let argv = spec.tools[0].spec().build_argv(
+            std::path::Path::new("in.gz"),
+            None,
+            ThreadCell::Fixed(4),
+        );
         assert!(argv.contains(&"in.gz".to_string()));
         assert!(argv.iter().any(|a| a == "-p4"));
     }

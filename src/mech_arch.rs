@@ -304,7 +304,11 @@ impl MechCaps {
 pub fn render(caps: &MechCaps) -> String {
     let mut s = String::new();
     s.push_str("\n========  CROSS-ARCH MECHANISM CAPABILITY  ========\n");
-    s.push_str(&format!("  host: {} / {}\n", caps.arch.label(), caps.os.label()));
+    s.push_str(&format!(
+        "  host: {} / {}\n",
+        caps.arch.label(),
+        caps.os.label()
+    ));
     s.push_str(&format!("  {}\n\n", caps.headline()));
     for c in &caps.caps {
         s.push_str(&format!("  [{}] {}\n", c.availability.label(), c.name));

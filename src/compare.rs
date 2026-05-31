@@ -183,7 +183,12 @@ impl ToolSpec {
     /// documented auto arg; `Fixed(n)` uses the thread-flag spelling. `{input}`,
     /// `{output}` are substituted. Returns argv WITHOUT the program (caller has
     /// the resolved bin).
-    pub fn build_argv(&self, input: &Path, output: Option<&Path>, threads: ThreadCell) -> Vec<String> {
+    pub fn build_argv(
+        &self,
+        input: &Path,
+        output: Option<&Path>,
+        threads: ThreadCell,
+    ) -> Vec<String> {
         let mut v: Vec<String> = Vec::new();
         for tok in &self.argv {
             let t = tok
@@ -281,7 +286,11 @@ impl BinaryProbe {
 pub fn resolve_in_path(cmd: &str) -> Option<PathBuf> {
     let p = Path::new(cmd);
     if cmd.contains('/') {
-        return if p.exists() { Some(p.to_path_buf()) } else { None };
+        return if p.exists() {
+            Some(p.to_path_buf())
+        } else {
+            None
+        };
     }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -333,7 +342,10 @@ pub fn classify_binary(path: &Path) -> BinaryKind {
     }
     if bytes.starts_with(b"#!") {
         // Read the interpreter from the shebang line.
-        let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+        let line_end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
         let line = String::from_utf8_lossy(&bytes[2..line_end]);
         let interp = interpreter_name(&line);
         return BinaryKind::Interpreted(interp);
@@ -371,7 +383,9 @@ const SCRIPT_INTERPRETERS: &[&str] = &[
 /// Is this interpreter name a scripting interpreter (vs e.g. a native loader)?
 pub fn is_script_interpreter(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    SCRIPT_INTERPRETERS.iter().any(|s| n == s.to_ascii_lowercase())
+    SCRIPT_INTERPRETERS
+        .iter()
+        .any(|s| n == s.to_ascii_lowercase())
 }
 
 fn read_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
@@ -478,7 +492,10 @@ fn read_loadavg1() -> Option<f64> {
         return s.split_whitespace().next()?.parse().ok();
     }
     // macOS / BSD: `sysctl -n vm.loadavg` → "{ 1.50 1.20 1.05 }".
-    let out = Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
+    let out = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     s.split_whitespace()
         .find_map(|t| t.trim_matches(|c| c == '{' || c == '}').parse::<f64>().ok())
@@ -746,7 +763,8 @@ impl Comparison {
         v.sort_by_key(|c| c.wall_minus_startup);
         let best = v.first()?;
         let margin = if let Some(second) = v.get(1) {
-            second.wall_minus_startup.as_secs_f64() / best.wall_minus_startup.as_secs_f64().max(1e-9)
+            second.wall_minus_startup.as_secs_f64()
+                / best.wall_minus_startup.as_secs_f64().max(1e-9)
                 - 1.0
         } else {
             f64::INFINITY // uncontested
@@ -847,15 +865,27 @@ impl Comparison {
         out.push_str(":\n");
         out.push_str(&format!(
             "  WINS  : {}\n",
-            if wins.is_empty() { "(none)".into() } else { wins.join(", ") }
+            if wins.is_empty() {
+                "(none)".into()
+            } else {
+                wins.join(", ")
+            }
         ));
         out.push_str(&format!(
             "  TIES  : {}\n",
-            if ties.is_empty() { "(none)".into() } else { ties.join(", ") }
+            if ties.is_empty() {
+                "(none)".into()
+            } else {
+                ties.join(", ")
+            }
         ));
         out.push_str(&format!(
             "  LOSES : {}\n",
-            if losses.is_empty() { "(none)".into() } else { losses.join(", ") }
+            if losses.is_empty() {
+                "(none)".into()
+            } else {
+                losses.join(", ")
+            }
         ));
         if !disq.is_empty() {
             out.push_str(&format!("  DISQUALIFIED: {}\n", disq.join(", ")));
@@ -883,7 +913,11 @@ impl Comparison {
             if !subj.valid() {
                 disq.push(format!(
                     "{cell_label} (subject {})",
-                    if subj.errored { "errored" } else { "WRONG BYTES" }
+                    if subj.errored {
+                        "errored"
+                    } else {
+                        "WRONG BYTES"
+                    }
                 ));
                 continue;
             }
@@ -903,7 +937,11 @@ impl Comparison {
                     // A win where every rival failed is a win BY DEFAULT — label
                     // it so an "all cells won" verdict can't quietly rest on rival
                     // crashes.
-                    let suffix = if contested { "" } else { " BY DEFAULT — rivals failed/wrong" };
+                    let suffix = if contested {
+                        ""
+                    } else {
+                        " BY DEFAULT — rivals failed/wrong"
+                    };
                     wins.push(format!("{cell_label} ({m}{suffix})"));
                 }
                 CellVerdict::Win { tool: w, .. } => {
@@ -925,7 +963,10 @@ impl Comparison {
                         .filter(|t| *t != &self.subject)
                         .map(|s| s.as_str())
                         .collect();
-                    ties.push(format!("{cell_label} (within noise vs {})", others.join("/")));
+                    ties.push(format!(
+                        "{cell_label} (within noise vs {})",
+                        others.join("/")
+                    ));
                 }
                 CellVerdict::Tie { .. } => {
                     // Subject not in the tie set → it's slower than the tied
@@ -1255,7 +1296,13 @@ fn run_once(
     let t0 = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return RunOutcome { wall: t0.elapsed(), digest: [0u8; 32], ok: false },
+        Err(_) => {
+            return RunOutcome {
+                wall: t0.elapsed(),
+                digest: [0u8; 32],
+                ok: false,
+            }
+        }
     };
     #[cfg(unix)]
     let pgid = child.id() as i32; // == pgid since process_group(0)
@@ -1301,7 +1348,9 @@ fn run_once(
     // On a clean exit, join the drain thread for the bytes. On a timeout we
     // still join, but the group-kill above closed the pipe so it returns
     // promptly (no unbounded hang); the bytes are irrelevant for a killed run.
-    let stdout_bytes = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     let bytes = match (spec.writes_to, &out_path) {
         (OutputMode::Stdout, _) => stdout_bytes,
@@ -1319,7 +1368,12 @@ fn run_once(
 
 /// Fold a tool's interleaved samples for one cell into a [`Cell`], applying the
 /// correctness check (hole #3) and the startup subtraction (hole #1).
-fn summarize_cell(spec: &ToolSpec, corpus: &Corpus, threads: ThreadCell, outs: &[RunOutcome]) -> Cell {
+fn summarize_cell(
+    spec: &ToolSpec,
+    corpus: &Corpus,
+    threads: ThreadCell,
+    outs: &[RunOutcome],
+) -> Cell {
     let mut walls: Vec<Duration> = outs.iter().filter(|o| o.ok).map(|o| o.wall).collect();
     let errored = walls.is_empty();
     walls.sort();
@@ -1604,14 +1658,23 @@ mod tests {
             refused: false,
         };
         assert!(
-            matches!(cmp.decide("c", ThreadCell::Fixed(1)), CellVerdict::Tie { .. }),
+            matches!(
+                cmp.decide("c", ThreadCell::Fixed(1)),
+                CellVerdict::Tie { .. }
+            ),
             "a 50% margin at n=2 must be a TIE, not a win"
         );
         // Same data at n=3 IS a win.
-        let cmp3 = Comparison { samples: 3, ..cmp.clone() };
+        let cmp3 = Comparison {
+            samples: 3,
+            ..cmp.clone()
+        };
         assert!(matches!(
             cmp3.decide("c", ThreadCell::Fixed(1)),
-            CellVerdict::Win { contested: true, .. }
+            CellVerdict::Win {
+                contested: true,
+                ..
+            }
         ));
     }
 
@@ -1762,7 +1825,7 @@ mod tests {
             subject: "tool-fast".to_string(),
             probes: BTreeMap::new(),
             cells: vec![
-                mk("tool-fast", 10, wrong, false),   // fast but WRONG
+                mk("tool-fast", 10, wrong, false),       // fast but WRONG
                 mk("tool-correct", 50, reference, true), // slow but right
             ],
             guard_warning: None,

@@ -14,9 +14,7 @@
 //! names are GENERIC (tool-correct / tool-wrong / tool-python).
 
 use fulcrum::audit::{self, Verdict};
-use fulcrum::compare::{
-    self, BinaryKind, Corpus, OutputMode, RunCfg, ThreadCell, ToolSpec,
-};
+use fulcrum::compare::{self, BinaryKind, Corpus, OutputMode, RunCfg, ThreadCell, ToolSpec};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -264,10 +262,16 @@ fn a_hanging_tool_is_killed_at_timeout_not_hung() {
         "sweep took {elapsed:?} — the hanging tool was not killed at the timeout"
     );
     let hang_cell = cmp.cells.iter().find(|c| c.tool == "tool-hang").unwrap();
-    assert!(hang_cell.errored, "the hanging tool must be recorded errored");
+    assert!(
+        hang_cell.errored,
+        "the hanging tool must be recorded errored"
+    );
     assert!(!hang_cell.valid());
     let good_cell = cmp.cells.iter().find(|c| c.tool == "tool-good").unwrap();
-    assert!(good_cell.valid(), "the good tool must still produce a valid cell");
+    assert!(
+        good_cell.valid(),
+        "the good tool must still produce a valid cell"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -327,13 +331,7 @@ fn a_real_win_survives_a_scoped_claim() {
         timeout: Duration::from_secs(30),
         tmp_dir: dir.clone(),
     };
-    let cmp = compare::run_comparison(
-        "tool-fast",
-        &tools,
-        &corpora,
-        &[ThreadCell::Fixed(1)],
-        &cfg,
-    );
+    let cmp = compare::run_comparison("tool-fast", &tools, &corpora, &[ThreadCell::Fixed(1)], &cfg);
 
     // Both correct; tool-fast must WIN above the noise floor (150ms margin).
     let claim = audit::Claim::parse(

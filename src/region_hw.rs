@@ -569,7 +569,11 @@ fn span_matches(s: &Span, subs: &[String]) -> bool {
 /// This is the "does the new per-region layer agree with the old run-level
 /// layer?" gate the task asks for — if the per-region numbers don't roll back
 /// up to the run-level TMA, one of them is wrong.
-pub fn reconcile(rows: &[RegionHw], run_backend_pct: f64, run_badspec_pct: f64) -> (Vec<String>, bool) {
+pub fn reconcile(
+    rows: &[RegionHw],
+    run_backend_pct: f64,
+    run_badspec_pct: f64,
+) -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let total_wall: f64 = rows.iter().map(|r| r.wall_us).sum();
     if total_wall <= 0.0 {
@@ -604,7 +608,11 @@ pub fn reconcile(rows: &[RegionHw], run_backend_pct: f64, run_badspec_pct: f64) 
     lines.push(format!(
         "reconcile vs run-level TMA: per-region load-mem-bound (wall-weighted) {pred_backend:.0}% \
          ≤ run backend-bound {run_backend_pct:.0}%  [{}]",
-        if backend_ok { "CONSISTENT (load-miss ≤ backend)" } else { "DIVERGES (exceeds backend)" }
+        if backend_ok {
+            "CONSISTENT (load-miss ≤ backend)"
+        } else {
+            "DIVERGES (exceeds backend)"
+        }
     ));
     if backend_ok && gap > 15.0 {
         lines.push(format!(
@@ -616,7 +624,11 @@ pub fn reconcile(rows: &[RegionHw], run_backend_pct: f64, run_badspec_pct: f64) 
     lines.push(format!(
         "reconcile vs run-level TMA: per-region branch-bound (wall-weighted) {pred_badspec:.0}% \
          ≤ run bad-speculation {run_badspec_pct:.0}%  [{}]",
-        if badspec_ok { "CONSISTENT (MPKI-bound ≤ bad-spec)" } else { "DIVERGES" }
+        if badspec_ok {
+            "CONSISTENT (MPKI-bound ≤ bad-spec)"
+        } else {
+            "DIVERGES"
+        }
     ));
     (lines, backend_ok && badspec_ok)
 }

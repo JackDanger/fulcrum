@@ -27,14 +27,38 @@ fn samples_bucket_into_the_correct_region_window() {
     let events = synth_events();
     // stage_a window [1000,2000): 3 DRAM + 1 L1.  stage_b [2000,3000): 4 L1.
     let mem = vec![
-        MemSample { ts_us: 1100.0, tier: MemTier::Dram },
-        MemSample { ts_us: 1500.0, tier: MemTier::Dram },
-        MemSample { ts_us: 1900.0, tier: MemTier::Dram },
-        MemSample { ts_us: 1200.0, tier: MemTier::L1 },
-        MemSample { ts_us: 2100.0, tier: MemTier::L1 },
-        MemSample { ts_us: 2400.0, tier: MemTier::L1 },
-        MemSample { ts_us: 2700.0, tier: MemTier::L1 },
-        MemSample { ts_us: 2900.0, tier: MemTier::L1 },
+        MemSample {
+            ts_us: 1100.0,
+            tier: MemTier::Dram,
+        },
+        MemSample {
+            ts_us: 1500.0,
+            tier: MemTier::Dram,
+        },
+        MemSample {
+            ts_us: 1900.0,
+            tier: MemTier::Dram,
+        },
+        MemSample {
+            ts_us: 1200.0,
+            tier: MemTier::L1,
+        },
+        MemSample {
+            ts_us: 2100.0,
+            tier: MemTier::L1,
+        },
+        MemSample {
+            ts_us: 2400.0,
+            tier: MemTier::L1,
+        },
+        MemSample {
+            ts_us: 2700.0,
+            tier: MemTier::L1,
+        },
+        MemSample {
+            ts_us: 2900.0,
+            tier: MemTier::L1,
+        },
     ];
     let region_funcs = vec![
         ("stage_a".to_string(), vec!["stage_a".to_string()]),

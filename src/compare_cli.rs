@@ -139,10 +139,14 @@ impl CompareSpec {
         for c in &self.corpora {
             let path = PathBuf::from(&c.path);
             if !path.exists() {
-                return Err(format!("corpus '{}' path does not exist: {}", c.name, c.path));
+                return Err(format!(
+                    "corpus '{}' path does not exist: {}",
+                    c.name, c.path
+                ));
             }
-            let (digest, plain_len) = run_reference(&self.reference.bin, &self.reference.argv, &path, ref_output)
-                .map_err(|e| format!("reference decode of corpus '{}' failed: {e}", c.name))?;
+            let (digest, plain_len) =
+                run_reference(&self.reference.bin, &self.reference.argv, &path, ref_output)
+                    .map_err(|e| format!("reference decode of corpus '{}' failed: {e}", c.name))?;
             let plain_bytes = c.plain_bytes.unwrap_or(plain_len);
             out.push(Corpus {
                 name: c.name.clone(),
@@ -175,8 +179,12 @@ fn run_reference(
     input: &Path,
     output_mode: &str,
 ) -> std::io::Result<([u8; 32], u64)> {
-    let resolved = crate::compare::resolve_in_path(bin)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("reference bin '{bin}' not on PATH")))?;
+    let resolved = crate::compare::resolve_in_path(bin).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("reference bin '{bin}' not on PATH"),
+        )
+    })?;
     let out_path = if output_mode == "file" {
         Some(std::env::temp_dir().join("fulcrum_reference.out"))
     } else {
@@ -187,7 +195,10 @@ fn run_reference(
         .map(|t| {
             t.replace("{input}", &input.display().to_string()).replace(
                 "{output}",
-                &out_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                &out_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             )
         })
         .collect();

@@ -179,8 +179,16 @@ mod tests {
         let rows = aggregate(&[&p], |s| s.to_string()).unwrap();
         let a = rows.iter().find(|r| r.key == "a.rs:10").unwrap();
         let b = rows.iter().find(|r| r.key == "b.rs:20").unwrap();
-        assert!((a.impact - 1.0).abs() < 1e-6, "lever impact ~1.0, got {}", a.impact);
-        assert!(b.impact.abs() < 1e-6, "off-path impact ~0, got {}", b.impact);
+        assert!(
+            (a.impact - 1.0).abs() < 1e-6,
+            "lever impact ~1.0, got {}",
+            a.impact
+        );
+        assert!(
+            b.impact.abs() < 1e-6,
+            "off-path impact ~0, got {}",
+            b.impact
+        );
         // a ranks above b.
         assert_eq!(rows[0].key, "a.rs:10");
         let _ = std::fs::remove_file(&p);
@@ -199,7 +207,13 @@ mod tests {
         );
         // Fold both lines of deflate_block.rs into one region.
         let rows = aggregate(&[&p], |s| {
-            s.rsplit('/').next().unwrap_or(s).rsplit(':').nth(1).unwrap_or(s).to_string()
+            s.rsplit('/')
+                .next()
+                .unwrap_or(s)
+                .rsplit(':')
+                .nth(1)
+                .unwrap_or(s)
+                .to_string()
         })
         .unwrap();
         assert_eq!(rows.len(), 1, "both lines fold into one region");

@@ -220,7 +220,11 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
         if !subj.valid() {
             disq.push(format!(
                 "{cell_label} ({})",
-                if subj.errored { "errored" } else { "WRONG BYTES" }
+                if subj.errored {
+                    "errored"
+                } else {
+                    "WRONG BYTES"
+                }
             ));
             continue;
         }
@@ -386,7 +390,8 @@ pub fn audit(claim: Claim, cmp: &Comparison) -> AuditResult {
     }
     if let Some(w) = &cmp.guard_warning {
         if w.contains("busy") || w.contains("contended") {
-            holes.push("#5 contention guard flagged the box as busy during measurement".to_string());
+            holes
+                .push("#5 contention guard flagged the box as busy during measurement".to_string());
         }
     }
 
@@ -415,7 +420,10 @@ pub fn render(a: &AuditResult) -> String {
         s.push_str(&format!("\n  scoped WINS  : {}\n", a.won.join(", ")));
     }
     if !a.tied.is_empty() {
-        s.push_str(&format!("  scoped TIES  : {}  (parity, within noise — NOT wins)\n", a.tied.join(", ")));
+        s.push_str(&format!(
+            "  scoped TIES  : {}  (parity, within noise — NOT wins)\n",
+            a.tied.join(", ")
+        ));
     }
     if !a.lost.is_empty() {
         s.push_str(&format!("  scoped LOSES : {}\n", a.lost.join(", ")));
@@ -458,7 +466,11 @@ mod tests {
             wall: Duration::from_millis(ms),
             wall_minus_startup: Duration::from_millis(ms),
             best_wall: Duration::from_millis(ms),
-            digest: if correct { sha256(b"ref") } else { sha256(b"bad") },
+            digest: if correct {
+                sha256(b"ref")
+            } else {
+                sha256(b"bad")
+            },
             correct,
             spread: 0.0,
             mbps: 1.0,
@@ -481,12 +493,20 @@ mod tests {
     #[test]
     fn parse_recognizes_scopes() {
         let kinds = vec!["compressible".to_string(), "incompressible".to_string()];
-        let c = Claim::parse("subject", "fastest at every thread count on compressible", &kinds);
+        let c = Claim::parse(
+            "subject",
+            "fastest at every thread count on compressible",
+            &kinds,
+        );
         assert_eq!(
             c.scope,
             ClaimScope::EveryThreadOnKind("compressible".to_string())
         );
-        let c2 = Claim::parse("subject", "the fastest decoder at every thread count, every situation", &kinds);
+        let c2 = Claim::parse(
+            "subject",
+            "the fastest decoder at every thread count, every situation",
+            &kinds,
+        );
         assert_eq!(c2.scope, ClaimScope::EveryCell);
         let c3 = Claim::parse("subject", "fastest on compressible at T8", &kinds);
         assert_eq!(
@@ -518,11 +538,39 @@ mod tests {
         // The motivating audit: "fastest at every thread count" but it LOSES T8.
         let cells = vec![
             // T1: subject wins.
-            cell("subject", "compressible", ThreadCell::Fixed(1), 100, true, false),
-            cell("rival", "compressible", ThreadCell::Fixed(1), 130, true, false),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(1),
+                100,
+                true,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(1),
+                130,
+                true,
+                false,
+            ),
             // T8: subject LOSES to rival.
-            cell("subject", "compressible", ThreadCell::Fixed(8), 90, true, false),
-            cell("rival", "compressible", ThreadCell::Fixed(8), 40, true, false),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(8),
+                90,
+                true,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(8),
+                40,
+                true,
+                false,
+            ),
         ];
         let cmp = cmp_with(cells);
         let claim = Claim::parse(
@@ -542,8 +590,22 @@ mod tests {
     fn wrong_bytes_makes_claim_false() {
         // Subject is FASTER at T1 but produces WRONG bytes → claim FALSE, #3 cited.
         let cells = vec![
-            cell("subject", "compressible", ThreadCell::Fixed(1), 10, false, false),
-            cell("rival", "compressible", ThreadCell::Fixed(1), 50, true, false),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(1),
+                10,
+                false,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(1),
+                50,
+                true,
+                false,
+            ),
         ];
         let cmp = cmp_with(cells);
         let claim = Claim::parse(
@@ -561,8 +623,22 @@ mod tests {
         // Subject wins, but ONLY because the rival is an interpreter shim; the
         // audit must SURVIVE yet cite #1 so the win is honestly contextualized.
         let cells = vec![
-            cell("subject", "compressible", ThreadCell::Fixed(1), 100, true, false),
-            cell("rival", "compressible", ThreadCell::Fixed(1), 130, true, false),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(1),
+                100,
+                true,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(1),
+                130,
+                true,
+                false,
+            ),
         ];
         let mut cmp = cmp_with(cells);
         cmp.probes.insert(
@@ -588,10 +664,38 @@ mod tests {
     fn clean_sweep_survives() {
         // Subject wins every scoped cell with correct bytes and no holes → SURVIVES.
         let cells = vec![
-            cell("subject", "compressible", ThreadCell::Fixed(1), 50, true, false),
-            cell("rival", "compressible", ThreadCell::Fixed(1), 80, true, false),
-            cell("subject", "compressible", ThreadCell::Fixed(4), 30, true, false),
-            cell("rival", "compressible", ThreadCell::Fixed(4), 60, true, false),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(1),
+                50,
+                true,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(1),
+                80,
+                true,
+                false,
+            ),
+            cell(
+                "subject",
+                "compressible",
+                ThreadCell::Fixed(4),
+                30,
+                true,
+                false,
+            ),
+            cell(
+                "rival",
+                "compressible",
+                ThreadCell::Fixed(4),
+                60,
+                true,
+                false,
+            ),
         ];
         let cmp = cmp_with(cells);
         let claim = Claim::parse(

@@ -229,7 +229,9 @@ pub fn analyze(
         let Some((idx, s)) = inner else { continue };
         if s.is_wait() {
             wait += dur;
-            let e = blocked_by.entry(blocker_of[idx].clone()).or_insert((0.0, 0, 0.0));
+            let e = blocked_by
+                .entry(blocker_of[idx].clone())
+                .or_insert((0.0, 0, 0.0));
             e.0 += dur;
             e.1 += 1;
             e.2 = e.2.max(dur);
@@ -252,7 +254,9 @@ pub fn analyze(
             if blocker.dur >= heavy_threshold_us {
                 heavy.push(HeavyChunk {
                     blocker_span: blocker.name.clone(),
-                    chunk_id: blocker.arg_u64("chunk_id").or_else(|| s.arg_u64("chunk_id")),
+                    chunk_id: blocker
+                        .arg_u64("chunk_id")
+                        .or_else(|| s.arg_u64("chunk_id")),
                     wait_us: s.dur,
                     blocker_dur_us: blocker.dur,
                 });

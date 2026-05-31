@@ -105,24 +105,56 @@ fn postdict_side_journal_is_a_large_slowdown() {
     let make_deltas = |cyc_replay: f64| {
         vec![
             // Swap wide store → narrow store: a small SAVING (narrow measured cheaper).
-            Delta::swap("ring store wide→narrow", inner_store_ops, cyc_wide_store, cyc_narrow_store),
+            Delta::swap(
+                "ring store wide→narrow",
+                inner_store_ops,
+                cyc_wide_store,
+                cyc_narrow_store,
+            ),
             // NEW: journal append on every element, on the hot path.
-            Delta::added("journal append (hot path)", journal_entries, cyc_journal_append),
+            Delta::added(
+                "journal append (hot path)",
+                journal_entries,
+                cyc_journal_append,
+            ),
             // NEW: the journal-replay pass — 21M >LLC gathers at `cyc_replay`.
-            Delta::added("journal replay (21M cold gathers)", journal_entries, cyc_replay),
+            Delta::added(
+                "journal replay (21M cold gathers)",
+                journal_entries,
+                cyc_replay,
+            ),
             // NEW: lost clean-tail fast path → slow-path re-decode.
-            Delta::added("lost clean-tail fast path", lost_tail_bytes, cyc_lost_tail_byte),
+            Delta::added(
+                "lost clean-tail fast path",
+                lost_tail_bytes,
+                cyc_lost_tail_byte,
+            ),
         ]
     };
 
-    let e_opt = estimate("side-journal (optimistic replay)", &base, &make_deltas(cyc_replay_optimistic));
-    let e_real = estimate("side-journal (realistic replay)", &base, &make_deltas(cyc_replay_realistic));
+    let e_opt = estimate(
+        "side-journal (optimistic replay)",
+        &base,
+        &make_deltas(cyc_replay_optimistic),
+    );
+    let e_real = estimate(
+        "side-journal (realistic replay)",
+        &base,
+        &make_deltas(cyc_replay_realistic),
+    );
     eprintln!(
         "side-journal predicted: optimistic {:+.0}% | realistic {:+.0}%  (the real outcome ≈ +150% wall = -60% throughput)",
         e_opt.predicted_pct(),
         e_real.predicted_pct()
     );
-    eprintln!("  realistic breakdown: {:?}", e_real.breakdown.iter().map(|(w, c)| format!("{w}:{:+.2}Gcyc", c / 1e9)).collect::<Vec<_>>());
+    eprintln!(
+        "  realistic breakdown: {:?}",
+        e_real
+            .breakdown
+            .iter()
+            .map(|(w, c)| format!("{w}:{:+.2}Gcyc", c / 1e9))
+            .collect::<Vec<_>>()
+    );
 
     // GATE 1 — "it must NOT predict a win": even at the OPTIMISTIC replay cost,
     // the prediction is a clear slowdown (positive wall). This is the cheap,

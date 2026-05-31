@@ -673,11 +673,20 @@ fn cmd_coz_jsonl(args: &[String]) -> ExitCode {
     };
     match coz_jsonl::aggregate(&paths, fold) {
         Ok(rows) => {
-            println!("\n=====  COZ CAUSAL IMPACT (per region, {} run(s))  =====", paths.len());
-            println!("{:>10}  {:<32} {:>10} {:>6}", "impact", "region (file)", "base ch/s", "n_exp");
+            println!(
+                "\n=====  COZ CAUSAL IMPACT (per region, {} run(s))  =====",
+                paths.len()
+            );
+            println!(
+                "{:>10}  {:<32} {:>10} {:>6}",
+                "impact", "region (file)", "base ch/s", "n_exp"
+            );
             println!("  speeding a region 1% moves throughput ~impact%. Trust high n_exp; ignore tiny-n rows.");
             for r in rows.iter().take(15) {
-                println!("{:>10.3}  {:<32} {:>10.1} {:>6}", r.impact, r.key, r.base_rate, r.n_exp);
+                println!(
+                    "{:>10.3}  {:<32} {:>10.1} {:>6}",
+                    r.impact, r.key, r.base_rate, r.n_exp
+                );
             }
             ExitCode::SUCCESS
         }
