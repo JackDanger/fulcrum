@@ -1,78 +1,36 @@
 # fulcrum
 
-A profiler for parallel pipelines. It finds the one region that will actually move your wall clock — and tells you *why* it's slow.
+You ran your profiler. It gave you a list. You spent a week on the #1 item. The wall clock didn't move.
 
-> The causal layer is [Coz](https://github.com/plasma-umass/coz)'s virtual-speedup idea (Curtsinger & Berger, SOSP '15). Built with [Claude](https://claude.com/claude-code).
+That's not a profiler bug — it's the right answer to the wrong question. In a parallel pipeline, CPU time and wall-clock time are different things. A stage burning 30% of your CPU might not be on the critical path at all. Speed it up by 10× and nothing changes, because the in-order consumer was never waiting for it.
 
----
-
-## The problem
-
-Run a sampling profiler on a parallel pipeline and it hands you a list of functions sorted by CPU time. In a pipelined system, that list can be completely wrong about what to optimize.
-
-A function burning 20% of all CPU cycles might not move your wall clock by a millisecond if you speed it up — it runs on a worker thread that's fully overlapped with the real bottleneck. The actual bottleneck might look *small* in the CPU sum because only its latency on the critical path matters, not its total cycles.
-
-The right question isn't "where is the CPU time?" It's: **if I sped up this region, how much would the wall move?**
-
-## How fulcrum answers it
-
-Three measurements, fused into one ranked list:
-
-**1. Causal (Coz-style)** — *If I sped up region X, how much would the wall move?*
-
-Coz virtual-speedup slows every other thread by δ so X appears δ-faster. The change in your throughput-marker rate is X's wall-elasticity.
-
-**2. Critical-path** — *Is region X even on the path that gates the wall?*
-
-A consumer-anchored span reconstruction from the trace. The in-order consumer gates the wall, so each consumer wait gets blamed on the worker span that produced the item it was waiting for.
-
-**3. Mechanism** — *Why is region X slow — what do I actually change?*
-
-Linux `perf` TMA top-down + PEBS + `c2c`, attributed per hot function: DRAM-bound, branch-miss, false-sharing.
-
-The **lever score** that ranks regions is layer 1 × layer 2:
-
-```
-lever-score = wall-elasticity × on-critical-path-share
-```
-
-A region with high elasticity but zero on-path share is a small lever. The product catches that automatically — it's the CPU-sum trap in reverse.
-
-## Validate before you trust it
-
-A causal ranking is only useful if it reproduces things you already know. `fulcrum validate` checks your known answers before you trust it on the unknowns:
-
-- A region you've confirmed as a non-lever must score ≈0
-- A region you've confirmed as a real lever must outrank it
-- The long-pole items you know gate the wall must surface on the critical path
-
-If those don't hold, the ranking is wrong and says so. If the tool can't get the known answers right, don't act on the unknown ones.
-
-> Fulcrum was built against a real parallel decompressor. It correctly flagged a 200+ ms copy as a non-lever — fully overlapped off the consumer's critical path, eliminating it moved the wall 0.0% — while pointing at the decode stage that actually banked the wall win. "The big copy is a non-lever" is exactly what a CPU-sum profiler gets wrong.
+Fulcrum answers the right question: **if I made this region faster, how much would the wall clock move?**
 
 ---
 
-## Quickstart
+## When this helps
 
-```bash
-cargo build --release
-```
+You have a parallel pipeline — something like a worker pool feeding an in-order consumer. Parse → transform → compress → emit, with N workers and one consumer draining in order. You've hit a wall on performance and regular profiling isn't pointing at anything actionable.
 
-Run the bundled **toy pipeline** — a four-stage worker pool (`parse → transform → compress → emit`) with an in-order consumer:
+Fulcrum is built for this exact shape.
 
-```bash
-cargo run --release --example toy_pipeline -- --items 240 --workers 4
-```
+## When it doesn't
 
-Then read the ranked lever list:
+- **Single-threaded code.** Use a regular profiler. The parallelism is what makes this hard, and if you don't have parallelism you don't have this problem.
+- **Pipelines without an in-order consumer.** The critical-path layer assumes one thread is the ordered output gate. Without that, on-path attribution is less precise.
+- **macOS and Windows.** The causal measurement (Coz) and hardware mechanism layer (Linux `perf`) are Linux-only. You still get the critical-path and ranking layers on any OS — which is often enough to find the answer.
 
-```bash
-./target/release/fulcrum critpath /tmp/fulcrum_toy.json --heavy-ms 5
-./target/release/fulcrum rank     /tmp/fulcrum_toy.json
-./target/release/fulcrum validate /tmp/fulcrum_toy.json
-```
+## What language does this work with?
 
-`rank` reports `transform` as the #1 lever and `emit` as a non-lever. `validate` confirms it from the trace alone:
+The instrumentation library is Rust. You add two lines to your Rust pipeline and get a trace file.
+
+The analyzer — the CLI that reads traces and produces rankings — is language-agnostic. It reads Chrome-trace JSON, which many languages and runtimes already emit. If your C, C++, or Zig pipeline already produces Chrome traces, you can point fulcrum at your trace today without touching Rust.
+
+---
+
+## What you get
+
+A ranked list of your pipeline's regions, scored by actual leverage on wall clock:
 
 ```
 ================  FULCRUM — RANKED LEVER LIST  ================
@@ -86,17 +44,71 @@ Then read the ranked lever list:
   NEXT LEVER -> transform  (lever-score 0.902 = elasticity n/a x 90% on-path)
 ```
 
-The critical-path, ranking, and validation layers run from the trace alone on any OS. The `elasticity` and `mechanism` columns light up once you add a Coz profile and a `perf` report.
+`transform` is the lever. `emit` might look significant when you watch it, but the consumer isn't waiting for it — it shows up on every profile and moves nothing.
+
+The score is `wall-elasticity × on-critical-path-fraction`. A region burning tons of CPU but running in parallel with the real bottleneck scores near zero. That's exactly what a CPU profiler gets wrong.
+
+The `elasticity` and `mechanism` columns fill in when you add a Coz profile and a Linux `perf` report. With just a trace you get the critical-path and ranking layers, which already tell you which region is the lever.
+
+---
+
+## How it works
+
+Three measurements fused into one score:
+
+**Causal** — virtual-speedup via [Coz](https://github.com/plasma-umass/coz) (Curtsinger & Berger, SOSP '15). Coz slows every other thread slightly so your region appears faster, then measures how throughput changes. That change IS the wall elasticity. If speeding up your region 10% moves the wall 8%, your region has high elasticity. Linux only.
+
+**Critical path** — consumer-anchored span reconstruction from the trace. The in-order consumer gates the wall clock. Each time it waits, fulcrum attributes the blame to the worker span it was waiting on. Regions that keep the consumer waiting score high. Regions the consumer never waits on score near zero regardless of CPU usage.
+
+**Mechanism** — Linux `perf` TMA analysis tells you *why* the top region is slow: DRAM-bound, branch-miss-heavy, false-sharing. This turns "optimize transform" into "transform has a 40% DRAM-bound stall — fix your memory access pattern."
+
+The lever score is layer 1 × layer 2. Layer 3 tells you what to do once you've found the lever.
+
+---
+
+## Verify before you trust
+
+A causal ranking is only useful if it gets the known answers right first. `fulcrum validate` lets you check the ranking against things you've already confirmed before you act on the unknowns.
+
+You tell it: this region is definitely a non-lever, this one is definitely real. If the ranking doesn't reproduce those, it tells you and exits nonzero. The tool was built against a real parallel decompressor, where it correctly flagged a 200+ ms copy as a non-lever — fully parallel, off the critical path, eliminating it moved the wall 0.0% — while pointing at the decode stage that actually banked the win.
+
+If the tool can't get the known answers right, don't act on the unknown ones.
+
+---
+
+## Quickstart
+
+```bash
+cargo build --release
+```
+
+Run the bundled toy pipeline — four stages with 4 workers and an in-order consumer:
+
+```bash
+cargo run --release --example toy_pipeline -- --items 1200 --workers 4
+```
+
+Then read the output:
+
+```bash
+./target/release/fulcrum critpath /tmp/fulcrum_toy.json --heavy-ms 5
+./target/release/fulcrum rank     /tmp/fulcrum_toy.json
+./target/release/fulcrum validate /tmp/fulcrum_toy.json
+```
+
+`transform` ranks #1 and `validate` confirms it. This is the tool working correctly.
+
+---
 
 ## Instrument your own pipeline
 
-Two probe points. That's the API:
+Two calls:
 
 ```rust
 use fulcrum::probe;
 
 fn worker(item: Item) {
-    let _g = probe::scope("decode");   // named region; ends when _g drops
+    let _g = probe::scope("decode");   // names this region; ends when _g drops
     // ... work ...
 }
 
@@ -106,69 +118,58 @@ fn consumer_emit() {
 }
 ```
 
-Two backends, both zero-config:
+Set `FULCRUM_TRACE=/tmp/run.json` when you run your binary. That's the only configuration required to get a trace.
 
-1. **Chrome-trace timeline** — set `FULCRUM_TRACE=/tmp/run.json` at runtime. No build flag needed.
-2. **Coz causal profiling** — build with `--features coz` and run under `coz run`. A coz-enabled binary runs normally outside `coz run`.
+For Coz causal profiling, build with `--features coz` and run under `coz run`. A coz-enabled binary runs normally outside `coz run` — you can ship the same binary.
 
-Describe your regions in a small JSON config (see [`examples/profile.example.json`](examples/profile.example.json)) and pass it with `--config`. The region names in `scope()`/`progress()` are the same strings the config and analyzer key on — they stay in lockstep through inlining and LTO.
-
-### Fulcrum is a general profiler — the gzippy values are just one profile
-
-Nothing pipeline-specific is compiled into the analyzer. The views that split the consumer timeline (`consumer`, `flow`, `critpath`, `vs`, `vs-sweep`) classify span names entirely from config, so they work on **your** vocabulary with no code change:
+Describe your regions in a small JSON config (see [`examples/profile.example.json`](examples/profile.example.json)):
 
 ```jsonc
 {
-  "regions": [ /* … your Coz/perf regions … */ ],
+  "regions": [ /* your region names */ ],
 
-  // Which thread is the in-order consumer, and how to bucket its spans into
-  // WAIT / COMPUTE / OUTPUT / IDLE for `fulcrum consumer`.
+  // Which thread is the in-order consumer and how to break down its time
   "consumer": {
-    "thread_prefix": "sink.",                 // identifies the consumer thread
-    "output":  { "exact": ["sink.flush"] },   // the irreducible byte floor
-    "compute": { "prefixes": ["sink.encode"] },
-    "idle_umbrellas": { "exact": ["sink.loop"] }
-    // WAIT is recognized automatically for the universal convention
-    // (wait.* / *.wait / *recv*); add a "wait" matcher for non-conventional names.
+    "thread_prefix": "consumer.",
+    "output":  { "exact": ["consumer.flush"] },
+    "compute": { "prefixes": ["consumer.encode"] }
+    // WAIT is recognized automatically for the standard convention (wait.*/recv*)
   },
 
-  // Pipeline stages for `fulcrum flow`, matched in declaration order (first
-  // match wins). A name starting with "·" is a recognized non-stage (a wait or
-  // an umbrella) — kept out of UNCLASSIFIED but contributing no busy work.
+  // Pipeline stages for the flow view, matched in order (first match wins)
   "stages": [
     { "name": "1·read",   "exact": ["src.read"] },
-    { "name": "2·encode", "prefixes": ["sink.encode"] }
-  ],
-
-  // Inner worker phases to prefer as critical-path blockers (so a consumer
-  // stall is blamed on the real phase, not the task umbrella that wraps it).
-  "inner_blockers": ["worker.compress", "worker.checksum"]
+    { "name": "2·encode", "prefixes": ["consumer.encode"] }
+  ]
 }
 ```
 
-Every matcher is `{exact, prefixes, suffixes, substrings}` (OR-combined). Three profiles ship built-in and are selectable by name with `--config <name>`:
+Pass it with `--config your_config.json`. Three built-in profiles also ship with the tool:
 
-- `--config generic` (the default with no `--config`): no pipeline vocabulary. The consumer view still finds the consumer by the most-wait heuristic and classifies waits by the universal convention; `flow` reports everything as UNCLASSIFIED and prints the span vocabulary you should turn into stages — the honest "I don't know your pipeline yet" starting point.
-- `--config gzippy`: the worked example — gzippy's parallel-decode vocabulary (`worker.bootstrap`, `consumer.write_data`, …). Profiling gzippy works out of the box.
-- `--config demo`: matches the bundled `examples/toy_pipeline.rs`.
+- `--config generic` (the default) — works on any pipeline without any configuration. The consumer view finds the consumer by the most-wait heuristic and classifies waits by convention. The flow view reports everything as UNCLASSIFIED and prints the span vocabulary you should turn into stages. The honest "I don't know your pipeline yet" starting point.
+- `--config demo` — matches the bundled `examples/toy_pipeline.rs`.
+- `--config gzippy` — a parallel gzip decompressor vocabulary included as a worked example. It's the pipeline fulcrum was originally built against.
 
-The new views these drive:
+---
+
+## Views
+
+Once you have a trace, several subcommands slice it differently:
 
 ```bash
-fulcrum consumer run.json                 # WAIT/COMPUTE/OUTPUT/IDLE split of the
-                                          # consumer wall, with a busy+idle==span
-                                          # reconciliation that fails loudly if the
-                                          # B/E pairing is unsound
-fulcrum flow run.json --whatif encode:2   # per-stage wall-critical vs slack, +
-                                          # a critical-path-bounded what-if
-fulcrum vs a.json b.json                  # span-by-span A-vs-B for two traces of
-                                          # the same pipeline shape
-fulcrum vs-sweep --at 8:a8.json:b8.json … # per-thread-count cross-tool divergence
+fulcrum consumer run.json                 # consumer wall broken down: WAIT/COMPUTE/OUTPUT/IDLE
+fulcrum flow run.json                     # per-stage: wall-critical vs slack
+fulcrum flow run.json --whatif encode:2   # predicted wall gain if this stage were 2× faster
+fulcrum vs a.json b.json                  # span-by-span comparison of two traces
 ```
 
-### The full workflow on Linux
+`flow` shows whether each stage is on the critical path and by how much. `--whatif` applies a hypothetical speedup through the critical-path model so you can see the predicted gain before you build anything.
 
-`fulcrum plan` prints the exact commands for your binary:
+---
+
+## Full Linux workflow
+
+`fulcrum plan` prints the exact capture commands for your binary:
 
 ```bash
 fulcrum plan --bin ./target/profiling/your_binary --args "input --threads 8" \
@@ -184,218 +185,55 @@ fulcrum rank /tmp/fulcrum_tl.json /tmp/profile.coz /tmp/fulcrum_report.txt \
 
 ---
 
-## Honest limitations
+## Per-region hardware counters (Linux)
 
-- **Coz and perf are Linux-only.** On macOS and Windows you get the critical-path, ranking, and validation layers from the trace alone — not the causal or mechanism columns.
-- **It's statistical.** Coz virtual-speedup and perf sampling are estimates. Pin to a fixed CPU set and reduce machine noise for stable numbers.
-- **Short programs need looping.** Coz needs many epochs and many progress-point visits. A program that finishes in milliseconds yields ~one epoch — loop the work in-process so you're measuring steady state, not startup.
-- **Best fit: in-order streaming pipelines.** The critical-path layer assumes an in-order consumer gates the wall — the worker-pool-with-ordered-output shape. Without that, on-path attribution is less precise.
-- **Mechanism is function-level**, not per-span. Enough to say "this region is DRAM-bound vs branch-bound," but won't split a function shared across two regions.
-
-## Heavy mode: per-region hardware truth + predict-before-build
-
-The three layers above answer *where* the lever is. Four heavier capabilities
-answer it with hardware counters and let you PREDICT a change's wall delta
-before you build it — so a lever stops being a flimsy hypothesis:
-
-**1. Per-region hardware counters** (`region_hw.rs`, `fulcrum region-hw`).
-Replaces the run-level TMA headline with PER-REGION truth: L1/L2/L3/DRAM hit
-rates, a `dram_bound` proxy, modeled load-latency, IPC, branch-MPKI, and a
-coarse stall split — for each named region. It joins PEBS `perf mem` samples to
-regions by **CLOCK_MONOTONIC timestamp window** (so it survives `lto=fat`
-inlining that smears a function/`ip` join), and **reconciles** against the v1
-run-level TMA: the per-region load-mem-bound must not exceed run backend-bound
-(a load-only proxy is a *lower bound* on backend stalls), and a large gap is
-reported as "the backend stall is store/port/execution-bound, not load-latency"
-— a real lever refinement. Capture both under `-k CLOCK_MONOTONIC`:
+By default, `fulcrum mech` gives you hardware data for the whole run. With `region-hw` you get it per region — replacing "the binary is 40% DRAM-bound" with "this specific region is 40% DRAM-bound, and nothing else is."
 
 ```bash
-FULCRUM_TRACE=/tmp/tl.json FULCRUM_TRACE_CLOCK=monotonic <bin> <args>      # absolute-clock trace
+FULCRUM_TRACE=/tmp/tl.json FULCRUM_TRACE_CLOCK=monotonic <bin> <args>
 perf mem record -k CLOCK_MONOTONIC -o /tmp/mem.data -- <bin> <args>
 perf script -i /tmp/mem.data -F time,data_src > /tmp/mem.txt
 fulcrum region-hw /tmp/tl.json /tmp/mem.txt --config c.json --topdown /tmp/td.txt
 ```
 
-**2. Primitive microbench harness** (`microbench.rs`). A pinned, RDTSCP-timed,
-dependency-free harness reporting **cyc/op, ns/op, bytes/cycle** for a closure
-with explicit working-set control (measure a primitive L1-hot AND DRAM-cold).
-The per-op costs fold into capability 3. (criterion reports wall ns; this
-reports *cycles*, which is what the estimator multiplies — and runs inside the
-target's own binary on the perf box.)
+This joins PEBS memory samples to regions by timestamp, which survives LTO inlining that breaks function-level attribution.
 
-**3. Counterfactual cost estimator** (`estimate.rs`). Predicts a structural
-change's wall delta = a region's measured **access counts** × a primitive's
-**measured per-op cost** × the region's **on-critical-path share** (the FULCRUM
-invariant: only on-path time moves the wall). Validated by a postdiction gate
-(`tests/estimator_postdiction.rs`) that reproduces three KNOWN outcomes — a
-catastrophic regression, a flat (no-win) change, and a real small win — anchored
-to MEASURED aggregate cycles. Honest about its limits: the cycle-multiply model
-catches signs and catastrophes reliably but under-predicts inner-loop wins (it
-doesn't model pipeline/branch stalls) and DRAM-bandwidth contention; for a
-bandwidth-bound cell it tells you to use a throughput model instead.
+---
 
-**4. Cross-tool region accounting** (`xtool.rs`, `fulcrum xtool`). Folds
-`perf stat --topdown` + `perf report` for several tools into one comparable
-accounting on the same input, so "what fast looks like" is data: TMA shape +
-cycle% per function bucket (decode/copy/window/alloc), normalized so SHAPE is
-comparable across tools running at different throughput, with a focused "where
-the tool under test differs" diff against each alternative.
+## Honest limitations
 
-## Fair cross-tool comparison + claim audit: do NOT over-claim "fastest"
+- **Coz and perf are Linux-only.** On macOS and Windows you get the critical-path, ranking, and validation layers from the trace. That's enough to identify the lever most of the time.
+- **Statistical.** Coz virtual-speedup and perf sampling are estimates. Pin to a fixed CPU set and reduce background load for stable numbers.
+- **Short programs need looping.** Coz needs many epochs to produce a stable measurement. A program that finishes in 30ms yields roughly one epoch — loop the work in-process so you're measuring steady state, not startup.
+- **Best fit: in-order streaming pipelines.** The critical-path layer assumes one thread is the ordered output gate. Without that shape, on-path attribution is less precise.
+- **Mechanism is function-level, not per-span.** It tells you "this region is DRAM-bound" but won't split a function that happens to span two regions.
 
-The accounting above explains *why* a tool is fast. Three more commands stop a
-speed comparison from LYING — the five classic ways a cross-tool benchmark
-inflates a "we're the fastest" claim are made impossible **by construction**:
+---
 
-**`fulcrum compare --spec tools.json`** (`compare.rs`). Runs N tools over a
-(corpus × thread-count) matrix and prints an HONEST win/lose/tie table:
-
-1. **Interpreter-wrapped competitor + startup tax** — it RESOLVES each tool's
-   real binary, sniffs it (native ELF/Mach-O vs a `#!python`/`sh` shim) and
-   WARNS, then MEASURES per-invocation startup (a `--version` run) and
-   SUBTRACTS it with a sanity clamp, so a pip-wheel shim's interpreter spin-up
-   can't masquerade as decode time.
-2. **Naive uniform flag** — each tool runs its DOCUMENTED BEST config (a
-   per-tool auto/thread-flag spelling), so it's auto-vs-auto, not an arbitrary
-   `-P N`.
-3. **No correctness check** — every run's output sha256 is verified against a
-   reference decoder; a mismatch DISQUALIFIES the cell. Speed over wrong bytes
-   is never a win.
-4. **Single cherry-picked cell** — it sweeps the whole matrix and reports the
-   HONEST SCOPE ("wins T1 incompressible; LOSES compressible by 1.4×; ties
-   T8") with an anti-over-claim verdict, never one cell.
-5. **best-of-N under contention** — runs are INTERLEAVED best-of-N with a
-   load-average + per-cell-spread guard that FLAGS or (with
-   `--strict-contention`) REFUSES a dirty box; a within-noise margin is a TIE,
-   not a win; below n=3 every result is a tie (a best-of-1/2 is noise); a win
-   where every rival crashed is labelled "BY DEFAULT", not a speed win.
-
-**`fulcrum audit --spec tools.json --claim "..."`** (`audit.rs`). Bakes the
-adversarial audit in: it parses a stated claim's scope ("fastest at every
-thread count on compressible") and reports **SURVIVES / NARROWS-TO-SCOPE /
-FALSE** against the fair matrix, citing which of the five holes changed the
-picture. A human can no longer accidentally publish "fastest everywhere" when
-the tool loses T8 or emits wrong bytes — the audit exits nonzero so CI gates it.
-
-**`fulcrum mech-caps`** (`mech_arch.rs`). The HW-counter layers (PEBS, TMA,
-RDTSCP cycles) are x86/Linux-precise; this detects the (arch, OS) and reports
-each capability **FULL / DEGRADED / UNAVAILABLE** — so on Apple-silicon /
-aarch64-linux it never prints x86-only numbers, and instead names the right
-API (Arm SPE, `xctrace`) or honestly degrades to the cross-platform wall +
-critical-path layers.
-
-```bash
-# generic spec — no competitor names; placeholders {input}/{threads}/{output}
-fulcrum compare --spec examples/compare.example.json --samples 9
-fulcrum audit   --spec examples/compare.example.json \
-  --claim "tool-a is the fastest decoder at every thread count, every situation"
-fulcrum mech-caps
-```
-
-## Exhaustive thread-count sweep (`fulcrum sweep`)
-
-The other commands profile one operating point. `sweep` answers "why does
-tool A stop scaling where tool B keeps going" across the WHOLE thread-count
-curve in a single capture, for several tools at once — so a scaling cliff is
-data, not a guess. Capture once, mine forever:
-
-```bash
-# On the perf box (where the binaries live): run the (tool × T × sink) matrix,
-# interleaved best-of-N, sha-verify all tools agree, one trace per cell.
-fulcrum sweep capture --spec sweep.json --out /tmp/run
-
-# Anywhere, any number of times: scaling decomposition (speedup, parallel
-# efficiency, cross-tool ratio, sink-write tax) + consumer-anchored
-# critical-path region share per T for the reference tool.
-fulcrum sweep mine /tmp/run --config region.json
-```
-
-Two sinks (`/dev/null` and a real file) are captured so the tmpfs page-cache
-write tax is separated from real decode scaling — a confound that, read from a
-single sink, sends you optimizing the wrong thing. `efficiency = speedup /
-T`; a region whose critical-path share RISES with T is a scaling blocker.
-
-## Speculation interconnectedness (`fulcrum causal`)
-
-`flow` and `vs` measure per-span TIMING. `causal` measures the COUPLING that
-TIMING hides: in a speculative parallel decoder, whether chunk N+1 takes the
-fast or the slow path depends on whether N's window was published — at the key
-N+1 looks up — by the time N+1's worker starts. That is a causal chain
-(consumer-advance → window-publish → successor decode-mode → resolution tax),
-and a per-span view cannot see it.
-
-```bash
-# Capture an enriched trace (the pipeline emits causal.* instant events when
-# its timeline is enabled), then reconstruct the chain — no source reading.
-fulcrum causal /tmp/trace.json --timeline 18
-```
-
-It reports four things from the `causal.*` events:
-
-1. **Runtime window-absent fraction vs static.** How many chunks ACTUALLY
-   speculated, against the static boundary fraction the codebase assumes. A
-   large gap means the decode-mode is decided at runtime, not by data layout.
-2. **Publish-latency + key-mismatch.** For each speculative chunk: was its
-   predecessor's window published, before it started, *at the key it looked
-   up*? Distinguishes "the window was late" (timing) from "the window exists
-   under a different key than the speculative seed" (structural) — two
-   findings that point at completely different fixes.
-3. **Dependency timeline.** A per-chunk swimlane (decode-start → mode →
-   publish → consume) so the serial window-chain and its stalls are visible.
-4. **Data-model tax.** The per-pass bytes+µs a window-absent chunk pays
-   (decode→u16, resolve, narrow) that a clean chunk never does.
-
-## Modern Coz profiles (`fulcrum coz-jsonl`)
-
-Recent `coz` emits `profile.jsonl` by default; its `--legacy-format` `.coz`
-(what `coz-parse`/`rank` read) aborts on modern Rust DWARF. `coz-jsonl` reads
-the jsonl directly and aggregates **across several runs** with an
-experiment-count confidence — because a single coz run is underpowered (a
-cheap line read 0.87 impact in one run, 0.18 across three):
-
-```bash
-fulcrum coz-jsonl run1.jsonl run2.jsonl run3.jsonl   # per-region causal impact
-```
-
-Operational gotchas baked into the module docs: build the profiled binary
-with `-C dwarf-version=4` and `debug=line-tables-only` (else coz aborts
-parsing DWARF-5), and always pass repeated runs — trust high-`n_exp` rows.
-
-## How it's organized
+## Source layout
 
 ```
 src/
-  probe.rs      instrumentation library (scope + progress; trace & coz backends;
-                FULCRUM_TRACE_CLOCK=monotonic for perf-correlatable timestamps)
-  trace.rs      Chrome-trace JSON ingestion + B/E span pairing
-  critpath.rs   consumer-anchored critical-path reconstruction (layer 2)
-  coz.rs        profile.coz parsing → per-region wall-elasticity curves (layer 1)
-  mech.rs       perf TMA / report parsing → per-function mechanism (layer 3)
-  region_hw.rs  PER-REGION hardware counters: PEBS-by-timestamp join + reconcile
-  microbench.rs pinned RDTSCP primitive microbench harness (cyc/op, B/cyc)
-  estimate.rs   counterfactual wall-delta estimator (signed confidence bracket)
-  xtool.rs      cross-tool region accounting (TMA + bucket shape, comparable)
-  compare.rs    FAIR cross-tool benchmark: matrix sweep, output-sha256 verify,
-                interpreter-shim + startup detection, interleaved best-of-N,
-                noise-aware win/tie, in-tree SHA-256 (closes the 5 holes)
-  compare_cli.rs generic --spec JSON (tools + corpora) + reference-digest build
-  audit.rs      claim-validator: SURVIVES / NARROWS-TO-SCOPE / FALSE
-  mech_arch.rs  cross-arch HW-counter capability (FULL/DEGRADED/UNAVAILABLE)
-  rank.rs       fuse the layers → ranked lever list
-  validate.rs   the trust gate: re-derive known ground truth
-  config.rs     declarative per-pipeline config (regions, progress point, ground truth)
-  main.rs       the fulcrum CLI (… + compare / audit / mech-caps)
+  probe.rs       instrumentation: scope("name") + progress("name")
+  trace.rs       Chrome-trace JSON parser, B/E span pairing
+  critpath.rs    consumer-anchored critical-path reconstruction
+  coz.rs         Coz profile parser → per-region wall-elasticity
+  mech.rs        perf TMA parser → per-function hardware mechanism
+  region_hw.rs   per-region hardware counters via PEBS timestamp join
+  microbench.rs  pinned RDTSC primitive microbench harness
+  estimate.rs    counterfactual wall-delta estimator
+  rank.rs        fuse layers into ranked lever list
+  validate.rs    trust gate: check against known ground truth
+  config.rs      declarative per-pipeline config
+  main.rs        CLI
 examples/
-  toy_pipeline.rs        ~150-line self-contained demo pipeline
+  toy_pipeline.rs        four-stage self-validating demo
   profile.example.json   annotated config template
-  compare.example.json   generic fair-compare spec (no competitor names)
 tests/
-  analyzer.rs              end-to-end tests over a synthetic trace
-  region_hw.rs             per-region PEBS join correctness
-  estimator_postdiction.rs the trust gate for capability 3 (postdict known outcomes)
-  fair_compare.rs          e2e trust test: wrong-bytes disqualified, shim flagged,
-                           hang killed at timeout, real win survives
+  analyzer.rs    end-to-end tests over a synthetic trace
 ```
+
+---
 
 ## License
 
