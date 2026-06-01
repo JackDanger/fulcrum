@@ -61,10 +61,18 @@ pub struct ModelParams {
     pub window_absent_frac: f64,
     /// Effective per-chunk decode latency d_w_eff = f·d_w + (1−f)·d_c, µs.
     pub d_w_eff_us: Option<f64>,
-    /// THE parameter: per-link publish latency, µs (median steady-state
-    /// inter-publish gap).
+    /// THE parameter: per-link publish latency, µs. MEAN inter-publish gap =
+    /// (last_publish − first_publish)/(N−1) — the bimodal-robust summary the
+    /// wall actually obeys (the publish distribution is bimodal: many ~0 gaps
+    /// from eagerly-resolved chunks punctuated by a few large resolve stalls,
+    /// so the MEDIAN understates the chain by an order of magnitude — see the
+    /// 2026-05-31 <BENCH_HOST> measurement where rapidgzip's gap_median was 0.04ms
+    /// but gap_mean 7.74ms). The publish-chain term uses this mean.
     pub l_resolve_us: Option<f64>,
-    /// p95 of the inter-publish gap (tail-of-distribution diagnostic).
+    /// MEDIAN inter-publish gap, µs (diagnostic — typical fast-resolve link).
+    pub l_resolve_median_us: Option<f64>,
+    /// p95 of the inter-publish gap (tail-of-distribution diagnostic — the
+    /// large resolve stalls that dominate the mean).
     pub l_resolve_p95_us: Option<f64>,
     /// Startup before steady state: first publish ts − trace start, µs.
     pub frontier_us: f64,
@@ -241,7 +249,15 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
             gaps.push(g);
         }
     }
-    let l_resolve_us = median(&gaps);
+    // MEAN gap is the publish-chain rate the wall obeys: Σgaps = the whole
+    // first→last publish span, so N·mean reconstructs that span exactly. The
+    // median is a diagnostic only (bimodal distribution — see field doc).
+    let l_resolve_us = if gaps.is_empty() {
+        None
+    } else {
+        Some(gaps.iter().sum::<f64>() / gaps.len() as f64)
+    };
+    let l_resolve_median_us = median(&gaps);
     let l_resolve_p95_us = percentile(&gaps, 95.0);
 
     // ── T ────────────────────────────────────────────────────────────────────
@@ -254,7 +270,12 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
     let n = n_chunks as f64;
     let worker_bound_us =
         d_w_eff_us.map(|dwe| frontier_us + (n / workers as f64) * dwe);
-    let publish_chain_us = l_resolve_us.map(|lr| frontier_us + n * lr);
+    // The chain is the first→last publish span anchored at `frontier` (=
+    // first publish), so it spans (N−1) links of mean latency, not N. Using
+    // mean L_resolve, frontier + (N−1)·L_resolve reconstructs last_publish
+    // exactly; + tail then reconstructs the wall.
+    let n_links = (n - 1.0).max(0.0);
+    let publish_chain_us = l_resolve_us.map(|lr| frontier_us + n_links * lr);
     let (wall_pred_us, binding) = match (worker_bound_us, publish_chain_us) {
         (Some(wb), Some(pc)) => {
             if pc >= wb {
@@ -277,6 +298,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         window_absent_frac,
         d_w_eff_us,
         l_resolve_us,
+        l_resolve_median_us,
         l_resolve_p95_us,
         frontier_us,
         tail_us,
@@ -349,7 +371,7 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
     let lever = match slower.binding {
         Binding::PublishChain => {
             let gap_us = match (a.l_resolve_us, b.l_resolve_us) {
-                (Some(la), Some(lb)) => (la - lb).abs() * slower.n_chunks as f64,
+                (Some(la), Some(lb)) => (la - lb).abs() * (slower.n_chunks as f64 - 1.0).max(0.0),
                 _ => 0.0,
             };
             format!(
@@ -419,7 +441,8 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
 fn knee_caveat(slower: &ModelParams, faster: &ModelParams) -> String {
     match (faster.l_resolve_us, slower.worker_bound_us) {
         (Some(target_lr), Some(wb)) => {
-            let projected_chain = slower.frontier_us + slower.n_chunks as f64 * target_lr;
+            let projected_chain =
+                slower.frontier_us + (slower.n_chunks as f64 - 1.0).max(0.0) * target_lr;
             if projected_chain < wb {
                 format!(
                     " — BUT the worker-bound knee caps it: at the faster L_resolve the \
@@ -482,8 +505,8 @@ mod tests {
     ///     L_resolve=5ms, 8 chunks ⇒ last publish at 20+35=55ms.
     ///   Construct so the WALL is 60ms (tail = 5ms).
     /// Expected:
-    ///   worker-bound  = frontier + (N/T)·d_w_eff = 20 + (8/4)·40 = 100ms
-    ///   publish-chain = frontier + N·L_resolve   = 20 + 8·5     = 60ms
+    ///   worker-bound  = frontier + (N/T)·d_w_eff   = 20 + (8/4)·40   = 100ms
+    ///   publish-chain = frontier + (N−1)·L_resolve = 20 + 7·5        = 55ms
     ///   max = worker-bound 100ms ⇒ binding = WorkerBound
     ///   wall_pred = 100 + tail(5) = 105ms
     #[test]
@@ -538,9 +561,9 @@ mod tests {
             "worker_bound {}",
             p.worker_bound_us.unwrap()
         );
-        // publish-chain = 20 + 8·5 = 60ms.
+        // publish-chain = frontier + (N−1)·L_resolve = 20 + 7·5 = 55ms.
         assert!(
-            (p.publish_chain_us.unwrap() - 60_000.0).abs() < 1.0,
+            (p.publish_chain_us.unwrap() - 55_000.0).abs() < 1.0,
             "publish_chain {}",
             p.publish_chain_us.unwrap()
         );

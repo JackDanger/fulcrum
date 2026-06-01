@@ -649,8 +649,9 @@ fn print_model(path: &str, p: &model::ModelParams) {
     println!("  d_w (window-absent)   : {}", o(p.d_w_us));
     println!("  d_w_eff (f-weighted)  : {}", o(p.d_w_eff_us));
     println!(
-        "  L_resolve (median)    : {}   [p95 {}]   << THE parameter",
+        "  L_resolve (MEAN)      : {}   [median {} | p95 {}]   << THE parameter",
         o(p.l_resolve_us),
+        o(p.l_resolve_median_us),
         o(p.l_resolve_p95_us)
     );
     println!("  frontier (startup)    : {}", trace::fmt_us(p.frontier_us));
