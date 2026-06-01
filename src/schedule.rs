@@ -166,19 +166,39 @@ fn idle_worker_intervals(spans: &[Span]) -> Vec<(f64, f64)> {
     v
 }
 
-/// µs of overlap between [a0,a1) and the union of `windows`.
+/// µs of [a0,a1) covered by the UNION of `windows` (NOT the sum — at T>1 many
+/// workers are idle concurrently, so summing per-worker overlap can exceed the
+/// stall duration and fabricate a PLACEMENT verdict; the question is "was ANY
+/// worker idle", i.e. set-union coverage, capped at the stall window).
 fn overlap_union(a0: f64, a1: f64, windows: &[(f64, f64)]) -> f64 {
     if a1 <= a0 {
         return 0.0;
     }
+    // Clip + sort intervals, then merge overlapping ones and sum merged widths.
+    let mut clipped: Vec<(f64, f64)> = windows
+        .iter()
+        .filter_map(|&(w0, w1)| {
+            let lo = a0.max(w0);
+            let hi = a1.min(w1);
+            (hi > lo).then_some((lo, hi))
+        })
+        .collect();
+    if clipped.is_empty() {
+        return 0.0;
+    }
+    clipped.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     let mut total = 0.0;
-    for &(w0, w1) in windows {
-        let lo = a0.max(w0);
-        let hi = a1.min(w1);
-        if hi > lo {
-            total += hi - lo;
+    let (mut cur0, mut cur1) = clipped[0];
+    for &(lo, hi) in &clipped[1..] {
+        if lo > cur1 {
+            total += cur1 - cur0;
+            cur0 = lo;
+            cur1 = hi;
+        } else {
+            cur1 = cur1.max(hi);
         }
     }
+    total += cur1 - cur0;
     total
 }
 
@@ -214,34 +234,48 @@ pub fn classify_stalls(spans: &[Span]) -> ScheduleVerdict {
         let dec = decodes.get(&idx);
         // decode_complete(i): when did the in-order decode of i finish?
         let decode_complete = dec.map(|d| d.ts_end).unwrap_or(f64::INFINITY);
+        // decode_start(i): when did the in-order decode of i BEGIN?
+        let decode_start = dec.map(|d| d.ts_start).unwrap_or(f64::INFINITY);
         let decode_lag = decode_complete - stall_start;
         let speculative = dec.map(|d| d.speculative).unwrap_or(false);
 
-        // The window during the stall in which chunk i was still undecoded:
-        // [stall_start, min(stall_end, decode_complete)). Capacity that sat
-        // idle in THAT window is "ready work unused" → PLACEMENT evidence.
-        let undecoded_hi = stall_end.min(decode_complete);
-        let idle_admissible = overlap_union(stall_start, undecoded_hi, &idle);
+        // The PLACEMENT window is [stall_start, decode_start): the slice of the
+        // stall BEFORE chunk i's decode even began. If a worker sat idle here,
+        // i COULD have been dispatched earlier — ready capacity unused. Once
+        // decode_start passes, the consumer is simply waiting for the decode to
+        // RUN (rate), and an idle OTHER worker is irrelevant (i is on one core;
+        // no admissible successor exists or the frontier is serial). Using the
+        // pre-decode window, not the whole undecoded window, is what stops the
+        // T>1 "8 idle workers" artifact from fabricating PLACEMENT.
+        let predecode_hi = stall_end.min(decode_start);
+        let idle_predecode = overlap_union(stall_start, predecode_hi, &idle);
+        // The placement-attributable portion of the stall = how long dispatch
+        // was deferrable (decode could have started this much sooner), bounded
+        // by the actual idle coverage in that window.
+        let placement_us = idle_predecode.min(decode_start - stall_start).max(0.0);
 
-        // Heuristic threshold: a stall is PLACEMENT-flavored if a worker was
-        // idle for a meaningful slice (>10% of the stall) while i was
-        // undecoded — capacity existed and was not used to finish i sooner.
-        let placement_evidence = idle_admissible > 0.10 * dur;
+        // PLACEMENT if a meaningful fraction of THIS stall was deferred-dispatch
+        // (decode start late + idle capacity), else RATE (gated on decode RUN).
+        let placement_evidence = placement_us > 0.10 * dur;
 
+        let idle_admissible = placement_us;
+
+        // Split the stall: the deferred-dispatch slice is PLACEMENT, the rest is
+        // RATE (waiting for the decode to RUN). Speculation-invalid is its own
+        // bucket and takes the whole stall (the speculative decode didn't help).
         let class = if speculative && decode_complete > stall_end {
-            // i was (also) decoded speculatively yet the in-order decode still
-            // finished after the stall — the speculation didn't help in order.
             StallClass::SpeculationInvalid
         } else if placement_evidence {
             StallClass::Placement
         } else {
             StallClass::Rate
         };
-
         match class {
-            StallClass::Rate => verdict.rate_us += dur,
-            StallClass::Placement => verdict.placement_us += dur,
             StallClass::SpeculationInvalid => verdict.speculation_us += dur,
+            _ => {
+                verdict.placement_us += placement_us;
+                verdict.rate_us += dur - placement_us;
+            }
         }
         verdict.total_stall_us += dur;
         verdict.n_stalls += 1;
@@ -294,19 +328,43 @@ mod tests {
         assert_eq!(v.winner(), "RATE");
     }
 
-    /// PLACEMENT: consumer stalls on chunk 5 which is undecoded, AND a worker
-    /// sat idle (pool.pick.wait) for most of the stall — ready capacity unused.
+    /// PLACEMENT: consumer stalls on chunk 5 at t=100, but chunk 5's decode
+    /// does not START until t=150 (deferred dispatch) while a worker sat idle
+    /// in [100,190]. The [100,150] pre-decode window had idle capacity ⇒ the
+    /// decode could have been placed earlier. placement_us = 50µs of 100µs.
     #[test]
-    fn placement_when_idle_worker_while_undecoded() {
+    fn placement_when_decode_start_deferred_with_idle_worker() {
         let spans = vec![
             sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
             sp("worker.decode_chunk", 2, 150.0, 250.0, json!({"chunk_id":5,"speculative":false})),
-            // worker idle for [100,190] during the stall.
             sp("pool.pick.wait", 3, 100.0, 190.0, json!({})),
         ];
         let v = classify_stalls(&spans);
         assert_eq!(v.stalls[0].class, StallClass::Placement);
-        assert!(v.placement_frac() > 0.99);
+        // 50µs deferred-dispatch (placement) + 50µs decode-run (rate).
+        assert!((v.placement_us - 50.0).abs() < 1e-6, "placement_us={}", v.placement_us);
+        assert!((v.rate_us - 50.0).abs() < 1e-6, "rate_us={}", v.rate_us);
+    }
+
+    /// The T>1 ARTIFACT GUARD: 8 workers idle CONCURRENTLY during a stall must
+    /// NOT sum to >100% placement. With the decode already running (started
+    /// before the stall), idle peers are irrelevant ⇒ pure RATE despite massive
+    /// summed idle time. This is the exact bug the <BENCH_HOST> T8 trace exposed.
+    #[test]
+    fn concurrent_idle_workers_do_not_fabricate_placement() {
+        let mut spans = vec![
+            sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
+            // decode STARTED at 50 (before the stall) — gated on RUN, not dispatch.
+            sp("worker.decode_chunk", 2, 50.0, 200.0, json!({"chunk_id":5,"speculative":false})),
+        ];
+        // 8 peer workers all idle for the whole stall (concurrent).
+        for t in 3..11 {
+            spans.push(sp("pool.pick.wait", t, 100.0, 200.0, json!({})));
+        }
+        let v = classify_stalls(&spans);
+        assert_eq!(v.stalls[0].class, StallClass::Rate);
+        assert!(v.placement_us < 1e-6, "placement leaked: {}", v.placement_us);
+        assert_eq!(v.winner(), "RATE");
     }
 
     /// SPECULATION-INVALID: chunk decoded speculatively but in-order decode
