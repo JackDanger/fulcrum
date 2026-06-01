@@ -23,8 +23,8 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, compare, compare_cli, coz, coz_jsonl, critpath, flow, mech, mech_arch, rank, region_hw,
-    sweep, trace, validate, vs, vs_sweep, xtool,
+    audit, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, flow, mech, mech_arch,
+    rank, region_hw, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -47,6 +47,8 @@ USAGE:\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
+  fulcrum causal <trace.json> [--timeline N] [--static-fraction P]\n\
+  fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
@@ -187,6 +189,402 @@ fn cmd_flow(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `fulcrum causal <trace.json> [--timeline N] [--latency-buckets]`
+///
+/// The speculation-interconnectedness view. Reconstructs each chunk's
+/// lifecycle from the `causal.*` instant events and reports: the RUNTIME
+/// window-absent fraction (vs the cited ~31% static), the window-publish
+/// latency distribution (WHY chunks go window-absent), the per-chunk
+/// dependency timeline (the serial window-chain + where it stalls), and the
+/// data-model-tax pass breakdown.
+fn cmd_causal(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(trace_path) = pos.first() else {
+        eprintln!("usage: fulcrum causal <trace.json> [--timeline N] [--static-fraction P]");
+        return ExitCode::FAILURE;
+    };
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = causal::analyze(&events);
+    let timeline_n: usize = flag(args, "--timeline")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let static_fraction: f64 = flag(args, "--static-fraction")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(31.0);
+    print_causal(&report, timeline_n, static_fraction);
+    ExitCode::SUCCESS
+}
+
+fn fmt_us(us: f64) -> String {
+    if us.abs() >= 1000.0 {
+        format!("{:.2}ms", us / 1000.0)
+    } else {
+        format!("{us:.1}us")
+    }
+}
+
+fn print_causal(r: &causal::CausalReport, timeline_n: usize, static_fraction: f64) {
+    println!(
+        "CAUSAL  wall={:.1}ms   chunks={}   (the speculation interconnectedness view)",
+        r.wall_us / 1000.0,
+        r.chunks.len()
+    );
+
+    // ── 1. Runtime window-absent fraction vs static ──────────────────────
+    println!("\n[1] RUNTIME WINDOW-ABSENT FRACTION  (does gzippy speculate MORE than the static boundary fraction?)");
+    if r.n_decode_decisions == 0 {
+        println!("  no causal.decode_decision events — was the trace captured with GZIPPY_TIMELINE set on a parallel-SM run?");
+    } else {
+        let runtime = 100.0 * r.n_window_absent as f64 / r.n_decode_decisions as f64;
+        println!(
+            "  decode decisions   : {}  (clean={}, window-absent={})",
+            r.n_decode_decisions, r.n_clean, r.n_window_absent
+        );
+        println!(
+            "  RUNTIME window-absent : {runtime:6.1}%      STATIC boundary fraction : {static_fraction:5.1}%"
+        );
+        let delta = runtime - static_fraction;
+        if delta.abs() < 3.0 {
+            println!(
+                "  → runtime ≈ static (Δ{delta:+.1}pp): speculation is set by the DATA's boundary layout, not late publishing."
+            );
+        } else if delta > 0.0 {
+            println!(
+                "  → runtime ≫ static (Δ{delta:+.1}pp): gzippy goes window-absent MORE than the layout forces. See [2] for the mechanism (key-mismatch vs late publish)."
+            );
+        } else {
+            println!(
+                "  → runtime < static (Δ{delta:+.1}pp): early-publish is beating the layout — fewer chunks speculate than boundaries imply."
+            );
+        }
+    }
+
+    // ── 2. Window-publish latency distribution ───────────────────────────
+    println!("\n[2] WINDOW-PUBLISH LATENCY  (decode_start − predecessor_publish; NEGATIVE = started before the window existed ⇒ forced window-absent)");
+    // The key-mismatch cause is reported regardless of whether exact-key
+    // latencies exist — it is the dominant structural reason for speculation.
+    if r.window_absent_key_mismatch > 0 {
+        println!(
+            "  KEY-MISMATCH window-absent : {}/{}  ({:.0}% of all window-absent)",
+            r.window_absent_key_mismatch,
+            r.n_window_absent,
+            if r.n_window_absent > 0 {
+                100.0 * r.window_absent_key_mismatch as f64 / r.n_window_absent as f64
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    → these decode at a PARTITION SEED; the predecessor window exists but is published at the REAL boundary key, which the seed never equals."
+        );
+        println!(
+            "    of those, predecessor boundary was published BEFORE the chunk started (timing would have allowed clean): {}/{}",
+            r.key_mismatch_pred_ready_in_time, r.window_absent_key_mismatch
+        );
+        println!(
+            "    ⇒ the cause is the KEY, not lateness: speculative prefetch CANNOT find its window because it looks up the wrong key by design."
+        );
+    }
+    if r.publish_latency_us.is_empty() {
+        println!(
+            "  exact-key latencies: none. window-absent chunks whose predecessor never published anywhere below their start: {}",
+            r.window_absent_pred_never_published_at_start
+        );
+    } else {
+        let lat = &r.publish_latency_us;
+        let neg = lat.iter().filter(|&&x| x < 0.0).count();
+        let mean = lat.iter().sum::<f64>() / lat.len() as f64;
+        println!(
+            "  samples={}  (predecessor publish observed)   pred-never-published={}",
+            lat.len(),
+            r.window_absent_pred_never_published_at_start
+        );
+        println!(
+            "  started BEFORE predecessor published : {neg}/{}  ({:.0}%)  ← these are CAUSALLY forced to speculate",
+            lat.len(),
+            100.0 * neg as f64 / lat.len() as f64
+        );
+        println!(
+            "  p10={}  p50={}  p90={}  mean={}",
+            fmt_us(causal::percentile(lat, 10.0)),
+            fmt_us(causal::percentile(lat, 50.0)),
+            fmt_us(causal::percentile(lat, 90.0)),
+            fmt_us(mean),
+        );
+    }
+
+    // ── 3. Per-chunk dependency timeline (the serial window-chain) ────────
+    println!("\n[3] DEPENDENCY TIMELINE  (per chunk in pipeline order: decode-start → mode → publish → consume; the serial window-chain)");
+    println!(
+        "  {:>4} {:>14} {:>6} {:>4} {:>11} {:>12} {:>11}",
+        "#", "start_bit", "mode", "spec", "dec_start", "publish", "consume"
+    );
+    let base = r
+        .chunks
+        .iter()
+        .filter_map(|c| c.decode_start_ts.or(c.consume_ts).or(c.publish_ts))
+        .fold(f64::INFINITY, f64::min);
+    let base = if base.is_finite() { base } else { 0.0 };
+    let rel = |t: Option<f64>| match t {
+        Some(v) => fmt_us(v - base),
+        None => "-".to_string(),
+    };
+    let shown = r.chunks.len().min(timeline_n);
+    for (i, c) in r.chunks.iter().take(timeline_n).enumerate() {
+        let mode = match c.window_present {
+            Some(true) => "clean",
+            Some(false) => "ABSENT",
+            None => "?",
+        };
+        let spec = match c.speculative {
+            Some(true) => "spec",
+            Some(false) => "ack",
+            None => "-",
+        };
+        // Stall marker: a window-absent chunk that started before its
+        // predecessor published is the visible serial-chain stall.
+        let stall = if c.window_present == Some(false) {
+            " ⟂absent"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>4} {:>14} {:>6} {:>4} {:>11} {:>12} {:>11}{}",
+            i,
+            c.start_bit,
+            mode,
+            spec,
+            rel(c.decode_start_ts),
+            c.publish_site
+                .as_deref()
+                .map(|s| format!("{}@{}", short_site(s), rel(c.publish_ts)))
+                .unwrap_or_else(|| rel(c.publish_ts)),
+            rel(c.consume_ts),
+            stall,
+        );
+    }
+    if r.chunks.len() > shown {
+        println!(
+            "  … {} more chunks (use --timeline N to widen)",
+            r.chunks.len() - shown
+        );
+    }
+
+    // ── 4. Data-model tax ─────────────────────────────────────────────────
+    let t = causal::tax_totals(r);
+    println!("\n[4] DATA-MODEL TAX  (the per-pass cost a window-absent chunk pays and a clean chunk never does)");
+    if t.n_taxed_chunks == 0 {
+        println!("  no taxed chunks (no marker bytes emitted).");
+    } else {
+        let total = t.total_decode_us + t.total_resolve_us + t.total_narrow_us;
+        println!(
+            "  taxed chunks={}  (fused={}, two-pass={})   marker bytes total={:.1} MiB",
+            t.n_taxed_chunks,
+            t.n_fused,
+            t.n_two_pass,
+            t.total_marker_bytes as f64 / (1024.0 * 1024.0),
+        );
+        let pct = |x: f64| if total > 0.0 { 100.0 * x / total } else { 0.0 };
+        println!(
+            "  pass 1  decode → u16 write    : {:>9}  ({:4.1}%)   [worker.bootstrap]",
+            fmt_us(t.total_decode_us),
+            pct(t.total_decode_us)
+        );
+        println!(
+            "  pass 2  resolve (replace_mk)  : {:>9}  ({:4.1}%)   [apply_window / fused LUT]",
+            fmt_us(t.total_resolve_us),
+            pct(t.total_resolve_us)
+        );
+        println!(
+            "  pass 3  narrow u16 → u8       : {:>9}  ({:4.1}%)   [0 on fused path]",
+            fmt_us(t.total_narrow_us),
+            pct(t.total_narrow_us)
+        );
+        println!(
+            "  (materialize window/ chunk)   : {:>9}            [predecessor decompress]",
+            fmt_us(t.total_materialize_us)
+        );
+        println!(
+            "  TOTAL tax (3 passes)          : {:>9}  = {:.1}% of wall",
+            fmt_us(total),
+            if r.wall_us > 0.0 {
+                100.0 * total / r.wall_us
+            } else {
+                0.0
+            }
+        );
+        // Bytes-moved framing: window-absent moves its buffer ~3× vs ~1×.
+        let mb = t.total_marker_bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "  bytes MOVED by the model      : decode writes {:.0}MiB(u16=2B) + resolve r/w {:.0}MiB + narrow r/w {:.0}MiB  ≈ {:.0}MiB vs ~{:.0}MiB fused-ideal",
+            mb * 2.0,
+            mb * 2.0 * 2.0,
+            mb * 3.0,
+            mb * (2.0 + 4.0 + 3.0),
+            mb * 3.0,
+        );
+    }
+}
+
+fn short_site(s: &str) -> &str {
+    match s {
+        "worker_early" => "wrk",
+        "consumer_clean" => "c.cln",
+        "consumer_marker" => "c.mrk",
+        other => other,
+    }
+}
+
+/// `fulcrum consumer <trace.json> [trace2.json ...]`
+///
+/// The CONSUMER-SPAN DECOMPOSITION view. For each trace (one per thread-count),
+/// computes EXCLUSIVE per-span self-time on the in-order consumer thread via a
+/// proper B/E stack (no nested same-name double-count — the bug that made
+/// `combine_crc` look like 62 ms), classifies each span as WAIT / COMPUTE /
+/// OUTPUT / IDLE, forms an explicit IDLE-GAP = span − Σ busy, and ASSERTS
+/// busy + idle == span (surfacing any reconciliation miss rather than hiding
+/// it). Pass several traces to get the per-thread-count table side by side.
+fn cmd_consumer(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    if pos.is_empty() {
+        eprintln!("usage: fulcrum consumer <trace.json> [trace2.json ...]");
+        return ExitCode::FAILURE;
+    }
+    let mut any_unreconciled = false;
+    for path in &pos {
+        let events = match trace::load_events(Path::new(path)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = consumer::analyze(&events);
+        if !report.reconcile.reconciled {
+            any_unreconciled = true;
+        }
+        print_consumer(path, &report);
+    }
+    if any_unreconciled {
+        // A reconciliation miss means the B/E pairing is unsound and every
+        // number is suspect — fail loudly so it can't be trusted silently.
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
+    let tlabel = r
+        .parallelization
+        .map(|p| format!("T{p}"))
+        .unwrap_or_else(|| "T?".to_string());
+    println!("\n========  CONSUMER DECOMPOSITION  {tlabel}  ({path})  ========");
+    println!(
+        "wall            : {:.1}ms   consumer tid {}/{}   consumer-span {:.1}ms",
+        r.wall_us / 1000.0,
+        r.consumer.0,
+        r.consumer.1,
+        r.consumer_span_us / 1000.0,
+    );
+
+    // ── Per-class roll-up (the headline) ──────────────────────────────────
+    let span = r.consumer_span_us.max(1.0);
+    let pct = |x: f64| 100.0 * x / span;
+    let get = |k: &str| *r.by_class.get(k).unwrap_or(&0.0);
+    println!("\n  CLASS      self-time     %span   meaning");
+    let classes = [
+        (
+            "OUTPUT",
+            "materialize decompressed bytes to the writer (floor)",
+        ),
+        (
+            "WAIT",
+            "blocked on a producer (decode-wait / fetch / prefetch)",
+        ),
+        (
+            "COMPUTE",
+            "consumer's own serial CPU (narrow / resolve / crc)",
+        ),
+        ("IDLE", "loop-umbrella self-time: un-instrumented gap"),
+        (
+            "UNKNOWN",
+            "un-classified span names (add to consumer::classify)",
+        ),
+    ];
+    for (k, meaning) in classes {
+        let v = get(k);
+        if k == "UNKNOWN" && v < 1.0 {
+            continue;
+        }
+        let bar_w = (pct(v) / 4.0).round() as usize;
+        println!(
+            "  {:<9} {:>9.1}ms  {:>6.1}%   {}  {}",
+            k,
+            v / 1000.0,
+            pct(v),
+            "█".repeat(bar_w.min(25)),
+            meaning,
+        );
+    }
+    let busy = get("WAIT") + get("COMPUTE") + get("OUTPUT") + get("UNKNOWN");
+    println!(
+        "  {:<9} {:>9.1}ms  {:>6.1}%   (WAIT+COMPUTE+OUTPUT+UNKNOWN)",
+        "Σ busy",
+        busy / 1000.0,
+        pct(busy)
+    );
+
+    // ── Per-span detail (exclusive self-time, classified) ─────────────────
+    println!("\n  per-span exclusive self-time (the double-count-free decomposition):");
+    println!(
+        "  {:<34} {:>8} {:>9} {:>9} {:>6}  class",
+        "span", "count", "self", "incl", "%span"
+    );
+    for s in &r.spans {
+        if s.self_us < 5.0 && s.class != consumer::Class::Output {
+            // hide sub-5µs noise from the detail (still in the class totals)
+            continue;
+        }
+        println!(
+            "  {:<34} {:>8} {:>9} {:>9} {:>5.1}%  {}",
+            s.name,
+            s.count,
+            trace::fmt_us(s.self_us),
+            trace::fmt_us(s.incl_us),
+            pct(s.self_us),
+            s.class.label(),
+        );
+    }
+
+    // ── Reconciliation self-test (the anti-phantom guarantee) ─────────────
+    let rc = &r.reconcile;
+    println!(
+        "\n  RECONCILE  span {:.1}ms  =  busy {:.1}ms  +  idle {:.1}ms   (residual {:.3}µs)  [{}]",
+        rc.span_us / 1000.0,
+        rc.busy_us / 1000.0,
+        rc.idle_us / 1000.0,
+        rc.residual_us,
+        if rc.reconciled {
+            "OK — B/E pairing sound, every span counted once"
+        } else {
+            "FAIL — unmatched begin/end; numbers above are SUSPECT"
+        },
+    );
+    if r.unclosed_at_eof > 0 {
+        println!(
+            "             ({} outer span(s) left open by a truncated trace, closed at last-observed ts)",
+            r.unclosed_at_eof
+        );
+    }
+}
+
 /// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
 /// Side-by-side per-span comparison: which code A burns more time in / gates the
 /// wall more than the same-named span in B.
@@ -308,7 +706,11 @@ fn print_flow(r: &flow::FlowReport) {
         "  {:<36} {:>8.1}ms  ({:.0}% of wall classified onto the critical path)",
         "Σ wall-critical",
         wc_sum / 1000.0,
-        if r.wall_us > 0.0 { 100.0 * wc_sum / r.wall_us } else { 0.0 },
+        if r.wall_us > 0.0 {
+            100.0 * wc_sum / r.wall_us
+        } else {
+            0.0
+        },
     );
     if !r.unclassified.is_empty() {
         let total: f64 = r.unclassified.iter().map(|(_, d)| d).sum();
@@ -1011,6 +1413,8 @@ fn main() -> ExitCode {
     match sub.as_str() {
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
+        "causal" => cmd_causal(rest),
+        "consumer" => cmd_consumer(rest),
         "vs" => cmd_vs(rest),
         "vs-sweep" => cmd_vs_sweep(rest),
         "coz-parse" => cmd_coz_parse(rest),
