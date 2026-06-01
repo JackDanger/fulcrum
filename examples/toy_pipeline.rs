@@ -173,6 +173,13 @@ fn main() {
     let mut buf: HashMap<u64, u64> = HashMap::new();
     let mut want: u64 = 0;
     let mut checksum: u64 = 0;
+    // Wrap the whole in-order drain in an umbrella span so the consumer
+    // decomposition's busy+idle == span reconciliation closes: the umbrella's
+    // EXCLUSIVE self-time is exactly the un-instrumented loop overhead (buffer
+    // management between waits/emits), which the `consumer` view reports as
+    // IDLE rather than leaving as an unreconciled residual. (`consumer.loop` is
+    // listed as an idle-umbrella in `Config::demo`.)
+    let _loop = probe::scope("consumer.loop");
     while want < items {
         if let Some(payload) = buf.remove(&want) {
             let _e = probe::scope("consumer.emit");

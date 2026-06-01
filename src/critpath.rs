@@ -39,14 +39,19 @@ use crate::trace::{pair_spans, wall_us, Event, Span};
 use std::collections::HashMap;
 
 /// Identify the consumer thread: the `(pid, tid)` that owns the in-order
-/// drain spans. We pick the thread with the most `consumer.*` span time; if
-/// no thread uses that convention, we fall back to the thread with the most
-/// total wait time (the one that blocks waiting for others is the consumer).
-pub fn consumer_tid(spans: &[Span]) -> Option<(u64, u64)> {
+/// drain spans. `thread_prefix` is the configured consumer-span prefix (e.g.
+/// `consumer.` for gzippy); when non-empty we pick the thread with the most
+/// span time under that prefix. When the prefix is empty OR no thread uses it,
+/// we fall back to the thread with the most total wait time (the one that
+/// blocks waiting for others is the consumer) — so a pipeline with NO consumer
+/// config is still handled by the universal wait convention.
+pub fn consumer_tid(spans: &[Span], thread_prefix: &str) -> Option<(u64, u64)> {
     let mut score: HashMap<(u64, u64), f64> = HashMap::new();
-    for s in spans {
-        if s.name.starts_with("consumer.") {
-            *score.entry((s.pid, s.tid)).or_default() += s.dur;
+    if !thread_prefix.is_empty() {
+        for s in spans {
+            if s.name.starts_with(thread_prefix) {
+                *score.entry((s.pid, s.tid)).or_default() += s.dur;
+            }
         }
     }
     if score.is_empty() {
@@ -151,14 +156,29 @@ fn pick_blocker<'a>(
 ///
 /// `preferred_blockers`: worker span names to prefer when several overlap a
 /// wait (typically the inner phases from your config's region `functions`).
+///
+/// Uses the default consumer prefix (`consumer.`); call [`analyze_with`] to
+/// override it for a pipeline whose consumer thread uses a different prefix.
 pub fn analyze(
     events: &[Event],
     heavy_threshold_us: f64,
     preferred_blockers: &[String],
 ) -> CritPath {
+    analyze_with(events, heavy_threshold_us, preferred_blockers, "consumer.")
+}
+
+/// As [`analyze`], but with an explicit consumer-thread span `thread_prefix`
+/// (empty ⇒ identify the consumer purely by the most-wait heuristic). This is
+/// what makes critical-path attribution work on a non-gzippy pipeline.
+pub fn analyze_with(
+    events: &[Event],
+    heavy_threshold_us: f64,
+    preferred_blockers: &[String],
+    thread_prefix: &str,
+) -> CritPath {
     let spans = pair_spans(events);
     let wall = wall_us(&spans);
-    let consumer = consumer_tid(&spans).unwrap_or((1, 1));
+    let consumer = consumer_tid(&spans, thread_prefix).unwrap_or((1, 1));
 
     let mut busy = 0.0_f64;
     let mut wait = 0.0_f64;

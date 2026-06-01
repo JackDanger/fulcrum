@@ -34,5 +34,26 @@
     "cp_top_region": "transform",
     "cp_offpath_region": "emit",
     "cp_offpath_max": 0.05
-  }
+  },
+
+  "//consumer": "Drives `fulcrum consumer` (WAIT/COMPUTE/OUTPUT/IDLE split of the in-order consumer's wall). thread_prefix identifies the consumer thread. Each class is a matcher {exact,prefixes,suffixes,substrings} (OR-combined). WAIT also always recognizes the universal convention (wait.* / *.wait / *recv*), so a wait matcher is only needed for non-conventional names. idle_umbrellas are the outer-loop wrappers whose own self-time is the un-instrumented inter-child gap.",
+  "consumer": {
+    "thread_prefix": "consumer.",
+    "output": { "exact": ["consumer.emit"] },
+    "compute": { "exact": ["consumer.combine"], "prefixes": ["consumer.resolve"] },
+    "idle_umbrellas": { "exact": ["consumer.loop"] }
+  },
+
+  "//stages": "Drives `fulcrum flow` (per-stage wall-critical vs slack). Matched in declaration order; FIRST match wins (declare catch-alls last). A name starting with '·' is a recognized non-stage (a wait or umbrella): kept out of UNCLASSIFIED but contributing no busy work.",
+  "stages": [
+    { "name": "1·parse", "exact": ["parse"] },
+    { "name": "2·transform", "exact": ["transform"] },
+    { "name": "3·compress", "exact": ["compress"] },
+    { "name": "4·emit", "exact": ["emit", "consumer.emit"] },
+    { "name": "·umbrella", "exact": ["worker.item", "consumer.loop"] },
+    { "name": "·wait", "exact": ["consumer.wait"] }
+  ],
+
+  "//inner_blockers": "Worker inner-phase span names to prefer when several overlap a consumer wait, so the stall is blamed on the real phase, not the task umbrella that wraps it.",
+  "inner_blockers": ["parse", "transform", "compress", "emit"]
 }

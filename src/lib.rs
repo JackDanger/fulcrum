@@ -13,9 +13,18 @@
 //!   * a **library** — [`probe`] is the tiny generic instrumentation you add
 //!     to your pipeline ([`probe::scope`] + [`probe::progress`]); the
 //!     analysis modules ([`trace`], [`critpath`], [`coz`], [`mech`], [`rank`],
-//!     [`validate`]) are reusable and configured by [`config::Config`]; and
+//!     [`validate`], [`consumer`], [`flow`], [`vs`]) are reusable and
+//!     configured by [`config::Config`]; and
 //!   * a **binary** — the `fulcrum` CLI (`src/main.rs`) that drives the
 //!     analysis over a trace + a Coz profile + a perf report.
+//!
+//! FULCRUM is a **general** profiler: nothing pipeline-specific is compiled
+//! into the analyzer. The views that decompose the consumer timeline
+//! ([`consumer`], [`flow`], [`critpath`], [`vs`], [`vs_sweep`]) classify span
+//! names entirely from [`config::Config`] — a [`config::Matcher`] of
+//! exact/prefix/suffix/substring rules per class — so they run on YOUR span
+//! vocabulary with no code change. [`config::Config::gzippy`] is the worked
+//! built-in example; [`config::Config::generic`] is the no-vocabulary default.
 //!
 //! See the bundled `examples/toy_pipeline.rs` for an end-to-end, dependency-
 //! free demonstration.
@@ -42,4 +51,5 @@ pub mod sweep;
 pub mod trace;
 pub mod validate;
 pub mod vs;
+pub mod vs_sweep;
 pub mod xtool;
