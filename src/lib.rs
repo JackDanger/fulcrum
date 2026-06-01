@@ -34,6 +34,7 @@ pub mod flow;
 pub mod mech;
 pub mod mech_arch;
 pub mod microbench;
+pub mod model;
 pub mod probe;
 pub mod rank;
 pub mod region_hw;
