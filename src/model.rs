@@ -1,48 +1,75 @@
-//! model.rs — the PARALLEL-SM QUANTITATIVE-MODEL view.
+//! model.rs — the PARALLEL-SM QUANTITATIVE-MODEL view (INDEPENDENT-parameter
+//! edition).
 //!
 //! Populates, from a single Chrome-trace timeline, the parameters of the
-//! advisor-validated wall model in
-//! `gzippy/plans/parallel-sm-model.md`, computes the predicted wall, and
-//! reports the residual against the observed wall. Given two traces (gzippy +
-//! rapidgzip) it prints the per-parameter DELTA and names the implied lever.
+//! advisor-validated wall model in `gzippy/plans/parallel-sm-model.md`,
+//! computes a PREDICTED wall, and reports the residual against the observed
+//! wall. Given two traces (gzippy + rapidgzip) it prints the per-parameter
+//! DELTA and names the implied lever.
 //!
-//! ## The model (verbatim from the spec)
+//! ## The tautology this edition exists to kill
 //!
-//! In-order parallel pipeline: `N` chunks, `T` workers decode in parallel, ONE
-//! in-order consumer publishes each chunk's 32 KiB tail-window. A chunk decodes
-//! CLEAN (fast windowed ISA-L) iff its predecessor's window is PUBLISHED when a
-//! worker STARTS it, else WINDOW-ABSENT (slow bootstrap → u16 markers →
-//! resolve).
+//! The previous edition defined `L_resolve` as the MEAN inter-publish gap =
+//! `(last_publish − first_publish)/(N−1)`. Then the publish-chain term was
+//! `frontier + (N−1)·L_resolve = frontier + (last − first) = last_publish`,
+//! and `wall_pred = max(·, last_publish) + tail`. When publish-chain bound,
+//! `wall_pred = last_publish + (wall_end − last_publish) = wall_end = wall` BY
+//! CONSTRUCTION — a telescoping identity, not a prediction. Its residual was
+//! +0.0% always, which "confirmed" nothing.
+//!
+//! ## The fix: measure each parameter from its OWN independent signal
+//!
+//! - `d_w` — median DURATION of WINDOW-ABSENT worker decode spans. Independent.
+//! - `d_c` — median DURATION of CLEAN worker decode spans (report its n; if n
+//!   is tiny it is cold-start garbage and is flagged unreliable). Independent.
+//! - `L_resolve` — **the per-link SERIAL resolve/publish WORK**, measured as the
+//!   median DURATION of the in-order consumer's publish span (the B/E span that
+//!   wraps `apply_window`/marker-resolution/`getLastWindow`+emplace), NOT the
+//!   inter-publish gap. This is a busy-duration the consumer actually spends,
+//!   so it is INDEPENDENT of where the publishes land in time. The wall is then
+//!   a genuine PREDICTION whose residual is nonzero and meaningful.
+//! - `frontier` — first publish ts − trace start. `tail` — wall-end − last
+//!   publish ts. `N`, `T`, window-absent fraction `f` — independent.
+//!
+//! `chain_gap` (mean inter-publish gap) is RETAINED but DEMOTED to a purely
+//! DESCRIPTIVE decomposition of the observed publish stream — it is NEVER fed
+//! into `wall_pred`. It is reported alongside `L_resolve` so the analyst can
+//! see how much of the inter-publish time is real resolve work (`L_resolve`)
+//! vs idle/overlap (`chain_gap − L_resolve`).
 //!
 //! ```text
-//! wall ≈ max( worker-bound:  frontier + (N/T)·d_w_eff ,
-//!             publish-chain: frontier + N·L_resolve  )  + tail
+//! wall_pred ≈ max( worker-bound:  frontier + (N/T)·d_w_eff ,
+//!                  publish-chain: frontier + (N−1)·L_resolve_independent )  + tail
+//! residual  = (wall_pred − wall_observed) / wall_observed     (NONZERO = GOOD)
 //! ```
 //!
-//! - `d_w_eff` = per-chunk decode latency, weighted by the window-absent
-//!   fraction f: `d_w_eff = f·d_w + (1−f)·d_c`.
-//! - `L_resolve` = per-link publish latency = the inter-publish gap
-//!   `t_publish(i) − t_publish(i−1)` on steady-state chunks. **This is the
-//!   parameter the whole campaign is about** — the catch-up term is a LATENCY,
-//!   not a throughput.
-//! - There is a worker-bound KNEE: cutting `L_resolve` lowers the wall only
-//!   until the worker-bound term becomes the max. The model PREDICTS the
-//!   FastBootstrap TIE (decode sped, wall flat) when worker-bound binds.
+//! ## Span-name ingestion (both tools, one view)
 //!
-//! ## How the parameters are read off the trace (instrument-agnostic)
+//! Decode spans (d_c/d_w):
+//!   - rapidgzip: `worker.decode`, arg `mode` ∈ {clean, window_absent}.
+//!   - gzippy:    `worker.decode_chunk`, arg `mode` when present, else derived
+//!                from `speculative` (true ⇒ window_absent bootstrap).
 //!
-//! Both gzippy and the patched rapidgzip emit the SAME shapes:
-//!   - `worker.decode` B/E spans, args `{start_bit, mode}` where mode is
-//!     `clean`|`window_absent` — split into d_c / d_w by median.
-//!   - `causal.window_publish` instant events, args `{start_bit, end_bit,
-//!     site, had_markers}`, emitted on the in-order consumer so trace order =
-//!     chunk-index order. Consecutive-gap = L_resolve; first = frontier
-//!     anchor; last → wall-end = tail.
-//!
-//! No code reading required: the same view runs on either tool, so the
-//! gzippy−rapidgzip parameter delta is apples-to-apples.
+//! Publish spans (L_resolve, frontier, tail, N) — the in-order consumer publish:
+//!   - rapidgzip: `causal.window_publish` — a B/E SPAN (its duration is the
+//!     emplace/getLastWindow serial work) when the trace patch wraps it; an
+//!     instant (ph="i") is still accepted for ordering/frontier/tail but yields
+//!     NO independent L_resolve (flagged).
+//!   - gzippy:    `consumer.window_publish_clean` / `consumer.window_publish_marker`
+//!     — B/E spans whose duration is the serial resolve work.
 
 use crate::trace::{pair_spans, wall_us, Event, Span};
+
+/// Span names that carry per-chunk worker decode duration.
+const DECODE_SPAN_NAMES: &[&str] = &["worker.decode", "worker.decode_chunk"];
+
+/// Span/event names for the in-order consumer tail-window publish.
+const PUBLISH_NAMES: &[&str] = &[
+    "causal.window_publish",
+    "consumer.window_publish",
+    "consumer.window_publish_clean",
+    "consumer.window_publish_marker",
+];
 
 /// One tool's populated parameter set + the model's prediction.
 #[derive(Debug, Clone)]
@@ -50,30 +77,41 @@ pub struct ModelParams {
     pub label: String,
     /// Worker count T (from --workers or detected).
     pub workers: u64,
-    /// Number of chunks (distinct window_publish events in consumer order).
+    /// Number of chunks (distinct publishes in consumer order).
     pub n_chunks: usize,
-    /// Window-absent decode latency/chunk, µs (median of mode=window_absent
-    /// `worker.decode` spans).
+    /// Window-absent decode latency/chunk, µs (median of window_absent decode
+    /// span durations). INDEPENDENT.
     pub d_w_us: Option<f64>,
-    /// Clean decode latency/chunk, µs (median of mode=clean `worker.decode`).
+    /// Number of window-absent decode spans the median is over.
+    pub n_d_w: usize,
+    /// Clean decode latency/chunk, µs (median of clean decode span durations).
+    /// INDEPENDENT.
     pub d_c_us: Option<f64>,
+    /// Number of clean decode spans the median is over. Small n ⇒ cold-start
+    /// garbage; see `d_c_reliable`.
+    pub n_d_c: usize,
+    /// False when `n_d_c` is too small to trust d_c (cold-start chunk-0 only).
+    pub d_c_reliable: bool,
     /// Runtime window-absent fraction f (window_absent decodes / total decodes).
     pub window_absent_frac: f64,
     /// Effective per-chunk decode latency d_w_eff = f·d_w + (1−f)·d_c, µs.
     pub d_w_eff_us: Option<f64>,
-    /// THE parameter: per-link publish latency, µs. MEAN inter-publish gap =
-    /// (last_publish − first_publish)/(N−1) — the bimodal-robust summary the
-    /// wall actually obeys (the publish distribution is bimodal: many ~0 gaps
-    /// from eagerly-resolved chunks punctuated by a few large resolve stalls,
-    /// so the MEDIAN understates the chain by an order of magnitude — see the
-    /// 2026-05-31 <BENCH_HOST> measurement where rapidgzip's gap_median was 0.04ms
-    /// but gap_mean 7.74ms). The publish-chain term uses this mean.
+    /// THE parameter, measured INDEPENDENTLY: per-link serial resolve/publish
+    /// WORK = median DURATION of the consumer publish span. None when the trace
+    /// only has instant publishes (no duration to measure) — then the model
+    /// CANNOT predict the publish-chain term and says so.
     pub l_resolve_us: Option<f64>,
-    /// MEDIAN inter-publish gap, µs (diagnostic — typical fast-resolve link).
-    pub l_resolve_median_us: Option<f64>,
-    /// p95 of the inter-publish gap (tail-of-distribution diagnostic — the
-    /// large resolve stalls that dominate the mean).
+    /// Number of consumer publish SPANS (with duration) the median is over.
+    pub n_publish_spans: usize,
+    /// p95 of the consumer publish span duration (tail resolve stalls).
     pub l_resolve_p95_us: Option<f64>,
+    /// DESCRIPTIVE ONLY (never fed into wall_pred): MEAN inter-publish gap =
+    /// (last − first)/(N−1). The OLD edition mislabeled this "L_resolve" and
+    /// built the tautology on it. Kept so the analyst sees how much of the
+    /// inter-publish time is real resolve work (l_resolve_us) vs idle/overlap.
+    pub chain_gap_mean_us: Option<f64>,
+    /// DESCRIPTIVE: median inter-publish gap.
+    pub chain_gap_median_us: Option<f64>,
     /// Startup before steady state: first publish ts − trace start, µs.
     pub frontier_us: f64,
     /// Drain after the last publish: wall-end − last publish ts, µs.
@@ -82,13 +120,13 @@ pub struct ModelParams {
     pub observed_wall_us: f64,
     /// Predicted worker-bound term: frontier + (N/T)·d_w_eff, µs.
     pub worker_bound_us: Option<f64>,
-    /// Predicted publish-chain term: frontier + N·L_resolve, µs.
+    /// Predicted publish-chain term: frontier + (N−1)·L_resolve_independent, µs.
     pub publish_chain_us: Option<f64>,
     /// wall_pred = max(worker_bound, publish_chain) + tail, µs.
     pub wall_pred_us: Option<f64>,
     /// Which term binds the prediction.
     pub binding: Binding,
-    /// Number of `worker.decode` spans seen (decode-mode coverage).
+    /// Number of decode spans seen (decode-mode coverage).
     pub n_decode_spans: usize,
 }
 
@@ -108,6 +146,9 @@ impl Binding {
         }
     }
 }
+
+/// Minimum clean-decode span count below which d_c is cold-start garbage.
+const MIN_RELIABLE_DC: usize = 4;
 
 /// Median of a slice (sorted copy). None if empty.
 pub fn median(xs: &[f64]) -> Option<f64> {
@@ -144,22 +185,63 @@ fn arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 fn arg_str(args: &serde_json::Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
-/// A single window-publish, in trace (= consumer = chunk-index) order.
+fn arg_bool(args: &serde_json::Value, key: &str) -> Option<bool> {
+    match args.get(key) {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decode mode for one decode span. Prefers an explicit `mode` arg (rapidgzip
+/// patch + any gzippy span tagged with it); falls back to gzippy's
+/// `speculative` arg (a speculative prefetch decodes WITHOUT the predecessor
+/// window ⇒ window_absent bootstrap).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DecodeMode {
+    Clean,
+    WindowAbsent,
+    Unknown,
+}
+
+fn decode_mode(args: &serde_json::Value) -> DecodeMode {
+    match arg_str(args, "mode").as_deref() {
+        Some("clean") => return DecodeMode::Clean,
+        Some("window_absent") => return DecodeMode::WindowAbsent,
+        _ => {}
+    }
+    match arg_bool(args, "speculative") {
+        Some(true) => DecodeMode::WindowAbsent,
+        Some(false) => DecodeMode::Clean,
+        None => DecodeMode::Unknown,
+    }
+}
+
+/// A single in-order publish, with its serial-work DURATION.
 #[derive(Debug, Clone)]
 struct Publish {
     ts: f64,
+    /// Span duration (the independent serial resolve work). 0.0 if the publish
+    /// was an instant (no duration available).
+    dur: f64,
+    /// True iff this publish came from a B/E span (so `dur` is a real measured
+    /// serial cost, not a synthetic 0).
+    has_duration: bool,
     end_bit: Option<u64>,
 }
 
 /// Populate the parameter set + prediction for one trace.
 ///
-/// `workers` overrides the detected T when `Some`. Steady-state for L_resolve
-/// trims the first `frontier_skip` publishes (startup ramp) and the last
-/// publish (tail), so the median reflects the link latency of the in-order
-/// catch-up, not the cold ramp.
+/// `workers` overrides the detected T when `Some`.
 pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelParams {
     let spans: Vec<Span> = pair_spans(events);
     let observed_wall_us = wall_us(&spans);
@@ -173,29 +255,58 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         0.0
     };
 
-    // ── d_c / d_w from worker.decode span durations, split by mode ────────────
+    // ── decode-mode JOIN map: gzippy emits a `worker.decode_mode` instant
+    //    keyed by start_bit carrying the ACTUAL window-present-at-decode-start
+    //    mode (the honest split, not the `speculative` dispatch intent). Build
+    //    start_bit → mode so a decode span without its own `mode` arg gets the
+    //    authoritative mode. ──────────────────────────────────────────────────
+    let mut mode_by_start_bit: std::collections::HashMap<u64, DecodeMode> =
+        std::collections::HashMap::new();
+    for e in events {
+        if e.ph == "i" && e.name == "worker.decode_mode" {
+            if let (Some(sb), Some(m)) = (arg_u64(&e.args, "start_bit"), arg_str(&e.args, "mode")) {
+                let dm = match m.as_str() {
+                    "clean" => DecodeMode::Clean,
+                    "window_absent" => DecodeMode::WindowAbsent,
+                    _ => DecodeMode::Unknown,
+                };
+                mode_by_start_bit.insert(sb, dm);
+            }
+        }
+    }
+
+    // ── d_c / d_w from decode span durations, split by mode ──────────────────
     let mut clean_durs: Vec<f64> = Vec::new();
     let mut absent_durs: Vec<f64> = Vec::new();
     for s in &spans {
-        if s.name != "worker.decode" {
+        if !DECODE_SPAN_NAMES.contains(&s.name.as_str()) {
             continue;
         }
-        match arg_str(&s.args, "mode").as_deref() {
-            Some("clean") => clean_durs.push(s.dur),
-            Some("window_absent") => absent_durs.push(s.dur),
-            _ => {}
+        // Prefer the authoritative joined mode (gzippy decode_mode instant),
+        // then the span's own `mode`/`speculative` arg (rapidgzip + fallback).
+        let mode = s
+            .arg_u64("start_bit")
+            .and_then(|sb| mode_by_start_bit.get(&sb).copied())
+            .unwrap_or_else(|| decode_mode(&s.args));
+        match mode {
+            DecodeMode::Clean => clean_durs.push(s.dur),
+            DecodeMode::WindowAbsent => absent_durs.push(s.dur),
+            DecodeMode::Unknown => {}
         }
     }
     let n_decode_spans = clean_durs.len() + absent_durs.len();
+    let n_d_c = clean_durs.len();
+    let n_d_w = absent_durs.len();
     let d_c_us = median(&clean_durs);
     let d_w_us = median(&absent_durs);
+    let d_c_reliable = n_d_c >= MIN_RELIABLE_DC;
     let window_absent_frac = if n_decode_spans > 0 {
         absent_durs.len() as f64 / n_decode_spans as f64
     } else {
         0.0
     };
     // d_w_eff weights the two decode latencies by the runtime window-absent
-    // fraction. If only one mode was seen, fall back to whichever exists.
+    // fraction. If only one mode exists, fall back to whichever exists.
     let d_w_eff_us = match (d_w_us, d_c_us) {
         (Some(dw), Some(dc)) => Some(window_absent_frac * dw + (1.0 - window_absent_frac) * dc),
         (Some(dw), None) => Some(dw),
@@ -203,26 +314,38 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         (None, None) => None,
     };
 
-    // ── window_publish events in consumer (= chunk-index) order ───────────────
+    // ── publishes: prefer B/E SPANS (carry the independent resolve DURATION),
+    //    fall back to instant events (ordering/frontier/tail only) ────────────
     let mut publishes: Vec<Publish> = Vec::new();
-    for e in events {
-        if e.ph == "i" && e.name == "causal.window_publish" {
+    for s in &spans {
+        if PUBLISH_NAMES.contains(&s.name.as_str()) {
             publishes.push(Publish {
-                ts: e.ts,
-                end_bit: arg_u64(&e.args, "end_bit"),
+                ts: s.ts_start,
+                dur: s.dur,
+                has_duration: true,
+                end_bit: arg_u64(&s.args, "end_bit"),
             });
         }
     }
-    // The events are appended to the trace in emit order; the in-order consumer
-    // emits them in chunk-index order. A multi-threaded writer interleaves
-    // lines but each event's ts is the publish instant, so sort by ts to
-    // recover the true publish sequence (the consumer is serial ⇒ its publishes
-    // are monotonic in ts regardless of file interleave).
+    if publishes.is_empty() {
+        // No B/E publish spans — accept instant publishes for ordering only.
+        for e in events {
+            if e.ph == "i" && PUBLISH_NAMES.contains(&e.name.as_str()) {
+                publishes.push(Publish {
+                    ts: e.ts,
+                    dur: 0.0,
+                    has_duration: false,
+                    end_bit: arg_u64(&e.args, "end_bit"),
+                });
+            }
+        }
+    }
+    // The in-order consumer emits publishes in chunk-index order; sort by ts to
+    // recover the true publish sequence regardless of file interleave.
     publishes.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
-    // De-duplicate identical (ts,end_bit) — a worker-early + later redundant
-    // consumer publish of the SAME chunk would otherwise double-count a link.
-    // Keep the first occurrence per end_bit (earliest publish unblocks the
-    // successor; the redundant re-publish is not a new link).
+    // De-dup identical end_bit (an eager-early + later redundant publish of the
+    // SAME chunk would double-count a link). Keep the FIRST (earliest unblocks
+    // the successor).
     let mut seen_endbits: std::collections::HashSet<u64> = std::collections::HashSet::new();
     publishes.retain(|p| match p.end_bit {
         Some(eb) => seen_endbits.insert(eb),
@@ -230,18 +353,27 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
     });
 
     let n_chunks = publishes.len();
-    let frontier_us = publishes
-        .first()
-        .map(|p| p.ts - trace_start)
-        .unwrap_or(0.0);
+    let frontier_us = publishes.first().map(|p| p.ts - trace_start).unwrap_or(0.0);
     let last_publish_ts = publishes.last().map(|p| p.ts);
     let tail_us = match last_publish_ts {
         Some(lp) => (trace_start + observed_wall_us) - lp,
         None => 0.0,
     };
 
-    // L_resolve = median steady-state inter-publish gap. Trim the first publish
-    // (frontier ramp folds into `frontier`) — every subsequent gap is a link.
+    // ── L_resolve: INDEPENDENT serial resolve WORK = publish span durations ───
+    // Only spans with a real measured duration count. If none, L_resolve is
+    // None and the publish-chain term is unpopulated — we DO NOT fall back to
+    // the inter-publish gap (that is the tautology).
+    let resolve_durs: Vec<f64> = publishes
+        .iter()
+        .filter(|p| p.has_duration)
+        .map(|p| p.dur)
+        .collect();
+    let n_publish_spans = resolve_durs.len();
+    let l_resolve_us = median(&resolve_durs);
+    let l_resolve_p95_us = percentile(&resolve_durs, 95.0);
+
+    // ── chain_gap: DESCRIPTIVE ONLY (never fed into wall_pred) ────────────────
     let mut gaps: Vec<f64> = Vec::new();
     for w in publishes.windows(2) {
         let g = w[1].ts - w[0].ts;
@@ -249,16 +381,12 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
             gaps.push(g);
         }
     }
-    // MEAN gap is the publish-chain rate the wall obeys: Σgaps = the whole
-    // first→last publish span, so N·mean reconstructs that span exactly. The
-    // median is a diagnostic only (bimodal distribution — see field doc).
-    let l_resolve_us = if gaps.is_empty() {
+    let chain_gap_mean_us = if gaps.is_empty() {
         None
     } else {
         Some(gaps.iter().sum::<f64>() / gaps.len() as f64)
     };
-    let l_resolve_median_us = median(&gaps);
-    let l_resolve_p95_us = percentile(&gaps, 95.0);
+    let chain_gap_median_us = median(&gaps);
 
     // ── T ────────────────────────────────────────────────────────────────────
     let workers = workers
@@ -266,14 +394,15 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         .unwrap_or(1)
         .max(1);
 
-    // ── prediction ────────────────────────────────────────────────────────────
+    // ── prediction (uses the INDEPENDENT L_resolve) ───────────────────────────
     let n = n_chunks as f64;
-    let worker_bound_us =
-        d_w_eff_us.map(|dwe| frontier_us + (n / workers as f64) * dwe);
-    // The chain is the first→last publish span anchored at `frontier` (=
-    // first publish), so it spans (N−1) links of mean latency, not N. Using
-    // mean L_resolve, frontier + (N−1)·L_resolve reconstructs last_publish
-    // exactly; + tail then reconstructs the wall.
+    let worker_bound_us = d_w_eff_us.map(|dwe| frontier_us + (n / workers as f64) * dwe);
+    // Publish-chain: the in-order consumer pays L_resolve of SERIAL work per
+    // link, over (N−1) links after the frontier. Because L_resolve is measured
+    // independently (not the gap), this is a genuine prediction: if the
+    // consumer's serial work doesn't reconstruct the first→last publish span,
+    // the residual is NONZERO — telling us how much of the chain is overlap /
+    // slack the simple serial-sum model omits.
     let n_links = (n - 1.0).max(0.0);
     let publish_chain_us = l_resolve_us.map(|lr| frontier_us + n_links * lr);
     let (wall_pred_us, binding) = match (worker_bound_us, publish_chain_us) {
@@ -294,12 +423,17 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         workers,
         n_chunks,
         d_w_us,
+        n_d_w,
         d_c_us,
+        n_d_c,
+        d_c_reliable,
         window_absent_frac,
         d_w_eff_us,
         l_resolve_us,
-        l_resolve_median_us,
+        n_publish_spans,
         l_resolve_p95_us,
+        chain_gap_mean_us,
+        chain_gap_median_us,
         frontier_us,
         tail_us,
         observed_wall_us,
@@ -311,8 +445,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
     }
 }
 
-/// Read T off a `drive` span's `parallelization` arg, if present (mirrors
-/// consumer::detect_parallelization so the two views agree on T).
+/// Read T off a `drive` span's `parallelization` arg, if present.
 fn detect_parallelization(events: &[Event]) -> Option<u64> {
     for e in events {
         if e.name == "drive" {
@@ -324,7 +457,10 @@ fn detect_parallelization(events: &[Event]) -> Option<u64> {
     None
 }
 
-/// Residual = (wall_pred − observed) / observed, as a signed fraction.
+/// Residual = (wall_pred − observed) / observed, as a signed fraction. With
+/// INDEPENDENT parameters this is genuinely nonzero — its sign tells you
+/// whether the serial-sum model OVER-predicts (serial work overlaps in
+/// reality ⇒ positive) or UNDER-predicts (unmodeled serial term ⇒ negative).
 pub fn residual_frac(p: &ModelParams) -> Option<f64> {
     p.wall_pred_us
         .map(|pred| (pred - p.observed_wall_us) / p.observed_wall_us.max(1.0))
@@ -342,9 +478,11 @@ pub struct ModelDelta {
     pub frac_a: f64,
     pub frac_b: f64,
     pub wall_ratio: f64,
-    /// The lever: which parameter's delta most explains the wall gap, with the
-    /// magnitude (wall-µs attributable).
+    /// The lever: which parameter's delta most explains the wall gap.
     pub lever: String,
+    /// Which single INDEPENDENT parameter the slower tool is WORST on relative
+    /// to the reference — for the holistic design step.
+    pub worst_param: String,
 }
 
 /// Compare two populated parameter sets. `a` is the baseline (gzippy), `b` the
@@ -357,9 +495,6 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
     };
     let wall_ratio = a.observed_wall_us / b.observed_wall_us.max(1.0);
 
-    // The lever lives on whatever term binds the SLOWER tool. If publish-chain
-    // binds the slower tool and L_resolve differs, L_resolve is the lever; if
-    // worker-bound binds, the decode latency (d_w_eff) is the lever.
     let (slower, faster) = if a.observed_wall_us >= b.observed_wall_us {
         (a, b)
     } else {
@@ -367,6 +502,7 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
     };
     let l_ratio = ratio(a.l_resolve_us, b.l_resolve_us);
     let dw_ratio = ratio(a.d_w_us, b.d_w_us);
+    let dc_ratio = ratio(a.d_c_us, b.d_c_us);
 
     let lever = match slower.binding {
         Binding::PublishChain => {
@@ -376,7 +512,7 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
             };
             format!(
                 "L_resolve (publish-chain binds the slower tool {}): {} vs {} per link \
-                 ⇒ ~{} of wall on N={} links{}",
+                 ⇒ ~{} of wall on {} links{}",
                 slower.label,
                 slower
                     .l_resolve_us
@@ -387,10 +523,7 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
                     .map(crate::trace::fmt_us)
                     .unwrap_or_else(|| "?".into()),
                 crate::trace::fmt_us(gap_us),
-                slower.n_chunks,
-                // Knee caveat: if the faster tool's worker-bound term is above
-                // the slower's publish-chain target, cutting L_resolve hits the
-                // knee before parity.
+                (slower.n_chunks as i64 - 1).max(0),
                 knee_caveat(slower, faster),
             )
         }
@@ -418,20 +551,45 @@ pub fn delta(a: &ModelParams, b: &ModelParams) -> ModelDelta {
             )
         }
         Binding::Unknown => "indeterminate (a term could not be populated — \
-            missing worker.decode or window_publish events)"
+            missing decode spans or publish spans/instants)"
             .to_string(),
+    };
+
+    // Worst parameter: the largest slower/faster ratio among the independently
+    // measured ones. Drives the holistic design step.
+    let worst_param = {
+        let cand: [(&str, Option<f64>); 3] = [
+            (
+                "d_w",
+                ratio(b.d_w_us, a.d_w_us).or(ratio(a.d_w_us, b.d_w_us)),
+            ),
+            (
+                "d_c",
+                ratio(b.d_c_us, a.d_c_us).or(ratio(a.d_c_us, b.d_c_us)),
+            ),
+            (
+                "L_resolve",
+                ratio(b.l_resolve_us, a.l_resolve_us).or(ratio(a.l_resolve_us, b.l_resolve_us)),
+            ),
+        ];
+        cand.iter()
+            .filter_map(|(n, r)| r.map(|r| (*n, (r - 1.0).abs())))
+            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_else(|| "indeterminate".into())
     };
 
     ModelDelta {
         a_label: a.label.clone(),
         b_label: b.label.clone(),
         d_w_ratio: dw_ratio,
-        d_c_ratio: ratio(a.d_c_us, b.d_c_us),
+        d_c_ratio: dc_ratio,
         l_resolve_ratio: l_ratio,
         frac_a: a.window_absent_frac,
         frac_b: b.window_absent_frac,
         wall_ratio,
         lever,
+        worst_param,
     }
 }
 
@@ -464,7 +622,7 @@ fn knee_caveat(slower: &ModelParams, faster: &ModelParams) -> String {
 mod tests {
     use super::*;
 
-    fn span(name: &str, mode: &str, tid: u64, t0: f64, t1: f64) -> [Event; 2] {
+    fn decode_span(name: &str, mode: &str, tid: u64, t0: f64, t1: f64) -> [Event; 2] {
         let args = serde_json::json!({ "mode": mode, "start_bit": (t0 as u64) });
         [
             Event {
@@ -486,43 +644,72 @@ mod tests {
         ]
     }
 
-    fn publish(ts: f64, end_bit: u64) -> Event {
-        Event {
-            name: "causal.window_publish".into(),
-            ph: "i".into(),
-            ts,
-            pid: 1,
-            tid: 1,
-            args: serde_json::json!({ "start_bit": end_bit - 100, "end_bit": end_bit, "site": "consumer" }),
-        }
+    /// A consumer publish as a B/E SPAN whose DURATION is the serial resolve
+    /// work (the independent L_resolve signal).
+    fn publish_span(t0: f64, dur: f64, end_bit: u64) -> [Event; 2] {
+        let args = serde_json::json!({ "start_bit": end_bit - 100, "end_bit": end_bit, "site": "consumer" });
+        [
+            Event {
+                name: "consumer.window_publish_marker".into(),
+                ph: "B".into(),
+                ts: t0,
+                pid: 1,
+                tid: 1,
+                args: args.clone(),
+            },
+            Event {
+                name: "consumer.window_publish_marker".into(),
+                ph: "E".into(),
+                ts: t0 + dur,
+                pid: 1,
+                tid: 1,
+                args,
+            },
+        ]
     }
 
-    /// Synthetic trace with HAND-KNOWN parameters:
-    ///   T = 4 workers, N = 8 chunks.
-    ///   d_c = 10ms (clean), d_w = 40ms (window-absent), all 8 window-absent
-    ///     ⇒ f = 1.0, d_w_eff = 40ms.
-    ///   window_publish every 5ms starting at t=20ms ⇒ frontier=20ms,
-    ///     L_resolve=5ms, 8 chunks ⇒ last publish at 20+35=55ms.
-    ///   Construct so the WALL is 60ms (tail = 5ms).
-    /// Expected:
-    ///   worker-bound  = frontier + (N/T)·d_w_eff   = 20 + (8/4)·40   = 100ms
-    ///   publish-chain = frontier + (N−1)·L_resolve = 20 + 7·5        = 55ms
-    ///   max = worker-bound 100ms ⇒ binding = WorkerBound
-    ///   wall_pred = 100 + tail(5) = 105ms
+    /// Anti-tautology synthetic trace. The hand-known INDEPENDENT parameters
+    /// DIFFER from the inter-publish gap, so a tautological (gap-based) model
+    /// would produce a DIFFERENT prediction and FAIL the asserts below.
+    ///
+    /// Setup: T=4, N=8, all window-absent (f=1), d_w=40ms.
+    ///   Publishes at t = 20,30,40,50,60,70,80,90 ms ⇒ inter-publish GAP = 10ms.
+    ///   Each publish SPAN duration (independent L_resolve) = 2ms — DELIBERATELY
+    ///     != the 10ms gap. The serial resolve work is only 2ms/link; the other
+    ///     8ms/link is overlap/idle.
+    ///   Wall anchored 0..100ms ⇒ tail = 100 − 90 = 10ms.
+    /// Expected (independent model):
+    ///   worker-bound  = frontier + (N/T)·d_w       = 20 + (8/4)·40 = 100ms
+    ///   publish-chain = frontier + (N−1)·L_resolve = 20 + 7·2       = 34ms
+    ///   max = worker-bound 100ms ⇒ wall_pred = 100 + tail(10) = 110ms.
+    /// A TAUTOLOGICAL model would compute publish-chain = 20 + 7·10 = 90ms =
+    /// last_publish, and (if it bound) wall_pred = 90 + 10 = 100ms = wall
+    /// EXACTLY (residual +0.0%). The asserts below pin L_resolve=2ms (NOT 10ms)
+    /// and publish-chain=34ms (NOT 90ms) — so re-introducing the gap-as-
+    /// L_resolve tautology breaks this test.
     #[test]
-    fn synthetic_known_params_populate_and_predict() {
+    fn independent_l_resolve_is_not_the_publish_gap() {
         let mut events: Vec<Event> = Vec::new();
-        // 8 window-absent decode spans, each 40ms, spread across 4 worker tids.
         for i in 0..8u64 {
-            let tid = 2 + (i % 4); // tids 2..=5 (consumer is tid 1)
+            let tid = 2 + (i % 4);
             let t0 = 1000.0 + i as f64 * 1000.0;
-            events.extend(span("worker.decode", "window_absent", tid, t0, t0 + 40_000.0));
+            events.extend(decode_span(
+                "worker.decode_chunk",
+                "window_absent",
+                tid,
+                t0,
+                t0 + 40_000.0,
+            ));
         }
-        // 8 publishes, 5ms apart, first at 20ms, end_bits distinct.
+        // Publishes 10ms apart, each a 2ms span. First at 20ms.
         for i in 0..8u64 {
-            events.push(publish(20_000.0 + i as f64 * 5_000.0, 1000 + i * 100));
+            events.extend(publish_span(
+                20_000.0 + i as f64 * 10_000.0,
+                2_000.0,
+                1000 + i * 100,
+            ));
         }
-        // Anchor wall: a consumer span from t=0 to t=60ms so observed wall=60ms.
+        // Wall anchor 0..100ms.
         events.push(Event {
             name: "drive".into(),
             ph: "B".into(),
@@ -534,7 +721,7 @@ mod tests {
         events.push(Event {
             name: "drive".into(),
             ph: "E".into(),
-            ts: 60_000.0,
+            ts: 100_000.0,
             pid: 1,
             tid: 1,
             args: serde_json::Value::Null,
@@ -545,63 +732,134 @@ mod tests {
         assert_eq!(p.n_chunks, 8);
         assert_eq!(p.n_decode_spans, 8);
         assert_eq!(p.d_w_us, Some(40_000.0), "d_w median");
-        assert_eq!(p.d_c_us, None, "no clean spans");
         assert!((p.window_absent_frac - 1.0).abs() < 1e-9);
-        assert_eq!(p.d_w_eff_us, Some(40_000.0));
-        assert_eq!(p.l_resolve_us, Some(5_000.0), "L_resolve = 5ms gap");
-        // frontier = first publish (20ms) − trace start (0) = 20ms.
-        assert!((p.frontier_us - 20_000.0).abs() < 1.0, "frontier {}", p.frontier_us);
-        // observed wall = 60ms (drive span 0..60ms).
-        assert!((p.observed_wall_us - 60_000.0).abs() < 1.0);
-        // tail = wall-end (60ms) − last publish (55ms) = 5ms.
-        assert!((p.tail_us - 5_000.0).abs() < 1.0, "tail {}", p.tail_us);
-        // worker-bound = 20 + (8/4)·40 = 100ms.
-        assert!(
-            (p.worker_bound_us.unwrap() - 100_000.0).abs() < 1.0,
-            "worker_bound {}",
-            p.worker_bound_us.unwrap()
+
+        // THE anti-tautology assertions: L_resolve is the SPAN DURATION (2ms),
+        // NOT the inter-publish gap (10ms).
+        assert_eq!(
+            p.l_resolve_us,
+            Some(2_000.0),
+            "L_resolve = independent span duration, not gap"
         );
-        // publish-chain = frontier + (N−1)·L_resolve = 20 + 7·5 = 55ms.
+        assert_eq!(p.n_publish_spans, 8, "all 8 publishes are B/E spans");
+        assert_eq!(
+            p.chain_gap_mean_us,
+            Some(10_000.0),
+            "chain_gap is descriptive = 10ms gap"
+        );
+        // The two MUST differ — that is the whole point.
+        assert_ne!(
+            p.l_resolve_us, p.chain_gap_mean_us,
+            "tautology returned: L_resolve == gap"
+        );
+
+        // frontier = 20ms, tail = 100−90 = 10ms.
         assert!(
-            (p.publish_chain_us.unwrap() - 55_000.0).abs() < 1.0,
-            "publish_chain {}",
+            (p.frontier_us - 20_000.0).abs() < 1.0,
+            "frontier {}",
+            p.frontier_us
+        );
+        assert!((p.tail_us - 10_000.0).abs() < 1.0, "tail {}", p.tail_us);
+
+        // publish-chain = 20 + 7·2 = 34ms (NOT the tautological 90ms).
+        assert!(
+            (p.publish_chain_us.unwrap() - 34_000.0).abs() < 1.0,
+            "publish_chain {} (tautology would give 90ms)",
             p.publish_chain_us.unwrap()
         );
-        // max(100,60)=100 ⇒ worker-bound; wall_pred = 100+5 = 105ms.
+        // worker-bound = 20 + 2·40 = 100ms; binds.
+        assert!((p.worker_bound_us.unwrap() - 100_000.0).abs() < 1.0);
         assert_eq!(p.binding, Binding::WorkerBound);
+        // wall_pred = 100 + 10 = 110ms ≠ wall(100ms) ⇒ residual = +10% (REAL,
+        // nonzero — proves the prediction is not a telescoping identity).
         assert!(
-            (p.wall_pred_us.unwrap() - 105_000.0).abs() < 1.0,
+            (p.wall_pred_us.unwrap() - 110_000.0).abs() < 1.0,
             "wall_pred {}",
             p.wall_pred_us.unwrap()
         );
+        let r = residual_frac(&p).unwrap();
+        assert!(
+            (r - 0.10).abs() < 1e-3,
+            "residual {r} should be +10% (nonzero)"
+        );
+        assert!(
+            r.abs() > 1e-6,
+            "residual must be NONZERO — a +0.0% is the tautology"
+        );
     }
 
-    /// A publish-chain-bound trace: slow L_resolve so N·L_resolve dominates,
-    /// and the delta vs a faster tool names L_resolve as the lever.
+    /// When publish-chain binds, the independent model must STILL yield a
+    /// nonzero residual (the tautology guard for the publish-chain branch).
     #[test]
-    fn publish_chain_binds_and_delta_names_l_resolve() {
-        // Tool A (slow): L_resolve = 20ms, d_w = 10ms, T=8, N=10.
+    fn publish_chain_binds_with_nonzero_residual() {
+        let mut events: Vec<Event> = Vec::new();
+        // Slow resolve: L_resolve span = 20ms each; fast decode 10ms, T=8, N=10.
+        for i in 0..10u64 {
+            let t0 = i as f64 * 100.0;
+            events.extend(decode_span(
+                "worker.decode_chunk",
+                "window_absent",
+                2 + i % 8,
+                t0,
+                t0 + 10_000.0,
+            ));
+        }
+        // Publishes 25ms apart (gap), each a 20ms span (independent L_resolve).
+        // gap(25ms) != L_resolve(20ms) ⇒ a gap-tautology would mispredict.
+        for i in 0..10u64 {
+            events.extend(publish_span(i as f64 * 25_000.0, 20_000.0, 1000 + i * 100));
+        }
+        let p = analyze(&events, "slow", Some(8));
         // worker-bound  = 0 + (10/8)·10 = 12.5ms
-        // publish-chain = 0 + 10·20     = 200ms  ⇒ binds.
+        // publish-chain = 0 + 9·20      = 180ms  ⇒ binds.
+        assert_eq!(p.binding, Binding::PublishChain, "publish-chain binds");
+        assert_eq!(p.l_resolve_us, Some(20_000.0), "L_resolve = span duration");
+        assert_ne!(
+            p.l_resolve_us, p.chain_gap_mean_us,
+            "L_resolve must differ from gap"
+        );
+        // wall_pred = 180 + tail (NONZERO residual since 180 != first→last span).
+        let r = residual_frac(&p).unwrap();
+        assert!(
+            r.abs() > 1e-3,
+            "residual {r} must be nonzero (not a tautology)"
+        );
+    }
+
+    /// Delta names L_resolve as lever when publish-chain binds the slower tool.
+    #[test]
+    fn delta_names_l_resolve_lever() {
         let mut a_events: Vec<Event> = Vec::new();
         for i in 0..10u64 {
             let t0 = i as f64 * 100.0;
-            a_events.extend(span("worker.decode", "window_absent", 2 + i % 8, t0, t0 + 10_000.0));
+            a_events.extend(decode_span(
+                "worker.decode_chunk",
+                "window_absent",
+                2 + i % 8,
+                t0,
+                t0 + 10_000.0,
+            ));
         }
         for i in 0..10u64 {
-            a_events.push(publish(i as f64 * 20_000.0, 1000 + i * 100));
+            a_events.extend(publish_span(i as f64 * 25_000.0, 20_000.0, 1000 + i * 100));
         }
         let a = analyze(&a_events, "slow", Some(8));
-        assert_eq!(a.binding, Binding::PublishChain, "A publish-chain binds");
+        assert_eq!(a.binding, Binding::PublishChain);
 
-        // Tool B (fast): L_resolve = 4ms (5× faster resolve), same decode/T/N.
         let mut b_events: Vec<Event> = Vec::new();
         for i in 0..10u64 {
             let t0 = i as f64 * 100.0;
-            b_events.extend(span("worker.decode", "window_absent", 2 + i % 8, t0, t0 + 10_000.0));
+            b_events.extend(decode_span(
+                "worker.decode_chunk",
+                "window_absent",
+                2 + i % 8,
+                t0,
+                t0 + 10_000.0,
+            ));
         }
+        // Fast resolve: 4ms spans, 5ms gaps.
         for i in 0..10u64 {
-            b_events.push(publish(i as f64 * 4_000.0, 1000 + i * 100));
+            b_events.extend(publish_span(i as f64 * 5_000.0, 4_000.0, 1000 + i * 100));
         }
         let b = analyze(&b_events, "fast", Some(8));
 
@@ -609,6 +867,124 @@ mod tests {
         assert!(d.lever.contains("L_resolve"), "lever: {}", d.lever);
         // L_resolve ratio b/a = 4/20 = 0.2.
         assert!((d.l_resolve_ratio.unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    /// Instant-only publishes (old rapidgzip patch) ⇒ NO independent L_resolve.
+    /// The model must NOT fabricate one from the gap; publish-chain unpopulated.
+    #[test]
+    fn instant_publishes_yield_no_independent_l_resolve() {
+        let mut events: Vec<Event> = Vec::new();
+        for i in 0..4u64 {
+            let t0 = i as f64 * 100.0;
+            events.extend(decode_span(
+                "worker.decode",
+                "window_absent",
+                2 + i,
+                t0,
+                t0 + 10_000.0,
+            ));
+        }
+        for i in 0..4u64 {
+            events.push(Event {
+                name: "causal.window_publish".into(),
+                ph: "i".into(),
+                ts: i as f64 * 5_000.0,
+                pid: 1,
+                tid: 1,
+                args: serde_json::json!({ "end_bit": 1000 + i * 100 }),
+            });
+        }
+        let p = analyze(&events, "instant-only", Some(4));
+        assert_eq!(
+            p.n_chunks, 4,
+            "instant publishes still counted for N/frontier/tail"
+        );
+        assert_eq!(p.n_publish_spans, 0, "no B/E publish spans");
+        assert_eq!(
+            p.l_resolve_us, None,
+            "no independent L_resolve from instants"
+        );
+        assert_eq!(
+            p.publish_chain_us, None,
+            "publish-chain cannot be predicted"
+        );
+        // chain_gap IS available (descriptive) but must not leak into the model.
+        assert_eq!(p.chain_gap_mean_us, Some(5_000.0));
+        assert_eq!(
+            p.binding,
+            Binding::WorkerBound,
+            "only worker-bound is populated"
+        );
+    }
+
+    /// gzippy derives decode mode from `speculative` when `mode` is absent.
+    #[test]
+    fn gzippy_speculative_arg_drives_mode() {
+        let mut events: Vec<Event> = Vec::new();
+        for i in 0..4u64 {
+            let t0 = i as f64 * 1000.0;
+            let spec = i % 2 == 0; // alternate
+            let args = serde_json::json!({ "speculative": spec, "start_bit": t0 as u64 });
+            events.push(Event {
+                name: "worker.decode_chunk".into(),
+                ph: "B".into(),
+                ts: t0,
+                pid: 1,
+                tid: 2 + i,
+                args: args.clone(),
+            });
+            events.push(Event {
+                name: "worker.decode_chunk".into(),
+                ph: "E".into(),
+                ts: t0 + 5_000.0,
+                pid: 1,
+                tid: 2 + i,
+                args,
+            });
+        }
+        let p = analyze(&events, "gz", Some(4));
+        assert_eq!(p.n_decode_spans, 4);
+        assert_eq!(p.n_d_w, 2, "two speculative=true ⇒ window_absent");
+        assert_eq!(p.n_d_c, 2, "two speculative=false ⇒ clean");
+    }
+
+    /// The `worker.decode_mode` instant (gzippy's authoritative mode) OVERRIDES
+    /// the span's `speculative` arg when they disagree (a prefetch that raced
+    /// the publish and ran CLEAN despite speculative=true).
+    #[test]
+    fn decode_mode_instant_overrides_speculative_arg() {
+        let mut events: Vec<Event> = Vec::new();
+        // Span at start_bit=500 tagged speculative=true (intent) but the
+        // authoritative instant says it ran CLEAN.
+        let span_args = serde_json::json!({ "speculative": true, "start_bit": 500u64 });
+        events.push(Event {
+            name: "worker.decode_chunk".into(),
+            ph: "B".into(),
+            ts: 0.0,
+            pid: 1,
+            tid: 2,
+            args: span_args.clone(),
+        });
+        events.push(Event {
+            name: "worker.decode_chunk".into(),
+            ph: "E".into(),
+            ts: 7_000.0,
+            pid: 1,
+            tid: 2,
+            args: span_args,
+        });
+        events.push(Event {
+            name: "worker.decode_mode".into(),
+            ph: "i".into(),
+            ts: 1.0,
+            pid: 1,
+            tid: 2,
+            args: serde_json::json!({ "start_bit": 500u64, "mode": "clean" }),
+        });
+        let p = analyze(&events, "gz", Some(4));
+        assert_eq!(p.n_d_c, 1, "instant mode=clean wins over speculative=true");
+        assert_eq!(p.n_d_w, 0);
+        assert_eq!(p.d_c_us, Some(7_000.0));
     }
 
     #[test]

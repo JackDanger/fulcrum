@@ -640,10 +640,12 @@ fn cmd_model(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let label = labels
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| Path::new(path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string()));
+        let label = labels.get(i).cloned().unwrap_or_else(|| {
+            Path::new(path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        });
         let p = model::analyze(&events, &label, workers);
         print_model(path, &p);
         populated.push(p);
@@ -669,14 +671,38 @@ fn print_model(path: &str, p: &model::ModelParams) {
         (p.window_absent_frac * p.n_decode_spans as f64).round() as u64,
         p.n_decode_spans
     );
-    println!("  d_c (clean decode)    : {}", o(p.d_c_us));
-    println!("  d_w (window-absent)   : {}", o(p.d_w_us));
+    println!(
+        "  d_c (clean decode)    : {}   [n={}{}]",
+        o(p.d_c_us),
+        p.n_d_c,
+        if p.d_c_reliable {
+            ""
+        } else {
+            " UNRELIABLE (cold-start n)"
+        }
+    );
+    println!(
+        "  d_w (window-absent)   : {}   [n={}]",
+        o(p.d_w_us),
+        p.n_d_w
+    );
     println!("  d_w_eff (f-weighted)  : {}", o(p.d_w_eff_us));
     println!(
-        "  L_resolve (MEAN)      : {}   [median {} | p95 {}]   << THE parameter",
+        "  L_resolve (INDEP)     : {}   [median publish-span dur, n={} | p95 {}]   << THE parameter (serial resolve WORK, NOT the inter-publish gap)",
         o(p.l_resolve_us),
-        o(p.l_resolve_median_us),
+        p.n_publish_spans,
         o(p.l_resolve_p95_us)
+    );
+    if p.n_publish_spans == 0 {
+        println!(
+            "    !! NO independent L_resolve: trace has instant publishes only (no span \
+             duration). publish-chain term is UNPOPULATED — cannot predict it."
+        );
+    }
+    println!(
+        "  chain_gap (DESCRIPTIVE): mean {} | median {}   (inter-publish gap — the OLD tautological 'L_resolve'; NOT fed into wall_pred)",
+        o(p.chain_gap_mean_us),
+        o(p.chain_gap_median_us)
     );
     println!("  frontier (startup)    : {}", trace::fmt_us(p.frontier_us));
     println!("  tail (drain)          : {}", trace::fmt_us(p.tail_us));
@@ -686,7 +712,7 @@ fn print_model(path: &str, p: &model::ModelParams) {
         o(p.worker_bound_us)
     );
     println!(
-        "  publish-chain = frontier + N·L_resolve   = {}   [{}]",
+        "  publish-chain = frontier + (N−1)·L_resolve = {}   [{}]",
         o(p.publish_chain_us),
         if p.binding == model::Binding::PublishChain {
             "BINDS"
@@ -699,13 +725,21 @@ fn print_model(path: &str, p: &model::ModelParams) {
         o(p.wall_pred_us),
         p.binding.label()
     );
-    println!("  wall_observed         : {}", trace::fmt_us(p.observed_wall_us));
+    println!(
+        "  wall_observed         : {}",
+        trace::fmt_us(p.observed_wall_us)
+    );
     match model::residual_frac(p) {
         Some(r) => {
-            let verdict = if r.abs() <= 0.10 {
-                "MODEL CONFIRMED (residual within ±10% noise)"
+            // With INDEPENDENT parameters a nonzero residual is EXPECTED and
+            // GOOD (genuine prediction). A +0.0% means the gap-as-L_resolve
+            // tautology has crept back in — that is a FAILURE, not a confirm.
+            let verdict = if r.abs() < 1e-4 {
+                "SUSPICIOUS: ~0% residual — likely the tautology returned (L_resolve == inter-publish gap). The prediction is not independent."
+            } else if r.abs() <= 0.15 {
+                "GOOD: small NONZERO residual ⇒ independent params predict the wall well"
             } else {
-                "RESIDUAL EXCEEDS 10% — model under-/over-predicts; an unmodeled term exists"
+                "LARGE residual — the serial-sum model omits a term (overlap/slack if +, hidden serial cost if −)"
             };
             println!(
                 "  residual (pred−obs)   : {:+.1}%   {}",
@@ -713,32 +747,40 @@ fn print_model(path: &str, p: &model::ModelParams) {
                 verdict
             );
         }
-        None => println!("  residual              : n/a (a model term is unpopulated)"),
+        None => println!(
+            "  residual              : n/a (publish-chain unpopulated — no independent L_resolve signal in this trace)"
+        ),
     }
 }
 
 fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
     let d = model::delta(a, b);
-    let r = |x: Option<f64>| x.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "n/a".into());
-    println!(
-        "\n========  DELTA  {} − {}  ========",
-        d.a_label, d.b_label
-    );
+    let r = |x: Option<f64>| {
+        x.map(|v| format!("{v:.2}×"))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    println!("\n========  DELTA  {} − {}  ========", d.a_label, d.b_label);
     println!(
         "  wall ratio {}/{}      : {:.2}×  (>1 ⇒ {} is slower)",
         d.a_label, d.b_label, d.wall_ratio, d.a_label
     );
     println!(
         "  d_w  ratio ({}/{})   : {}",
-        d.b_label, d.a_label, r(d.d_w_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.d_w_ratio)
     );
     println!(
         "  d_c  ratio ({}/{})   : {}",
-        d.b_label, d.a_label, r(d.d_c_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.d_c_ratio)
     );
     println!(
         "  L_resolve ratio ({}/{}): {}",
-        d.b_label, d.a_label, r(d.l_resolve_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.l_resolve_ratio)
     );
     println!(
         "  window-absent frac    : {} {:.1}%   vs   {} {:.1}%",
@@ -747,7 +789,11 @@ fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
         d.b_label,
         d.frac_b * 100.0
     );
-    println!("\n  LEVER: {}", d.lever);
+    println!(
+        "\n  WORST PARAM ({} vs {}): {}",
+        d.a_label, d.b_label, d.worst_param
+    );
+    println!("  LEVER: {}", d.lever);
 }
 
 /// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
