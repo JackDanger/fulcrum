@@ -310,8 +310,25 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
     for tname in &tools {
         print!("| {:>8} {:>6} ", format!("{tname}_dn"), "eff");
     }
-    println!("| {:>9} | {:>10}", "ratio", "sinktax");
+    println!(
+        "| {:>9} | {:>10} | {:>9} | {:>10}",
+        "ratio", "sinktax", "ref_med", "ref_spread"
+    );
     println!("{}", "-".repeat(100));
+
+    // Full-stat lookup (min/median/spread) for the reference tool, so each row
+    // can surface the run-to-run spread alongside the min — a large spread means
+    // the min is a lucky draw and the ratio above it is noisy.
+    let refstat = |t: usize, sink: &str| -> Option<WallStat> {
+        let keys: &[&str] = if sink == "file" {
+            &["file", "tmpfs"]
+        } else {
+            &[sink]
+        };
+        keys.iter()
+            .find_map(|k| wall.get(&(reference.to_string(), t, k.to_string())))
+            .and_then(|v| stat(v.clone()))
+    };
 
     let t1 = *threads.first().unwrap_or(&1);
     for &t in &threads {

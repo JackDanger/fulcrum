@@ -172,6 +172,10 @@ pub struct ConsumerReport {
     pub by_class: BTreeMap<&'static str, f64>,
     /// The busy/idle/span reconciliation.
     pub reconcile: Reconcile,
+    /// Begins still open at EOF that were synthetically closed at the last
+    /// observed timestamp — a truncated-trace indicator (the real causal_T*.json
+    /// end mid-stream, so this is normally non-zero for the outer umbrellas).
+    pub unclosed_at_eof: usize,
 }
 
 /// Pick the consumer thread: the `(pid, tid)` with the most WAIT self-time
@@ -395,6 +399,7 @@ pub fn analyze(events: &[Event]) -> ConsumerReport {
             residual_us,
             reconciled,
         },
+        unclosed_at_eof: sr.unclosed_at_eof,
     }
 }
 
@@ -438,7 +443,13 @@ mod tests {
         // making Σ = 100+40+30 = 170 > the 100µs span — the exact bug class that
         // made combine_crc look like 62ms. Assert Σ self == span instead.
         assert_eq!(sr.total_self_us, 100.0);
-        assert_eq!(sr.outer_incl_us, 100.0);
+        // For a complete trace the consumer time-extent equals the outermost
+        // inclusive span (both 100µs here).
+        assert_eq!(sr.extent_us, 100.0);
+        assert_eq!(
+            sr.unclosed_at_eof, 0,
+            "all begins closed in a complete trace"
+        );
     }
 
     /// A same-name nested span (outer `loop`, inner `loop`) is the trickiest
@@ -461,7 +472,7 @@ mod tests {
             sr.self_us["loop"], 100.0,
             "same-name nesting: exclusive total is the span, not span+inner"
         );
-        assert_eq!(sr.outer_incl_us, 100.0);
+        assert_eq!(sr.extent_us, 100.0);
     }
 
     /// busy + idle == span reconciliation. By construction Σ self-time equals
@@ -532,6 +543,10 @@ mod tests {
             r.reconcile.residual_us
         );
         assert_eq!(r.consumer_span_us, 200.0, "universe is the time-extent");
+        assert_eq!(
+            r.unclosed_at_eof, 2,
+            "drive + consumer.iter were left open by the truncation"
+        );
         assert_eq!(*r.by_class.get("OUTPUT").unwrap(), 120.0);
         assert_eq!(
             *r.by_class.get("IDLE").unwrap(),

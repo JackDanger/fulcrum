@@ -575,6 +575,12 @@ fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
             "FAIL — unmatched begin/end; numbers above are SUSPECT"
         },
     );
+    if r.unclosed_at_eof > 0 {
+        println!(
+            "             ({} outer span(s) left open by a truncated trace, closed at last-observed ts)",
+            r.unclosed_at_eof
+        );
+    }
 }
 
 /// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
