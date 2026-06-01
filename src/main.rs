@@ -717,6 +717,37 @@ fn cmd_decompose(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `fulcrum alloc <trace.json>` — the allocation view. Reads the
+/// `alloc.region` (+ `rusage.region` minflt) instants gzippy emits, joins them
+/// per-`(tid,region)`, and LOCALIZES minor faults to the frontier-decode region
+/// the consumer blocks on — WITHOUT decompose's CPU-sum-over-wall lie. Prints a
+/// descriptive verdict (reuse / huge churn / THP / fault concentration); never
+/// claims a wall lever (that needs S3 + a warm-buffer perturbation).
+fn cmd_alloc(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(trace_path) = pos.first() else {
+        eprintln!("usage: fulcrum alloc <trace.json>\n  (trace from a gzippy run with GZIPPY_TIMELINE set, built --features rpmalloc-stats)");
+        return ExitCode::FAILURE;
+    };
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spans = trace::pair_spans(&events);
+    let mut bndl = bundle::ProfileBundle::from_spans(&spans);
+    let samples = fulcrum::alloc::alloc_samples(&events);
+    let orphans = bndl.join_samples(&spans, &samples);
+    let report = fulcrum::alloc::analyze(&bndl);
+    print!("{}", fulcrum::alloc::render(&report));
+    if orphans > 0 {
+        println!("  ({orphans} alloc samples fell outside any span — trace coverage gap)");
+    }
+    ExitCode::SUCCESS
+}
+
 /// Pull residual counters out of the trace. gzippy emits them as instant
 /// events named `rusage.region` carrying `tid`-implied + counter args; we read
 /// any instant whose args contain known residual counter keys and turn it into
@@ -1739,6 +1770,7 @@ fn main() -> ExitCode {
         "consumer" => cmd_consumer(rest),
         "schedule" => cmd_schedule(rest),
         "decompose" => cmd_decompose(rest),
+        "alloc" => cmd_alloc(rest),
         "model" => cmd_model(rest),
         "vs" => cmd_vs(rest),
         "vs-sweep" => cmd_vs_sweep(rest),
