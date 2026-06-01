@@ -203,15 +203,18 @@ pub fn render(d: &Decomposition) -> String {
         d.wall_us / 1000.0
     ));
     out.push_str(&format!(
-        "  Σ named regions       : {:.2}ms ({:.1}%)\n",
+        "  consumer own work     : {:.2}ms ({:.1}%)  (COMPUTE+OUTPUT self-time)\n",
         d.named_region_us / 1000.0,
         100.0 * d.named_region_us / wall
     ));
     out.push_str(&format!(
-        "  residual (unexplained): {:.2}ms ({:.1}%)\n",
+        "  wait/residual         : {:.2}ms ({:.1}%)  (consumer blocked on producers + unmodeled)\n",
         d.residual_us / 1000.0,
         100.0 * d.residual_us / wall
     ));
+    out.push_str(
+        "  (the rusage counters below are summed ACROSS ALL THREADS, so a term can\n   exceed the consumer's own self-time — it NAMES the producer-side mechanism\n   the consumer waits on. % is of WALL.)\n",
+    );
     if d.terms.is_empty() {
         out.push_str(
             "  NAMED residual        : (no getrusage/schedstat counters in trace — \
@@ -238,9 +241,12 @@ pub fn render(d: &Decomposition) -> String {
             d.unnamed_residual_us / 1000.0,
             100.0 * d.unnamed_residual_us / wall
         ));
+        let top = terms.first().unwrap();
         out.push_str(&format!(
-            "  VERDICT: named {:.0}% of the residual.\n",
-            100.0 * d.named_residual_frac()
+            "  VERDICT: dominant NAMED mechanism = {} ({:.1}% of wall, {:.0} events).\n",
+            top.name,
+            100.0 * top.modeled_us / wall,
+            top.raw
         ));
     }
     out
