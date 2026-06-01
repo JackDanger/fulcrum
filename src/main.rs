@@ -40,8 +40,9 @@ USAGE:\n\
   fulcrum mech-report <perf_report.txt>\n\
   fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
   fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
-  fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]\n\
-  fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels a,b] [--config c.json]\n\
+  fulcrum vs <A-trace.json> <B-trace.json> [--labels a,b] [--config profile]\n\
+  fulcrum vs-sweep --at T:a.json:b.json [--at ...] [--labels a,b] [--config c.json]\n\
+  fulcrum flow <trace.json> [--whatif stage:factor] [--config profile]\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
@@ -53,8 +54,13 @@ USAGE:\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
 `fulcrum::probe` writes one when FULCRUM_TRACE=/path.json is set). profile.coz\n\
-is produced by running your instrumented binary under `coz run`. With no\n\
---config, a built-in demo config (matching examples/toy_pipeline.rs) is used.\n\
+is produced by running your instrumented binary under `coz run`.\n\
+\n\
+--config takes a profile.json PATH or a built-in profile NAME: `generic`\n\
+(the no-vocabulary default — works on any pipeline via the universal wait\n\
+convention), `gzippy` (the worked example vocabulary), or `demo` (matches\n\
+examples/toy_pipeline.rs). The consumer/flow/vs views classify span names\n\
+entirely from the config, so they run on YOUR span vocabulary unchanged.\n\
 \n\
 compare/audit run a FAIR cross-tool benchmark from a generic --spec JSON\n\
 (no competitor names baked in): it verifies every output's sha256 vs a\n\

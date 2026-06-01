@@ -113,6 +113,59 @@ Two backends, both zero-config:
 
 Describe your regions in a small JSON config (see [`examples/profile.example.json`](examples/profile.example.json)) and pass it with `--config`. The region names in `scope()`/`progress()` are the same strings the config and analyzer key on — they stay in lockstep through inlining and LTO.
 
+### Fulcrum is a general profiler — the gzippy values are just one profile
+
+Nothing pipeline-specific is compiled into the analyzer. The views that split the consumer timeline (`consumer`, `flow`, `critpath`, `vs`, `vs-sweep`) classify span names entirely from config, so they work on **your** vocabulary with no code change:
+
+```jsonc
+{
+  "regions": [ /* … your Coz/perf regions … */ ],
+
+  // Which thread is the in-order consumer, and how to bucket its spans into
+  // WAIT / COMPUTE / OUTPUT / IDLE for `fulcrum consumer`.
+  "consumer": {
+    "thread_prefix": "sink.",                 // identifies the consumer thread
+    "output":  { "exact": ["sink.flush"] },   // the irreducible byte floor
+    "compute": { "prefixes": ["sink.encode"] },
+    "idle_umbrellas": { "exact": ["sink.loop"] }
+    // WAIT is recognized automatically for the universal convention
+    // (wait.* / *.wait / *recv*); add a "wait" matcher for non-conventional names.
+  },
+
+  // Pipeline stages for `fulcrum flow`, matched in declaration order (first
+  // match wins). A name starting with "·" is a recognized non-stage (a wait or
+  // an umbrella) — kept out of UNCLASSIFIED but contributing no busy work.
+  "stages": [
+    { "name": "1·read",   "exact": ["src.read"] },
+    { "name": "2·encode", "prefixes": ["sink.encode"] }
+  ],
+
+  // Inner worker phases to prefer as critical-path blockers (so a consumer
+  // stall is blamed on the real phase, not the task umbrella that wraps it).
+  "inner_blockers": ["worker.compress", "worker.checksum"]
+}
+```
+
+Every matcher is `{exact, prefixes, suffixes, substrings}` (OR-combined). Three profiles ship built-in and are selectable by name with `--config <name>`:
+
+- `--config generic` (the default with no `--config`): no pipeline vocabulary. The consumer view still finds the consumer by the most-wait heuristic and classifies waits by the universal convention; `flow` reports everything as UNCLASSIFIED and prints the span vocabulary you should turn into stages — the honest "I don't know your pipeline yet" starting point.
+- `--config gzippy`: the worked example — gzippy's parallel-decode vocabulary (`worker.bootstrap`, `consumer.write_data`, …). Profiling gzippy works out of the box.
+- `--config demo`: matches the bundled `examples/toy_pipeline.rs`.
+
+The new views these drive:
+
+```bash
+fulcrum consumer run.json                 # WAIT/COMPUTE/OUTPUT/IDLE split of the
+                                          # consumer wall, with a busy+idle==span
+                                          # reconciliation that fails loudly if the
+                                          # B/E pairing is unsound
+fulcrum flow run.json --whatif encode:2   # per-stage wall-critical vs slack, +
+                                          # a critical-path-bounded what-if
+fulcrum vs a.json b.json                  # span-by-span A-vs-B for two traces of
+                                          # the same pipeline shape
+fulcrum vs-sweep --at 8:a8.json:b8.json … # per-thread-count cross-tool divergence
+```
+
 ### The full workflow on Linux
 
 `fulcrum plan` prints the exact commands for your binary:
