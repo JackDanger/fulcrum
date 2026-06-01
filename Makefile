@@ -109,7 +109,7 @@ release: test
 # ── plumbing ──────────────────────────────────────────────────────────────────
 
 build:
-	cargo build --release --examples
+	cargo build --release --bin fulcrum --examples
 
 clean:
 	@rm -f $(TRACE) /tmp/fulcrum_toy_2w.json /tmp/fulcrum_toy_8w.json \
