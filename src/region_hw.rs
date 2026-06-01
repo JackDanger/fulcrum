@@ -563,6 +563,276 @@ fn span_matches(s: &Span, subs: &[String]) -> bool {
     subs.iter().any(|sub| s.name.contains(sub.as_str()))
 }
 
+/// The concurrency above which a per-region counter split is structurally
+/// untrustworthy: more than half this region's wall overlaps OTHER regions
+/// running on other threads, so the interval-overlap attribution smears their
+/// counts together. At/above this the gate FAILS CLOSED.
+pub const SMEAR_GATE_CONCURRENCY: f64 = 0.5;
+
+/// Tolerance for the conservation self-checks (attributed-vs-whole-process).
+pub const CONSERVATION_TOL: f64 = 0.05;
+
+/// Fail-closed trust verdict for a `region_hw` rollup. This is the anti-phantom
+/// gate: it REFUSES to bless a per-region split (and blocks any downstream
+/// "confirmed" verdict) when the windows are smeared, or when the attributed
+/// counters do not conserve against the whole-process totals.
+///
+/// Three independent checks, ALL must pass for `trusted == true`:
+/// 1. **Smear gate** — no region with wall>0 may have concurrency ≥
+///    [`SMEAR_GATE_CONCURRENCY`]. A smeared region's counts are an
+///    indistinguishable blend of itself and whatever else ran in its window.
+/// 2. **Cycles conservation** — Σ attributed `cycles` over regions must equal
+///    the whole-process `cycles` total within [`CONSERVATION_TOL`]. A large
+///    deficit is the UNATTRIBUTED HOLE (e.g. consumer-wait latency that retires
+///    no instructions on any traced region) — exactly the thing region_hw
+///    cannot see, surfaced as a number.
+/// 3. **Instructions conservation** — same, for `instructions`.
+///
+/// `whole_*` are the whole-process `perf stat` totals (concurrency-immune). Pass
+/// `None` to skip a conservation check (only the smear gate then runs).
+#[derive(Debug, Clone)]
+pub struct TrustVerdict {
+    pub trusted: bool,
+    /// Regions whose concurrency ≥ the gate (smeared).
+    pub smeared: Vec<String>,
+    pub max_concurrency: f64,
+    /// Σ attributed cycles / instructions over regions.
+    pub attributed_cycles: f64,
+    pub attributed_instructions: f64,
+    /// Whole-process totals (concurrency-immune), if provided.
+    pub whole_cycles: Option<f64>,
+    pub whole_instructions: Option<f64>,
+    /// Conservation gaps as a SIGNED fraction of the whole-process total
+    /// ((attributed - whole) / whole). Negative = the unattributed hole.
+    pub cycles_gap_frac: Option<f64>,
+    pub instructions_gap_frac: Option<f64>,
+    pub lines: Vec<String>,
+}
+
+impl TrustVerdict {
+    fn sum_counter(rows: &[RegionHw], name: &str) -> f64 {
+        rows.iter()
+            .filter_map(|r| r.counters.get(name).copied())
+            .sum()
+    }
+}
+
+/// Compute the fail-closed trust verdict (see [`TrustVerdict`]).
+pub fn trust_gate(
+    rows: &[RegionHw],
+    whole_cycles: Option<f64>,
+    whole_instructions: Option<f64>,
+) -> TrustVerdict {
+    let mut lines = Vec::new();
+    let mut trusted = true;
+
+    // (1) smear gate.
+    let smeared: Vec<String> = rows
+        .iter()
+        .filter(|r| r.wall_us > 0.0 && r.concurrency >= SMEAR_GATE_CONCURRENCY)
+        .map(|r| format!("{} (conc={:.0}%)", r.region, r.concurrency * 100.0))
+        .collect();
+    let max_concurrency = rows
+        .iter()
+        .filter(|r| r.wall_us > 0.0)
+        .map(|r| r.concurrency)
+        .fold(0.0_f64, f64::max);
+    if !smeared.is_empty() {
+        trusted = false;
+        lines.push(format!(
+            "SMEAR GATE FAILED: {} region(s) ≥{:.0}% cross-region concurrency: {}. \
+             Per-region counter SPLIT is UNRELIABLE — counts are smeared across threads. \
+             Use a CAUSAL PERTURBATION (perturb-don't-attribute), not this table, for any verdict.",
+            smeared.len(),
+            SMEAR_GATE_CONCURRENCY * 100.0,
+            smeared.join(", ")
+        ));
+    } else {
+        lines.push(format!(
+            "smear gate PASS: max cross-region concurrency {:.0}% < {:.0}%.",
+            max_concurrency * 100.0,
+            SMEAR_GATE_CONCURRENCY * 100.0
+        ));
+    }
+
+    // (2) + (3) conservation self-checks.
+    let attributed_cycles = TrustVerdict::sum_counter(rows, "cycles");
+    let attributed_instructions = TrustVerdict::sum_counter(rows, "instructions");
+
+    let check = |label: &str, attributed: f64, whole: Option<f64>, lines: &mut Vec<String>, trusted: &mut bool| -> Option<f64> {
+        let whole = whole?;
+        if whole <= 0.0 {
+            lines.push(format!("{label} conservation: whole-process total is 0 — skipped."));
+            return None;
+        }
+        let gap = (attributed - whole) / whole;
+        if gap.abs() > CONSERVATION_TOL {
+            *trusted = false;
+            let hole = if gap < 0.0 {
+                format!(
+                    " UNATTRIBUTED HOLE = {:.1}% of whole-process {label} retired OUTSIDE any \
+                     traced region (latency/wait the regions structurally cannot see)",
+                    -gap * 100.0
+                )
+            } else {
+                format!(" OVER-COUNT = {:.1}% (regions double-charged)", gap * 100.0)
+            };
+            lines.push(format!(
+                "{label} conservation FAILED: attributed {:.3e} vs whole {:.3e} ⇒ gap {:+.1}% (>{:.0}% tol).{}",
+                attributed, whole, gap * 100.0, CONSERVATION_TOL * 100.0, hole
+            ));
+        } else {
+            lines.push(format!(
+                "{label} conservation PASS: attributed {:.3e} vs whole {:.3e} ⇒ gap {:+.1}% (≤{:.0}% tol).",
+                attributed, whole, gap * 100.0, CONSERVATION_TOL * 100.0
+            ));
+        }
+        Some(gap)
+    };
+
+    let cycles_gap_frac = check("cycles", attributed_cycles, whole_cycles, &mut lines, &mut trusted);
+    let instructions_gap_frac = check(
+        "instructions",
+        attributed_instructions,
+        whole_instructions,
+        &mut lines,
+        &mut trusted,
+    );
+
+    TrustVerdict {
+        trusted,
+        smeared: rows
+            .iter()
+            .filter(|r| r.wall_us > 0.0 && r.concurrency >= SMEAR_GATE_CONCURRENCY)
+            .map(|r| r.region.clone())
+            .collect(),
+        max_concurrency,
+        attributed_cycles,
+        attributed_instructions,
+        whole_cycles,
+        whole_instructions,
+        cycles_gap_frac,
+        instructions_gap_frac,
+        lines,
+    }
+}
+
+/// Result of the region_hw POSITIVE-CONTROL self-test (PROCESS #4): does the
+/// rollup reproduce a KNOWN ground-truth split on a synthetic workload? If this
+/// fails, the attribution math is broken and NO real T8 output may be trusted.
+#[derive(Debug, Clone)]
+pub struct SelfTest {
+    pub passed: bool,
+    pub lines: Vec<String>,
+}
+
+/// Run the positive-control self-test. Builds a synthetic trace with two
+/// DISJOINT regions (so concurrency must be 0 and attribution must be exact),
+/// hands rollup interval counters whose ground-truth split is known by
+/// construction, and asserts the rollup reproduces it within tolerance.
+///
+/// Region A occupies [0,1000)µs, region B [1000,2000)µs. We feed two counter
+/// intervals, one fully inside each window, with cycles {A:1e6, B:3e6}. A
+/// correct rollup must attribute ~1e6 cycles to A and ~3e6 to B (25%/75%),
+/// concurrency 0 for both, and the trust gate must read TRUSTED.
+pub fn self_test() -> SelfTest {
+    let mut lines = Vec::new();
+    let mut passed = true;
+
+    // Synthetic DISJOINT spans (B/E on the monotonic timeline, µs), on the SAME
+    // thread so they cannot overlap: regionA [0,1000), regionB [1000,2000).
+    let json = r#"[
+      {"name":"fulcrum.clock_base","ph":"M","ts":0,"pid":1,"tid":0,"args":{"clock":"monotonic","base_ns":0}},
+      {"name":"regionA","ph":"B","ts":0,"pid":1,"tid":1},
+      {"name":"regionA","ph":"E","ts":1000,"pid":1,"tid":1},
+      {"name":"regionB","ph":"B","ts":1000,"pid":1,"tid":1},
+      {"name":"regionB","ph":"E","ts":2000,"pid":1,"tid":1}
+    ]"#;
+    let events: Vec<crate::trace::Event> = serde_json::from_str(json).unwrap();
+    let region_funcs = vec![
+        ("A".to_string(), vec!["regionA".to_string()]),
+        ("B".to_string(), vec!["regionB".to_string()]),
+    ];
+    // Counter intervals: one inside A's window, one inside B's.
+    let mk = |ts_us: f64, dur_us: f64, cyc: f64, ins: f64| {
+        let mut counts = BTreeMap::new();
+        counts.insert("cycles".to_string(), cyc);
+        counts.insert("instructions".to_string(), ins);
+        CounterInterval { ts_us, dur_us, counts }
+    };
+    let intervals = vec![
+        mk(500.0, 500.0, 1.0e6, 2.0e6),    // fully inside A [0,1000)
+        mk(1500.0, 500.0, 3.0e6, 6.0e6),   // fully inside B [1000,2000)
+    ];
+
+    let rows = rollup(&events, &[], &intervals, &region_funcs);
+    let get = |reg: &str, ev: &str| -> f64 {
+        rows.iter()
+            .find(|r| r.region == reg)
+            .and_then(|r| r.counters.get(ev).copied())
+            .unwrap_or(0.0)
+    };
+    let close = |got: f64, want: f64| (got - want).abs() <= want * 0.01 + 1.0;
+
+    // concurrency must be 0 (disjoint).
+    for r in &rows {
+        if r.concurrency > 1e-6 {
+            passed = false;
+            lines.push(format!(
+                "FAIL: region {} concurrency {:.3} != 0 on a DISJOINT synthetic workload",
+                r.region, r.concurrency
+            ));
+        }
+    }
+    // ground-truth split.
+    let checks = [
+        ("A cycles", get("A", "cycles"), 1.0e6),
+        ("B cycles", get("B", "cycles"), 3.0e6),
+        ("A instructions", get("A", "instructions"), 2.0e6),
+        ("B instructions", get("B", "instructions"), 6.0e6),
+    ];
+    for (label, got, want) in checks {
+        if close(got, want) {
+            lines.push(format!("ok: {label} = {got:.3e} (want {want:.3e})"));
+        } else {
+            passed = false;
+            lines.push(format!("FAIL: {label} = {got:.3e}, want {want:.3e}"));
+        }
+    }
+    // and the trust gate must read TRUSTED on the synthetic clean case.
+    let v = trust_gate(&rows, Some(4.0e6), Some(8.0e6));
+    if !v.trusted {
+        passed = false;
+        lines.push("FAIL: trust gate read UNRELIABLE on the clean positive control".into());
+    } else {
+        lines.push("ok: trust gate reads TRUSTED on the clean positive control".into());
+    }
+
+    SelfTest { passed, lines }
+}
+
+/// Render the trust verdict as a header block. When NOT trusted, this is a
+/// loud refusal banner that downstream callers must treat as a block on any
+/// "confirmed" conclusion drawn from the per-region table.
+pub fn render_trust(v: &TrustVerdict) -> String {
+    let mut s = String::new();
+    s.push_str("\n========  REGION-HW TRUST GATE (fail-closed)  ========\n");
+    if v.trusted {
+        s.push_str("  VERDICT: TRUSTED — per-region split is usable (smear + conservation OK).\n");
+    } else {
+        s.push_str(
+            "  VERDICT: UNRELIABLE — per-region split is NOT a valid basis for a 'confirmed'\n  \
+             conclusion. The numbers below are smeared and/or do not conserve. This is the\n  \
+             anti-phantom gate: at T>1 a per-region counter table cannot prove WHERE the\n  \
+             cycles went; use a causal perturbation.\n",
+        );
+    }
+    for l in &v.lines {
+        s.push_str(&format!("  - {l}\n"));
+    }
+    s
+}
+
 /// Reconcile the per-region split against the v1 run-level TMA headline: the
 /// region-wall-weighted average of the per-region `mem_bound` should land
 /// within tolerance of the run-level backend-bound%, and the weighted

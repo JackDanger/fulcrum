@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, model, rank, region_hw, schedule, sweep, trace, validate, vs, vs_sweep,
-    xtool,
+    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, sweep, trace, validate,
+    vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -1477,6 +1477,22 @@ fn cmd_region_hw(args: &[String]) -> ExitCode {
             (r.name.clone(), subs)
         })
         .collect();
+    // POSITIVE-CONTROL self-test (PROCESS #4): the attribution math must
+    // reproduce a known ground-truth split BEFORE any real T8 output is trusted.
+    let st = region_hw::self_test();
+    println!("\n========  REGION-HW POSITIVE-CONTROL SELF-TEST  ========");
+    for l in &st.lines {
+        println!("  {l}");
+    }
+    if !st.passed {
+        eprintln!(
+            "fulcrum: region-hw SELF-TEST FAILED — the attribution math is broken; \
+             refusing to emit a per-region split (it cannot be trusted)."
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("  self-test PASS — attribution math reproduces ground truth.");
+
     let rows = region_hw::rollup(&events, &mem, &intervals, &region_funcs);
     eprintln!(
         "region-hw: {} PEBS samples, {} counter intervals, {} regions",
@@ -1484,6 +1500,40 @@ fn cmd_region_hw(args: &[String]) -> ExitCode {
         intervals.len(),
         rows.len()
     );
+
+    // Whole-process counter totals (concurrency-immune) for the conservation
+    // self-checks: from an explicit --whole perf-stat file if given, else the
+    // SUM of the interval counters (the whole run is the sum of its intervals).
+    let sum_intervals = |name: &str| -> Option<f64> {
+        let s: f64 = intervals
+            .iter()
+            .filter_map(|iv| iv.counts.get(name).copied())
+            .sum();
+        (s > 0.0).then_some(s)
+    };
+    let (mut whole_cycles, mut whole_instructions) =
+        (sum_intervals("cycles"), sum_intervals("instructions"));
+    if let Some(wp) = flag(args, "--whole") {
+        if let Ok(text) = std::fs::read_to_string(wp) {
+            let wiv = region_hw::parse_perf_stat_intervals(&text, 0.0);
+            let wsum = |name: &str| -> Option<f64> {
+                let s: f64 = wiv.iter().filter_map(|iv| iv.counts.get(name).copied()).sum();
+                (s > 0.0).then_some(s)
+            };
+            if let Some(c) = wsum("cycles") {
+                whole_cycles = Some(c);
+            }
+            if let Some(i) = wsum("instructions") {
+                whole_instructions = Some(i);
+            }
+        }
+    }
+
+    // FAIL-CLOSED TRUST GATE: smear (concurrency≥0.5) + conservation. Printed
+    // FIRST so a reader cannot use the table below without seeing the verdict.
+    let trust = region_hw::trust_gate(&rows, whole_cycles, whole_instructions);
+    print!("{}", region_hw::render_trust(&trust));
+
     print!("{}", region_hw::render(&rows));
     // Reconcile against the run-level TMA if a --topdown capture was given.
     if let Some(td_path) = flag(args, "--topdown") {
@@ -1494,14 +1544,18 @@ fn cmd_region_hw(args: &[String]) -> ExitCode {
             for l in &lines {
                 println!("  {l}");
             }
-            println!(
-                "  verdict: {}",
-                if ok {
-                    "per-region rolls up to run-level TMA — consistent"
-                } else {
-                    "per-region DIVERGES from run-level TMA — investigate"
-                }
-            );
+            // Block any "confirmed/consistent" reconciliation when the trust
+            // gate failed — a smeared/non-conserving split cannot CONFIRM
+            // anything, even if its smeared numbers happen to roll up.
+            let verdict = if !trust.trusted {
+                "BLOCKED — region-hw trust gate UNRELIABLE; this reconciliation \
+                 cannot confirm anything (smear/conservation failed above)"
+            } else if ok {
+                "per-region rolls up to run-level TMA — consistent"
+            } else {
+                "per-region DIVERGES from run-level TMA — investigate"
+            };
+            println!("  verdict: {verdict}");
         }
     }
     ExitCode::SUCCESS
@@ -1715,6 +1769,61 @@ fn cmd_compare(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// provenance: read the decoder witness from a gzippy binary and emit the
+/// self-labeling header (which decoder was/will be measured). The bench harness
+/// runs this so EVERY bundle/report carries pure-Rust-vs-ISA-L provenance.
+///
+///   fulcrum provenance <gzippy-binary> [--features "..."] [--routing "path=..."]
+///                       [--rev <git-describe>] [--out provenance.json]
+///
+/// Exit nonzero if the witness contradicts the declared features (e.g. a
+/// pure-rust-inflate build that still links isal_inflate) or is UNKNOWN — so a
+/// CI/harness step cannot silently measure the wrong decoder.
+fn cmd_provenance(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(bin) = pos.first() else {
+        eprintln!(
+            "provenance needs <gzippy-binary> [--features \"...\"] [--routing \"path=...\"]\n  \
+             [--rev <git-describe>] [--out provenance.json]\n\n  \
+             Reads the isal_inflate dynsym count from the binary (0=pure-rust, >0=ISA-L FFI)\n  \
+             and bakes the decoder identity into a header every report can print."
+        );
+        return usage();
+    };
+    let features = flag(args, "--features").unwrap_or("").to_string();
+    let routing = flag(args, "--routing").unwrap_or("").to_string();
+    let rev = flag(args, "--rev").unwrap_or("").to_string();
+    let prov = provenance::DecoderProvenance::capture(Path::new(bin), &features, &routing, &rev);
+    print!("{}", prov.render_header());
+
+    if let Some(out) = flag(args, "--out") {
+        match serde_json::to_string_pretty(&prov) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(out, json) {
+                    eprintln!("fulcrum: provenance: could not write {out}: {e}");
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("fulcrum: provenance written to {out}");
+            }
+            Err(e) => {
+                eprintln!("fulcrum: provenance: serialize failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // Fail closed on a contradiction or unknown witness — never let a run be
+    // interpreted with the wrong (or unverified) decoder.
+    match prov.decoder {
+        provenance::Decoder::Unknown => {
+            eprintln!("fulcrum: provenance UNKNOWN — could not read symbols; refusing to bless.");
+            ExitCode::FAILURE
+        }
+        _ if prov.consistency_warning().is_some() => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 /// audit: run the fair comparison, then validate a STATED claim against it.
 fn cmd_audit(args: &[String]) -> ExitCode {
     let (Some(_), Some(claim_text)) = (flag(args, "--spec"), flag(args, "--claim")) else {
@@ -1778,6 +1887,7 @@ fn main() -> ExitCode {
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),
         "region-hw" => cmd_region_hw(rest),
+        "provenance" => cmd_provenance(rest),
         "xtool" => cmd_xtool(rest),
         "compare" => cmd_compare(rest),
         "sweep" => cmd_sweep(rest),

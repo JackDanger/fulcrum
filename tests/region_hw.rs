@@ -3,7 +3,8 @@
 //! each sample to the correct region, and the tier math must come out right.
 
 use fulcrum::region_hw::{
-    parse_perf_script_mem, parse_perf_stat_intervals, rollup, MemSample, MemTier,
+    parse_perf_script_mem, parse_perf_stat_intervals, rollup, self_test, trust_gate, MemSample,
+    MemTier,
 };
 use fulcrum::trace::Event;
 
@@ -138,4 +139,94 @@ fn parses_perf_script_data_src_lines() {
     assert_eq!(s[2].tier, MemTier::L1);
     // Timestamp converted seconds→µs.
     assert!((s[0].ts_us - 3_475_282_374_280.0).abs() < 1.0);
+}
+
+/// Build a trace where two regions run CONCURRENTLY on different threads in the
+/// SAME wall window — the T8 smear case the gate must catch.
+fn smeared_events() -> Vec<Event> {
+    let json = r#"[
+      {"name":"fulcrum.clock_base","ph":"M","ts":0,"pid":1,"tid":0,"args":{"clock":"monotonic","base_ns":1000000}},
+      {"name":"worker.decode","ph":"B","ts":1000,"pid":1,"tid":1},
+      {"name":"worker.decode","ph":"E","ts":3000,"pid":1,"tid":1},
+      {"name":"worker.consumer","ph":"B","ts":1000,"pid":1,"tid":2},
+      {"name":"worker.consumer","ph":"E","ts":3000,"pid":1,"tid":2}
+    ]"#;
+    serde_json::from_str(json).unwrap()
+}
+
+#[test]
+fn smear_gate_fails_closed_on_concurrent_regions() {
+    let events = smeared_events();
+    let region_funcs = vec![
+        ("decode".to_string(), vec!["decode".to_string()]),
+        ("consumer".to_string(), vec!["consumer".to_string()]),
+    ];
+    let rows = rollup(&events, &[], &[], &region_funcs);
+    // Both windows are identical → each is 100% overlapped by the other.
+    for r in &rows {
+        assert!(r.concurrency > 0.99, "{} should be fully smeared", r.region);
+    }
+    let v = trust_gate(&rows, None, None);
+    assert!(!v.trusted, "smear gate must FAIL CLOSED at concurrency≥0.5");
+    assert_eq!(v.smeared.len(), 2);
+    assert!(v.max_concurrency > 0.99);
+}
+
+#[test]
+fn smear_gate_passes_on_disjoint_regions() {
+    let events = synth_events();
+    let region_funcs = vec![
+        ("a".to_string(), vec!["stage_a".to_string()]),
+        ("b".to_string(), vec!["stage_b".to_string()]),
+    ];
+    let rows = rollup(&events, &[], &[], &region_funcs);
+    let v = trust_gate(&rows, None, None);
+    assert!(v.trusted, "disjoint regions must pass the smear gate");
+    assert!(v.smeared.is_empty());
+}
+
+#[test]
+fn conservation_gap_surfaces_the_unattributed_hole() {
+    // Disjoint regions (smear clean) but the whole-process cycles total is much
+    // larger than what the regions attribute → a big NEGATIVE gap = the hole.
+    let events = synth_events();
+    let csv = "\
+0.001000,1000000000,,cycles
+0.003000,1000000000,,cycles
+";
+    let intervals = parse_perf_stat_intervals(csv, 1000.0);
+    let region_funcs = vec![
+        ("a".to_string(), vec!["stage_a".to_string()]),
+        ("b".to_string(), vec!["stage_b".to_string()]),
+    ];
+    let rows = rollup(&events, &[], &intervals, &region_funcs);
+    // attributed ≈ 2e9; declare whole-process = 4e9 → 50% hole.
+    let v = trust_gate(&rows, Some(4.0e9), None);
+    assert!(!v.trusted, "a 50% conservation hole must fail the gate");
+    let gap = v.cycles_gap_frac.expect("cycles gap computed");
+    assert!(gap < -0.4, "gap should be a large negative hole, got {gap}");
+}
+
+#[test]
+fn conservation_passes_when_attributed_matches_whole() {
+    let events = synth_events();
+    let csv = "\
+0.001000,1000000000,,cycles
+0.003000,1000000000,,cycles
+";
+    let intervals = parse_perf_stat_intervals(csv, 1000.0);
+    let region_funcs = vec![
+        ("a".to_string(), vec!["stage_a".to_string()]),
+        ("b".to_string(), vec!["stage_b".to_string()]),
+    ];
+    let rows = rollup(&events, &[], &intervals, &region_funcs);
+    // whole-process = attributed (≈2e9) → no hole, passes.
+    let v = trust_gate(&rows, Some(2.0e9), None);
+    assert!(v.trusted, "matching totals must pass; lines={:?}", v.lines);
+}
+
+#[test]
+fn positive_control_self_test_reproduces_ground_truth() {
+    let st = self_test();
+    assert!(st.passed, "region_hw self-test must pass: {:?}", st.lines);
 }
