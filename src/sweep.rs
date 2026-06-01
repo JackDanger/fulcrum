@@ -349,7 +349,12 @@ pub fn mine(out_dir: &Path, config: Option<&Path>) -> std::io::Result<()> {
         let ratio = ref_dn / other_dn;
         let tax = bestmin(&reference, t, "file").unwrap_or(f64::NAN)
             - bestmin(&reference, t, "devnull").unwrap_or(f64::NAN);
-        println!("| {ratio:>9.2} | {tax:>10.3}");
+        // Reference run-to-run stats (median/spread) so a large spread flags the
+        // min above as a lucky draw and the ratio as noisy.
+        let (ref_med, ref_spread) = refstat(t, "devnull")
+            .map(|s| (s.median, s.spread))
+            .unwrap_or((f64::NAN, f64::NAN));
+        println!("| {ratio:>9.2} | {tax:>10.3} | {ref_med:>8.3} | {ref_spread:>10.3}");
     }
     println!("\neff = parallel efficiency = speedup(vs T{t1}) / (T/{t1}); 1.00 = perfect scaling.");
     println!("ratio = {reference}_dn / other_dn (>1 = {reference} slower). sinktax = file − devnull wall for {reference}.");

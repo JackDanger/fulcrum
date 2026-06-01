@@ -62,6 +62,7 @@ fn demo_config() -> Config {
             cp_offpath_max: Some(0.05),
             ..Default::default()
         },
+        ..Default::default()
     }
 }
 
