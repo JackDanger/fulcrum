@@ -9,11 +9,11 @@
 //! gzippy decodes chunks in parallel. Each chunk, at the instant its worker
 //! STARTS, checks the WindowMap for its predecessor's 32 KiB tail-window:
 //!
-//!   - present  ⇒ CLEAN decode: fast windowed ISA-L, no markers, no tax.
-//!   - absent   ⇒ WINDOW-ABSENT decode: slow `deflate_block` bootstrap that
-//!                emits u16 markers, then a 3-pass data-model tax later
-//!                (decode→u16 write, replace_markers read+write, narrow
-//!                u16→u8 read+write) to resolve them once the window arrives.
+//! - present ⇒ CLEAN decode: fast windowed ISA-L, no markers, no tax.
+//! - absent ⇒ WINDOW-ABSENT decode: slow `deflate_block` bootstrap that emits
+//!   u16 markers, then a 3-pass data-model tax later (decode→u16 write,
+//!   replace_markers read+write, narrow u16→u8 read+write) to resolve them once
+//!   the window arrives.
 //!
 //! The predecessor's window is PUBLISHED either early on the worker (clean
 //! tail) or serially on the in-order consumer. So there is a COUPLED chain:

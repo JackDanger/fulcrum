@@ -89,16 +89,31 @@ fn positional(args: &[String]) -> Vec<&str> {
     out
 }
 
-/// Load the config named by `--config`, or fall back to the built-in demo.
+/// Load the config named by `--config` / `--profile`, or fall back to the
+/// built-in demo (the toy-pipeline default).
+///
+/// `--config` accepts either a JSON file PATH or one of the built-in profile
+/// NAMES (`gzippy`, `demo`, `generic`), so `fulcrum consumer t.json --config
+/// gzippy` works out-of-the-box with no file. `--profile <name>` is an alias.
 fn load_config(args: &[String]) -> Config {
-    match flag(args, "--config") {
-        Some(p) => match Config::load(Path::new(p)) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("fulcrum: --config {p}: {e}\n         falling back to the demo config.");
-                Config::demo()
+    let named = flag(args, "--config").or_else(|| flag(args, "--profile"));
+    match named {
+        Some(name) => {
+            if let Some(c) = Config::builtin(name) {
+                return c;
             }
-        },
+            match Config::load(Path::new(name)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "fulcrum: --config {name}: {e}\n         (not a built-in profile name \
+                         either: try gzippy | demo | generic)\n         falling back to the demo \
+                         config."
+                    );
+                    Config::demo()
+                }
+            }
+        }
         None => Config::demo(),
     }
 }
@@ -157,8 +172,8 @@ fn cmd_flow(args: &[String]) -> ExitCode {
     // Prefer the inner decode phases (bootstrap vs ISA-L) as wait blockers so
     // consumer stall is attributed to the real phase, not the task umbrella.
     let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
-    let report = flow::analyze_flow(&events, &preferred);
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    let report = flow::analyze_flow(&events, &cfg, &preferred);
     print_flow(&report);
     if let Some(spec) = flag(args, "--whatif") {
         // STAGE-substring:FACTOR  e.g.  decode:2  or  "consumer write:1e9"
@@ -168,10 +183,10 @@ fn cmd_flow(args: &[String]) -> ExitCode {
                 .stages
                 .iter()
                 .find(|s| s.name.contains(needle))
-                .map(|s| s.name)
+                .map(|s| s.name.clone())
             {
                 Some(name) => {
-                    if let Some((w, saved)) = flow::whatif(&report, name, factor) {
+                    if let Some((w, saved)) = flow::whatif(&report, &name, factor) {
                         println!("\n  what-if: {name} ×{factor} faster");
                         println!(
                             "    wall {:.1}ms → {:.1}ms  (saves {:.1}ms, {:.1}%)  [critical-path upper bound]",
@@ -456,6 +471,7 @@ fn cmd_consumer(args: &[String]) -> ExitCode {
         eprintln!("usage: fulcrum consumer <trace.json> [trace2.json ...]");
         return ExitCode::FAILURE;
     }
+    let cfg = load_config(args);
     let mut any_unreconciled = false;
     for path in &pos {
         let events = match trace::load_events(Path::new(path)) {
@@ -465,7 +481,7 @@ fn cmd_consumer(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let report = consumer::analyze(&events);
+        let report = consumer::analyze(&events, &cfg.consumer);
         if !report.reconcile.reconciled {
             any_unreconciled = true;
         }
@@ -515,7 +531,7 @@ fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
         ("IDLE", "loop-umbrella self-time: un-instrumented gap"),
         (
             "UNKNOWN",
-            "un-classified span names (add to consumer::classify)",
+            "un-classified span names (add to the config's consumer.* matchers)",
         ),
     ];
     for (k, meaning) in classes {
@@ -598,8 +614,15 @@ fn cmd_vs(args: &[String]) -> ExitCode {
     let (al, bl) = labels.split_once(',').unwrap_or(("gzippy", "rapidgzip"));
     let cfg = load_config(args);
     let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
-    match vs::compare(al, Path::new(a), bl, Path::new(b), &preferred) {
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    match vs::compare(
+        al,
+        Path::new(a),
+        bl,
+        Path::new(b),
+        &preferred,
+        &cfg.consumer.thread_prefix,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fulcrum: {e}");
@@ -647,8 +670,8 @@ fn cmd_vs_sweep(args: &[String]) -> ExitCode {
     };
     let cfg = load_config(args);
     let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
-    match vs_sweep::run(al, bl, &inputs, &preferred) {
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    match vs_sweep::run(al, bl, &inputs, &cfg, &preferred) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fulcrum: {e}");
@@ -715,7 +738,7 @@ fn print_flow(r: &flow::FlowReport) {
     if !r.unclassified.is_empty() {
         let total: f64 = r.unclassified.iter().map(|(_, d)| d).sum();
         println!(
-            "  ⚠ UNCLASSIFIED spans ({:.1}ms busy across {} names) — add to flow::classify:",
+            "  ⚠ UNCLASSIFIED spans ({:.1}ms busy across {} names) — add them to a config `stages` entry:",
             total / 1000.0,
             r.unclassified.len()
         );

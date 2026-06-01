@@ -31,6 +31,7 @@
 //! These are distinct failure modes (the advisor's correction to a single
 //! "concurrency" metric): a fix for one does not fix the other.
 
+use crate::config::{Config, StageDef};
 use crate::critpath::{self, CritPath};
 use crate::trace::{pair_spans, wall_us, Event};
 use std::collections::{HashMap, HashSet};
@@ -41,7 +42,7 @@ pub const STARVED_OCCUPANCY: f64 = 0.75;
 /// One pipeline stage's flow accounting.
 #[derive(Debug, Clone)]
 pub struct StageRow {
-    pub name: &'static str,
+    pub name: String,
     /// Time on the consumer's in-order critical path attributed to this stage
     /// (consumer self-work in the stage + consumer waits blamed on this
     /// stage's worker spans). Cutting this shortens the wall.
@@ -76,144 +77,71 @@ pub struct FlowReport {
     pub unclassified: Vec<(String, f64)>,
 }
 
-/// Map a span name to a pipeline stage. Order of the returned label is also the
-/// pipeline order used for rendering. Unknown names return `None` →
-/// UNCLASSIFIED.
+/// Map a span name to a pipeline stage NAME, using the configured stage list.
+/// Stages are tried in DECLARATION ORDER and the FIRST match wins — so a
+/// catch-all stage (e.g. a `consumer.` prefix) must be declared AFTER the more
+/// specific ones. A returned name beginning with `·` (e.g. `·wait`,
+/// `·umbrella`) is a non-stage: recognized so it isn't UNCLASSIFIED, but it
+/// carries no busy work and never renders as a row. `None` ⇒ UNCLASSIFIED
+/// (surfaced loudly).
 ///
-/// Tuned for gzippy's parallel single-member span vocabulary, but the buckets
-/// are generic pipeline roles (dispatch → decode → find → resolve → write).
-pub fn classify(name: &str) -> Option<&'static str> {
-    // Waits are handled via critpath attribution, not as a stage of their own;
-    // they carry no busy work. Classify by the conventional wait names so they
-    // are not dumped into UNCLASSIFIED.
-    let n = name;
-    let stage = if n.starts_with("coord.")
-        || n == "pool.submit"
-        || n.starts_with("pool.pick")
-        || n == "consumer.process_prefetches"
-        || n == "consumer.block_finder_get"
-        || n == "consumer.try_take_prefetched"
-    {
-        "1·dispatch (upstream)"
-    } else if n == "worker.bootstrap" || n == "worker.block_body" || n == "worker.block_header" {
-        "2·worker bootstrap (window-absent)"
-    } else if n == "worker.isal_stream_inflate" || n == "worker.absorb_isal_tail" {
-        "3·worker ISA-L (clean tail)"
-    } else if n == "consumer.wait_replaced_markers"
-        || n == "consumer.publish_windows"
-        || n.starts_with("consumer.window_")
-        || n == "consumer.dispatch_post_process"
-        || n.starts_with("post_process.")
-    {
-        "5·consumer resolve (markers/window)"
-    } else if n == "consumer.write_data"
-        || n == "consumer.write_narrowed"
-        || n == "consumer.combine_crc"
-        || n == "consumer.drain"
-        || n == "consumer.arc_take_or_clone"
-    {
-        "6·consumer write (output)"
-    } else if n.starts_with("wait.")
-        || n.ends_with(".wait")
-        || n == "ttp.rx_recv_block"
-        || n == "future.recv"
-        || n.starts_with("chan_recv")
-        || n.starts_with("ttp.")
-    {
-        // A named wait: belongs to no busy stage; its wall cost is attributed
-        // to a blocker via critpath. Tag it so it isn't UNCLASSIFIED.
-        "·wait"
-    } else if n.starts_with("consumer.") {
-        // Any other consumer self-work.
-        "6·consumer write (output)"
-    } else if n.starts_with("lock.")
-        || n == "consumer.iter"
-        || n == "drive"
-        || n == "pool.run_task"
-        || n == "worker.decode_chunk"
-        || n.starts_with("worker.scan")
-        || n == "worker.seed_first"
-    {
-        // Umbrella / lock-held markers: not a stage. Excluded so blame lands on
-        // the INNER LEAF decode phases (block_body/bootstrap = window-absent;
-        // isal = clean tail), not the wrapper. `worker.scan_candidate` /
-        // `worker.scan_run` / `worker.seed_first` WRAP a full candidate decode
-        // (all 39 chunks take the slow path), so crediting them as a
-        // "block-find" stage double-counts the enclosed decode and manufactures
-        // a phantom block-finder bottleneck. The pure find_blocks scan is cheap
-        // (failed candidates waste ~2.6KB total) — the cost inside is the
-        // productive decode.
-        "·umbrella"
-    } else {
-        return None;
-    };
-    Some(stage)
+/// The semantics are vocabulary-agnostic; the gzippy stage set lives in
+/// [`Config::gzippy`] (`dispatch → bootstrap → ISA-L → resolve → write`). A
+/// pipeline with no configured stages gets an all-UNCLASSIFIED report whose
+/// vocabulary dump tells the user what to turn into stages.
+pub fn classify<'a>(name: &str, stages: &'a [StageDef]) -> Option<&'a str> {
+    stages
+        .iter()
+        .find(|s| s.matcher.matches(name))
+        .map(|s| s.name.as_str())
 }
-
-/// Pipeline order for rendering (stages not present are skipped).
-const STAGE_ORDER: &[&str] = &[
-    "1·dispatch (upstream)",
-    "2·worker bootstrap (window-absent)",
-    "3·worker ISA-L (clean tail)",
-    "5·consumer resolve (markers/window)",
-    "6·consumer write (output)",
-];
-
-/// Worker inner-phase span names to prefer as wait blockers, so the consumer's
-/// stall is attributed to the real inner phase (block-find vs bootstrap vs
-/// ISA-L) instead of the `pool.run_task` / `worker.decode_chunk` umbrella that
-/// wraps the whole task and would otherwise win on overlap.
-///
-/// CRITICAL: this set must include EVERY inner phase, NOT just the decode
-/// phases. Listing only decode phases (bootstrap/ISA-L) biases the attribution
-/// — it forces blame onto decode even when `worker.scan_candidate`
-/// (block-finding) had more overlap with the consumer's wait, manufacturing a
-/// false "decode is the lever" conclusion. (Learned the hard way: a
-/// decode-only preferred set reported bootstrap=209ms wall-critical; with
-/// block-find included the honest answer is scan=156ms, bootstrap=27ms — and
-/// the latter reconciles the FastBootstrap TIE.)
-pub const INNER_DECODE_BLOCKERS: &[&str] = &[
-    "worker.bootstrap",
-    "worker.block_body",
-    "worker.block_header",
-    "worker.isal_stream_inflate",
-    "worker.absorb_isal_tail",
-];
 
 /// Given a critpath entry label, return the stage it belongs to. Labels are
 /// either a raw span name (consumer self-work) or `"blocked-on:<span>"` (a
 /// consumer wait blamed on a worker span) — in the latter case the stage is
 /// that of the blocker span, so consumer stall lands on the stage that caused
 /// it.
-fn stage_of_label(label: &str) -> Option<&'static str> {
+fn stage_of_label<'a>(label: &str, stages: &'a [StageDef]) -> Option<&'a str> {
     let span_name = label.strip_prefix("blocked-on:").unwrap_or(label);
-    classify(span_name).filter(|s| !s.starts_with('·'))
+    classify(span_name, stages).filter(|s| !s.starts_with('·'))
 }
 
-/// Build the flow report from a Chrome-trace event stream.
-pub fn analyze_flow(events: &[Event], preferred_blockers: &[String]) -> FlowReport {
+/// Build the flow report from a Chrome-trace event stream, using `cfg.stages`
+/// for the stage vocabulary + render order and `preferred_blockers` for
+/// critical-path attribution (the caller passes `cfg.inner_blockers`, which
+/// biases blame onto the real inner phase rather than the task umbrella).
+pub fn analyze_flow(events: &[Event], cfg: &Config, preferred_blockers: &[String]) -> FlowReport {
+    let stages_cfg = &cfg.stages;
     let spans = pair_spans(events);
     let wall = wall_us(&spans);
-    let cp: CritPath = critpath::analyze(events, f64::INFINITY, preferred_blockers);
+    let cp: CritPath = critpath::analyze_with(
+        events,
+        f64::INFINITY,
+        preferred_blockers,
+        &cfg.consumer.thread_prefix,
+    );
 
     // --- WALL-CRITICAL per stage (from the consumer-anchored decomposition) ---
-    let mut wall_crit: HashMap<&'static str, f64> = HashMap::new();
+    let mut wall_crit: HashMap<String, f64> = HashMap::new();
     for e in &cp.entries {
-        if let Some(stage) = stage_of_label(&e.label) {
-            *wall_crit.entry(stage).or_default() += e.on_path_us;
+        if let Some(stage) = stage_of_label(&e.label, stages_cfg) {
+            *wall_crit.entry(stage.to_string()).or_default() += e.on_path_us;
         }
     }
 
     // --- TOTAL-BUSY / threads / window per stage (from raw work spans) ---
-    let mut busy: HashMap<&'static str, f64> = HashMap::new();
-    let mut tids: HashMap<&'static str, HashSet<(u64, u64)>> = HashMap::new();
-    let mut win: HashMap<&'static str, (f64, f64)> = HashMap::new();
+    let mut busy: HashMap<String, f64> = HashMap::new();
+    let mut tids: HashMap<String, HashSet<(u64, u64)>> = HashMap::new();
+    let mut win: HashMap<String, (f64, f64)> = HashMap::new();
     let mut unclassified: HashMap<String, f64> = HashMap::new();
     for s in &spans {
-        match classify(&s.name) {
+        match classify(&s.name, stages_cfg) {
             Some(stage) if !stage.starts_with('·') => {
-                *busy.entry(stage).or_default() += s.dur;
-                tids.entry(stage).or_default().insert((s.pid, s.tid));
+                let stage = stage.to_string();
+                *busy.entry(stage.clone()).or_default() += s.dur;
+                tids.entry(stage.clone())
+                    .or_default()
+                    .insert((s.pid, s.tid));
                 let w = win
                     .entry(stage)
                     .or_insert((f64::INFINITY, f64::NEG_INFINITY));
@@ -225,8 +153,14 @@ pub fn analyze_flow(events: &[Event], preferred_blockers: &[String]) -> FlowRepo
         }
     }
 
+    // Render in configured stage order, skipping non-stages (`·…`) and any
+    // stage with neither busy nor wall-critical time.
     let mut stages = Vec::new();
-    for &name in STAGE_ORDER {
+    for sd in stages_cfg {
+        let name = &sd.name;
+        if name.starts_with('·') {
+            continue;
+        }
         let b = busy.get(name).copied().unwrap_or(0.0);
         let wc = wall_crit.get(name).copied().unwrap_or(0.0);
         if b == 0.0 && wc == 0.0 {
@@ -241,7 +175,7 @@ pub fn analyze_flow(events: &[Event], preferred_blockers: &[String]) -> FlowRepo
             0.0
         };
         stages.push(StageRow {
-            name,
+            name: name.clone(),
             wall_critical_us: wc,
             total_busy_us: b,
             threads,
@@ -279,6 +213,7 @@ pub fn whatif(report: &FlowReport, stage: &str, factor: f64) -> Option<(f64, f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use serde_json::json;
 
     fn ev(name: &str, ph: &str, ts: f64, tid: u64) -> Event {
@@ -329,15 +264,18 @@ mod tests {
             "consumer.iter",
         ];
         for v in vocab {
-            assert!(classify(v).is_some(), "unclassified gzippy span: {v}");
+            assert!(
+                classify(v, &Config::gzippy().stages).is_some(),
+                "unclassified gzippy span: {v}"
+            );
         }
-        assert!(classify("totally.unknown.span").is_none());
+        assert!(classify("totally.unknown.span", &Config::gzippy().stages).is_none());
     }
 
     #[test]
     fn slack_is_busy_minus_wall_critical() {
         let r = StageRow {
-            name: "x",
+            name: "x".to_string(),
             wall_critical_us: 30.0,
             total_busy_us: 1000.0,
             threads: 8,
@@ -369,7 +307,7 @@ mod tests {
         events.push(ev("worker.block_body", "B", 12.0, 3));
         events.push(ev("worker.block_body", "E", 98.0, 3));
 
-        let r = analyze_flow(&events, &[]);
+        let r = analyze_flow(&events, &Config::gzippy(), &[]);
         let decode = r
             .stages
             .iter()
@@ -390,7 +328,7 @@ mod tests {
             wall_us: 1000.0,
             stages: vec![
                 StageRow {
-                    name: "2·worker bootstrap (window-absent)",
+                    name: "2·worker bootstrap (window-absent)".to_string(),
                     wall_critical_us: 100.0,
                     total_busy_us: 900.0,
                     threads: 8,
@@ -400,7 +338,7 @@ mod tests {
                     starved: false,
                 },
                 StageRow {
-                    name: "6·consumer write (output)",
+                    name: "6·consumer write (output)".to_string(),
                     wall_critical_us: 200.0,
                     total_busy_us: 200.0,
                     threads: 1,

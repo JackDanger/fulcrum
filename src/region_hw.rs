@@ -248,6 +248,7 @@ impl RegionHw {
     ///   * `mem_bound`  ∝ fraction of loads beyond L2, weighted by DRAM depth
     ///   * `branch_bound` ∝ branch-MPKI (capped)
     ///   * `core_bound`  = the remainder (compute / port contention)
+    ///
     /// All three sum to 1.0. Returns `None` if neither PEBS nor counters
     /// attributed anything to the region.
     pub fn stall_split(&self) -> Option<StallSplit> {
@@ -309,6 +310,7 @@ pub fn clock_base_ns(events: &[Event]) -> Option<u64> {
 /// into [`MemSample`]s. Accepts the two common shapes:
 ///   * `perf script -F time,data_src`:  `   3475282.374280:  1e05080021 |OP …|LVL L3 hit|…`
 ///   * a pre-decoded `time tier` two-column form (`3475282.374 L3`), for tests.
+///
 /// Lines without a recognizable tier are skipped (kernel samples with `N/A`).
 pub fn parse_perf_script_mem(text: &str) -> Vec<MemSample> {
     let mut out = Vec::new();

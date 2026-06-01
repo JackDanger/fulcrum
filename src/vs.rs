@@ -6,11 +6,13 @@
 //! waiting in tool A, and how does the SAME-named span behave in tool B (where
 //! it is not)?** For every span name present in either trace it reports, side by
 //! side:
-//!   - TOTAL-BUSY ms (Σ span duration across all worker threads) — "how much CPU
-//!     this code burned"; comparable across tools without wait instrumentation.
-//!   - WALL-CRITICAL ms (consumer-anchored critical-path share from
-//!     [`crate::critpath`]) — "how much this code gated the wall."
-//!   - distinct threads.
+//!
+//! - TOTAL-BUSY ms (Σ span duration across all worker threads) — "how much CPU
+//!   this code burned"; comparable across tools without wait instrumentation.
+//! - WALL-CRITICAL ms (consumer-anchored critical-path share from
+//!   [`crate::critpath`]) — "how much this code gated the wall."
+//! - distinct threads.
+//!
 //! Rows are sorted by the A−B busy gap, so the code A spends more time in than B
 //! rises to the top — that is the lever.
 
@@ -31,7 +33,11 @@ struct ToolView {
     by_name: HashMap<String, PerSpan>,
 }
 
-fn analyze_one(path: &Path, preferred: &[String]) -> std::io::Result<ToolView> {
+fn analyze_one(
+    path: &Path,
+    preferred: &[String],
+    consumer_prefix: &str,
+) -> std::io::Result<ToolView> {
     let events = load_events(path)?;
     let spans = pair_spans(&events);
     let wall = crate::trace::wall_us(&spans);
@@ -49,7 +55,7 @@ fn analyze_one(path: &Path, preferred: &[String]) -> std::io::Result<ToolView> {
     // wait blamed on the worker span producing the awaited item) — fold both
     // onto the underlying span name so a tool's waits land on the code that
     // caused them.
-    let cp = critpath::analyze(&events, f64::INFINITY, preferred);
+    let cp = critpath::analyze_with(&events, f64::INFINITY, preferred, consumer_prefix);
     for entry in &cp.entries {
         let name = entry
             .label
@@ -74,9 +80,10 @@ pub fn compare(
     b_label: &str,
     b_path: &Path,
     preferred: &[String],
+    consumer_prefix: &str,
 ) -> std::io::Result<()> {
-    let a = analyze_one(a_path, preferred)?;
-    let b = analyze_one(b_path, preferred)?;
+    let a = analyze_one(a_path, preferred, consumer_prefix)?;
+    let b = analyze_one(b_path, preferred, consumer_prefix)?;
 
     println!(
         "VS  {a_label}={:.1}ms  {b_label}={:.1}ms  (wall)   ratio {:.2}×",
@@ -105,7 +112,9 @@ pub fn compare(
     names.sort();
     names.dedup();
     let empty = PerSpan::default();
-    let mut rows: Vec<(&String, f64, f64, f64, usize, usize, f64, f64)> = names
+    // (span, a_busy, b_busy, Δbusy, a_threads, b_threads, a_wall_crit, b_wall_crit)
+    type Row<'a> = (&'a String, f64, f64, f64, usize, usize, f64, f64);
+    let mut rows: Vec<Row> = names
         .iter()
         .map(|n| {
             let pa = a.by_name.get(*n).unwrap_or(&empty);
@@ -191,8 +200,8 @@ mod tests {
             ],
         );
         // Just assert analyze_one computes the busy split; compare() prints.
-        let va = analyze_one(&a, &[]).unwrap();
-        let vb = analyze_one(&b, &[]).unwrap();
+        let va = analyze_one(&a, &[], "consumer.").unwrap();
+        let vb = analyze_one(&b, &[], "consumer.").unwrap();
         let da = va.by_name["worker.decode_chunk"].busy_us;
         let db = vb.by_name["worker.decode_chunk"].busy_us;
         assert!((da - 200.0).abs() < 1e-6);

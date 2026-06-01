@@ -7,9 +7,11 @@
 //!
 //! For each T it computes, per pipeline ROLE (dispatch / window-absent-decode /
 //! clean-decode / marker-resolve / consumer-wait / consumer-write), both tools'
-//!   - BUSY ms  (Σ work-span duration across all threads), and
-//!   - WALL-CRITICAL ms  (consumer-anchored critical-path share — the part that,
-//!     if removed, shortens the wall),
+//!
+//! - BUSY ms (Σ work-span duration across all threads), and
+//! - WALL-CRITICAL ms (consumer-anchored critical-path share — the part that,
+//!   if removed, shortens the wall),
+//!
 //! then RANKS the roles by the **gzippy − rapidgzip WALL-CRITICAL divergence**
 //! (Δwc). The role with the largest positive Δwc is the LEVER: the region where
 //! gzippy pays wall-critical cost that rapidgzip does not.
@@ -29,6 +31,7 @@
 //! in-order stall is a first-class, comparable line — that stall is the whole
 //! point of an in-order pipeline and must not be hidden inside a blocker stage.
 
+use crate::config::Config;
 use crate::critpath::{self, CritPath};
 use crate::flow::{self, FlowReport};
 use crate::trace::load_events;
@@ -107,21 +110,23 @@ pub struct ToolAt {
 /// it: every µs is either consumer SELF-work (a consumer span) or a consumer
 /// WAIT (blamed on a worker span). So we credit wall-critical directly from
 /// `cp.entries`:
-///   - a self-work label (`consumer.write_data`, `post_process.*`, …) → its
-///     consumer role (write / resolve), via `flow::classify`.
-///   - a `blocked-on:<worker-span>` label → the WORKER role that produced the
-///     awaited item (window-absent decode / clean decode / …), so the stall
-///     lands on the code that caused it.
-///   - a wait blamed on an umbrella/unknown span (no worker role) → the
-///     `ConsumerWait` residual role, so it is never silently dropped.
+///
+/// - a self-work label (`consumer.write_data`, `post_process.*`, …) → its
+///   consumer role (write / resolve), via `flow::classify`.
+/// - a `blocked-on:<worker-span>` label → the WORKER role that produced the
+///   awaited item (window-absent decode / clean decode / …), so the stall lands
+///   on the code that caused it.
+/// - a wait blamed on an umbrella/unknown span (no worker role) → the
+///   `ConsumerWait` residual role, so it is never silently dropped.
+///
 /// This makes `ConsumerWait` the IN-ORDER STALL THAT IS NOT EXPLAINED BY A
 /// NAMED WORKER STAGE — disjoint from the decode roles, so nothing is
 /// double-counted. BUSY comes from the flow stages (Σ all-thread span time).
-fn fold_tool(report: &FlowReport, cp: &CritPath) -> ToolAt {
+fn fold_tool(report: &FlowReport, cp: &CritPath, cfg: &Config) -> ToolAt {
     let mut roles: BTreeMap<Role, RoleCell> = BTreeMap::new();
     // BUSY per role from the flow stages (work spans, Σ across all threads).
     for s in &report.stages {
-        if let Some(role) = role_of_stage(s.name) {
+        if let Some(role) = role_of_stage(&s.name) {
             roles.entry(role).or_default().busy_us += s.total_busy_us;
         }
     }
@@ -130,11 +135,11 @@ fn fold_tool(report: &FlowReport, cp: &CritPath) -> ToolAt {
         let role = match e.label.strip_prefix("blocked-on:") {
             // A consumer WAIT: blame the worker stage that produced the awaited
             // item; if it maps to no worker role, it is residual stall.
-            Some(blocker) => flow::classify(blocker)
+            Some(blocker) => flow::classify(blocker, &cfg.stages)
                 .and_then(role_of_stage)
                 .unwrap_or(Role::ConsumerWait),
             // Consumer SELF-work: classify the consumer span to its role.
-            None => match flow::classify(&e.label).and_then(role_of_stage) {
+            None => match flow::classify(&e.label, &cfg.stages).and_then(role_of_stage) {
                 Some(r) => r,
                 None => continue, // umbrella/unclassified self-work: not a role
             },
@@ -150,11 +155,16 @@ fn fold_tool(report: &FlowReport, cp: &CritPath) -> ToolAt {
 }
 
 /// Analyze one trace into a [`ToolAt`].
-fn analyze_tool(path: &Path, preferred: &[String]) -> std::io::Result<ToolAt> {
+fn analyze_tool(path: &Path, cfg: &Config, preferred: &[String]) -> std::io::Result<ToolAt> {
     let events = load_events(path)?;
-    let report = flow::analyze_flow(&events, preferred);
-    let cp = critpath::analyze(&events, f64::INFINITY, preferred);
-    Ok(fold_tool(&report, &cp))
+    let report = flow::analyze_flow(&events, cfg, preferred);
+    let cp = critpath::analyze_with(
+        &events,
+        f64::INFINITY,
+        preferred,
+        &cfg.consumer.thread_prefix,
+    );
+    Ok(fold_tool(&report, &cp, cfg))
 }
 
 /// One thread-count cell of the sweep: both tools folded + the per-role
@@ -198,10 +208,11 @@ pub fn cell(
     threads: usize,
     a_path: &Path,
     b_path: &Path,
+    cfg: &Config,
     preferred: &[String],
 ) -> std::io::Result<SweepCell> {
-    let a = analyze_tool(a_path, preferred)?;
-    let b = analyze_tool(b_path, preferred)?;
+    let a = analyze_tool(a_path, cfg, preferred)?;
+    let b = analyze_tool(b_path, cfg, preferred)?;
     let mut diverge = Vec::new();
     for role in Role::all() {
         let ca = a.roles.get(&role).copied().unwrap_or_default();
@@ -265,11 +276,12 @@ pub fn run(
     a_label: &str,
     b_label: &str,
     inputs: &[SweepInput],
+    cfg: &Config,
     preferred: &[String],
 ) -> std::io::Result<Vec<SweepCell>> {
     let mut cells = Vec::new();
     for inp in inputs {
-        cells.push(cell(inp.threads, &inp.a_path, &inp.b_path, preferred)?);
+        cells.push(cell(inp.threads, &inp.a_path, &inp.b_path, cfg, preferred)?);
     }
     render(a_label, b_label, &cells);
     Ok(cells)
@@ -281,9 +293,7 @@ fn ms(us: f64) -> f64 {
 
 /// Print the per-T rich report + the cross-T scaling matrix.
 pub fn render(a_label: &str, b_label: &str, cells: &[SweepCell]) {
-    println!(
-        "\n========  VS-SWEEP — {a_label} vs {b_label} across thread counts  ========"
-    );
+    println!("\n========  VS-SWEEP — {a_label} vs {b_label} across thread counts  ========");
     println!(
         "  Per role: BUSY (Σ all threads) and WALL-CRITICAL (on the in-order consumer path).\n  \
          Δwc = {a_label} − {b_label} wall-critical: POSITIVE = {a_label} pays wall cost {b_label} does NOT.\n  \
@@ -411,7 +421,9 @@ pub fn render(a_label: &str, b_label: &str, cells: &[SweepCell]) {
         };
         println!("   {trend}");
     }
-    println!("  (units: Δwc ms = {a_label}−{b_label}. A lever that GROWS with T is a SCALING defect:");
+    println!(
+        "  (units: Δwc ms = {a_label}−{b_label}. A lever that GROWS with T is a SCALING defect:"
+    );
     println!("   {a_label} has structural machinery whose wall cost compounds with parallelism;");
     println!("   a FLAT lever is a fixed serial cost. Read the largest, growing row as the change to make.)");
 
@@ -490,11 +502,9 @@ mod tests {
         // the WindowAbsentDecode role's wall-critical diverges +~180us → lever.
         let g = pipeline_trace("g", 200.0, 190.0);
         let r = pipeline_trace("r", 20.0, 15.0);
-        let preferred: Vec<String> = flow::INNER_DECODE_BLOCKERS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let c = cell(8, &g, &r, &preferred).unwrap();
+        let cfg = Config::gzippy();
+        let preferred: Vec<String> = cfg.inner_blockers.clone();
+        let c = cell(8, &g, &r, &cfg, &preferred).unwrap();
 
         let lever = c.lever().expect("a lever exists");
         // The wait is attributed to the window-absent decode blocker (not the
@@ -530,11 +540,9 @@ mod tests {
         // Both tools identical → no positive divergence → no lever.
         let g = pipeline_trace("p_g", 100.0, 90.0);
         let r = pipeline_trace("p_r", 100.0, 90.0);
-        let preferred: Vec<String> = flow::INNER_DECODE_BLOCKERS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let c = cell(4, &g, &r, &preferred).unwrap();
+        let cfg = Config::gzippy();
+        let preferred: Vec<String> = cfg.inner_blockers.clone();
+        let c = cell(4, &g, &r, &cfg, &preferred).unwrap();
         // All Δwc ≈ 0 → lever() returns None (nothing diverges positively).
         for d in &c.diverge {
             assert!(
@@ -555,7 +563,10 @@ mod tests {
             "4:/a/g4.json:/a/r4.json".to_string(),
         ];
         let inputs = parse_inputs(&specs).unwrap();
-        assert_eq!(inputs.iter().map(|i| i.threads).collect::<Vec<_>>(), [1, 4, 8]);
+        assert_eq!(
+            inputs.iter().map(|i| i.threads).collect::<Vec<_>>(),
+            [1, 4, 8]
+        );
         assert_eq!(inputs[0].a_path, PathBuf::from("/a/g1.json"));
     }
 
@@ -570,23 +581,27 @@ mod tests {
         // gzippy + rapidgzip shared span vocabulary must each fold to a role
         // (via flow::classify → role_of_stage) or be a deliberate non-stage.
         assert_eq!(
-            role_of_stage(flow::classify("worker.bootstrap").unwrap()),
+            role_of_stage(flow::classify("worker.bootstrap", &Config::gzippy().stages).unwrap()),
             Some(Role::WindowAbsentDecode)
         );
         assert_eq!(
-            role_of_stage(flow::classify("worker.isal_stream_inflate").unwrap()),
+            role_of_stage(
+                flow::classify("worker.isal_stream_inflate", &Config::gzippy().stages).unwrap()
+            ),
             Some(Role::CleanDecode)
         );
         assert_eq!(
-            role_of_stage(flow::classify("post_process.apply_window").unwrap()),
+            role_of_stage(
+                flow::classify("post_process.apply_window", &Config::gzippy().stages).unwrap()
+            ),
             Some(Role::MarkerResolve)
         );
         assert_eq!(
-            role_of_stage(flow::classify("consumer.write_data").unwrap()),
+            role_of_stage(flow::classify("consumer.write_data", &Config::gzippy().stages).unwrap()),
             Some(Role::ConsumerWrite)
         );
         assert_eq!(
-            role_of_stage(flow::classify("coord.prefetch_call").unwrap()),
+            role_of_stage(flow::classify("coord.prefetch_call", &Config::gzippy().stages).unwrap()),
             Some(Role::Dispatch)
         );
     }
