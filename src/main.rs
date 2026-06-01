@@ -24,7 +24,7 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, flow, mech, mech_arch,
-    rank, region_hw, sweep, trace, validate, vs, vs_sweep, xtool,
+    model, rank, region_hw, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -50,6 +50,7 @@ USAGE:\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P]\n\
   fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
+  fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]   parallel-SM wall-model params + lever delta\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
@@ -605,6 +606,148 @@ fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
             r.unclosed_at_eof
         );
     }
+}
+
+/// `fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]`
+///
+/// Populates the parallel-SM wall-model parameter table from a trace (d_c,
+/// d_w, L_resolve, frontier, tail, N, T), predicts the wall, and reports the
+/// residual against the observed wall. Given TWO traces it prints the
+/// gzippy−rapidgzip parameter delta and names the implied lever + magnitude.
+fn cmd_model(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    if pos.is_empty() {
+        eprintln!(
+            "usage: fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]\n\
+             \n\
+             Populates plans/parallel-sm-model.md's parameter table from a trace,\n\
+             predicts wall = max(worker-bound, publish-chain) + tail, and prints the\n\
+             residual vs observed wall. Two traces => the parameter DELTA + lever."
+        );
+        return ExitCode::FAILURE;
+    }
+    let workers: Option<u64> = flag(args, "--workers").and_then(|s| s.parse().ok());
+    let labels: Vec<String> = flag(args, "--labels")
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let mut populated: Vec<model::ModelParams> = Vec::new();
+    for (i, path) in pos.iter().enumerate() {
+        let events = match trace::load_events(Path::new(path)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let label = labels
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| Path::new(path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string()));
+        let p = model::analyze(&events, &label, workers);
+        print_model(path, &p);
+        populated.push(p);
+    }
+
+    if populated.len() >= 2 {
+        print_model_delta(&populated[0], &populated[1]);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_model(path: &str, p: &model::ModelParams) {
+    let o = |x: Option<f64>| x.map(trace::fmt_us).unwrap_or_else(|| "n/a".into());
+    println!(
+        "\n========  PARALLEL-SM MODEL  {}  (T{})  ({path})  ========",
+        p.label, p.workers
+    );
+    println!("  N (chunks)            : {}", p.n_chunks);
+    println!("  worker.decode spans   : {}", p.n_decode_spans);
+    println!(
+        "  window-absent frac f  : {:.1}%  ({} of {} decodes)",
+        p.window_absent_frac * 100.0,
+        (p.window_absent_frac * p.n_decode_spans as f64).round() as u64,
+        p.n_decode_spans
+    );
+    println!("  d_c (clean decode)    : {}", o(p.d_c_us));
+    println!("  d_w (window-absent)   : {}", o(p.d_w_us));
+    println!("  d_w_eff (f-weighted)  : {}", o(p.d_w_eff_us));
+    println!(
+        "  L_resolve (MEAN)      : {}   [median {} | p95 {}]   << THE parameter",
+        o(p.l_resolve_us),
+        o(p.l_resolve_median_us),
+        o(p.l_resolve_p95_us)
+    );
+    println!("  frontier (startup)    : {}", trace::fmt_us(p.frontier_us));
+    println!("  tail (drain)          : {}", trace::fmt_us(p.tail_us));
+    println!();
+    println!(
+        "  worker-bound  = frontier + (N/T)·d_w_eff = {}",
+        o(p.worker_bound_us)
+    );
+    println!(
+        "  publish-chain = frontier + N·L_resolve   = {}   [{}]",
+        o(p.publish_chain_us),
+        if p.binding == model::Binding::PublishChain {
+            "BINDS"
+        } else {
+            "slack"
+        }
+    );
+    println!(
+        "  wall_pred = max(worker-bound, publish-chain) + tail = {}  [binding: {}]",
+        o(p.wall_pred_us),
+        p.binding.label()
+    );
+    println!("  wall_observed         : {}", trace::fmt_us(p.observed_wall_us));
+    match model::residual_frac(p) {
+        Some(r) => {
+            let verdict = if r.abs() <= 0.10 {
+                "MODEL CONFIRMED (residual within ±10% noise)"
+            } else {
+                "RESIDUAL EXCEEDS 10% — model under-/over-predicts; an unmodeled term exists"
+            };
+            println!(
+                "  residual (pred−obs)   : {:+.1}%   {}",
+                r * 100.0,
+                verdict
+            );
+        }
+        None => println!("  residual              : n/a (a model term is unpopulated)"),
+    }
+}
+
+fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
+    let d = model::delta(a, b);
+    let r = |x: Option<f64>| x.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "n/a".into());
+    println!(
+        "\n========  DELTA  {} − {}  ========",
+        d.a_label, d.b_label
+    );
+    println!(
+        "  wall ratio {}/{}      : {:.2}×  (>1 ⇒ {} is slower)",
+        d.a_label, d.b_label, d.wall_ratio, d.a_label
+    );
+    println!(
+        "  d_w  ratio ({}/{})   : {}",
+        d.b_label, d.a_label, r(d.d_w_ratio)
+    );
+    println!(
+        "  d_c  ratio ({}/{})   : {}",
+        d.b_label, d.a_label, r(d.d_c_ratio)
+    );
+    println!(
+        "  L_resolve ratio ({}/{}): {}",
+        d.b_label, d.a_label, r(d.l_resolve_ratio)
+    );
+    println!(
+        "  window-absent frac    : {} {:.1}%   vs   {} {:.1}%",
+        d.a_label,
+        d.frac_a * 100.0,
+        d.b_label,
+        d.frac_b * 100.0
+    );
+    println!("\n  LEVER: {}", d.lever);
 }
 
 /// `fulcrum vs <gzippy-trace> <rapidgzip-trace> [--labels A,B]`
@@ -1444,6 +1587,7 @@ fn main() -> ExitCode {
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
         "consumer" => cmd_consumer(rest),
+        "model" => cmd_model(rest),
         "vs" => cmd_vs(rest),
         "vs-sweep" => cmd_vs_sweep(rest),
         "coz-parse" => cmd_coz_parse(rest),
