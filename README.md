@@ -262,6 +262,36 @@ write tax is separated from real decode scaling — a confound that, read from a
 single sink, sends you optimizing the wrong thing. `efficiency = speedup /
 T`; a region whose critical-path share RISES with T is a scaling blocker.
 
+## Speculation interconnectedness (`fulcrum causal`)
+
+`flow` and `vs` measure per-span TIMING. `causal` measures the COUPLING that
+TIMING hides: in a speculative parallel decoder, whether chunk N+1 takes the
+fast or the slow path depends on whether N's window was published — at the key
+N+1 looks up — by the time N+1's worker starts. That is a causal chain
+(consumer-advance → window-publish → successor decode-mode → resolution tax),
+and a per-span view cannot see it.
+
+```bash
+# Capture an enriched trace (the pipeline emits causal.* instant events when
+# its timeline is enabled), then reconstruct the chain — no source reading.
+fulcrum causal /tmp/trace.json --timeline 18
+```
+
+It reports four things from the `causal.*` events:
+
+1. **Runtime window-absent fraction vs static.** How many chunks ACTUALLY
+   speculated, against the static boundary fraction the codebase assumes. A
+   large gap means the decode-mode is decided at runtime, not by data layout.
+2. **Publish-latency + key-mismatch.** For each speculative chunk: was its
+   predecessor's window published, before it started, *at the key it looked
+   up*? Distinguishes "the window was late" (timing) from "the window exists
+   under a different key than the speculative seed" (structural) — two
+   findings that point at completely different fixes.
+3. **Dependency timeline.** A per-chunk swimlane (decode-start → mode →
+   publish → consume) so the serial window-chain and its stalls are visible.
+4. **Data-model tax.** The per-pass bytes+µs a window-absent chunk pays
+   (decode→u16, resolve, narrow) that a clean chunk never does.
+
 ## Modern Coz profiles (`fulcrum coz-jsonl`)
 
 Recent `coz` emits `profile.jsonl` by default; its `--legacy-format` `.coz`
