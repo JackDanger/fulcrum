@@ -24,23 +24,36 @@
 //!
 //! ## The four classes
 //!
-//!   - WAIT   : the consumer is blocked on a producer (`rx_recv_block`,
-//!              `block_finder_get`/`block_fetcher_get`, `future_recv`,
-//!              `try_take_prefetched`, `wait_replaced_markers`). Shrinking
-//!              these is a PRODUCER/SCHEDULING lever, not a consumer-code one.
-//!   - COMPUTE: the consumer's own serial CPU work (`write_narrowed` u16→u8
-//!              narrow tax, `window_publish_marker`/`resolve_markers` marker
-//!              resolution, `combine_crc`, `publish_windows`, …).
-//!   - OUTPUT : `write_data` — materializing the decompressed bytes to the
-//!              writer. The irreducible floor (you must emit every output byte).
-//!   - IDLE   : consumer-span inclusive minus everything classified above. A
-//!              gap the instrumentation did not name; large IDLE ⇒ add spans.
+//! - WAIT: the consumer is blocked on a producer (`rx_recv_block`,
+//!   `block_finder_get`/`block_fetcher_get`, `future_recv`,
+//!   `try_take_prefetched`, `wait_replaced_markers`). Shrinking these is a
+//!   PRODUCER/SCHEDULING lever, not a consumer-code one.
+//! - COMPUTE: the consumer's own serial CPU work (`write_narrowed` u16→u8
+//!   narrow tax, `window_publish_marker`/`resolve_markers` marker resolution,
+//!   `combine_crc`, `publish_windows`, …).
+//! - OUTPUT: `write_data` — materializing the decompressed bytes to the writer.
+//!   The irreducible floor (you must emit every output byte).
+//! - IDLE: consumer-span inclusive minus everything classified above. A gap the
+//!   instrumentation did not name; large IDLE ⇒ add spans.
 //!
 //! Classification is by name (see [`classify`]); unknown names are reported in
 //! their own bucket so coverage is auditable rather than silently folded.
 
+use crate::config::ConsumerProfile;
 use crate::trace::{Event, Span};
 use std::collections::BTreeMap;
+
+/// The universal blocking-receive convention, recognized as WAIT regardless of
+/// profile (mirrors [`Span::is_wait`] on a bare name). A pipeline that follows
+/// the `wait.*` / `*.wait` / `*recv*` convention needs NO consumer config to
+/// get correct WAIT classification.
+fn is_conventional_wait(name: &str) -> bool {
+    name.starts_with("wait.")
+        || name.ends_with(".wait")
+        || name.contains("rx_recv")
+        || name.ends_with(".recv")
+        || name.ends_with("_recv_block")
+}
 
 /// The four consumer time classes (plus UNKNOWN for un-classified names).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,60 +78,27 @@ impl Class {
     }
 }
 
-/// Classify a consumer span name into one of the four classes.
+/// Classify a consumer span name into one of the four classes, using the
+/// supplied [`ConsumerProfile`].
 ///
-/// WAIT recognizes the blocking-receive convention ([`Span::is_wait`]) plus the
-/// pipeline's explicit prefetch/marker waits. OUTPUT is the single
-/// byte-materialization span. COMPUTE is the consumer's own serial work.
-/// Anything else is UNKNOWN (surfaced, not hidden).
-pub fn classify(name: &str) -> Class {
-    // OUTPUT: the decompressed-byte materialization (the irreducible floor).
-    if name == "consumer.write_data" {
+/// Precedence: OUTPUT (the irreducible byte floor) → WAIT (the universal
+/// blocking-receive convention PLUS the profile's `wait` matcher) → IDLE (the
+/// profile's outer-loop umbrellas, whose exclusive self-time IS the inter-child
+/// gap) → COMPUTE (the consumer's own serial work). Anything else is UNKNOWN
+/// (surfaced, never hidden). OUTPUT is checked before WAIT so an output span is
+/// never miscounted as a wait; WAIT before COMPUTE so the universal convention
+/// dominates a stray compute entry.
+pub fn classify(name: &str, p: &ConsumerProfile) -> Class {
+    if p.output.matches(name) {
         return Class::Output;
     }
-    // WAIT: the conventional recv/wait names plus the pipeline's explicit
-    // "is the next thing ready yet?" stalls. `try_take_prefetched` is a WAIT
-    // umbrella: it blocks on a future being delivered by a worker.
-    if name.contains("rx_recv")
-        || name.ends_with("_recv_block")
-        || name.ends_with(".recv")
-        || name.starts_with("wait.")
-        || name.ends_with(".wait")
-        || name.contains("block_finder_get")
-        || name.contains("block_fetcher_get")
-        || name == "consumer.try_take_prefetched"
-        || name == "consumer.wait_replaced_markers"
-        || name == "consumer.future_recv"
-    {
+    if is_conventional_wait(name) || p.wait.matches(name) {
         return Class::Wait;
     }
-    // IDLE: the outer consumer-loop umbrellas. Their EXCLUSIVE self-time is the
-    // gap between named children — the un-instrumented loop overhead — which is
-    // exactly the idle-gap the reconciliation surfaces. Classifying them here
-    // (rather than as COMPUTE/UNKNOWN) makes the four classes sum to the span.
-    if name == "consumer.iter" || name == "consumer.drain" || name == "drive" {
+    if p.idle_umbrellas.matches(name) {
         return Class::Idle;
     }
-    // COMPUTE: the consumer's own serial CPU work. The narrow tax
-    // (`write_narrowed`, u16→u8) and marker resolution are the dominant ones;
-    // the rest are book-keeping. Matched by exact name so coverage is explicit.
-    const COMPUTE: &[&str] = &[
-        "consumer.write_narrowed",
-        "consumer.window_publish_marker",
-        "consumer.window_publish_clean",
-        "consumer.resolve_markers",
-        "consumer.combine_crc",
-        "consumer.publish_windows",
-        "consumer.arc_take_or_clone",
-        "consumer.dispatch_post_process",
-        "consumer.process_prefetches",
-        "coord.prefetch_call",
-        "coord.prefetch_emit",
-        "pool.submit",
-        "ttp.get_if_available",
-        "ttp.take_prefetch",
-    ];
-    if COMPUTE.contains(&name) {
+    if p.compute.matches(name) {
         return Class::Compute;
     }
     Class::Unknown
@@ -178,13 +158,27 @@ pub struct ConsumerReport {
     pub unclosed_at_eof: usize,
 }
 
-/// Pick the consumer thread: the `(pid, tid)` with the most WAIT self-time
-/// (the in-order consumer is the thread that blocks on producers). Falls back
-/// to tid==1 if no waits are present, then to the busiest thread.
-fn pick_consumer(spans: &[Span]) -> (u64, u64) {
+/// Pick the consumer thread. If the profile sets a `thread_prefix`, prefer the
+/// `(pid, tid)` that owns the most spans with that prefix (the explicit
+/// identification). Otherwise fall back to the most-WAIT-self-time thread (the
+/// in-order consumer is the thread that blocks on producers), then tid==1, then
+/// the busiest thread. The fallback chain makes the GENERIC profile still find
+/// a sensible consumer with zero configuration.
+fn pick_consumer(spans: &[Span], p: &ConsumerProfile) -> (u64, u64) {
+    if !p.thread_prefix.is_empty() {
+        let mut by_thread: BTreeMap<(u64, u64), f64> = BTreeMap::new();
+        for s in spans {
+            if s.name.starts_with(p.thread_prefix.as_str()) {
+                *by_thread.entry((s.pid, s.tid)).or_default() += s.dur;
+            }
+        }
+        if let Some((&k, _)) = by_thread.iter().max_by(|a, b| a.1.total_cmp(b.1)) {
+            return k;
+        }
+    }
     let mut wait_by_thread: BTreeMap<(u64, u64), f64> = BTreeMap::new();
     for s in spans {
-        if classify(&s.name) == Class::Wait {
+        if classify(&s.name, p) == Class::Wait {
             *wait_by_thread.entry((s.pid, s.tid)).or_default() += s.dur;
         }
     }
@@ -338,11 +332,12 @@ fn stack_self_time(events: &[Event], consumer: (u64, u64)) -> StackResult {
     }
 }
 
-/// Analyze one trace into a [`ConsumerReport`].
-pub fn analyze(events: &[Event]) -> ConsumerReport {
+/// Analyze one trace into a [`ConsumerReport`], using the supplied profile to
+/// identify the consumer thread and classify its spans.
+pub fn analyze(events: &[Event], p: &ConsumerProfile) -> ConsumerReport {
     let spans = crate::trace::pair_spans(events);
     let wall_us = crate::trace::wall_us(&spans);
-    let consumer = pick_consumer(&spans);
+    let consumer = pick_consumer(&spans, p);
     let sr = stack_self_time(events, consumer);
 
     let mut spans_out: Vec<SpanStat> = sr
@@ -350,7 +345,7 @@ pub fn analyze(events: &[Event]) -> ConsumerReport {
         .iter()
         .map(|(name, &self_us)| SpanStat {
             name: name.clone(),
-            class: classify(name),
+            class: classify(name, p),
             self_us,
             incl_us: sr.incl_us.get(name).copied().unwrap_or(0.0),
             count: sr.count.get(name).copied().unwrap_or(0),
@@ -406,7 +401,14 @@ pub fn analyze(events: &[Event]) -> ConsumerReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use serde_json::json;
+
+    /// The gzippy consumer profile, used by the tests that exercise gzippy span
+    /// names through `analyze`/`classify`.
+    fn gz() -> ConsumerProfile {
+        Config::gzippy().consumer
+    }
 
     fn ev(name: &str, ph: &str, ts: f64) -> Event {
         serde_json::from_value(json!({
@@ -491,7 +493,7 @@ mod tests {
             ev("consumer.write_narrowed", "E", 200.0),
             ev("consumer.iter", "E", 200.0),
         ];
-        let r = analyze(&events);
+        let r = analyze(&events, &gz());
         assert!(
             r.reconcile.reconciled,
             "busy+idle must reconcile to span (residual {})",
@@ -534,7 +536,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        let r = analyze(&events);
+        let r = analyze(&events, &gz());
         // Extent = 200 − 0 = 200. write_data OUTPUT = 120. The remaining 80 is
         // the unclosed drive+iter self-time → IDLE. Must reconcile exactly.
         assert!(
@@ -557,14 +559,17 @@ mod tests {
 
     #[test]
     fn classify_buckets() {
-        assert_eq!(classify("consumer.write_data"), Class::Output);
-        assert_eq!(classify("ttp.rx_recv_block"), Class::Wait);
-        assert_eq!(classify("wait.block_fetcher_get"), Class::Wait);
-        assert_eq!(classify("consumer.block_finder_get"), Class::Wait);
-        assert_eq!(classify("consumer.try_take_prefetched"), Class::Wait);
-        assert_eq!(classify("consumer.write_narrowed"), Class::Compute);
-        assert_eq!(classify("consumer.window_publish_marker"), Class::Compute);
-        assert_eq!(classify("consumer.combine_crc"), Class::Compute);
-        assert_eq!(classify("totally.unknown.span"), Class::Unknown);
+        assert_eq!(classify("consumer.write_data", &gz()), Class::Output);
+        assert_eq!(classify("ttp.rx_recv_block", &gz()), Class::Wait);
+        assert_eq!(classify("wait.block_fetcher_get", &gz()), Class::Wait);
+        assert_eq!(classify("consumer.block_finder_get", &gz()), Class::Wait);
+        assert_eq!(classify("consumer.try_take_prefetched", &gz()), Class::Wait);
+        assert_eq!(classify("consumer.write_narrowed", &gz()), Class::Compute);
+        assert_eq!(
+            classify("consumer.window_publish_marker", &gz()),
+            Class::Compute
+        );
+        assert_eq!(classify("consumer.combine_crc", &gz()), Class::Compute);
+        assert_eq!(classify("totally.unknown.span", &gz()), Class::Unknown);
     }
 }

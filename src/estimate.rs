@@ -190,6 +190,7 @@ impl Estimate {
     ///     latency sum once it contends with other cores; and
     ///   * **inner-loop pipeline/branch** effects — removing a per-iteration
     ///     branch/dependency unblocks more retire slots than the raw cycle delta.
+    ///
     /// So we widen the point into a bracket whose magnitude spans
     /// `[point, point × K]` (K = the modeling-uncertainty factor below),
     /// preserving the sign. A near-zero point (an off-path / non-lever change)

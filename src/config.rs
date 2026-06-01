@@ -86,6 +86,93 @@ pub struct GroundTruth {
     pub cp_offpath_max: Option<f64>,
 }
 
+/// A declarative span-name matcher: a span name matches if it equals any
+/// `exact` name, OR starts with any `prefixes` entry, OR ends with any
+/// `suffixes` entry, OR contains any `substrings` entry. Empty everywhere ⇒
+/// matches nothing. This is the one primitive every configurable
+/// classification (consumer classes, pipeline stages, blockers) is built from,
+/// so a pipeline that names its spans differently from gzippy is described
+/// purely as data — no analyzer code changes.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Matcher {
+    #[serde(default)]
+    pub exact: Vec<String>,
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    #[serde(default)]
+    pub suffixes: Vec<String>,
+    #[serde(default)]
+    pub substrings: Vec<String>,
+}
+
+impl Matcher {
+    /// True if `name` matches any rule. An empty matcher matches nothing.
+    pub fn matches(&self, name: &str) -> bool {
+        self.exact.iter().any(|e| e == name)
+            || self.prefixes.iter().any(|p| name.starts_with(p.as_str()))
+            || self.suffixes.iter().any(|s| name.ends_with(s.as_str()))
+            || self.substrings.iter().any(|s| name.contains(s.as_str()))
+    }
+
+    /// True when no rule is set (matches nothing).
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+            && self.prefixes.is_empty()
+            && self.suffixes.is_empty()
+            && self.substrings.is_empty()
+    }
+
+    fn exact_of(names: &[&str]) -> Self {
+        Matcher {
+            exact: names.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+}
+
+/// How the consumer thread's spans are classified into WAIT / COMPUTE /
+/// OUTPUT / IDLE for the `consumer` decomposition view. Every needle is data;
+/// the gzippy values live in [`Config::gzippy`]. The universal blocking-receive
+/// convention ([`crate::trace::Span::is_wait`]: `wait.*`, `*.wait`, `*recv*`)
+/// is ALWAYS recognized as WAIT in addition to anything configured here, so a
+/// pipeline that follows the convention needs no consumer config at all.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ConsumerProfile {
+    /// Span-name prefix that identifies the in-order consumer thread (the
+    /// thread whose serial chain is the wall). Empty ⇒ fall back to the
+    /// most-WAIT thread / tid==1 heuristic. gzippy: `consumer.`.
+    #[serde(default)]
+    pub thread_prefix: String,
+    /// OUTPUT — irreducible byte-materialization spans.
+    #[serde(default)]
+    pub output: Matcher,
+    /// WAIT — blocked-on-producer spans, in ADDITION to the universal
+    /// convention.
+    #[serde(default)]
+    pub wait: Matcher,
+    /// IDLE — outer-loop umbrella spans whose exclusive self-time IS the
+    /// inter-child gap (so the four classes sum to the consumer span).
+    #[serde(default)]
+    pub idle_umbrellas: Matcher,
+    /// COMPUTE — the consumer's own serial CPU work.
+    #[serde(default)]
+    pub compute: Matcher,
+}
+
+/// One pipeline stage for the `flow` view: a display name plus the matcher of
+/// span names that count as busy work in that stage. Stages render in
+/// declaration order. A stage name beginning with `·` (e.g. `·wait`,
+/// `·umbrella`) is a NON-stage: its spans are recognized (kept out of
+/// UNCLASSIFIED) but contribute no busy work and never appear as a stage row —
+/// used for waits (attributed via critpath) and umbrellas (whose enclosed leaf
+/// work is what should be credited).
+#[derive(Clone, Debug, Deserialize)]
+pub struct StageDef {
+    pub name: String,
+    #[serde(flatten)]
+    pub matcher: Matcher,
+}
+
 /// The full profile configuration.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -96,6 +183,22 @@ pub struct Config {
     pub regions: Vec<RegionDef>,
     #[serde(default)]
     pub ground_truth: GroundTruth,
+    /// Consumer-decomposition classification (see [`ConsumerProfile`]). With
+    /// the default (empty) profile the view still works via the universal wait
+    /// convention and the most-WAIT-thread heuristic.
+    #[serde(default)]
+    pub consumer: ConsumerProfile,
+    /// Pipeline stages for the `flow` view, in render order. Empty ⇒ flow
+    /// reports every span name as its own "stage" is NOT done; instead an empty
+    /// stage list yields an all-UNCLASSIFIED report, signalling the user to
+    /// supply stages. The gzippy stages are in [`Config::gzippy`].
+    #[serde(default)]
+    pub stages: Vec<StageDef>,
+    /// Inner-phase span names to prefer as critical-path wait blockers (so a
+    /// consumer stall is blamed on the real inner phase, not the task umbrella
+    /// that wraps it). See [`crate::flow`].
+    #[serde(default)]
+    pub inner_blockers: Vec<String>,
 }
 
 fn default_progress_point() -> String {
@@ -225,6 +328,237 @@ impl Config {
                 cp_offpath_region: Some("emit".to_string()),
                 cp_offpath_max: Some(0.05),
             },
+            // The toy's in-order consumer thread emits `consumer.emit` (its
+            // OUTPUT) and blocks on `consumer.wait` (recognized by the
+            // universal convention, but listed for explicitness). This makes
+            // `fulcrum consumer <toy-trace>` work on the bundled demo.
+            consumer: ConsumerProfile {
+                thread_prefix: "consumer.".to_string(),
+                output: Matcher::exact_of(&["consumer.emit"]),
+                wait: Matcher::exact_of(&["consumer.wait"]),
+                idle_umbrellas: Matcher::exact_of(&["consumer.loop", "drive"]),
+                compute: Matcher::default(),
+            },
+            // The toy's four worker stages as flow stages, plus the consumer
+            // output. Worker spans run under `worker.item`; the leaf stage
+            // scopes are the bare stage names.
+            stages: vec![
+                StageDef {
+                    name: "1·parse".to_string(),
+                    matcher: Matcher::exact_of(&["parse"]),
+                },
+                StageDef {
+                    name: "2·transform".to_string(),
+                    matcher: Matcher::exact_of(&["transform"]),
+                },
+                StageDef {
+                    name: "3·compress".to_string(),
+                    matcher: Matcher::exact_of(&["compress"]),
+                },
+                StageDef {
+                    name: "4·emit".to_string(),
+                    matcher: Matcher::exact_of(&["emit", "consumer.emit"]),
+                },
+                StageDef {
+                    name: "·umbrella".to_string(),
+                    matcher: Matcher {
+                        exact: vec!["worker.item".to_string(), "consumer.loop".to_string()],
+                        ..Default::default()
+                    },
+                },
+                StageDef {
+                    name: "·wait".to_string(),
+                    matcher: Matcher::exact_of(&["consumer.wait"]),
+                },
+            ],
+            inner_blockers: vec![
+                "parse".to_string(),
+                "transform".to_string(),
+                "compress".to_string(),
+                "emit".to_string(),
+            ],
         }
+    }
+
+    /// A built-in profile selected by NAME (so `--config gzippy` works with no
+    /// file). Returns `None` for an unknown name (caller then tries it as a
+    /// file path).
+    pub fn builtin(name: &str) -> Option<Config> {
+        match name {
+            "gzippy" => Some(Config::gzippy()),
+            "demo" | "toy" => Some(Config::demo()),
+            "generic" | "default" => Some(Config::generic()),
+            _ => None,
+        }
+    }
+
+    /// The fully generic profile: NO pipeline-specific needles. The consumer
+    /// view still finds the consumer thread via the most-WAIT heuristic and
+    /// classifies waits via the universal convention; OUTPUT/COMPUTE are
+    /// reported as UNKNOWN until the user supplies a config. The flow view has
+    /// no stages, so it reports everything as UNCLASSIFIED and prints the span
+    /// vocabulary the user should turn into stages. This is the honest
+    /// "I don't know your pipeline yet" default for a brand-new target.
+    pub fn generic() -> Config {
+        Config {
+            progress_point: "work_done".to_string(),
+            regions: Vec::new(),
+            ground_truth: GroundTruth::default(),
+            consumer: ConsumerProfile::default(),
+            stages: Vec::new(),
+            inner_blockers: Vec::new(),
+        }
+    }
+
+    /// The gzippy built-in profile: the span vocabulary of gzippy's parallel
+    /// single-member decode pipeline. This is the worked example that ships
+    /// in-tree — `fulcrum consumer gzippy_trace.json --config gzippy` works
+    /// with no JSON file. Anyone profiling THEIR pipeline writes the equivalent
+    /// as a small `--config profile.json` (see the README "your pipeline"
+    /// section); nothing here is compiled into the analyzer.
+    pub fn gzippy() -> Config {
+        let m =
+            |exact: &[&str], prefixes: &[&str], substrings: &[&str], suffixes: &[&str]| Matcher {
+                exact: exact.iter().map(|s| s.to_string()).collect(),
+                prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+                substrings: substrings.iter().map(|s| s.to_string()).collect(),
+                suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
+            };
+        Config {
+            progress_point: "work_done".to_string(),
+            regions: Vec::new(),
+            ground_truth: GroundTruth::default(),
+            consumer: ConsumerProfile {
+                thread_prefix: "consumer.".to_string(),
+                output: Matcher::exact_of(&["consumer.write_data"]),
+                wait: m(
+                    &[
+                        "consumer.try_take_prefetched",
+                        "consumer.wait_replaced_markers",
+                        "consumer.future_recv",
+                    ],
+                    &[],
+                    &["block_finder_get", "block_fetcher_get"],
+                    &[],
+                ),
+                idle_umbrellas: Matcher::exact_of(&["consumer.iter", "consumer.drain", "drive"]),
+                compute: Matcher::exact_of(&[
+                    "consumer.write_narrowed",
+                    "consumer.window_publish_marker",
+                    "consumer.window_publish_clean",
+                    "consumer.resolve_markers",
+                    "consumer.combine_crc",
+                    "consumer.publish_windows",
+                    "consumer.arc_take_or_clone",
+                    "consumer.dispatch_post_process",
+                    "consumer.process_prefetches",
+                    "coord.prefetch_call",
+                    "coord.prefetch_emit",
+                    "pool.submit",
+                    "ttp.get_if_available",
+                    "ttp.take_prefetch",
+                ]),
+            },
+            stages: vec![
+                StageDef {
+                    name: "1·dispatch (upstream)".to_string(),
+                    matcher: m(
+                        &[
+                            "pool.submit",
+                            "consumer.process_prefetches",
+                            "consumer.block_finder_get",
+                            "consumer.try_take_prefetched",
+                        ],
+                        &["coord.", "pool.pick"],
+                        &[],
+                        &[],
+                    ),
+                },
+                StageDef {
+                    name: "2·worker bootstrap (window-absent)".to_string(),
+                    matcher: Matcher::exact_of(&[
+                        "worker.bootstrap",
+                        "worker.block_body",
+                        "worker.block_header",
+                    ]),
+                },
+                StageDef {
+                    name: "3·worker ISA-L (clean tail)".to_string(),
+                    matcher: Matcher::exact_of(&[
+                        "worker.isal_stream_inflate",
+                        "worker.absorb_isal_tail",
+                    ]),
+                },
+                StageDef {
+                    name: "5·consumer resolve (markers/window)".to_string(),
+                    matcher: m(
+                        &[
+                            "consumer.wait_replaced_markers",
+                            "consumer.publish_windows",
+                            "consumer.dispatch_post_process",
+                        ],
+                        &["consumer.window_", "post_process."],
+                        &[],
+                        &[],
+                    ),
+                },
+                StageDef {
+                    name: "6·consumer write (output)".to_string(),
+                    // The trailing `consumer.` prefix catches any other
+                    // consumer self-work as output (matches the original
+                    // fall-through). It is LAST so the more-specific stages win.
+                    matcher: m(
+                        &[
+                            "consumer.write_data",
+                            "consumer.write_narrowed",
+                            "consumer.combine_crc",
+                            "consumer.drain",
+                            "consumer.arc_take_or_clone",
+                        ],
+                        &["consumer."],
+                        &[],
+                        &[],
+                    ),
+                },
+                StageDef {
+                    name: "·wait".to_string(),
+                    matcher: m(
+                        &["ttp.rx_recv_block", "future.recv"],
+                        &["wait.", "ttp.", "chan_recv"],
+                        &[],
+                        &[".wait"],
+                    ),
+                },
+                StageDef {
+                    name: "·umbrella".to_string(),
+                    matcher: m(
+                        &[
+                            "consumer.iter",
+                            "drive",
+                            "pool.run_task",
+                            "worker.decode_chunk",
+                            "worker.seed_first",
+                        ],
+                        &["lock.", "worker.scan"],
+                        &[],
+                        &[],
+                    ),
+                },
+            ],
+            inner_blockers: vec![
+                "worker.bootstrap".to_string(),
+                "worker.block_body".to_string(),
+                "worker.block_header".to_string(),
+                "worker.isal_stream_inflate".to_string(),
+                "worker.absorb_isal_tail".to_string(),
+            ],
+        }
+    }
+}
+
+impl Default for Config {
+    /// The generic profile (no pipeline-specific needles).
+    fn default() -> Self {
+        Config::generic()
     }
 }

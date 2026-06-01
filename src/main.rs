@@ -24,7 +24,7 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, flow, mech, mech_arch,
-    model, rank, region_hw, sweep, trace, validate, vs, xtool,
+    model, rank, region_hw, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -40,6 +40,9 @@ USAGE:\n\
   fulcrum mech-report <perf_report.txt>\n\
   fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
   fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
+  fulcrum vs <A-trace.json> <B-trace.json> [--labels a,b] [--config profile]\n\
+  fulcrum vs-sweep --at T:a.json:b.json [--at ...] [--labels a,b] [--config c.json]\n\
+  fulcrum flow <trace.json> [--whatif stage:factor] [--config profile]\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
@@ -52,8 +55,13 @@ USAGE:\n\
 \n\
 The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
 `fulcrum::probe` writes one when FULCRUM_TRACE=/path.json is set). profile.coz\n\
-is produced by running your instrumented binary under `coz run`. With no\n\
---config, a built-in demo config (matching examples/toy_pipeline.rs) is used.\n\
+is produced by running your instrumented binary under `coz run`.\n\
+\n\
+--config takes a profile.json PATH or a built-in profile NAME: `generic`\n\
+(the no-vocabulary default — works on any pipeline via the universal wait\n\
+convention), `gzippy` (the worked example vocabulary), or `demo` (matches\n\
+examples/toy_pipeline.rs). The consumer/flow/vs views classify span names\n\
+entirely from the config, so they run on YOUR span vocabulary unchanged.\n\
 \n\
 compare/audit run a FAIR cross-tool benchmark from a generic --spec JSON\n\
 (no competitor names baked in): it verifies every output's sha256 vs a\n\
@@ -88,16 +96,31 @@ fn positional(args: &[String]) -> Vec<&str> {
     out
 }
 
-/// Load the config named by `--config`, or fall back to the built-in demo.
+/// Load the config named by `--config` / `--profile`, or fall back to the
+/// built-in demo (the toy-pipeline default).
+///
+/// `--config` accepts either a JSON file PATH or one of the built-in profile
+/// NAMES (`gzippy`, `demo`, `generic`), so `fulcrum consumer t.json --config
+/// gzippy` works out-of-the-box with no file. `--profile <name>` is an alias.
 fn load_config(args: &[String]) -> Config {
-    match flag(args, "--config") {
-        Some(p) => match Config::load(Path::new(p)) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("fulcrum: --config {p}: {e}\n         falling back to the demo config.");
-                Config::demo()
+    let named = flag(args, "--config").or_else(|| flag(args, "--profile"));
+    match named {
+        Some(name) => {
+            if let Some(c) = Config::builtin(name) {
+                return c;
             }
-        },
+            match Config::load(Path::new(name)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "fulcrum: --config {name}: {e}\n         (not a built-in profile name \
+                         either: try gzippy | demo | generic)\n         falling back to the demo \
+                         config."
+                    );
+                    Config::demo()
+                }
+            }
+        }
         None => Config::demo(),
     }
 }
@@ -156,8 +179,8 @@ fn cmd_flow(args: &[String]) -> ExitCode {
     // Prefer the inner decode phases (bootstrap vs ISA-L) as wait blockers so
     // consumer stall is attributed to the real phase, not the task umbrella.
     let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
-    let report = flow::analyze_flow(&events, &preferred);
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    let report = flow::analyze_flow(&events, &cfg, &preferred);
     print_flow(&report);
     if let Some(spec) = flag(args, "--whatif") {
         // STAGE-substring:FACTOR  e.g.  decode:2  or  "consumer write:1e9"
@@ -167,10 +190,10 @@ fn cmd_flow(args: &[String]) -> ExitCode {
                 .stages
                 .iter()
                 .find(|s| s.name.contains(needle))
-                .map(|s| s.name)
+                .map(|s| s.name.clone())
             {
                 Some(name) => {
-                    if let Some((w, saved)) = flow::whatif(&report, name, factor) {
+                    if let Some((w, saved)) = flow::whatif(&report, &name, factor) {
                         println!("\n  what-if: {name} ×{factor} faster");
                         println!(
                             "    wall {:.1}ms → {:.1}ms  (saves {:.1}ms, {:.1}%)  [critical-path upper bound]",
@@ -455,6 +478,7 @@ fn cmd_consumer(args: &[String]) -> ExitCode {
         eprintln!("usage: fulcrum consumer <trace.json> [trace2.json ...]");
         return ExitCode::FAILURE;
     }
+    let cfg = load_config(args);
     let mut any_unreconciled = false;
     for path in &pos {
         let events = match trace::load_events(Path::new(path)) {
@@ -464,7 +488,7 @@ fn cmd_consumer(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let report = consumer::analyze(&events);
+        let report = consumer::analyze(&events, &cfg.consumer);
         if !report.reconcile.reconciled {
             any_unreconciled = true;
         }
@@ -514,7 +538,7 @@ fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
         ("IDLE", "loop-umbrella self-time: un-instrumented gap"),
         (
             "UNKNOWN",
-            "un-classified span names (add to consumer::classify)",
+            "un-classified span names (add to the config's consumer.* matchers)",
         ),
     ];
     for (k, meaning) in classes {
@@ -739,9 +763,65 @@ fn cmd_vs(args: &[String]) -> ExitCode {
     let (al, bl) = labels.split_once(',').unwrap_or(("gzippy", "rapidgzip"));
     let cfg = load_config(args);
     let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(flow::INNER_DECODE_BLOCKERS.iter().map(|s| s.to_string()));
-    match vs::compare(al, Path::new(a), bl, Path::new(b), &preferred) {
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    match vs::compare(
+        al,
+        Path::new(a),
+        bl,
+        Path::new(b),
+        &preferred,
+        &cfg.consumer.thread_prefix,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels a,b]`
+///
+/// Per-thread-count cross-tool divergence report: for each T, the per-role
+/// (dispatch/decode/resolve/consumer-wait/write) gzippy-vs-rapidgzip busy +
+/// wall-critical breakdown, RANKED by the wall-critical divergence, with a
+/// top-line LEVER per T and a cross-T scaling matrix — so a reader names the
+/// necessary gzippy change without opening gzippy's source.
+fn cmd_vs_sweep(args: &[String]) -> ExitCode {
+    let labels = flag(args, "--labels").unwrap_or("gzippy,rapidgzip");
+    let (al, bl) = labels.split_once(',').unwrap_or(("gzippy", "rapidgzip"));
+    // Collect every `--at` spec (repeatable).
+    let mut specs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--at" {
+            if let Some(v) = args.get(i + 1) {
+                specs.push(v.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if specs.is_empty() {
+        eprintln!(
+            "usage: fulcrum vs-sweep --at T:gzippy.json:rapidgzip.json [--at ...] [--labels gzippy,rapidgzip] [--config c.json]\n  \
+             (repeat --at per thread count; both traces must share the parallel-SM span vocabulary)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let inputs = match vs_sweep::parse_inputs(&specs) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = load_config(args);
+    let mut preferred = preferred_blockers(&cfg);
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    match vs_sweep::run(al, bl, &inputs, &cfg, &preferred) {
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fulcrum: {e}");
             ExitCode::FAILURE
@@ -807,7 +887,7 @@ fn print_flow(r: &flow::FlowReport) {
     if !r.unclassified.is_empty() {
         let total: f64 = r.unclassified.iter().map(|(_, d)| d).sum();
         println!(
-            "  ⚠ UNCLASSIFIED spans ({:.1}ms busy across {} names) — add to flow::classify:",
+            "  ⚠ UNCLASSIFIED spans ({:.1}ms busy across {} names) — add them to a config `stages` entry:",
             total / 1000.0,
             r.unclassified.len()
         );
@@ -1509,6 +1589,7 @@ fn main() -> ExitCode {
         "consumer" => cmd_consumer(rest),
         "model" => cmd_model(rest),
         "vs" => cmd_vs(rest),
+        "vs-sweep" => cmd_vs_sweep(rest),
         "coz-parse" => cmd_coz_parse(rest),
         "mech-report" => cmd_mech_report(rest),
         "rank" => cmd_rank(rest),
