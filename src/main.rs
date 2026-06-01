@@ -23,8 +23,9 @@
 
 use fulcrum::config::Config;
 use fulcrum::{
-    audit, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, flow, mech, mech_arch,
-    model, rank, region_hw, sweep, trace, validate, vs, vs_sweep, xtool,
+    audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
+    flow, mech, mech_arch, model, rank, region_hw, schedule, sweep, trace, validate, vs, vs_sweep,
+    xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -606,6 +607,153 @@ fn print_consumer(path: &str, r: &consumer::ConsumerReport) {
             r.unclosed_at_eof
         );
     }
+}
+
+/// `fulcrum schedule <trace.json>` — S1, the PLACEMENT-vs-RATE arbiter.
+///
+/// Classifies every consumer stall (`wait.block_fetcher_get`) as PLACEMENT
+/// (idle worker existed while the frontier chunk was undecoded — ready capacity
+/// unused), RATE (frontier genuinely not decoded; all capacity busy), or
+/// SPECULATION-INVALID. Prints the verdict: which note wins.
+fn cmd_schedule(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(trace_path) = pos.first() else {
+        eprintln!("usage: fulcrum schedule <trace.json>");
+        return ExitCode::FAILURE;
+    };
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spans = trace::pair_spans(&events);
+    let v = schedule::classify_stalls(&spans);
+    println!("fulcrum schedule — S1 PLACEMENT-vs-RATE arbiter");
+    if v.n_stalls == 0 {
+        println!("  no consumer stalls (wait.block_fetcher_get) in this trace.");
+        println!("  (either the run never serial-stalled, or the trace predates the span.)");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "  consumer stalls       : {} totalling {:.2}ms",
+        v.n_stalls,
+        v.total_stall_us / 1000.0
+    );
+    println!(
+        "    PLACEMENT (ready work unused) : {:.2}ms ({:.1}%)",
+        v.placement_us / 1000.0,
+        100.0 * v.placement_frac()
+    );
+    println!(
+        "    RATE (frontier not decoded)   : {:.2}ms ({:.1}%)",
+        v.rate_us / 1000.0,
+        100.0 * v.rate_frac()
+    );
+    if v.speculation_us > 0.0 {
+        println!(
+            "    SPECULATION-INVALID           : {:.2}ms ({:.1}%)",
+            v.speculation_us / 1000.0,
+            100.0 * v.speculation_us / v.total_stall_us.max(1.0)
+        );
+    }
+    let win = v.winner();
+    let note = if win == "PLACEMENT" {
+        "project_wall_is_consumer_critical_path WINS — port queuePrefetchedChunkPostProcessing (eager successor placement)"
+    } else {
+        "project_t8_saturated_pool_diag WINS — frontier is rate-bound; lever is decode speed (~15% bounded)"
+    };
+    println!("  VERDICT: {win}-dominant. {note}");
+    ExitCode::SUCCESS
+}
+
+/// `fulcrum decompose <trace.json>` — NAME the model residual.
+///
+/// wall = Σ(named consumer regions) + NAMED residual
+/// (page-fault / ctxsw / blocked-on-host / queueing / alloc), from the
+/// getrusage + schedstat counters gzippy emits at region boundaries.
+fn cmd_decompose(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(trace_path) = pos.first() else {
+        eprintln!("usage: fulcrum decompose <trace.json>");
+        return ExitCode::FAILURE;
+    };
+    let cfg = load_config(args);
+    let events = match trace::load_events(Path::new(trace_path)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spans = trace::pair_spans(&events);
+
+    // Named regions = the consumer thread's accounted self-time (COMPUTE +
+    // OUTPUT + UNKNOWN; WAIT and IDLE are not "named work", they are the gap
+    // the residual lives in). The model's universe is the in-order consumer.
+    let creport = consumer::analyze(&events, &cfg.consumer);
+    let named_region_us: f64 = creport
+        .by_class
+        .iter()
+        .filter(|(k, _)| **k != "WAIT" && **k != "IDLE")
+        .map(|(_, v)| *v)
+        .sum();
+
+    // Build the bundle and join the residual counters (emitted as instant
+    // events; we model them as zero-width samples on the producing tid).
+    let mut bndl = bundle::ProfileBundle::from_spans(&spans);
+    let samples = residual_samples(&events);
+    let orphans = bndl.join_samples(&spans, &samples);
+
+    let d = decompose::decompose(&bndl, named_region_us);
+    println!("fulcrum decompose — NAMED wall residual");
+    print!("{}", decompose::render(&d));
+    if orphans > 0 {
+        println!("  ({orphans} residual samples fell outside any span — trace coverage gap)");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Pull residual counters out of the trace. gzippy emits them as instant
+/// events named `rusage.region` carrying `tid`-implied + counter args; we read
+/// any instant whose args contain known residual counter keys and turn it into
+/// a zero-width [`bundle::Sample`] on its tid.
+fn residual_samples(events: &[trace::Event]) -> Vec<bundle::Sample> {
+    use std::collections::BTreeMap;
+    let keys = [
+        decompose::C_MINFLT,
+        decompose::C_MAJFLT,
+        decompose::C_NVCSW,
+        decompose::C_NIVCSW,
+        decompose::C_RUNNABLE_NS,
+        decompose::C_RSS_DELTA,
+    ];
+    let mut out = Vec::new();
+    for e in events {
+        if e.ph != "i" {
+            continue;
+        }
+        let mut values = BTreeMap::new();
+        for k in keys {
+            if let Some(v) = e.args.get(k).and_then(|x| match x {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::String(s) => s.parse().ok(),
+                _ => None,
+            }) {
+                values.insert(k.to_string(), v);
+            }
+        }
+        if !values.is_empty() {
+            out.push(bundle::Sample {
+                tid: e.tid,
+                ts_us: e.ts,
+                dur_us: 0.0,
+                values,
+            });
+        }
+    }
+    out
 }
 
 /// `fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]`
@@ -1587,6 +1735,8 @@ fn main() -> ExitCode {
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
         "consumer" => cmd_consumer(rest),
+        "schedule" => cmd_schedule(rest),
+        "decompose" => cmd_decompose(rest),
         "model" => cmd_model(rest),
         "vs" => cmd_vs(rest),
         "vs-sweep" => cmd_vs_sweep(rest),

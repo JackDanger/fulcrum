@@ -30,11 +30,14 @@
 //! free demonstration.
 
 pub mod audit;
+pub mod bundle;
 pub mod causal;
 pub mod compare;
 pub mod compare_cli;
 pub mod config;
 pub mod consumer;
+pub mod decompose;
+pub mod schedule;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
