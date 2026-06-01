@@ -29,6 +29,7 @@
 //! See the bundled `examples/toy_pipeline.rs` for an end-to-end, dependency-
 //! free demonstration.
 
+pub mod alloc;
 pub mod audit;
 pub mod bundle;
 pub mod causal;
