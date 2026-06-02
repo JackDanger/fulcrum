@@ -30,11 +30,14 @@
 //! free demonstration.
 
 pub mod audit;
+pub mod bundle;
 pub mod causal;
 pub mod compare;
 pub mod compare_cli;
 pub mod config;
 pub mod consumer;
+pub mod decompose;
+pub mod schedule;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
@@ -42,6 +45,7 @@ pub mod estimate;
 pub mod flow;
 pub mod mech;
 pub mod mech_arch;
+pub mod memlife;
 pub mod microbench;
 pub mod model;
 pub mod probe;
