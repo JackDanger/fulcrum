@@ -483,8 +483,9 @@ impl Config {
                     ]),
                 },
                 StageDef {
-                    name: "3·worker ISA-L (clean tail)".to_string(),
+                    name: "3·worker clean decode tail".to_string(),
                     matcher: Matcher::exact_of(&[
+                        "worker.stream_inflate",
                         "worker.isal_stream_inflate",
                         "worker.absorb_isal_tail",
                     ]),
@@ -549,6 +550,7 @@ impl Config {
                 "worker.bootstrap".to_string(),
                 "worker.block_body".to_string(),
                 "worker.block_header".to_string(),
+                "worker.stream_inflate".to_string(),
                 "worker.isal_stream_inflate".to_string(),
                 "worker.absorb_isal_tail".to_string(),
             ],
