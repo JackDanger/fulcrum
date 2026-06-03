@@ -154,6 +154,36 @@ struct Publish {
     end_bit: Option<u64>,
 }
 
+/// Primary: `causal.window_publish` instants (gzippy + patched rapidgzip).
+/// Fallback: `consumer.window_publish_*` span starts when instants are absent
+/// (older rapidgzip traces without the model-params patch).
+fn collect_window_publishes(events: &[Event], spans: &[Span]) -> Vec<Publish> {
+    let mut publishes: Vec<Publish> = Vec::new();
+    for e in events {
+        if e.ph == "i" && e.name == "causal.window_publish" {
+            publishes.push(Publish {
+                ts: e.ts,
+                end_bit: arg_u64(&e.args, "end_bit"),
+            });
+        }
+    }
+    if publishes.is_empty() {
+        for s in spans {
+            if s.name == "consumer.window_publish_clean"
+                || s.name == "consumer.window_publish_marker"
+                || s.name == "consumer.window_publish"
+            {
+                publishes.push(Publish {
+                    ts: s.ts_start,
+                    end_bit: arg_u64(&s.args, "end_bit"),
+                });
+            }
+        }
+        publishes.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    publishes
+}
+
 /// Populate the parameter set + prediction for one trace.
 ///
 /// `workers` overrides the detected T when `Some`. Steady-state for L_resolve
@@ -173,27 +203,76 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         0.0
     };
 
-    // ── d_c / d_w from worker.decode span durations, split by mode ────────────
+    // ── d_c / d_w from worker.decode_chunk (+ legacy worker.decode) ───────────
+    let mut mode_by_start: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    for e in events {
+        if e.ph == "i" && e.name == "causal.decode_decision" {
+            if let (Some(sb), Some(m)) = (arg_u64(&e.args, "start_bit"), arg_str(&e.args, "mode"))
+            {
+                mode_by_start.insert(sb, m);
+            }
+        }
+    }
     let mut clean_durs: Vec<f64> = Vec::new();
     let mut absent_durs: Vec<f64> = Vec::new();
     for s in &spans {
-        if s.name != "worker.decode" {
-            continue;
-        }
-        match arg_str(&s.args, "mode").as_deref() {
-            Some("clean") => clean_durs.push(s.dur),
-            Some("window_absent") => absent_durs.push(s.dur),
-            _ => {}
+        if s.name == "worker.decode_chunk" {
+            let Some(sb) = arg_u64(&s.args, "start_bit") else {
+                continue;
+            };
+            match mode_by_start.get(&sb).map(String::as_str) {
+                Some("clean") => clean_durs.push(s.dur),
+                Some("window_absent") => absent_durs.push(s.dur),
+                _ => {}
+            }
+        } else if s.name == "worker.decode" {
+            match arg_str(&s.args, "mode").as_deref() {
+                Some("clean") => clean_durs.push(s.dur),
+                Some("window_absent") => absent_durs.push(s.dur),
+                _ => {}
+            }
         }
     }
     let n_decode_spans = clean_durs.len() + absent_durs.len();
-    let d_c_us = median(&clean_durs);
-    let d_w_us = median(&absent_durs);
-    let window_absent_frac = if n_decode_spans > 0 {
+
+    // Runtime window-absent fraction: `causal.decode_decision` is authoritative
+    // (one instant per worker decode start). Joining mode onto `worker.decode_chunk`
+    // under-counts when many prefetches only emit bootstrap/stream spans.
+    let mut n_clean_decisions = 0usize;
+    let mut n_absent_decisions = 0usize;
+    for e in events {
+        if e.ph == "i" && e.name == "causal.decode_decision" {
+            match arg_str(&e.args, "mode").as_deref() {
+                Some("clean") => n_clean_decisions += 1,
+                Some("window_absent") => n_absent_decisions += 1,
+                _ => {}
+            }
+        }
+    }
+    let n_mode_decisions = n_clean_decisions + n_absent_decisions;
+    let window_absent_frac = if n_mode_decisions > 0 {
+        n_absent_decisions as f64 / n_mode_decisions as f64
+    } else if n_decode_spans > 0 {
         absent_durs.len() as f64 / n_decode_spans as f64
     } else {
         0.0
     };
+
+    // Per-mode decode latency: prefer joined `worker.decode_chunk`; fall back to
+    // the phase spans gzippy actually emits (bootstrap = marker, stream_inflate =
+    // clean tail on pure-Rust builds).
+    let mut bootstrap_durs: Vec<f64> = Vec::new();
+    let mut clean_tail_durs: Vec<f64> = Vec::new();
+    for s in &spans {
+        match s.name.as_str() {
+            "worker.bootstrap" => bootstrap_durs.push(s.dur),
+            "worker.stream_inflate" | "worker.isal_stream_inflate" => clean_tail_durs.push(s.dur),
+            _ => {}
+        }
+    }
+    let d_c_us = median(&clean_durs).or_else(|| median(&clean_tail_durs));
+    let d_w_us = median(&absent_durs).or_else(|| median(&bootstrap_durs));
     // d_w_eff weights the two decode latencies by the runtime window-absent
     // fraction. If only one mode was seen, fall back to whichever exists.
     let d_w_eff_us = match (d_w_us, d_c_us) {
@@ -204,15 +283,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
     };
 
     // ── window_publish events in consumer (= chunk-index) order ───────────────
-    let mut publishes: Vec<Publish> = Vec::new();
-    for e in events {
-        if e.ph == "i" && e.name == "causal.window_publish" {
-            publishes.push(Publish {
-                ts: e.ts,
-                end_bit: arg_u64(&e.args, "end_bit"),
-            });
-        }
-    }
+    let mut publishes = collect_window_publishes(events, &spans);
     // The events are appended to the trace in emit order; the in-order consumer
     // emits them in chunk-index order. A multi-threaded writer interleaves
     // lines but each event's ts is the publish instant, so sort by ts to
@@ -229,7 +300,21 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         None => true,
     });
 
-    let n_chunks = publishes.len();
+    let n_chunks = if !publishes.is_empty() {
+        publishes.len()
+    } else {
+        let from_decode = spans
+            .iter()
+            .filter(|s| s.name == "worker.decode_chunk")
+            .count();
+        if from_decode > 0 {
+            from_decode
+        } else if n_mode_decisions > 0 {
+            n_mode_decisions
+        } else {
+            0
+        }
+    };
     let frontier_us = publishes
         .first()
         .map(|p| p.ts - trace_start)
@@ -509,6 +594,67 @@ mod tests {
     ///   publish-chain = frontier + (N−1)·L_resolve = 20 + 7·5        = 55ms
     ///   max = worker-bound 100ms ⇒ binding = WorkerBound
     ///   wall_pred = 100 + tail(5) = 105ms
+    #[test]
+    fn window_absent_frac_from_decode_decisions_not_chunk_join() {
+        let mut events: Vec<Event> = Vec::new();
+        // Many decisions, few matching decode_chunk spans (prefetch-only bootstrap).
+        for i in 0..9u64 {
+            events.push(Event {
+                name: "causal.decode_decision".into(),
+                ph: "i".into(),
+                ts: 1000.0 + i as f64,
+                pid: 1,
+                tid: 2,
+                args: serde_json::json!({ "start_bit": i * 1000, "mode": "window_absent" }),
+            });
+        }
+        for i in 0..1u64 {
+            events.push(Event {
+                name: "causal.decode_decision".into(),
+                ph: "i".into(),
+                ts: 2000.0 + i as f64,
+                pid: 1,
+                tid: 2,
+                args: serde_json::json!({ "start_bit": 9000 + i, "mode": "clean" }),
+            });
+        }
+        // decode_chunk at unrelated start_bit — must not drive f (only decisions do).
+        events.extend(span(
+            "worker.decode_chunk",
+            "window_absent",
+            2,
+            0.0,
+            10_000.0,
+        ));
+        for e in &mut events {
+            if e.name == "worker.decode_chunk" {
+                if let Some(o) = e.args.as_object_mut() {
+                    o.insert("start_bit".into(), serde_json::json!(999_999u64));
+                }
+            }
+        }
+        events.push(publish(50_000.0, 100));
+        events.push(Event {
+            name: "drive".into(),
+            ph: "B".into(),
+            ts: 0.0,
+            pid: 1,
+            tid: 1,
+            args: serde_json::Value::Null,
+        });
+        events.push(Event {
+            name: "drive".into(),
+            ph: "E".into(),
+            ts: 100_000.0,
+            pid: 1,
+            tid: 1,
+            args: serde_json::Value::Null,
+        });
+        let p = analyze(&events, "decisions_frac", Some(4));
+        assert!((p.window_absent_frac - 0.9).abs() < 1e-9, "f={}", p.window_absent_frac);
+        assert_eq!(p.n_decode_spans, 0);
+    }
+
     #[test]
     fn synthetic_known_params_populate_and_predict() {
         let mut events: Vec<Event> = Vec::new();

@@ -937,7 +937,10 @@ fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
 fn cmd_vs(args: &[String]) -> ExitCode {
     let pos = positional(args);
     let (Some(a), Some(b)) = (pos.first(), pos.get(1)) else {
-        eprintln!("usage: fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]");
+        eprintln!(
+            "usage: fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]\n  \
+                   fulcrum vs <A> <B> --by-role [--threads N]  (pipeline-role busy + wall-critical)"
+        );
         return ExitCode::FAILURE;
     };
     let labels = flag(args, "--labels").unwrap_or("gzippy,rapidgzip");
@@ -945,18 +948,39 @@ fn cmd_vs(args: &[String]) -> ExitCode {
     let cfg = load_config(args);
     let mut preferred = preferred_blockers(&cfg);
     preferred.extend(cfg.inner_blockers.iter().cloned());
-    match vs::compare(
-        al,
-        Path::new(a),
-        bl,
-        Path::new(b),
-        &preferred,
-        &cfg.consumer.thread_prefix,
-    ) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            ExitCode::FAILURE
+    if flag(args, "--by-role").is_some() {
+        let threads = flag(args, "--threads")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        match vs_sweep::compare_pair(
+            threads,
+            al,
+            Path::new(a),
+            bl,
+            Path::new(b),
+            &cfg,
+            &preferred,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match vs::compare(
+            al,
+            Path::new(a),
+            bl,
+            Path::new(b),
+            &preferred,
+            &cfg.consumer.thread_prefix,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

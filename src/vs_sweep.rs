@@ -55,7 +55,7 @@ impl Role {
         match self {
             Role::Dispatch => "dispatch (upstream feed)",
             Role::WindowAbsentDecode => "window-absent decode (bootstrap)",
-            Role::CleanDecode => "clean decode (ISA-L tail)",
+            Role::CleanDecode => "clean decode tail (stream_inflate / isal)",
             Role::MarkerResolve => "marker-resolve / apply-window",
             Role::ConsumerWait => "consumer-wait (in-order stall)",
             Role::ConsumerWrite => "consumer-write (output)",
@@ -80,7 +80,7 @@ pub fn role_of_stage(stage: &str) -> Option<Role> {
     match stage {
         "1·dispatch (upstream)" => Some(Role::Dispatch),
         "2·worker bootstrap (window-absent)" => Some(Role::WindowAbsentDecode),
-        "3·worker ISA-L (clean tail)" => Some(Role::CleanDecode),
+        "3·worker clean decode tail" => Some(Role::CleanDecode),
         "5·consumer resolve (markers/window)" => Some(Role::MarkerResolve),
         "6·consumer write (output)" => Some(Role::ConsumerWrite),
         _ => None,
@@ -268,6 +268,21 @@ pub fn parse_inputs(specs: &[String]) -> Result<Vec<SweepInput>, String> {
     }
     out.sort_by_key(|i| i.threads);
     Ok(out)
+}
+
+/// Single trace-pair role report (same table as one row of [`run`], without sweep).
+pub fn compare_pair(
+    threads: usize,
+    a_label: &str,
+    a_path: &Path,
+    b_label: &str,
+    b_path: &Path,
+    cfg: &Config,
+    preferred: &[String],
+) -> std::io::Result<()> {
+    let c = cell(threads, a_path, b_path, cfg, preferred)?;
+    render(a_label, b_label, std::slice::from_ref(&c));
+    Ok(())
 }
 
 /// Run the full sweep and print the rich report. `a_label`/`b_label` name the

@@ -241,6 +241,7 @@ mod tests {
             "worker.block_body",
             "worker.block_header",
             "worker.decode_chunk",
+            "worker.stream_inflate",
             "worker.isal_stream_inflate",
             "worker.absorb_isal_tail",
             "pool.run_task",
