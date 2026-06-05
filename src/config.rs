@@ -508,6 +508,7 @@ impl Config {
                     &[
                         "consumer.try_take_prefetched",
                         "consumer.wait_replaced_markers",
+                        "consumer.dispatch_recv",
                         "consumer.future_recv",
                     ],
                     &[],
@@ -578,6 +579,7 @@ impl Config {
                             "consumer.wait_replaced_markers",
                             "consumer.publish_windows",
                             "consumer.dispatch_post_process",
+                            "consumer.dispatch_recv",
                         ],
                         &["consumer.window_", "post_process."],
                         &[],
