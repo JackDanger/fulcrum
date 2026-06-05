@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, sweep, trace, validate,
-    vs, vs_sweep, xtool,
+    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, spans, sweep, trace,
+    validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -51,6 +51,7 @@ USAGE:\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P]\n\
   fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
+  fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]   span atlas (excl-self + wall-crit)\n\
   fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
   fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
   fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]   parallel-SM wall-model params + lever delta\n\
@@ -475,6 +476,42 @@ fn short_site(s: &str) -> &str {
 /// OUTPUT / IDLE, forms an explicit IDLE-GAP = span − Σ busy, and ASSERTS
 /// busy + idle == span (surfacing any reconciliation miss rather than hiding
 /// it). Pass several traces to get the per-thread-count table side by side.
+fn cmd_spans(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    if pos.is_empty() {
+        eprintln!("usage: fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]");
+        return ExitCode::FAILURE;
+    }
+    let cfg = load_config(args);
+    let top = flag(args, "--top")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let path = Path::new(pos[0]);
+    if let Some(parent) = flag(args, "--under") {
+        match spans::children_under(path, parent) {
+            Ok(rows) => {
+                spans::print_children(pos[0], parent, &rows);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match spans::analyze(path, &cfg) {
+            Ok(r) => {
+                spans::print_report(pos[0], &r, top);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
 fn cmd_consumer(args: &[String]) -> ExitCode {
     let pos = positional(args);
     if pos.is_empty() {
@@ -1901,6 +1938,7 @@ fn main() -> ExitCode {
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
         "consumer" => cmd_consumer(rest),
+        "spans" => cmd_spans(rest),
         "schedule" => cmd_schedule(rest),
         "decompose" => cmd_decompose(rest),
         "alloc" => cmd_alloc(rest),
