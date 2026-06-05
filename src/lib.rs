@@ -39,6 +39,7 @@ pub mod config;
 pub mod consumer;
 pub mod decompose;
 pub mod schedule;
+pub mod spans;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;

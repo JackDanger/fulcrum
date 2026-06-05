@@ -424,9 +424,82 @@ impl Config {
                 substrings: substrings.iter().map(|s| s.to_string()).collect(),
                 suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
             };
+        let region = |name: &str, file: &str, lo: u32, hi: u32, funcs: &[&str]| RegionDef {
+            name: name.to_string(),
+            source: vec![SourceRange {
+                file: file.to_string(),
+                lo,
+                hi,
+            }],
+            functions: funcs.iter().map(|s| s.to_string()).collect(),
+        };
         Config {
             progress_point: "work_done".to_string(),
-            regions: Vec::new(),
+            regions: vec![
+                region(
+                    "bootstrap.block_body",
+                    "gzip_chunk.rs",
+                    1105,
+                    1165,
+                    &["worker.block_body"],
+                ),
+                region(
+                    "bootstrap.block_header",
+                    "gzip_chunk.rs",
+                    1075,
+                    1095,
+                    &["worker.block_header"],
+                ),
+                region(
+                    "bootstrap.huffman_loop",
+                    "isal_lut_bulk.rs",
+                    899,
+                    1020,
+                    &["read_compressed", "MarkerRing"],
+                ),
+                region(
+                    "bootstrap.ring_drain",
+                    "isal_lut_bulk.rs",
+                    804,
+                    818,
+                    &["drain_to", "block_body.drain"],
+                ),
+                region(
+                    "bootstrap.emit_backref",
+                    "marker_inflate.rs",
+                    2035,
+                    2200,
+                    &["emit_backref_ring"],
+                ),
+                region(
+                    "worker.boundary_scan",
+                    "chunk_fetcher.rs",
+                    3280,
+                    3350,
+                    &["worker.scan_", "try_speculative"],
+                ),
+                region(
+                    "consumer.window_tail",
+                    "chunk_data.rs",
+                    1060,
+                    1120,
+                    &["get_last_window"],
+                ),
+                region(
+                    "consumer.marker_resolve",
+                    "chunk_fetcher.rs",
+                    2720,
+                    2760,
+                    &["post_process", "apply_window", "resolve_chunk"],
+                ),
+                region(
+                    "worker.isal_clean",
+                    "isal_lut_bulk.rs",
+                    180,
+                    400,
+                    &["isal_stream_inflate", "decode_block"],
+                ),
+            ],
             ground_truth: GroundTruth::default(),
             consumer: ConsumerProfile {
                 thread_prefix: "consumer.".to_string(),
@@ -446,11 +519,14 @@ impl Config {
                     "consumer.write_narrowed",
                     "consumer.window_publish_marker",
                     "consumer.window_publish_clean",
+                    "consumer.get_last_window",
                     "consumer.resolve_markers",
                     "consumer.combine_crc",
                     "consumer.publish_windows",
                     "consumer.arc_take_or_clone",
                     "consumer.dispatch_post_process",
+                    "consumer.writev",
+                    "consumer.queue_prefetched_postproc",
                     "consumer.process_prefetches",
                     "coord.prefetch_call",
                     "coord.prefetch_emit",
@@ -476,11 +552,16 @@ impl Config {
                 },
                 StageDef {
                     name: "2·worker bootstrap (window-absent)".to_string(),
-                    matcher: Matcher::exact_of(&[
-                        "worker.bootstrap",
-                        "worker.block_body",
-                        "worker.block_header",
-                    ]),
+                    matcher: m(
+                        &[
+                            "worker.bootstrap",
+                            "worker.block_body",
+                            "worker.block_header",
+                        ],
+                        &["worker.block_body."],
+                        &[],
+                        &[],
+                    ),
                 },
                 StageDef {
                     name: "3·worker clean decode tail".to_string(),
