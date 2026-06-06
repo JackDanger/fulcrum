@@ -49,7 +49,8 @@ USAGE:\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
-  fulcrum causal <trace.json> [--timeline N] [--static-fraction P]\n\
+  fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
+  fulcrum stats <trace.log>   parse GZIPPY_VERBOSE counters (bootstrap ring split, clean-decode paths)\n\
   fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
   fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]   span atlas (excl-self + wall-crit)\n\
   fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
@@ -223,10 +224,20 @@ fn cmd_flow(args: &[String]) -> ExitCode {
 /// latency distribution (WHY chunks go window-absent), the per-chunk
 /// dependency timeline (the serial window-chain + where it stalls), and the
 /// data-model-tax pass breakdown.
+fn load_verbose_log(path: &str) -> Option<fulcrum::verbose_stats::GzippyVerboseStats> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(fulcrum::verbose_stats::parse_gzippy_verbose_log(&s)),
+        Err(e) => {
+            eprintln!("fulcrum: verbose-log {path}: {e}");
+            None
+        }
+    }
+}
+
 fn cmd_causal(args: &[String]) -> ExitCode {
     let pos = positional(args);
     let Some(trace_path) = pos.first() else {
-        eprintln!("usage: fulcrum causal <trace.json> [--timeline N] [--static-fraction P]");
+        eprintln!("usage: fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]");
         return ExitCode::FAILURE;
     };
     let events = match trace::load_events(Path::new(trace_path)) {
@@ -243,7 +254,28 @@ fn cmd_causal(args: &[String]) -> ExitCode {
     let static_fraction: f64 = flag(args, "--static-fraction")
         .and_then(|s| s.parse().ok())
         .unwrap_or(31.0);
+    let verbose = flag(args, "--verbose-log").map(load_verbose_log).flatten();
     print_causal(&report, timeline_n, static_fraction);
+    if let Some(ref v) = verbose {
+        println!();
+        fulcrum::verbose_stats::print_verbose_stats(v);
+    }
+    fulcrum::verbose_stats::print_remediation(&report, verbose.as_ref(), static_fraction);
+    ExitCode::SUCCESS
+}
+
+/// `fulcrum stats <trace.log>` — parse GZIPPY_VERBOSE stderr capture.
+fn cmd_stats(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(log_path) = pos.first() else {
+        eprintln!("usage: fulcrum stats <trace.log>");
+        return ExitCode::FAILURE;
+    };
+    let v = match load_verbose_log(log_path) {
+        Some(v) => v,
+        None => return ExitCode::FAILURE,
+    };
+    fulcrum::verbose_stats::print_verbose_stats(&v);
     ExitCode::SUCCESS
 }
 
@@ -1937,6 +1969,7 @@ fn main() -> ExitCode {
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
+        "stats" => cmd_stats(rest),
         "consumer" => cmd_consumer(rest),
         "spans" => cmd_spans(rest),
         "schedule" => cmd_schedule(rest),

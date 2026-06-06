@@ -14,6 +14,11 @@ make demo            # show the full analysis output
 
 A profiler for parallel pipelines. It finds the one region that will actually move the wall clock by fusing three measurements: Coz virtual-speedup (causal), consumer-anchored critical-path reconstruction, and Linux perf/PEBS (mechanism). The tool self-validates against known ground truth before reporting.
 
+**Extend Fulcrum when it leaves hard work on the table.** If you grep `trace.log`, tally
+verbose counters by hand, or enable poisonous trace detail to answer a causation question,
+add that capability to Fulcrum (`stats`, causal `--verbose-log` + `[5] REMEDIATION`, new
+subcommands) and wire it into `run_locked_fulcrum.sh` before changing the pipeline.
+
 ## Key files
 
 | File | Purpose |
