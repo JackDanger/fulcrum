@@ -9,9 +9,9 @@ HYPOTHESIS label with the exact perturbation that would test it.
 See plans/fulcrum-product.md (charter) in the host repo, and README.md here.
 """
 
-__version__ = "3.0.0"
+__version__ = "0.3.0"
 
 # The measurement-protocol version. Bumped whenever the meaning of a stored
 # number changes (sink law, mask convention, timing method). Part of every
 # measurement fingerprint: numbers from different protocols never compare.
-PROTOCOL_VERSION = "fulcrum-v3"
+PROTOCOL_VERSION = "fulcrum-v3"  # protocol lineage is INDEPENDENT of package version — banked artifacts key off this string; never re-sync it
