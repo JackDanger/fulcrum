@@ -13,6 +13,7 @@ pub struct GzippyVerboseStats {
     pub ring_drain_ms: f64,
     pub ring_huffman_pct_body: f64,
     pub ring_drain_pct_body: f64,
+    pub clean_pred_key: u64,
     pub clean_pred_seed: u64,
     pub clean_handoff_stop: u64,
     pub clean_boundary_seed: u64,
@@ -64,7 +65,23 @@ fn parse_line(line: &str, out: &mut GzippyVerboseStats) {
                 out.ring_drain_pct_body = p;
             }
         }
-    } else if let Some(rest) = line.strip_prefix("Clean decode (pred@seed / handoff@stop / boundary@seed / candidate):") {
+    } else if let Some(rest) = line.strip_prefix(
+        "Clean decode (pred@key / pred@seed / handoff@stop / boundary@seed / candidate):",
+    ) {
+        let nums: Vec<u64> = rest
+            .split('/')
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .collect();
+        if nums.len() >= 5 {
+            out.clean_pred_key = nums[0];
+            out.clean_pred_seed = nums[1];
+            out.clean_handoff_stop = nums[2];
+            out.clean_boundary_seed = nums[3];
+            out.clean_candidate = nums[4];
+        }
+    } else if let Some(rest) =
+        line.strip_prefix("Clean decode (pred@seed / handoff@stop / boundary@seed / candidate):")
+    {
         let nums: Vec<u64> = rest
             .split('/')
             .map(|s| s.trim().parse().unwrap_or(0))
@@ -121,7 +138,11 @@ fn parse_u64(s: &str) -> u64 {
 /// Print verbose-stats section for `fulcrum stats` / causal `--verbose-log`.
 pub fn print_verbose_stats(v: &GzippyVerboseStats) {
     println!("VERBOSE-STATS  (from GZIPPY_VERBOSE trace.log — zero wall-tax counters)");
-    if v.bootstrap_body_ms <= 0.0 && v.clean_pred_seed == 0 && v.clean_handoff_stop == 0 {
+    if v.bootstrap_body_ms <= 0.0
+        && v.clean_pred_key == 0
+        && v.clean_pred_seed == 0
+        && v.clean_handoff_stop == 0
+    {
         println!("  (no recognized verbose lines — capture with GZIPPY_VERBOSE=1 on trace runs)");
         return;
     }
@@ -140,13 +161,21 @@ pub fn print_verbose_stats(v: &GzippyVerboseStats) {
             v.ring_huffman_pct_body, v.ring_drain_pct_body
         );
     }
-    println!(
-        "  clean-decode paths: pred@seed={}  handoff@stop={}  boundary@seed={}  candidate={}",
-        v.clean_pred_seed,
-        v.clean_handoff_stop,
-        v.clean_boundary_seed,
-        v.clean_candidate
-    );
+    if v.clean_pred_key > 0 {
+        println!(
+            "  clean-decode paths: pred@key={}  pred@seed={}  handoff@stop={}  boundary@seed={}  candidate={}",
+            v.clean_pred_key,
+            v.clean_pred_seed,
+            v.clean_handoff_stop,
+            v.clean_boundary_seed,
+            v.clean_candidate
+        );
+    } else {
+        println!(
+            "  clean-decode paths: pred@seed={}  handoff@stop={}  boundary@seed={}  candidate={}",
+            v.clean_pred_seed, v.clean_handoff_stop, v.clean_boundary_seed, v.clean_candidate
+        );
+    }
     println!(
         "  early window: published={} handoff_key={} tail_not_clean={} range_speculative={}",
         v.early_window_published,
@@ -179,12 +208,19 @@ pub fn print_remediation(
     };
 
     if r.window_absent_key_mismatch > 0 && key_frac >= 50.0 {
-        println!("  ► PRIMARY (KEY-MISMATCH {:.0}% of window-absent):", key_frac);
+        println!(
+            "  ► PRIMARY (KEY-MISMATCH {:.0}% of window-absent):",
+            key_frac
+        );
         println!("    Workers call WindowMap::get(partition_seed) but windows publish at REAL boundary keys.");
         println!("    Wire production decodeBlock like vendor tryToDecode:");
         println!("      1. get_predecessor_for_worker(seed) → clean decode AT seed with pred dict");
-        println!("      2. get_handoff_in_partition(seed, stop_hint) → clean decode AT handoff_key");
-        println!("      3. rewrite chunk metadata: encoded=seed, max=handoff (GzipChunk.hpp:716-722)");
+        println!(
+            "      2. get_handoff_in_partition(seed, stop_hint) → clean decode AT handoff_key"
+        );
+        println!(
+            "      3. rewrite chunk metadata: encoded=seed, max=handoff (GzipChunk.hpp:716-722)"
+        );
         println!("    Sites: chunk_fetcher.rs run_decode_task, try_speculative_decode_candidate");
         if let Some(vs) = v {
             let handoff_hits = vs.clean_handoff_stop + vs.clean_pred_seed + vs.clean_boundary_seed;
