@@ -20,3 +20,8 @@ perf.data.old
 fulcrum_*.json
 fulcrum_report.txt
 fulcrum_topdown.txt
+
+# Python decision engine (decide/)
+__pycache__/
+*.pyc
+decide/.selftest-stamp.json
