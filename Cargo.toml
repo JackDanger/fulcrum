@@ -1,6 +1,6 @@
 [package]
 name = "fulcrum"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Causal-mechanistic pipeline profiler: finds the highest-leverage region to optimize by measuring wall-elasticity (Coz-style virtual speedup) fused with critical-path reconstruction and perf/PEBS mechanism attribution, self-validated against known ground truth."

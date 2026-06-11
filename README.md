@@ -105,6 +105,29 @@ On Linux, `fulcrum plan` prints the exact capture commands for your binary and `
 
 ---
 
+## The two layers
+
+This repo holds two complementary layers:
+
+- **Rust crate (repo root)** — the *measurement instrument*: trace/span
+  analysis over Chrome-trace JSON (`spans`, `critpath`, `flow`, `causal`,
+  `model`, `vs`, `rank`, `validate`, hardware-counter joins, provenance).
+  It turns raw traces into attributed, reconciled numbers.
+- **Python decision engine ([`decide/`](decide/))** — the *judgment layer*
+  that consumes measurements: it enforces eight scar-named measurement
+  invariants (SINK-LAW, FROZEN-OR-LABELED, SHA-OR-VOID, SPREAD-RESOLUTION,
+  CAUSAL-OR-HYPOTHESIS, EFFECT-VERIFIED-OR-FLAGGED, SELF-TEST-OR-NO-TRUST,
+  FINGERPRINT-OR-NO-COMPARE), stamps every number with a measurement
+  fingerprint, keeps a hash-chained contradiction ledger, and emits ranked,
+  re-verifiable decision briefs through a pluggable `ProjectAdapter`
+  interface. See [decide/README.md](decide/README.md).
+
+A profiler tells you where the time went; the Rust layer tells you what
+would move the wall; the `decide/` layer refuses to let a broken
+measurement tell you anything at all.
+
+---
+
 ## Limitations
 
 - Coz and perf are Linux-only

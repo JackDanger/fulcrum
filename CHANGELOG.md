@@ -4,6 +4,45 @@ All notable changes to **fulcrum** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-11
+
+The headline of 0.3.0 is the **decision-engine layer**: the repo now holds
+two layers — the Rust crate (the trace/span measurement instrument) and a
+new pure-Python decision engine under `decide/` that consumes measurements
+and decides what to do next, refusing or labeling anything untrustworthy.
+
+### Added
+
+- **`decide/` — the causal performance-decision engine** (Python >= 3.9,
+  stdlib-only), developed during the gzippy campaign and now part of this
+  repo:
+  - eight enforced, scar-named measurement invariants: SINK-LAW,
+    FROZEN-OR-LABELED, SHA-OR-VOID, SPREAD-RESOLUTION, CAUSAL-OR-HYPOTHESIS,
+    EFFECT-VERIFIED-OR-FLAGGED, SELF-TEST-OR-NO-TRUST,
+    FINGERPRINT-OR-NO-COMPARE — each a refusal or loud label, each with a
+    self-test proving the enforcement fires (`decide/docs/CASE-STUDIES.md`
+    tells the stories behind them);
+  - measurement fingerprints ({sink, mask, freeze, binary sha, corpus sha,
+    protocol, comparator version, host identity}) gating every ratio;
+  - an append-only, hash-chained results ledger with
+    supersede/invalidate/pending-reconcile semantics;
+  - ranked decision briefs (`analyze`), a whole-system trace analyzer
+    (`total`), and a pluggable `ProjectAdapter` interface (gzippy ships as
+    the first adapter, plus a toy adapter in the selftests);
+  - 4 selftest suites, 147 checks, writing a SELF-TEST-OR-NO-TRUST stamp
+    keyed to a source hash.
+- Rust `verbose_stats`: parse the new `pred@key` clean-decode counter from
+  GZIPPY_VERBOSE logs (backward compatible with the old 4-field line).
+
+### Fixed
+
+- `decide/` selftests: the toy-adapter mixed-sink test imported a
+  nonexistent `IncomparableError` (the enforcement raises
+  `InvariantViolation`), crashing the adapter suite after 144 of 147
+  checks; all 147 now run and pass.
+- Doc snippets in `src/decompose.rs` are fenced as text so `cargo test`'s
+  doctest pass no longer fails on pseudo-code.
+
 ## [0.2.0] - 2026-06-01
 
 The headline of 0.2.0 is **generalization**: fulcrum is now a general parallel-
@@ -73,5 +112,6 @@ change. The original gzippy span set ships as one built-in profile.
   (perf) layers fused over a Chrome-trace timeline + a declarative profile
   config; the `rank` / `validate` / `compare` / `audit` / `sweep` workflow.
 
+[0.3.0]: https://github.com/JackDanger/fulcrum/releases/tag/v0.3.0
 [0.2.0]: https://github.com/JackDanger/fulcrum/releases/tag/v0.2.0
 [0.1.0]: https://github.com/JackDanger/fulcrum/releases/tag/v0.1.0
