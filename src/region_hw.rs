@@ -659,10 +659,17 @@ pub fn trust_gate(
     let attributed_cycles = TrustVerdict::sum_counter(rows, "cycles");
     let attributed_instructions = TrustVerdict::sum_counter(rows, "instructions");
 
-    let check = |label: &str, attributed: f64, whole: Option<f64>, lines: &mut Vec<String>, trusted: &mut bool| -> Option<f64> {
+    let check = |label: &str,
+                 attributed: f64,
+                 whole: Option<f64>,
+                 lines: &mut Vec<String>,
+                 trusted: &mut bool|
+     -> Option<f64> {
         let whole = whole?;
         if whole <= 0.0 {
-            lines.push(format!("{label} conservation: whole-process total is 0 — skipped."));
+            lines.push(format!(
+                "{label} conservation: whole-process total is 0 — skipped."
+            ));
             return None;
         }
         let gap = (attributed - whole) / whole;
@@ -690,7 +697,13 @@ pub fn trust_gate(
         Some(gap)
     };
 
-    let cycles_gap_frac = check("cycles", attributed_cycles, whole_cycles, &mut lines, &mut trusted);
+    let cycles_gap_frac = check(
+        "cycles",
+        attributed_cycles,
+        whole_cycles,
+        &mut lines,
+        &mut trusted,
+    );
     let instructions_gap_frac = check(
         "instructions",
         attributed_instructions,
@@ -758,11 +771,15 @@ pub fn self_test() -> SelfTest {
         let mut counts = BTreeMap::new();
         counts.insert("cycles".to_string(), cyc);
         counts.insert("instructions".to_string(), ins);
-        CounterInterval { ts_us, dur_us, counts }
+        CounterInterval {
+            ts_us,
+            dur_us,
+            counts,
+        }
     };
     let intervals = vec![
-        mk(500.0, 500.0, 1.0e6, 2.0e6),    // fully inside A [0,1000)
-        mk(1500.0, 500.0, 3.0e6, 6.0e6),   // fully inside B [1000,2000)
+        mk(500.0, 500.0, 1.0e6, 2.0e6),  // fully inside A [0,1000)
+        mk(1500.0, 500.0, 3.0e6, 6.0e6), // fully inside B [1000,2000)
     ];
 
     let rows = rollup(&events, &[], &intervals, &region_funcs);

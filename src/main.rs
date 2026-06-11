@@ -890,10 +890,12 @@ fn cmd_model(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let label = labels
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| Path::new(path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string()));
+        let label = labels.get(i).cloned().unwrap_or_else(|| {
+            Path::new(path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        });
         let p = model::analyze(&events, &label, workers);
         print_model(path, &p);
         populated.push(p);
@@ -949,7 +951,10 @@ fn print_model(path: &str, p: &model::ModelParams) {
         o(p.wall_pred_us),
         p.binding.label()
     );
-    println!("  wall_observed         : {}", trace::fmt_us(p.observed_wall_us));
+    println!(
+        "  wall_observed         : {}",
+        trace::fmt_us(p.observed_wall_us)
+    );
     match model::residual_frac(p) {
         Some(r) => {
             let verdict = if r.abs() <= 0.10 {
@@ -957,11 +962,7 @@ fn print_model(path: &str, p: &model::ModelParams) {
             } else {
                 "RESIDUAL EXCEEDS 10% — model under-/over-predicts; an unmodeled term exists"
             };
-            println!(
-                "  residual (pred−obs)   : {:+.1}%   {}",
-                r * 100.0,
-                verdict
-            );
+            println!("  residual (pred−obs)   : {:+.1}%   {}", r * 100.0, verdict);
         }
         None => println!("  residual              : n/a (a model term is unpopulated)"),
     }
@@ -969,26 +970,32 @@ fn print_model(path: &str, p: &model::ModelParams) {
 
 fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
     let d = model::delta(a, b);
-    let r = |x: Option<f64>| x.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "n/a".into());
-    println!(
-        "\n========  DELTA  {} − {}  ========",
-        d.a_label, d.b_label
-    );
+    let r = |x: Option<f64>| {
+        x.map(|v| format!("{v:.2}×"))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    println!("\n========  DELTA  {} − {}  ========", d.a_label, d.b_label);
     println!(
         "  wall ratio {}/{}      : {:.2}×  (>1 ⇒ {} is slower)",
         d.a_label, d.b_label, d.wall_ratio, d.a_label
     );
     println!(
         "  d_w  ratio ({}/{})   : {}",
-        d.b_label, d.a_label, r(d.d_w_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.d_w_ratio)
     );
     println!(
         "  d_c  ratio ({}/{})   : {}",
-        d.b_label, d.a_label, r(d.d_c_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.d_c_ratio)
     );
     println!(
         "  L_resolve ratio ({}/{}): {}",
-        d.b_label, d.a_label, r(d.l_resolve_ratio)
+        d.b_label,
+        d.a_label,
+        r(d.l_resolve_ratio)
     );
     println!(
         "  window-absent frac    : {} {:.1}%   vs   {} {:.1}%",
@@ -1610,7 +1617,10 @@ fn cmd_region_hw(args: &[String]) -> ExitCode {
         if let Ok(text) = std::fs::read_to_string(wp) {
             let wiv = region_hw::parse_perf_stat_intervals(&text, 0.0);
             let wsum = |name: &str| -> Option<f64> {
-                let s: f64 = wiv.iter().filter_map(|iv| iv.counts.get(name).copied()).sum();
+                let s: f64 = wiv
+                    .iter()
+                    .filter_map(|iv| iv.counts.get(name).copied())
+                    .sum();
                 (s > 0.0).then_some(s)
             };
             if let Some(c) = wsum("cycles") {

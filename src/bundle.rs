@@ -135,7 +135,10 @@ impl ProfileBundle {
         if spans.is_empty() {
             return bundle;
         }
-        let min = spans.iter().map(|s| s.ts_start).fold(f64::INFINITY, f64::min);
+        let min = spans
+            .iter()
+            .map(|s| s.ts_start)
+            .fold(f64::INFINITY, f64::min);
         let max = spans
             .iter()
             .map(|s| s.ts_end)
@@ -175,7 +178,11 @@ impl ProfileBundle {
         }
         let mut orphans = 0u64;
         for sample in samples {
-            let width = if sample.dur_us > 0.0 { sample.dur_us } else { 0.0 };
+            let width = if sample.dur_us > 0.0 {
+                sample.dur_us
+            } else {
+                0.0
+            };
             let s_lo = sample.ts_us - width;
             let s_hi = sample.ts_us;
             let candidates = match by_tid.get(&sample.tid) {
@@ -221,8 +228,7 @@ impl ProfileBundle {
                     let prev_w = entry.value.abs();
                     let new_w = add.abs();
                     if prev_w + new_w > 0.0 {
-                        entry.purity =
-                            (entry.purity * prev_w + purity * new_w) / (prev_w + new_w);
+                        entry.purity = (entry.purity * prev_w + purity * new_w) / (prev_w + new_w);
                     }
                     entry.value += add;
                 }
@@ -238,12 +244,7 @@ impl ProfileBundle {
 /// covers the same instant. For the common instant case (lo==hi==ts), this
 /// returns the single innermost containing span. For an interval, it returns
 /// the set of leaf spans the window passes through, with each one's overlap µs.
-fn leaf_overlaps<'a>(
-    candidates: &[&'a Span],
-    lo: f64,
-    hi: f64,
-    ts: f64,
-) -> Vec<(&'a Span, f64)> {
+fn leaf_overlaps<'a>(candidates: &[&'a Span], lo: f64, hi: f64, ts: f64) -> Vec<(&'a Span, f64)> {
     // Spans on one thread form a properly-nested forest (B/E stack). The leaf
     // covering an instant `t` is the shortest-duration span containing `t`.
     let contains = |s: &Span, t: f64| s.ts_start <= t && t < s.ts_end;
@@ -380,7 +381,7 @@ mod tests {
     #[test]
     fn instant_goes_to_innermost_leaf() {
         let spans = vec![
-            span(1, "consumer.iter", 0.0, 100.0, None), // outer
+            span(1, "consumer.iter", 0.0, 100.0, None),       // outer
             span(1, "consumer.write_data", 40.0, 60.0, None), // inner leaf
         ];
         let mut bundle = ProfileBundle::from_spans(&spans);

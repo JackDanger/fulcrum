@@ -130,7 +130,10 @@ fn decode_intervals(spans: &[Span]) -> BTreeMap<u64, DecodeInterval> {
             continue;
         };
         let spec = s.arg_u64("speculative").map(|v| v != 0).unwrap_or(false)
-            || matches!(s.args.get("speculative"), Some(serde_json::Value::Bool(true)));
+            || matches!(
+                s.args.get("speculative"),
+                Some(serde_json::Value::Bool(true))
+            );
         *any_spec.entry(idx).or_insert(false) |= spec;
         // keep the decode that ENDS latest (the one the consumer ultimately waits on)
         match map.get(&idx) {
@@ -316,11 +319,29 @@ mod tests {
     #[test]
     fn rate_when_frontier_undecoded_and_no_idle() {
         let spans = vec![
-            sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
+            sp(
+                "wait.block_fetcher_get",
+                1,
+                100.0,
+                200.0,
+                json!({"chunk_id":5}),
+            ),
             // chunk 5 decoded on a worker, finishing at 250 (after stall end).
-            sp("worker.decode_chunk", 2, 50.0, 250.0, json!({"chunk_id":5,"speculative":false})),
+            sp(
+                "worker.decode_chunk",
+                2,
+                50.0,
+                250.0,
+                json!({"chunk_id":5,"speculative":false}),
+            ),
             // another worker busy the whole time (no pool.pick.wait).
-            sp("worker.decode_chunk", 3, 50.0, 260.0, json!({"chunk_id":6,"speculative":false})),
+            sp(
+                "worker.decode_chunk",
+                3,
+                50.0,
+                260.0,
+                json!({"chunk_id":6,"speculative":false}),
+            ),
         ];
         let v = classify_stalls(&spans);
         assert_eq!(v.n_stalls, 1);
@@ -335,14 +356,30 @@ mod tests {
     #[test]
     fn placement_when_decode_start_deferred_with_idle_worker() {
         let spans = vec![
-            sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
-            sp("worker.decode_chunk", 2, 150.0, 250.0, json!({"chunk_id":5,"speculative":false})),
+            sp(
+                "wait.block_fetcher_get",
+                1,
+                100.0,
+                200.0,
+                json!({"chunk_id":5}),
+            ),
+            sp(
+                "worker.decode_chunk",
+                2,
+                150.0,
+                250.0,
+                json!({"chunk_id":5,"speculative":false}),
+            ),
             sp("pool.pick.wait", 3, 100.0, 190.0, json!({})),
         ];
         let v = classify_stalls(&spans);
         assert_eq!(v.stalls[0].class, StallClass::Placement);
         // 50µs deferred-dispatch (placement) + 50µs decode-run (rate).
-        assert!((v.placement_us - 50.0).abs() < 1e-6, "placement_us={}", v.placement_us);
+        assert!(
+            (v.placement_us - 50.0).abs() < 1e-6,
+            "placement_us={}",
+            v.placement_us
+        );
         assert!((v.rate_us - 50.0).abs() < 1e-6, "rate_us={}", v.rate_us);
     }
 
@@ -353,9 +390,21 @@ mod tests {
     #[test]
     fn concurrent_idle_workers_do_not_fabricate_placement() {
         let mut spans = vec![
-            sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
+            sp(
+                "wait.block_fetcher_get",
+                1,
+                100.0,
+                200.0,
+                json!({"chunk_id":5}),
+            ),
             // decode STARTED at 50 (before the stall) — gated on RUN, not dispatch.
-            sp("worker.decode_chunk", 2, 50.0, 200.0, json!({"chunk_id":5,"speculative":false})),
+            sp(
+                "worker.decode_chunk",
+                2,
+                50.0,
+                200.0,
+                json!({"chunk_id":5,"speculative":false}),
+            ),
         ];
         // 8 peer workers all idle for the whole stall (concurrent).
         for t in 3..11 {
@@ -363,7 +412,11 @@ mod tests {
         }
         let v = classify_stalls(&spans);
         assert_eq!(v.stalls[0].class, StallClass::Rate);
-        assert!(v.placement_us < 1e-6, "placement leaked: {}", v.placement_us);
+        assert!(
+            v.placement_us < 1e-6,
+            "placement leaked: {}",
+            v.placement_us
+        );
         assert_eq!(v.winner(), "RATE");
     }
 
@@ -372,8 +425,20 @@ mod tests {
     #[test]
     fn speculation_invalid_flagged() {
         let spans = vec![
-            sp("wait.block_fetcher_get", 1, 100.0, 200.0, json!({"chunk_id":5})),
-            sp("worker.decode_chunk", 2, 150.0, 260.0, json!({"chunk_id":5,"speculative":true})),
+            sp(
+                "wait.block_fetcher_get",
+                1,
+                100.0,
+                200.0,
+                json!({"chunk_id":5}),
+            ),
+            sp(
+                "worker.decode_chunk",
+                2,
+                150.0,
+                260.0,
+                json!({"chunk_id":5,"speculative":true}),
+            ),
         ];
         let v = classify_stalls(&spans);
         assert_eq!(v.stalls[0].class, StallClass::SpeculationInvalid);

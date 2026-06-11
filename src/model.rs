@@ -144,7 +144,9 @@ fn arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 fn arg_str(args: &serde_json::Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// A single window-publish, in trace (= consumer = chunk-index) order.
@@ -208,8 +210,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
         std::collections::HashMap::new();
     for e in events {
         if e.ph == "i" && e.name == "causal.decode_decision" {
-            if let (Some(sb), Some(m)) = (arg_u64(&e.args, "start_bit"), arg_str(&e.args, "mode"))
-            {
+            if let (Some(sb), Some(m)) = (arg_u64(&e.args, "start_bit"), arg_str(&e.args, "mode")) {
                 mode_by_start.insert(sb, m);
             }
         }
@@ -315,10 +316,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
             0
         }
     };
-    let frontier_us = publishes
-        .first()
-        .map(|p| p.ts - trace_start)
-        .unwrap_or(0.0);
+    let frontier_us = publishes.first().map(|p| p.ts - trace_start).unwrap_or(0.0);
     let last_publish_ts = publishes.last().map(|p| p.ts);
     let tail_us = match last_publish_ts {
         Some(lp) => (trace_start + observed_wall_us) - lp,
@@ -353,8 +351,7 @@ pub fn analyze(events: &[Event], label: &str, workers: Option<u64>) -> ModelPara
 
     // ── prediction ────────────────────────────────────────────────────────────
     let n = n_chunks as f64;
-    let worker_bound_us =
-        d_w_eff_us.map(|dwe| frontier_us + (n / workers as f64) * dwe);
+    let worker_bound_us = d_w_eff_us.map(|dwe| frontier_us + (n / workers as f64) * dwe);
     // The chain is the first→last publish span anchored at `frontier` (=
     // first publish), so it spans (N−1) links of mean latency, not N. Using
     // mean L_resolve, frontier + (N−1)·L_resolve reconstructs last_publish
@@ -651,7 +648,11 @@ mod tests {
             args: serde_json::Value::Null,
         });
         let p = analyze(&events, "decisions_frac", Some(4));
-        assert!((p.window_absent_frac - 0.9).abs() < 1e-9, "f={}", p.window_absent_frac);
+        assert!(
+            (p.window_absent_frac - 0.9).abs() < 1e-9,
+            "f={}",
+            p.window_absent_frac
+        );
         assert_eq!(p.n_decode_spans, 0);
     }
 
@@ -662,7 +663,13 @@ mod tests {
         for i in 0..8u64 {
             let tid = 2 + (i % 4); // tids 2..=5 (consumer is tid 1)
             let t0 = 1000.0 + i as f64 * 1000.0;
-            events.extend(span("worker.decode", "window_absent", tid, t0, t0 + 40_000.0));
+            events.extend(span(
+                "worker.decode",
+                "window_absent",
+                tid,
+                t0,
+                t0 + 40_000.0,
+            ));
         }
         // 8 publishes, 5ms apart, first at 20ms, end_bits distinct.
         for i in 0..8u64 {
@@ -696,7 +703,11 @@ mod tests {
         assert_eq!(p.d_w_eff_us, Some(40_000.0));
         assert_eq!(p.l_resolve_us, Some(5_000.0), "L_resolve = 5ms gap");
         // frontier = first publish (20ms) − trace start (0) = 20ms.
-        assert!((p.frontier_us - 20_000.0).abs() < 1.0, "frontier {}", p.frontier_us);
+        assert!(
+            (p.frontier_us - 20_000.0).abs() < 1.0,
+            "frontier {}",
+            p.frontier_us
+        );
         // observed wall = 60ms (drive span 0..60ms).
         assert!((p.observed_wall_us - 60_000.0).abs() < 1.0);
         // tail = wall-end (60ms) − last publish (55ms) = 5ms.
@@ -732,7 +743,13 @@ mod tests {
         let mut a_events: Vec<Event> = Vec::new();
         for i in 0..10u64 {
             let t0 = i as f64 * 100.0;
-            a_events.extend(span("worker.decode", "window_absent", 2 + i % 8, t0, t0 + 10_000.0));
+            a_events.extend(span(
+                "worker.decode",
+                "window_absent",
+                2 + i % 8,
+                t0,
+                t0 + 10_000.0,
+            ));
         }
         for i in 0..10u64 {
             a_events.push(publish(i as f64 * 20_000.0, 1000 + i * 100));
@@ -744,7 +761,13 @@ mod tests {
         let mut b_events: Vec<Event> = Vec::new();
         for i in 0..10u64 {
             let t0 = i as f64 * 100.0;
-            b_events.extend(span("worker.decode", "window_absent", 2 + i % 8, t0, t0 + 10_000.0));
+            b_events.extend(span(
+                "worker.decode",
+                "window_absent",
+                2 + i % 8,
+                t0,
+                t0 + 10_000.0,
+            ));
         }
         for i in 0..10u64 {
             b_events.push(publish(i as f64 * 4_000.0, 1000 + i * 100));

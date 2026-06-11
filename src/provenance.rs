@@ -105,7 +105,8 @@ impl DecoderProvenance {
     /// harness said `pure-rust-inflate` but `isal_inflate` symbols are present).
     pub fn consistency_warning(&self) -> Option<String> {
         let feat = self.cargo_features.to_lowercase();
-        let declared_pure = feat.contains("pure-rust-inflate") && !feat.contains("isal-compression");
+        let declared_pure =
+            feat.contains("pure-rust-inflate") && !feat.contains("isal-compression");
         match (declared_pure, self.decoder) {
             (true, Decoder::Isal) => Some(format!(
                 "PROVENANCE CONTRADICTION: features declare pure-rust-inflate but the binary \
@@ -170,7 +171,11 @@ impl DecoderProvenance {
             "  decoder:            {}  (isal_inflate symbols = {}, via {})\n",
             self.decoder.label(),
             self.isal_inflate_symbols,
-            if self.symbol_tool.is_empty() { "none" } else { &self.symbol_tool }
+            if self.symbol_tool.is_empty() {
+                "none"
+            } else {
+                &self.symbol_tool
+            }
         ));
         if !self.cargo_features.is_empty() {
             s.push_str(&format!("  cargo features:     {}\n", self.cargo_features));

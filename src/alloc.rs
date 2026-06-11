@@ -97,11 +97,13 @@ fn is_frontier(region: &str) -> bool {
 pub fn analyze(bundle: &ProfileBundle) -> AllocReport {
     let mut by_region: BTreeMap<String, RegionAlloc> = BTreeMap::new();
     for (key, cell) in &bundle.cells {
-        let entry = by_region.entry(key.region.clone()).or_insert_with(|| RegionAlloc {
-            region: key.region.clone(),
-            pure: true,
-            ..Default::default()
-        });
+        let entry = by_region
+            .entry(key.region.clone())
+            .or_insert_with(|| RegionAlloc {
+                region: key.region.clone(),
+                pure: true,
+                ..Default::default()
+            });
         let mut add = |name: &str, into: &mut f64| {
             if let Some(v) = cell.counters.get(name) {
                 *into += v.value;
