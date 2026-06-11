@@ -94,10 +94,7 @@ pub fn analyze(path: &Path, cfg: &Config) -> std::io::Result<SpansReport> {
     let events = load_events(path)?;
     let spans = pair_spans(&events);
     let wall = crate::trace::wall_us(&spans);
-    let last_ts = events
-        .iter()
-        .map(|e| e.ts)
-        .fold(0.0_f64, f64::max);
+    let last_ts = events.iter().map(|e| e.ts).fold(0.0_f64, f64::max);
 
     let mut threads: HashSet<(u64, u64)> = HashSet::new();
     for e in &events {
@@ -259,10 +256,7 @@ pub fn print_report(path: &str, r: &SpansReport, top: usize) {
     );
     let n = top.min(r.rows.len());
     for row in r.rows.iter().take(n) {
-        if row.self_us < 100.0
-            && row.wall_critical_us < 100.0
-            && row.busy_us < 1000.0
-        {
+        if row.self_us < 100.0 && row.wall_critical_us < 100.0 && row.busy_us < 1000.0 {
             continue;
         }
         let pct = if r.wall_us > 0.0 {

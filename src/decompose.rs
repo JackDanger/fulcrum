@@ -6,11 +6,15 @@
 //! servicing, allocator zeroing, involuntary context switches (preemption /
 //! blocked-on-host), and runnable-but-not-running queueing. This view turns
 //!
-//!     wall = Σ(named regions) + 17% UNEXPLAINED
+//! ```text
+//! wall = Σ(named regions) + 17% UNEXPLAINED
+//! ```
 //!
 //! into
 //!
-//!     wall = Σ(named regions) + page-fault X% + ctxsw Y% + alloc Z% + blocked-on-host W%
+//! ```text
+//! wall = Σ(named regions) + page-fault X% + ctxsw Y% + alloc Z% + blocked-on-host W%
+//! ```
 //!
 //! using PERF-FREE, self-keyed counters that gzippy emits at region
 //! boundaries via getrusage(RUSAGE_THREAD) and /proc/self/task/<tid>/schedstat:
@@ -180,7 +184,11 @@ pub fn decompose(bundle: &ProfileBundle, named_region_us: f64) -> Decomposition 
         // present (they overlap), so flag it as informational by zeroing its
         // modeled cost when minflt already covers it.
         let pages = (rss_delta.abs() / 4096.0).round();
-        let modeled = if minflt > 0.0 { 0.0 } else { pages * cost::MINFLT_US };
+        let modeled = if minflt > 0.0 {
+            0.0
+        } else {
+            pages * cost::MINFLT_US
+        };
         d.terms.push(ResidualTerm {
             name: "rss-growth (alloc/zeroing, info)",
             modeled_us: modeled,
