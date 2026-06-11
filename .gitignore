@@ -25,3 +25,4 @@ fulcrum_topdown.txt
 __pycache__/
 *.pyc
 decide/.selftest-stamp.json
+.claude/
