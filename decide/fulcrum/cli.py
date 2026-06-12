@@ -10,6 +10,13 @@ scripts/fulcrum_decide.py shims):
   total <trace.json> [<other.json>] [--counters F] [--T N] [--feature F]
       The validated whole-system trace analyzer (one trace or a cross-tool
       delta).
+  locate <trace.json> [<more.json>...] [--wall-ms X] [--threshold pct]
+      POSITIVE localization: closed wall ledger over a critical-path model
+      (longest-busy-path v1). wall == on-path compute + on-path wait +
+      residual, conservation-asserted (CONSERVATION-OR-NO-LOCATE); rows are
+      FLAGGED when the residual exceeds --threshold (default 2%%, tie to the
+      instrument self-test spread). Each row carries the recommended
+      exemption-probe falsifier design (text; the sweep itself is not v1).
   selftest
       Run every suite (trace engine, decision engine, invariant enforcement);
       writes the SELF-TEST-OR-NO-TRUST stamp on success.
@@ -145,6 +152,39 @@ def decide_main(argv=None):
     report_mod.print_report(rep, tie_bar=adapter.tie_bar)
 
 
+def locate_main(argv):
+    """`fulcrum locate <trace.json> [...] [--wall-ms X] [--threshold pct]`."""
+    from .core.locate import DEFAULT_THRESHOLD_PCT, locate
+
+    wall_ms = None
+    threshold = DEFAULT_THRESHOLD_PCT
+    files = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--wall-ms":
+            wall_ms = float(argv[i + 1]); i += 2; continue
+        if a == "--threshold":
+            threshold = float(argv[i + 1]); i += 2; continue
+        if a.startswith("--"):
+            print(f"locate: unknown option {a}")
+            sys.exit(2)
+        files.append(a); i += 1
+    if not files:
+        print(__doc__)
+        sys.exit(1)
+
+    _trust_banner()
+    adapter = GzippyAdapter()
+    try:
+        result = locate(files, wall_ms=wall_ms, threshold_pct=threshold,
+                        wait_names=adapter.taxonomy.wait_prefixes)
+    except tr.InstrumentError as e:
+        print(f"\n[INSTRUMENT REFUSED] {e}")
+        sys.exit(2)
+    report_mod.print_locate(result)
+
+
 def ledger_main(rest):
     """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
     verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
@@ -241,6 +281,8 @@ def main(argv=None):
         decide_main(rest)
     elif cmd == "total":
         total_main(rest)
+    elif cmd == "locate":
+        locate_main(rest)
     elif cmd == "selftest":
         from .selftests import run_all
         sys.exit(run_all())

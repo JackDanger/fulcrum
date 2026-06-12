@@ -4,6 +4,27 @@ All notable changes to **fulcrum** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`fulcrum locate` — positive localization via a closed wall ledger**
+  (`decide/fulcrum/core/locate.py`): consumes GZIPPY_TIMELINE-style Chrome
+  traces and emits a critical path (longest-busy-path v1 approximation over
+  per-thread leaf segments), a conservation-asserted wall ledger
+  (`wall == on-path compute + on-path wait + residual`, the residual being a
+  first-class "where it can still hide" object), and a ranked per-span
+  on-path/slack table in the decision-brief style — each row carrying the
+  recommended exemption-probe falsifier design as text (the probe sweep
+  itself is deliberately not in v1). New ninth scar-named invariant
+  **CONSERVATION-OR-NO-LOCATE**: a result whose residual exceeds the
+  configurable threshold (default 2%, tie to the instrument self-test
+  spread) is emitted FLAGGED, never silently trusted; an overlapping
+  (double-counted) path refuses outright. New `locate` selftest suite
+  (synthetic serial-chain / overlapped-parallel / one-straggler /
+  wait-dominated traces with known critical paths, flag + refusal firing
+  tests): 5 suites, 177 checks total. Documented in `decide/docs/SCHEMA.md`.
+
 ## [0.3.0] - 2026-06-11
 
 The headline of 0.3.0 is the **decision-engine layer**: the repo now holds
