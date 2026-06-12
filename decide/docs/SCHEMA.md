@@ -124,3 +124,55 @@ Analyzed cells are banked to an append-only jsonl ledger (default
 (retires a measurement error). **Append-only is a convention the tooling
 upholds, not an OS guarantee** — see `core/ledger.py` for the tamper-evidence
 hash chain.
+
+## `fulcrum locate` — the closed wall ledger (CONSERVATION-OR-NO-LOCATE)
+
+`fulcrum locate <trace.json> [<more.json>...] [--wall-ms X] [--threshold pct]`
+consumes GZIPPY_TIMELINE-style Chrome traces (B/E event pairs with
+`ts`/`tid`/`name`, parsed by the same trusted engine as `total`) and emits
+POSITIVE localization — the complement of the perturbation tools, which can
+only rule regions out.
+
+**Critical-path model (v1 approximation = longest-busy-path).** Per-thread
+leaf segments (deepest open span at each instant — the no-double-count
+sweep), then a forward walk over the wall: the path stays on the thread it
+is following while that thread is compute-busy; when it goes idle or only
+waits, the path switches to a compute-busy thread (latest-ending segment
+wins); when nothing computes, a wait-busy thread carries the path (a wait
+with nothing running IS the wall); when nothing is busy at all, the instant
+falls into the residual. Cross-thread happens-before edges keyed on
+chunk/key args are future work.
+
+**The closed ledger.** Every result asserts and reports
+
+```
+wall == on-path compute + on-path wait + residual
+```
+
+- `wall` is the trace extent, or the DECLARED `--wall-ms` (then the residual
+  also covers uninstrumented head/tail — exactly the point);
+- the **residual is a first-class "where it can still hide" object**: a
+  residual above `--threshold` (default 2%) marks EVERY emitted row
+  `FLAGGED [CONSERVATION-OR-NO-LOCATE]` — emitted, never silently trusted;
+  a NEGATIVE residual (classified path exceeds the claimed wall) is flagged
+  as instrument-or-wall-claim inconsistency; an overlapping (double-counted)
+  path REFUSES outright;
+- **tie `--threshold` to the instrument self-test spread**: run the
+  measuring instrument binary-vs-itself (interleaved A/A) and use the spread
+  it shows against itself — a residual below that is indistinguishable from
+  noise; above it is unlocated wall and keeps the flag.
+
+**Wait classification** comes from the project adapter's wait-span prefix
+list (`taxonomy.wait_prefixes`); the default, with no adapter, is the
+substring heuristic `{recv, wait, get, poll}`.
+
+**Output rows** (decision-brief style, ranked by on-path self-time): span,
+class, on-path ms + share of classified path (the positive localizer),
+off-path slack ms (the CPU-sum trap caught by construction), distribution
+health across traces when more than one is given, and per-row the
+recommended **exemption-probe falsifier design** (text only — the P2 sweep
+is deliberately NOT implemented in v1):
+
+> sleep-tax all instrumented regions at t={10,20,30}%, exempt `<span>`;
+> require linear wall(t); extrapolate exemption delta to t->0;
+> sleep-primary, frequency-witnessed

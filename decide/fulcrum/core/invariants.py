@@ -116,6 +116,28 @@ INVARIANTS = (
                     "trace.py trust assertions",
     ),
     Invariant(
+        name="CONSERVATION-OR-NO-LOCATE",
+        rule="A locate result must CLOSE its wall ledger: wall == "
+             "critical-path-classified time (compute + wait) + residual, "
+             "with the residual reported as a first-class 'where it can "
+             "still hide' object. A residual exceeding the configured "
+             "threshold (default 2%, tied to the instrument self-test "
+             "spread) marks EVERY emitted row FLAGGED — never silently "
+             "trusted; a negative residual (classified path exceeds the "
+             "wall) is flagged as instrument-or-wall-claim inconsistency; "
+             "an overlapping (double-counted) path REFUSES outright.",
+        scar="Localization by producer-side attribution manufactured "
+             "phantoms all campaign (the 377ms pair-drain, the combine_crc "
+             "'62ms serial CRC' nested-span double-count): perturbation "
+             "could rule regions OUT but nothing could positively LOCATE "
+             "slowdown, because un-closed ledgers let wall time hide in "
+             "unattributed gaps that the analyst then back-filled with "
+             "stories.",
+        enforcement="locate.locate_one residual gate (flagged result + "
+                    "flag_label on every row); locate.assert_path_closed "
+                    "refusal; selftests/test_locate.py",
+    ),
+    Invariant(
         name="FINGERPRINT-OR-NO-COMPARE",
         rule="Every stored number carries {sink, mask, freeze, binary sha, "
              "corpus sha, protocol version, comparator version, host "
