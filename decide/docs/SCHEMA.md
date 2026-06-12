@@ -134,14 +134,29 @@ POSITIVE localization — the complement of the perturbation tools, which can
 only rule regions out.
 
 **Critical-path model (v1 approximation = longest-busy-path).** Per-thread
-leaf segments (deepest open span at each instant — the no-double-count
-sweep), then a forward walk over the wall: the path stays on the thread it
-is following while that thread is compute-busy; when it goes idle or only
+leaf segments (deepest open span at each instant — no-double-count sweep),
+then a forward walk over the wall: the path stays on the thread it is
+following while that thread is compute-busy; when it goes idle or only
 waits, the path switches to a compute-busy thread (latest-ending segment
 wins); when nothing computes, a wait-busy thread carries the path (a wait
-with nothing running IS the wall); when nothing is busy at all, the instant
-falls into the residual. Cross-thread happens-before edges keyed on
-chunk/key args are future work.
+with nothing running IS the wall); when no non-park span is busy, the
+instant falls into the residual. **Park spans are NON-COVERING** (see
+below). Cross-thread happens-before edges keyed on chunk/key args are
+future work. **The path is a greedy longest-busy-path approximation with no
+downstream lookahead**: with multiple concurrently-busy threads the ranking
+can follow a non-critical thread; cross-thread happens-before keying is v2.
+
+**Span classification** produces three classes: `compute`, `wait`, and `park`.
+
+- **wait**: adapter-supplied prefix list; default substring heuristic
+  `{recv, wait, get, poll}`. Wait spans carry the path when nothing else
+  computes — a blocking wait with nothing running IS the wall.
+- **park**: adapter-supplied prefix list (`park_names` parameter; default
+  `{"pool.pick.wait"}`). Park spans represent thread-pool parked-idle threads
+  that neither produce work nor block on external resources. **Park is
+  NON-COVERING**: instants covered only by park spans fall into the residual,
+  the same as if no span were present. The path never follows a park span.
+  Adapters should list any thread-pool parked-idle span name prefixes.
 
 **The closed ledger.** Every result asserts and reports
 
@@ -149,22 +164,30 @@ chunk/key args are future work.
 wall == on-path compute + on-path wait + residual
 ```
 
-- `wall` is the trace extent, or the DECLARED `--wall-ms` (then the residual
-  also covers uninstrumented head/tail — exactly the point);
-- the **residual is a first-class "where it can still hide" object**: a
-  residual above `--threshold` (default 2%) marks EVERY emitted row
-  `FLAGGED [CONSERVATION-OR-NO-LOCATE]` — emitted, never silently trusted;
-  a NEGATIVE residual (classified path exceeds the claimed wall) is flagged
-  as instrument-or-wall-claim inconsistency; an overlapping (double-counted)
-  path REFUSES outright;
-- **tie `--threshold` to the instrument self-test spread**: run the
-  measuring instrument binary-vs-itself (interleaved A/A) and use the spread
-  it shows against itself — a residual below that is indistinguishable from
-  noise; above it is unlocated wall and keeps the flag.
+Two first-class unlocated-wall metrics surface hidden uncertainty:
 
-**Wait classification** comes from the project adapter's wait-span prefix
-list (`taxonomy.wait_prefixes`); the default, with no adapter, is the
-substring heuristic `{recv, wait, get, poll}`.
+- **residual** = wall instants not covered by any non-park span. This
+  includes genuine uninstrumented gaps AND instants covered only by park
+  spans (parked-idle threads). `wall` is the trace extent, or the DECLARED
+  `--wall-ms` (then the residual also covers uninstrumented head/tail —
+  exactly the point). A NEGATIVE residual (classified path exceeds the
+  claimed wall) is flagged as instrument-or-wall-claim inconsistency; an
+  overlapping (double-counted) path REFUSES outright.
+
+- **wait-only-carried** = on-path intervals carried by a wait span with
+  ZERO concurrent compute on any thread. A wait span correctly carries the
+  path when nothing else is computing, but if no compute ever overlaps that
+  interval the cause is unlocated — scheduling overhead, uninstrumented
+  prefetch, or a real resource bottleneck.
+
+**The FLAGGED condition** fires when `(residual + wait-only-carried) / wall`
+exceeds `--threshold` (default 2%), marking EVERY emitted row
+`FLAGGED [CONSERVATION-OR-NO-LOCATE]` — emitted, never silently trusted.
+
+**Tie `--threshold` to the instrument self-test spread**: run the measuring
+instrument binary-vs-itself (interleaved A/A) and use the spread it shows
+against itself — a combined unlocated fraction below that is
+indistinguishable from noise; above it is unlocated wall and keeps the flag.
 
 **Output rows** (decision-brief style, ranked by on-path self-time): span,
 class, on-path ms + share of classified path (the positive localizer),

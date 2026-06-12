@@ -10,14 +10,24 @@ controls, and corruption tests proving the refusal/flag FIRES:
   - perfectly-overlapped  : the busy consumer carries the whole path,
     parallel                worker time is 100%% slack (off-path);
   - one straggler         : the straggler's span ranks #1; the consumer's
-                            wait is on-path only for the uncovered tail;
+                            wait is on-path only for the uncovered tail
+                            (the tail has no concurrent compute so it is
+                            also wait-only-carried — FLAGGED above threshold);
   - wait-dominated        : on-path wait dominates the ledger (a wait with
-                            nothing computing IS the wall);
+                            nothing computing IS the wall); the wait-only-
+                            carried is high so the result is FLAGGED;
   - FLAGGED               : a wall gap > threshold emits FLAGGED rows
                             (CONSERVATION-OR-NO-LOCATE), control threshold
                             un-flags; a declared wall smaller than the path
                             flags NEGATIVE residual;
   - corruption            : an overlapping (double-counted) path REFUSES.
+  - park spans (FIX 1)    : park-classified spans are NON-COVERING; instants
+                            covered only by park fall into the residual;
+                            a real-compute control stays CONSERVED;
+  - greedy failure (FIX 2): two busy threads where greedy stickiness follows
+                            the wrong thread — ledger still CONSERVES but the
+                            ranking is the documented-wrong greedy outcome
+                            (cited as FIX-2).
 """
 
 import contextlib
@@ -28,6 +38,7 @@ import tempfile
 
 from ..core import trace as tr
 from ..core.locate import (
+    DEFAULT_PARK_NAMES,
     assert_path_closed,
     flag_label,
     locate,
@@ -77,6 +88,8 @@ def run():
           "serial chain: wall == compute + wait + residual (closure exact)")
     check(r["on_path_wait_ms"] == 0.0,
           "serial chain: no wait-classified time (all compute)")
+    check(r["wait_only_carried_ms"] == 0.0,
+          "serial chain: no wait-only-carried (no wait spans)")
     res = locate([p_serial])
     check(res["rows"][0]["span"] == "transform"
           and abs(res["rows"][0]["on_path_ms"] - 150.0) < 0.001,
@@ -117,6 +130,8 @@ def run():
     # 3. ONE STRAGGLER: three workers (two finish at 100ms, one runs to
     #    300ms); consumer blocks in a wait until 310ms. The straggler's
     #    span must rank #1; the wait is on-path only for the tail.
+    #    FIX 1: the 10ms tail is wait-only-carried (no concurrent compute),
+    #    so the combined unlocated fraction exceeds 2% → FLAGGED.
     # ------------------------------------------------------------------
     p_strag = os.path.join(d, "straggler.json")
     ev = (span_events("consumer.wait_done", 1, 0.0, 310_000.0)
@@ -139,12 +154,17 @@ def run():
           "tail (not its whole 310ms duration)")
     check(abs(r["on_path_wait_ms"] - 10.0) < 0.001
           and abs(r["on_path_compute_ms"] - 300.0) < 0.001
-          and not r["flagged"],
-          "straggler: ledger = 300ms compute + 10ms wait + ~0 residual, "
-          "conserved")
+          and abs(r["residual_ms"]) < 0.001,
+          "straggler: ledger closes — 300ms compute + 10ms wait + ~0 residual "
+          "(wall == compute + wait + residual)")
+    check(r["flagged"] and abs(r["wait_only_carried_ms"] - 10.0) < 0.001,
+          "straggler: FLAGGED — 10ms wait-only-carried (consumer.wait_done "
+          "on-path after all compute ends, no concurrent compute during tail)")
 
     # ------------------------------------------------------------------
     # 4. WAIT-DOMINATED: a recv covers the wall, only 20ms computes.
+    #    FIX 1: the 260ms recv tail (after compute ends) is wait-only-
+    #    carried (no concurrent compute) → FLAGGED above threshold.
     # ------------------------------------------------------------------
     p_wait = os.path.join(d, "waitdom.json")
     ev = (span_events("rx.recv_block", 1, 0.0, 280_000.0)
@@ -159,8 +179,12 @@ def run():
     check(res["rows"][0]["span"] == "rx.recv_block"
           and res["rows"][0]["cls"] == "wait",
           "wait-dominated: the blocking recv ranks #1, classified wait")
-    check(not r["flagged"],
-          "wait-dominated: conserved (residual ~0)")
+    check(abs(r["residual_ms"]) < 0.001,
+          "wait-dominated: residual ~0 (ledger closes; wall == compute + "
+          "wait + residual)")
+    check(r["flagged"] and abs(r["wait_only_carried_ms"] - 260.0) < 0.001,
+          "wait-dominated: FLAGGED — 260ms wait-only-carried (rx.recv_block "
+          "on-path with zero concurrent compute after work.decode finishes)")
 
     # ------------------------------------------------------------------
     # 5. FLAGGED (CONSERVATION-OR-NO-LOCATE): a 50ms hole in a 200ms wall
@@ -257,11 +281,128 @@ def run():
           and "RANKED LOCALIZATION" in out and "FALSIFIER" in out,
           "rendering: ledger + invariant name + ranked table + FALSIFIER "
           "lines all present in the report")
+    check("wait-only-carried" in out,
+          "rendering: wait-only-carried ledger line appears in the report")
+    check("greedy" in out and "v2" in out,
+          "rendering: greedy caveat (no downstream lookahead) and v2 "
+          "reference appear in the ranked table header")
     buf2 = io.StringIO()
     with contextlib.redirect_stdout(buf2):
         print_locate(locate([p_gap]))
     check("FLAGGED [CONSERVATION-OR-NO-LOCATE]" in buf2.getvalue(),
           "rendering: a non-conserving result prints the FLAG banner on the "
           "ranked table")
+
+    # ------------------------------------------------------------------
+    # 9. FIX 1 — PARK spans: pool.pick.wait (and any adapter-supplied park
+    #    prefix) is NON-COVERING. Instants covered only by park fall into
+    #    the residual, same as if no span were present.
+    #
+    #    Park trace: T1 computes [0-100ms]; T2 has pool.pick.wait [100-200ms].
+    #    Under the old (wait) classification, pool.pick.wait would carry
+    #    [100-200ms] on-path as wait — residual = 0, not flagged.
+    #    Under park (FIX 1), pool.pick.wait is non-covering → [100-200ms]
+    #    falls into residual (100ms / 200ms = 50% > 2%) → FLAGGED.
+    #
+    #    Control: replace pool.pick.wait with real compute → CONSERVED.
+    # ------------------------------------------------------------------
+    p_park = os.path.join(d, "park.json")
+    ev_park = (span_events("work.go", 1, 0.0, 100_000.0)
+               + span_events("pool.pick.wait", 2, 100_000.0, 200_000.0))
+    write_trace(p_park, ev_park)
+
+    r_park = locate_one(p_park)
+    check(r_park["residual_ms"] > 0.0,
+          "park: pool.pick.wait is NON-COVERING; instants covered only by "
+          "park fall into residual (residual > 0)")
+    check(abs(r_park["residual_ms"] - 100.0) < 0.001,
+          "park: residual == 100ms (the 100ms window covered only by "
+          "pool.pick.wait)")
+    check(r_park["flagged"],
+          "park: residual 50% of wall > 2% threshold → FLAGGED")
+    check(r_park["on_path_wait_ms"] == 0.0,
+          "park: pool.pick.wait contributes 0ms to on-path wait (park "
+          "is non-covering, not wait)")
+    check(r_park["wait_only_carried_ms"] == 0.0,
+          "park: wait_only_carried = 0 (no wait spans, park is separate "
+          "class)")
+
+    # Verify DEFAULT_PARK_NAMES is exported and contains pool.pick.wait
+    check("pool.pick.wait" in DEFAULT_PARK_NAMES,
+          "park: DEFAULT_PARK_NAMES contains pool.pick.wait")
+
+    # Control: same wall interval, real compute instead of park → CONSERVED
+    p_park_ctl = os.path.join(d, "park_ctl.json")
+    ev_ctl = (span_events("work.go", 1, 0.0, 100_000.0)
+              + span_events("work.other", 2, 100_000.0, 200_000.0))
+    write_trace(p_park_ctl, ev_ctl)
+    r_ctl = locate_one(p_park_ctl)
+    check(abs(r_ctl["residual_ms"]) < 0.001 and not r_ctl["flagged"],
+          "park control: real compute covering the same instants → CONSERVED "
+          "(residual ~0, not flagged)")
+
+    # Adapter-supplied park_names overrides the default
+    p_custom_park = os.path.join(d, "custom_park.json")
+    ev_cp = (span_events("work.go", 1, 0.0, 100_000.0)
+             + span_events("my.idle.slot", 2, 100_000.0, 200_000.0))
+    write_trace(p_custom_park, ev_cp)
+    r_default = locate_one(p_custom_park)  # my.idle.slot → compute by default
+    r_custom = locate_one(p_custom_park, park_names=("my.idle.",))
+    check(r_default["residual_ms"] == 0.0 and not r_default["flagged"],
+          "park custom: with no park override, my.idle.slot is compute → "
+          "CONSERVED (residual 0)")
+    check(r_custom["residual_ms"] > 0.0 and r_custom["flagged"],
+          "park custom: adapter-supplied park_names=('my.idle.',) makes "
+          "my.idle.slot non-covering → residual > 0, FLAGGED")
+
+    # ------------------------------------------------------------------
+    # 10. FIX 2 — GREEDY KNOWN FAILURE (documented; not fixed in v1).
+    #
+    #     Two busy threads where greedy stickiness provably follows the
+    #     WRONG thread:
+    #       T1: work.a [0-100ms], work.a_next [100-200ms]  ← true critical path
+    #       T2: work.b [0-150ms]  ← greedy sticks here (ends latest at t=0)
+    #
+    #     Greedy walk: at t=0 pick T2 (work.b ends at 150ms > work.a 100ms).
+    #     Stick with T2 through [0-150ms]. At 150ms switch to work.a_next.
+    #     Path: work.b[0-150ms] + work.a_next[150-200ms] = 200ms = wall.
+    #
+    #     The ledger CONSERVES (path length == wall, residual 0) despite the
+    #     wrong thread selection — the path choice never corrupts the ledger.
+    #     The ranking is the documented-wrong greedy outcome: work.b gets 150ms
+    #     on-path credit, work.a gets 0ms (wrong — it IS on the true critical
+    #     path). Cross-thread happens-before keying (the fix) is v2.
+    # ------------------------------------------------------------------
+    p_greedy = os.path.join(d, "greedy_fail.json")
+    ev_gf = (span_events("work.a", 1, 0.0, 100_000.0)
+             + span_events("work.a_next", 1, 100_000.0, 200_000.0)
+             + span_events("work.b", 2, 0.0, 150_000.0))
+    write_trace(p_greedy, ev_gf)
+    r_gf = locate_one(p_greedy)
+
+    check(abs(r_gf["residual_ms"]) < 0.001 and abs(r_gf["wall_ms"] - 200.0) < 0.001
+          and not r_gf["flagged"],
+          "FIX-2 greedy failure: ledger CONSERVES despite wrong thread "
+          "selection (residual ~0, wall=200ms) — path choice never corrupts "
+          "the ledger")
+    rows_gf = {row["span"]: row for row in r_gf["table"]}
+    check(abs(rows_gf["work.b"]["on_path_ms"] - 150.0) < 0.001
+          and rows_gf["work.a"]["on_path_ms"] == 0.0,
+          "FIX-2 greedy failure (DOCUMENTED WRONG OUTCOME): work.b ranks "
+          "with 150ms on-path; work.a has 0ms despite being on the true "
+          "critical path — greedy stickiness follows T2 (ends later); "
+          "cross-thread happens-before keying is v2")
+    check(abs(rows_gf["work.a_next"]["on_path_ms"] - 50.0) < 0.001,
+          "FIX-2 greedy failure: work.a_next gets 50ms credit (only the "
+          "tail after T2 ends, not its full 100ms) — documented wrong, v2")
+
+    # Verify the greedy caveat appears in the rendered output (FIX-2 in report)
+    buf_gf = io.StringIO()
+    with contextlib.redirect_stdout(buf_gf):
+        print_locate(locate([p_greedy]))
+    out_gf = buf_gf.getvalue()
+    check("greedy" in out_gf and "downstream lookahead" in out_gf,
+          "FIX-2 rendering: the greedy-approximation caveat with 'downstream "
+          "lookahead' appears in the ranked table header")
 
     return check.finish("locate selftest")

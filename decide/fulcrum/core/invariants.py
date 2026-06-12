@@ -119,13 +119,23 @@ INVARIANTS = (
         name="CONSERVATION-OR-NO-LOCATE",
         rule="A locate result must CLOSE its wall ledger: wall == "
              "critical-path-classified time (compute + wait) + residual, "
-             "with the residual reported as a first-class 'where it can "
-             "still hide' object. A residual exceeding the configured "
-             "threshold (default 2%, tied to the instrument self-test "
-             "spread) marks EVERY emitted row FLAGGED — never silently "
-             "trusted; a negative residual (classified path exceeds the "
-             "wall) is flagged as instrument-or-wall-claim inconsistency; "
-             "an overlapping (double-counted) path REFUSES outright.",
+             "where RESIDUAL = wall instants not covered by any non-park "
+             "span. Park spans (thread-pool parked-idle, adapter-supplied "
+             "prefix list, default: pool.pick.wait) are NON-COVERING — "
+             "instants covered only by park fall into the residual, the "
+             "same as if no span were present. A second first-class ledger "
+             "line, WAIT-ONLY-CARRIED, records on-path intervals carried "
+             "by a wait span with ZERO concurrent compute on any thread — "
+             "this surfaces on-path wait that is unlocated (nothing is "
+             "computing, so the cause may be scheduling overhead, "
+             "uninstrumented prefetch, or a real resource bottleneck). "
+             "The FLAGGED condition fires when (residual + "
+             "wait-only-carried) / wall exceeds the configured threshold "
+             "(default 2%, tied to the instrument self-test spread), "
+             "marking EVERY emitted row FLAGGED — never silently trusted; "
+             "a negative residual (classified path exceeds the wall) is "
+             "flagged as instrument-or-wall-claim inconsistency; an "
+             "overlapping (double-counted) path REFUSES outright.",
         scar="Localization by producer-side attribution manufactured "
              "phantoms all campaign (the 377ms pair-drain, the combine_crc "
              "'62ms serial CRC' nested-span double-count): perturbation "
@@ -133,9 +143,10 @@ INVARIANTS = (
              "slowdown, because un-closed ledgers let wall time hide in "
              "unattributed gaps that the analyst then back-filled with "
              "stories.",
-        enforcement="locate.locate_one residual gate (flagged result + "
-                    "flag_label on every row); locate.assert_path_closed "
-                    "refusal; selftests/test_locate.py",
+        enforcement="locate.locate_one residual + wait-only-carried gate "
+                    "(flagged result + flag_label on every row); "
+                    "locate.assert_path_closed refusal; "
+                    "selftests/test_locate.py",
     ),
     Invariant(
         name="FINGERPRINT-OR-NO-COMPARE",

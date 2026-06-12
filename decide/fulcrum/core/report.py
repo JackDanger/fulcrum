@@ -68,8 +68,17 @@ def print_locate(result, max_path_entries=40, max_rows=15):
               f"{pct(r['on_path_compute_ms'])}")
         print(f"  on-path wait      : {r['on_path_wait_ms']:10.3f} ms  "
               f"{pct(r['on_path_wait_ms'])}")
+        woc = r.get("wait_only_carried_ms", 0.0)
+        woc_pct = r.get("wait_only_carried_pct", 0.0)
+        print(f"  wait-only-carried : {woc:10.3f} ms  "
+              f"{pct(woc):>7}  "
+              f"(wait on-path, zero concurrent compute — in unlocated fraction)")
         print(f"  residual (hides?) : {r['residual_ms']:10.3f} ms  "
               f"{pct(r['residual_ms'])}")
+        combined = r.get("combined_unlocated_pct", r["residual_pct"] + woc_pct)
+        print(f"  unlocated total   : {r['residual_ms'] + woc:10.3f} ms  "
+              f"{combined:5.1f}%  "
+              f"= residual + wait-only-carried (threshold {r['threshold_pct']:.1f}%)")
         ok = "CONSERVED" if not r["flagged"] else \
             f"FLAGGED [CONSERVATION-OR-NO-LOCATE] {r['flag_reason']}"
         print(f"  conservation      : wall == compute + wait + residual  "
@@ -90,6 +99,10 @@ def print_locate(result, max_path_entries=40, max_rows=15):
 
     print("\n-- RANKED LOCALIZATION (on-path self-time = the positive "
           "localizer; slack = off-path) --")
+    print("  NOTE (v1): path = greedy longest-busy-path approximation; no "
+          "downstream lookahead — with multiple concurrently-busy threads "
+          "the ranking can follow a non-critical thread. Cross-thread "
+          "happens-before keying is v2.")
     if flag:
         print(f"  !! every row below is {flag}")
     for i, row in enumerate(result["rows"][:max_rows], 1):
