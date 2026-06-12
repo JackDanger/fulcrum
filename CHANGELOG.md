@@ -6,6 +6,51 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`fulcrum locate` — three advisor-review fixes** (FIX 1/2/3):
+
+  **FIX 1 (load-bearing): park spans + wait-only-carried make residual
+  meaningful.** Added a third span class `park` (adapter-supplied prefix
+  list, default `{"pool.pick.wait"}`; adapters should list thread-pool
+  parked-idle spans). Park is **NON-COVERING**: instants covered only by
+  park spans fall into the residual, the same as no-span. The residual now
+  precisely measures *wall instants not covered by any non-park span*
+  rather than uninstrumented gaps only. Added a second first-class ledger
+  line **wait-only-carried** = on-path intervals carried by a wait span with
+  zero concurrent compute on any thread (surfaces blocking waits where
+  nothing was running — scheduling overhead or real bottleneck). The
+  **FLAGGED condition** now fires when `(residual + wait-only-carried) /
+  wall > threshold` (default 2%); previously it fired on `residual` alone.
+  Module docstring, CONSERVATION-OR-NO-LOCATE invariant rule text, and
+  `decide/docs/SCHEMA.md` updated to state precisely what each metric
+  measures. Selftest: park trace shows `residual > 0` and FLAGS; control
+  with real compute stays CONSERVED; wait-dominated and straggler traces now
+  FLAG correctly (their wait-only-carried exceeds 2%).
+
+  **FIX 2 (caveat + selftest): greedy extractor limitation documented.** The
+  ranked table header in `report.py print_locate` now carries a caveat line:
+  the path is a greedy longest-busy-path approximation with no downstream
+  lookahead; with multiple concurrently-busy threads the ranking can follow a
+  non-critical thread; cross-thread happens-before keying is v2. New selftest
+  constructs the known failure (T1: work.a→work.a\_next gates the wall; T2:
+  work.b ends later — greedy sticks with T2): asserts the ledger CONSERVES
+  (path choice never corrupts the ledger) and records the documented-wrong
+  greedy ranking as the expected v1 outcome.
+
+  **FIX 3 (cosmetic): leaf\_segments docstring corrected.** `leaf_segments`
+  uses end-before-begin tie-break at coincident timestamps
+  (`(start,1)/(end,0)`) — the opposite of `trace.per_thread_busy_idle`'s
+  begin-before-end convention. The docstring previously claimed "same
+  no-double-count attribution as `trace.per_thread_busy_idle`"; that claim
+  is removed and replaced with an accurate description of the end-before-begin
+  convention and the difference. The code is unchanged (the corrected-docstring
+  option was chosen because all test outcomes are preserved under the existing
+  convention; adopting begin-before-end would require verifying all adjacent-
+  timestamp test cases).
+
+  **Selftest count**: 177 → 195 checks (all green).
+
 ### Added
 
 - **`fulcrum locate` — positive localization via a closed wall ledger**
