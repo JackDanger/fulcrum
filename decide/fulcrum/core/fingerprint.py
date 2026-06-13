@@ -42,9 +42,6 @@ class Fingerprint:
     # host identity: "cpu-model|kernel|host-id" (derived on the box).
     host: str = "unknown"
 
-    def is_complete(self):
-        return all(getattr(self, f) != "unknown" for f in COMPARE_FIELDS)
-
     def to_dict(self):
         return asdict(self)
 

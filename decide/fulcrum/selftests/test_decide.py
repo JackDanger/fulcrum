@@ -1,7 +1,6 @@
-"""Decision-engine self-tests (ported wholesale from scripts/fulcrum_decide.py
---selftest; every original check retained). Synthetic artifact dirs with KNOWN
-structure validate the knob harness, distribution health, guard matrix, prof
-parser + bank comparator, effect predicates, ranking and DO-THIS-NEXT."""
+"""Decision-engine self-tests. Synthetic artifact dirs with KNOWN structure
+validate the knob harness, distribution health, guard matrix, prof parser +
+bank comparator, effect predicates, ranking and DO-THIS-NEXT."""
 
 import os
 import shutil
@@ -272,11 +271,16 @@ def run():
                                         "freeze_state=thawed")
     open(man_path, "w").write(txt)
     raised = False
+    raised_msg = ""
     try:
         analyze_run(load_run(d, AD), AD)
-    except InstrumentError:
+    except InstrumentError as e:
         raised = True
+        raised_msg = str(e)
     check(raised, "UNFROZEN run REFUSED without --allow-thaw")
+    check("FROZEN-OR-LABELED" in raised_msg,
+          "UNFROZEN refusal names the FROZEN-OR-LABELED invariant in its "
+          "message (the scar tag is not silently dropped)")
     rep3 = analyze_run(load_run(d, AD), AD, allow_thaw=True)
     check(any("UNFROZEN" in r["status"] for r in rep3["rows"]),
           "--allow-thaw labels every wall-derived row UNFROZEN")
@@ -327,5 +331,41 @@ def run():
               if "slab_alloc" in r["component"]),
           "e2e-reverted: slab-engagement effect-verified note in slab_alloc "
           "status")
+
+    # 11. EFFECT-VERIFIED-OR-FLAGGED end-to-end: a knob whose effect predicate
+    #     FAILS (the switch did not flip) is demoted to tier 5 with an
+    #     EFFECT-CHECK-FAILED status — never ranked as causal. (The unit
+    #     effect_check False path is covered above; this proves analyze_run
+    #     CONSUMES it.)
+    d11 = tempfile.mkdtemp(prefix="fulcrum_decide_st11_")
+    cdir11 = os.path.join(d11, "cell_silesia_T1")
+    ksb = os.path.join(cdir11, "knob_seeded_block")
+    os.makedirs(ksb)
+    write_manifest(d11, freeze="frozen")
+    write_samples(os.path.join(cdir11, "wall_gz.txt"), GZ)
+    write_samples(os.path.join(cdir11, "wall_rg.txt"), RG)
+    # A real-looking wall delta — which must NOT earn a causal tier because
+    # the effect predicate proves the switch never engaged.
+    write_samples(os.path.join(ksb, "base.txt"), GZ)
+    write_samples(os.path.join(ksb, "knob.txt"), [x - 0.060 for x in GZ])
+    with open(os.path.join(ksb, "meta.txt"), "w") as f:
+        f.write("knob=seeded_block\nenv=GZIPPY_SEEDED_BLOCK=0\n"
+                "pred=verbose_seeded\ncell=silesia:1\nmask=0\nsha_ok=1\n")
+    edir11 = os.path.join(d11, "knob_effects_silesia_T1")
+    os.makedirs(edir11)
+    with open(os.path.join(edir11, "effect_base_seeded_block.txt"), "w") as f:
+        f.write("seeded_block=16 seeded_wrapper=16 \n")
+    # knob arm STILL seeded_block=16 => the kill-switch did not flip.
+    with open(os.path.join(edir11, "effect_knob_seeded_block.txt"), "w") as f:
+        f.write("seeded_block=16 seeded_wrapper=0 \n")
+    rep11 = analyze_run(load_run(d11, AD), AD)
+    sb_rows = [r for r in rep11["rows"] if "seeded_block" in r["component"]]
+    check(len(sb_rows) == 1 and sb_rows[0]["tier"] == 5
+          and "EFFECT-CHECK-FAILED" in sb_rows[0]["status"],
+          "EFFECT-VERIFIED-OR-FLAGGED e2e: a knob whose switch did not flip is "
+          "demoted to tier 5 EFFECT-CHECK-FAILED (the -60ms wall delta is NOT "
+          "ranked causal)")
+    check(sb_rows[0]["effect_verified"] is False,
+          "EFFECT-VERIFIED-OR-FLAGGED e2e: the row records effect_verified=False")
 
     return check.finish("decision-engine selftest")

@@ -1,8 +1,8 @@
 """fulcrum CLI.
 
-Subcommands (also reachable through the host project's `scripts/fulcrum`
-front door and the byte-compatible scripts/fulcrum_total.py /
-scripts/fulcrum_decide.py shims):
+Subcommands (also reachable through a host project's `scripts/fulcrum`
+front door — a thin wrapper that forwards here via the FULCRUM_HOME env var;
+gzippy ships one):
 
   analyze <artifact-dir> [--allow-thaw] [--feature F] [--ledger PATH|--no-ledger]
       Render the ranked decision table + DECISION BRIEF from a pulled
@@ -33,6 +33,10 @@ scripts/fulcrum_decide.py shims):
       Retire a banked row that was a measurement error (never an anchor
       again; nothing is promoted).
 
+The ledger path defaults to ./artifacts/fulcrum/ledger.jsonl; set
+FULCRUM_LEDGER to override it (or pass an explicit path to `ledger` /
+`--ledger` to `analyze`).
+
 Measurement runs themselves (freeze, masks, sinks, sha pins) live in the
 project's environment-control policy — for gzippy, scripts/bench/decide.sh.
 """
@@ -62,7 +66,8 @@ def _trust_banner():
 
 
 def total_main(argv=None):
-    """Byte-compatible CLI of the legacy scripts/fulcrum_total.py."""
+    """The `total` trace-analyzer subcommand (whole-system trace analysis or a
+    cross-tool delta)."""
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
         from .selftests import test_total
@@ -109,7 +114,7 @@ def total_main(argv=None):
 
 
 def decide_main(argv=None):
-    """Byte-compatible CLI of the legacy scripts/fulcrum_decide.py, plus
+    """The `analyze` subcommand: the ranked decision table + brief, with
     fingerprint + ledger options."""
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
