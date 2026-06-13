@@ -24,16 +24,42 @@ over-count / ambiguous-partition / under-coverage / percentage-only / delta-
 closure tests). It ingests a `perf stat` total + a `perf report -F
 period,symbol` capture, role-matches symbols into adapter categories, and
 closes `measured_total == categorized + uncategorized + report-residual`,
-refusing an over-count (the 690M class) or an ambiguous partition (the double-
-count source) and flagging an unaccounted residual above threshold. A second
-capture adds the conservation-asserted role-matched delta table.
-**Remaining sub-item (needs real hardware):** the gzippy decode-role category
-patterns in `adapters/gzippy.py::insn_categories` are PROVISIONAL — seeded from
-the decode taxonomy, not yet calibrated against a real `perf report -F
-period,symbol` of gzippy-native / gzippy-isal / rapidgzip. They are safe
-unrefined (an over-broad pattern REFUSES, an uncaught symbol FLAGS — neither
-silently mis-buckets), but tightening them against a real capture (and choosing
-the per-byte volume denominator) is a supervisor run on solvency/neurotic.
+refusing an over-count (the 690M class), an ambiguous partition (the double-
+count source), or a stat<->report EVENT mismatch (the denominator-mismatch
+class, INSN-EVENT-MISMATCH) and flagging an unaccounted residual above
+threshold. A second capture adds the conservation-asserted role-matched delta
+table.
+
+**Remaining sub-item (needs real hardware) — CALIBRATION NEEDED:** the gzippy
+decode-role category patterns in `adapters/gzippy.py::insn_categories` are
+PROVISIONAL — seeded from the decode taxonomy, NOT yet calibrated against a real
+`perf report -F period,symbol` of gzippy-native / gzippy-isal / rapidgzip.
+
+Closure catches TWO mis-calibration modes (an over-broad pattern matching two
+roles REFUSES as an ambiguous partition; an uncaught symbol FLAGS via the
+uncategorized bucket) but it does NOT catch the third — a symbol charged to
+exactly ONE WRONG category. That mis-attribution conserves perfectly (the total
+is unchanged) while corrupting the per-category SPLIT, which is the actual
+deliverable ("where do gzippy's +2.8B excess instructions go"). A green/
+CONSERVED ledger is therefore NECESSARY-BUT-NOT-SUFFICIENT for a correct split
+(`selftests/test_insn.py` pins this). Getting each symbol into its TRUE bucket
+is the calibration's responsibility — it cannot be claimed "safe unrefined."
+
+How to calibrate (supervisor run on solvency/neurotic, frozen box):
+`GzippyAdapter.calibration_capture_cmds(binary, corpus)` emits the exact
+`perf stat` + `perf record/report -F period,symbol` capture pair per binary;
+diff the report symbols against the category patterns and reassign any
+single-wrong-bucket symbol; also choose the per-byte volume denominator
+(uncompressed corpus size). Until that runs, the per-category numbers are
+UNCALIBRATED and must not be quoted as the answer.
+
+**Residual threshold at scale (documented limit):** the FLAG threshold is 5%
+of the measured total (`insn.DEFAULT_THRESHOLD_PCT`). At a 2.8B-instruction
+scale that is ~140M instructions that can vanish into report-residual +
+uncategorized WITHOUT flagging — large enough to hide a real per-category
+divergence. The 5% default is tied to a small-capture A/A spread; a large real
+capture should pass a tighter `--threshold` derived from the observed report
+sampling coverage, not leave the default.
 
 ## Calibration-reference store
 TSC-cycle numbers drift with core-clock/frequency state (the bank-divergence

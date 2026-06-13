@@ -40,7 +40,7 @@ named for the scar that made it law, and
 | EFFECT-VERIFIED-OR-FLAGGED | a kill-switch A/B is causal only if a counter proves the switch flipped |
 | SELF-TEST-OR-NO-TRUST | the engine refuses trust until its self-tests (incl. corruption-fires tests) pass at this source version |
 | CONSERVATION-OR-NO-LOCATE | `locate` must close its wall ledger (wall == on-path compute + on-path wait + residual); unlocated wall above threshold FLAGS every row, an overlapping path is refused |
-| INSN-CLOSURE-OR-NO-LEDGER | `insn` must close its instruction ledger (measured_total == categorized + uncategorized + report-residual, each symbol charged once); an over-count or an ambiguous category partition (the double-count source) is refused, an unaccounted residual above threshold FLAGS every row |
+| INSN-CLOSURE-OR-NO-LEDGER | `insn` must close its instruction ledger (measured_total == categorized + uncategorized + report-residual, each symbol charged once); an over-count, an ambiguous category partition (the double-count source), or a stat<->report EVENT mismatch (INSN-EVENT-MISMATCH, the denominator-mismatch class) is refused, an unaccounted residual above threshold FLAGS every row. Closure is NECESSARY-BUT-NOT-SUFFICIENT for the per-category split — a single-wrong-bucket symbol conserves silently; correct bucketing is the adapter calibration's job |
 | FINGERPRINT-OR-NO-COMPARE | every number carries {sink, mask, freeze, binary sha, corpus sha, protocol, comparator version, host identity}; cross-fingerprint ratios are refused |
 
 Supporting disciplines the tool executes:

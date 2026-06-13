@@ -225,7 +225,9 @@ retired instructions go" with a CLOSED ledger instead of hand attribution
   `<count> [.] <symbol>` (a leading overhead `%` column, if present, is
   stripped and the period kept). A **percentage-only** (`-F overhead`) report
   is REFUSED — absolutizing percentages against the stat total would make the
-  over-count refusal vacuous.
+  over-count refusal vacuous. The report's **event header**
+  (`# Samples: ... of event '<event>'`) is parsed and cross-checked against the
+  stat's anchor event — see INSN-EVENT-MISMATCH below.
 - `--a-bytes` / `--b-bytes` (optional): the volume denominator (bytes
   processed) for per-byte rates — the cross-binary comparison the campaign
   needs when raw insn counts differ.
@@ -252,6 +254,15 @@ with each perf symbol charged to AT MOST ONE category.
 
 - **report-residual** = `measured_total - Σ per-symbol counts`: instructions
   the `perf stat` total accounts for but the `perf report` did not sample.
+- **INSN-EVENT-MISMATCH** (REFUSED): the `perf report` was sampled on a
+  DIFFERENT event than the `perf stat` total it is closed against (e.g. `cycles`
+  vs `instructions`). Charging one event's periods against the other's total
+  "conserves" on the wrong denominator and yields a meaningless per-category
+  shape — the denominator-mismatch class behind the prior 2.7-insn/byte
+  hallucination. Fires only when BOTH event headers are known and disagree (a
+  report with no `# Samples: of event` header cannot be cross-checked and is
+  accepted; known aliases such as `inst_retired.any` ≡ `instructions` do not
+  refuse).
 - **OVER-COUNT** (REFUSED): the per-symbol report sums to MORE than the
   measured total beyond `--tol` (default 2%). The symbols cannot retire more
   than the CPU did — a double-count, a mixed-run pairing, or the wrong perf
@@ -259,7 +270,20 @@ with each perf symbol charged to AT MOST ONE category.
 - **The FLAGGED condition** fires when `(uncategorized + max(residual,0)) /
   measured_total` exceeds `--threshold` (default 5%; tie to the instrument's
   own A/A spread), marking every row `FLAGGED [INSN-CLOSURE]` — the divergence
-  can still hide outside the named categories.
+  can still hide outside the named categories. At scale this default is loose:
+  5% of a 2.8B total is ~140M instructions that can hide unflagged; a large
+  real capture should pass a tighter `--threshold`.
+
+**Closure is NECESSARY-BUT-NOT-SUFFICIENT for the per-category split.** The
+guards above protect the TOTAL (event match, over-count) and forbid
+double-counting (ambiguity). They do NOT — cannot — catch a symbol charged to
+exactly ONE WRONG category: that mis-attribution conserves perfectly (the total
+is unchanged) while corrupting the per-category split, which is the actual
+deliverable. A green/CONSERVED ledger does not certify the split is correct;
+correct bucketing is the adapter's category-calibration responsibility
+(validated against a real capture — see `MISSING.md` and
+`GzippyAdapter.calibration_capture_cmds`). `selftests/test_insn.py` pins this
+limit with a single-wrong-bucket input that closes.
 
 **Cross-binary delta (two captures).** Role-matched per-category insn (and
 insn/byte) deltas, `A - B`, ranked by `|delta|` — the positive answer to
