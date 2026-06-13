@@ -60,6 +60,10 @@ USAGE:\n\
   fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]   span atlas (excl-self + wall-crit)\n\
   fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
   fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
+  fulcrum alloc <trace.json>   per-(tid,region) fault localization (needs --features rpmalloc-stats)\n\
+  fulcrum memlife <run.json>   cross-tool per-buffer memory-lifecycle attribution\n\
+  fulcrum memlife vs <A.json> <B.json>    A vs B vs delta (per-MB-decoded)\n\
+  fulcrum memlife growth <T1.json> <T8.json>  T1→T8 written-bytes growth per component\n\
   fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]   parallel-SM wall-model params + lever delta\n\
   fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
 \n\
