@@ -19,6 +19,20 @@ so its refusals get adversarial inputs that must make the guard FIRE:
     refusal (FIRES)           (no absolute count to close on);
   - stat without insns        : perf stat missing the instructions line ->
     refusal (FIRES)           InstrumentError;
+  - EVENT-MISMATCH refusal    : a report sampled on a DIFFERENT event than the
+    (FIRES)                    stat (cycles vs instructions) whose periods sum
+                              within tolerance -> REFUSED (the denominator-
+                              mismatch class); + same-event / alias / no-header
+                              controls that must NOT refuse;
+  - NECESSARY-NOT-SUFFICIENT  : a single-WRONG-bucket input CLOSES and is
+    (limit pinned)            CONSERVED yet the per-category split is wrong —
+                              closure does not certify the split (calibration's
+                              job, not the ledger's);
+
+Every refusal is asserted BY NAME (`_raises_named`), not just by exception
+TYPE — a refactor that swaps which guard fires can't keep a type-only test
+green while the protection rots (the GAP-3 scar).
+
   - cross-binary delta        : role-matched category deltas locate the excess;
                               the delta ledger CLOSES (Σ deltas == total delta);
   - conservation              : categorized + uncategorized + residual ==
@@ -37,12 +51,18 @@ TOY_CATS = [
 ]
 
 
-def _raises(fn):
+def _raises_named(fn, name):
+    """Assert fn() raises an InstrumentError that NAMES `name` — via the
+    structured `.invariant` field OR the message text. Asserting the NAME (not
+    just the exception TYPE) is GAP-3: a refactor that swaps which guard fires,
+    or rots a guard into a different one, keeps a type-only `_raises` green while
+    the actual protection is gone. Pinning the name catches that."""
     try:
         fn()
         return False
-    except InstrumentError:
-        return True
+    except InstrumentError as e:
+        inv = getattr(e, "invariant", None)
+        return inv == name or name in str(e)
 
 
 def run():
@@ -88,9 +108,11 @@ def run():
     over_report = ("  690  [.] decode_huffman_body\n"
                    "  690  [.] apply_window\n"
                    "  310  [.] crc32_fold\n")  # sums to 1690 > 1000
-    check(_raises(lambda: I.insn_from_text(stat, over_report, TOY_CATS)),
-          "OVER-COUNT refusal FIRES: report (1690) > stat (1000) raises "
-          "InstrumentError (the 690M double-count made impossible)")
+    check(_raises_named(lambda: I.insn_from_text(stat, over_report, TOY_CATS),
+                        "INSN-CLOSURE"),
+          "OVER-COUNT refusal FIRES by name [INSN-CLOSURE]: report (1690) > "
+          "stat (1000) raises InstrumentError (the 690M double-count made "
+          "impossible)")
     # control: a 1% over (within 2% tol) does NOT refuse
     near_report = "  1,010  [.] decode_huffman_body\n"
     led_near = I.insn_from_text(stat, near_report, TOY_CATS)
@@ -102,9 +124,12 @@ def run():
     # 3. AMBIGUOUS-partition refusal MUST FIRE: a symbol matching two cats.
     # ------------------------------------------------------------------
     bad_cats = [("huffman", ("decode",)), ("window_copy", ("decode_window",))]
-    check(_raises(lambda: I.resolve_category("decode_window_huffman", bad_cats)),
-          "AMBIGUOUS-partition refusal FIRES: a symbol matching 2 categories "
-          "raises InstrumentError (the double-count SOURCE)")
+    check(_raises_named(
+            lambda: I.resolve_category("decode_window_huffman", bad_cats),
+            "INSN-AMBIGUOUS-PARTITION"),
+          "AMBIGUOUS-partition refusal FIRES by name [INSN-AMBIGUOUS-PARTITION]:"
+          " a symbol matching 2 categories raises InstrumentError (the "
+          "double-count SOURCE)")
     check(I.resolve_category("decode_huffman", bad_cats) == "huffman",
           "ambiguous control: a symbol matching exactly one category resolves "
           "(no false refusal)")
@@ -144,18 +169,21 @@ def run():
     pct_report = ("# Overhead Symbol\n"
                   "  45.23%  [.] decode_huffman_body\n"
                   "  30.10%  [.] apply_window\n")
-    check(_raises(lambda: I.parse_perf_report(pct_report)),
-          "PARSER refusal FIRES: a percentage-only (-F overhead) report raises "
-          "InstrumentError (no absolute count to close on)")
+    check(_raises_named(lambda: I.parse_perf_report(pct_report),
+                        "INSN-PERCENT-ONLY"),
+          "PARSER refusal FIRES by name [INSN-PERCENT-ONLY]: a percentage-only "
+          "(-F overhead) report raises InstrumentError (no absolute count to "
+          "close on)")
     # overhead+period form IS accepted (percent stripped, period kept)
     op_report = "  45.23%  600  [.] decode_huffman_body\n"
     parsed = I.parse_perf_report(op_report)
     check(parsed == [("decode_huffman_body", 600)],
           "parser: an overhead+period report keeps the absolute period "
           "(600), drops the percent column")
-    check(_raises(lambda: I.parse_perf_stat("  2,000  cycles:u\n")),
-          "PARSER refusal FIRES: perf stat without an instructions line raises "
-          "InstrumentError")
+    check(_raises_named(lambda: I.parse_perf_stat("  2,000  cycles:u\n"),
+                        "INSN-NO-INSTRUCTIONS"),
+          "PARSER refusal FIRES by name [INSN-NO-INSTRUCTIONS]: perf stat "
+          "without an instructions line raises InstrumentError")
     parsed_stat = I.parse_perf_stat("  1,234,567  instructions:u\n")
     check(parsed_stat["instructions"] == 1234567,
           "parser: perf stat instructions parsed with commas stripped "
@@ -196,12 +224,81 @@ def run():
           "total delta (the 690M double-count cannot reappear here)")
 
     # ------------------------------------------------------------------
+    # 6b. EVENT-MISMATCH refusal MUST FIRE (GAP 2, the denominator-mismatch
+    #     class): a stat on `instructions` paired with a report whose periods
+    #     are a DIFFERENT event (cycles) but sum within tolerance. WITHOUT the
+    #     cross-check this CONSERVES-but-WRONG (cycles periods bucketed as
+    #     instructions); the guard must REFUSE.
+    # ------------------------------------------------------------------
+    stat_insns = "  1,000  instructions:u\n"
+    report_cycles = ("# Samples: 4K of event 'cycles:u'\n"
+                     "  600  [.] decode_huffman_body\n"
+                     "  300  [.] apply_window\n"
+                     "  100  [.] crc32_fold\n")  # sums to 1000, but WRONG event
+    check(_raises_named(
+            lambda: I.insn_from_text(stat_insns, report_cycles, TOY_CATS),
+            "INSN-EVENT-MISMATCH"),
+          "EVENT-MISMATCH refusal FIRES by name [INSN-EVENT-MISMATCH]: a "
+          "report sampled on 'cycles' closed against an 'instructions' stat "
+          "(periods sum within tol) is REFUSED — the denominator-mismatch class")
+    # negative control: SAME event ('instructions') -> NOT refused, conserves.
+    report_insns = ("# Samples: 4K of event 'instructions:u'\n"
+                    "  600  [.] decode_huffman_body\n"
+                    "  300  [.] apply_window\n"
+                    "  100  [.] crc32_fold\n")
+    led_match = I.insn_from_text(stat_insns, report_insns, TOY_CATS)
+    check(not led_match["flagged"] and led_match["residual"] == 0,
+          "event-mismatch control: a report on the SAME event "
+          "('instructions') is ACCEPTED and CONSERVES (no false refusal)")
+    # alias control: 'inst_retired.any' stat vs 'instructions' report is the
+    # same logical event -> NOT refused.
+    led_alias = I.insn_from_text("  1,000  inst_retired.any\n", report_insns,
+                                 TOY_CATS)
+    check(led_alias["categorized"] == 1000,
+          "event-mismatch control: 'inst_retired.any' stat vs 'instructions' "
+          "report is a known alias — accepted, not falsely refused")
+    # absent-header control: a report with NO `# Samples: of event` header
+    # cannot be cross-checked -> accepted (preserves legacy synthetic captures).
+    led_noevent = I.insn_from_text(
+        stat_insns, "  1,000  [.] decode_huffman_body\n", TOY_CATS)
+    check(led_noevent["categorized"] == 1000,
+          "event-mismatch control: a report with no event header is accepted "
+          "(no header => no cross-check, never a false refusal)")
+
+    # ------------------------------------------------------------------
+    # 6c. CLOSURE IS NECESSARY-BUT-NOT-SUFFICIENT (GAP 1): a symbol charged to
+    #     exactly ONE WRONG category. The total still CLOSES and the ledger is
+    #     CONSERVED (green) — yet the per-category SPLIT is wrong. This pins the
+    #     documented limit so no one reads a green ledger as a correct split.
+    #     `apply_window_huffman` is a (contrived) symbol that the TOY taxonomy
+    #     buckets into `huffman` (it contains "read_token"? no) — construct it
+    #     so it matches ONLY huffman though it is really window work.
+    # ------------------------------------------------------------------
+    # A symbol whose TRUE role is window-copy but whose name only matches the
+    # huffman pattern 'read_token' (a mis-named/mis-calibrated symbol). It is
+    # charged 100% to huffman; the total closes perfectly.
+    miscal_report = ("  400  [.] decode_huffman_body\n"
+                     "  300  [.] read_token_for_window_copy\n"  # really window
+                     "  300  [.] apply_window\n")
+    led_miscal = I.insn_from_text(stat, miscal_report, TOY_CATS)
+    mcats = {r["category"]: r for r in led_miscal["categories"]}
+    check(led_miscal["categorized"] == 1000 and led_miscal["residual"] == 0
+          and not led_miscal["flagged"],
+          "necessary-not-sufficient: a single-WRONG-bucket input still CLOSES "
+          "and is CONSERVED (green ledger)")
+    check(mcats["huffman"]["insns"] == 700 and mcats["window_copy"]["insns"]
+          == 300,
+          "necessary-not-sufficient: yet the SPLIT is WRONG — 300 window insns "
+          "mis-charged to huffman (700 vs the true 400); closure did NOT catch "
+          "it. Correct bucketing is the CALIBRATION's job, not the ledger's.")
+
+    # ------------------------------------------------------------------
     # 7. files entry: mismatched B (stat without report) refuses.
     # ------------------------------------------------------------------
-    check(_raises(lambda: I.insn_from_files(
+    check(_raises_named(lambda: I.insn_from_files(
         "/nope/a.stat", "/nope/a.report", TOY_CATS,
-        b_stat="/nope/b.stat")),
-          "files entry: a B stat with no B report refuses (cannot close a "
-          "half-specified ledger)")
+        b_stat="/nope/b.stat"), "INSN-HALF-PAIR"),
+          "files entry: a B stat with no B report refuses by name "
+          "[INSN-HALF-PAIR] (cannot close a half-specified ledger)")
 
     return check.finish("fulcrum selftest: insn")
