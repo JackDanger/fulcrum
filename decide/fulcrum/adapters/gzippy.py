@@ -1,7 +1,8 @@
 """gzippy adapter — the first (reference) ProjectAdapter.
 
-Everything gzippy-specific that used to be hard-coded in scripts/fulcrum_*.py
-lives here: the span taxonomy, the counter sidecar patterns, the re-derived
+Everything gzippy-specific lives here (it used to be hard-coded in the
+now-removed scripts/fulcrum_*.py shims): the span taxonomy, the counter
+sidecar patterns, the re-derived
 routing/seeding guard, the knob registry + effect predicates, the contig_prof
 parser, the banked comparators, and the re-verify command surfaces.
 
@@ -537,7 +538,11 @@ class GzippyAdapter(ProjectAdapter):
                 f"--knob-n 21 --bin {run['manifest'].get('bin')}")
 
     def reverify_trace(self, ck, run, feature):
-        return (f"python3 scripts/fulcrum_total.py "
+        # The host front door is scripts/fulcrum (gzippy's wrapper, which
+        # forwards here via FULCRUM_HOME); `total` is the trace analyzer
+        # subcommand. (NOT scripts/fulcrum_total.py — that legacy shim was
+        # removed when the engine moved into this package.)
+        return (f"scripts/fulcrum total "
                 f"<artdir>/cell_{ck[0]}_T{ck[1]}/trace.json "
                 f"--feature {feature}")
 

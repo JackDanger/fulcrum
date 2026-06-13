@@ -435,10 +435,13 @@ def run():
     expected = {"SINK-LAW", "FROZEN-OR-LABELED", "SHA-OR-VOID",
                 "SPREAD-RESOLUTION", "CAUSAL-OR-HYPOTHESIS",
                 "EFFECT-VERIFIED-OR-FLAGGED", "SELF-TEST-OR-NO-TRUST",
-                "FINGERPRINT-OR-NO-COMPARE"}
-    check(expected <= names,
-          f"invariant registry complete ({len(expected)} charter rules "
-          f"present)")
+                "CONSERVATION-OR-NO-LOCATE", "FINGERPRINT-OR-NO-COMPARE"}
+    # EXACT set equality (not subset): adding an invariant without listing it
+    # here FAILS (forces a firing-proof test alongside it), and removing one
+    # FAILS too (a charter rule cannot silently disappear).
+    check(names == expected,
+          f"invariant registry is EXACTLY the {len(expected)} charter rules "
+          f"(missing={sorted(expected - names)}, extra={sorted(names - expected)})")
     check(all(i.scar and i.rule and i.enforcement for i in INVARIANTS),
           "every invariant carries rule + scar + enforcement location")
 
