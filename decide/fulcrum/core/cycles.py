@@ -82,7 +82,11 @@ from .trace import InstrumentError  # noqa: F401  (re-exported failure type)
 
 #: L1 closure tolerance: the four categories may miss slots by up to this
 #: fraction (hardware multiplexing, rounding) without refusing.
-DEFAULT_TOL_PCT = 1.5
+#: Intel TMA events measured in a group should deviate < 0.5%; when perf
+#: is forced to regroup events across PMUs (the "WARNING: events were
+#: regrouped" message) multiplexing noise can push deviation to ~1.6-2.0%.
+#: 2.0% is the upper bound for a valid-but-multiplexed measurement.
+DEFAULT_TOL_PCT = 2.0
 
 #: Fraction of the backend-bound that is memory-stall vs core-stall.
 #: Not a closure threshold — an approximate split; larger tolerance.
@@ -170,11 +174,32 @@ L1_BUCKETS = ("retiring", "bad_spec", "fe_bound", "be_bound")
 
 
 def _canon_event(ev):
-    """Canonicalize a perf-event name: lower, strip `:u`/`:k`/`:upp` suffix.
-    Returns the normalized base name."""
+    """Canonicalize a perf-event name.
+
+    Steps, in order:
+    1. Strip the `:u`/`:k`/`:upp` perf modifier suffix (split on first `:`).
+    2. Lowercase and strip surrounding whitespace.
+    3. Strip the PMU prefix of the form `<pmu_name>/<event_name>/` →
+       keep only `<event_name>`.  This handles Intel hybrid PMU prefixed
+       events like `cpu_core/topdown-retiring/` → `topdown-retiring` and
+       `cpu_core/cycle_activity.stalls_l1d_miss/` →
+       `cycle_activity.stalls_l1d_miss`.  The alias sets use unprefixed
+       names throughout; the PMU prefix is stripped before lookup.
+
+    Returns the normalized base name (empty string if input is blank)."""
     if not ev:
         return ""
-    return ev.split(":")[0].strip().lower()
+    base = ev.split(":")[0].strip().lower()
+    # Strip PMU prefix: 'cpu_core/event_name/' → 'event_name'
+    # The event name is the segment between the first and second '/' chars
+    # in patterns like '<pmu>/<event>/'.  If '/' is absent, the event has
+    # no PMU prefix and is returned as-is.
+    if "/" in base:
+        parts = base.split("/")
+        # parts[0] = PMU name, parts[1] = event name, parts[2] = '' (trailing /)
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return base
 
 
 def _lookup(events, aliases):
