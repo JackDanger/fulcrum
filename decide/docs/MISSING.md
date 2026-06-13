@@ -30,28 +30,16 @@ class, INSN-EVENT-MISMATCH) and flagging an unaccounted residual above
 threshold. A second capture adds the conservation-asserted role-matched delta
 table.
 
-**Remaining sub-item (needs real hardware) — CALIBRATION NEEDED:** the gzippy
-decode-role category patterns in `adapters/gzippy.py::insn_categories` are
-PROVISIONAL — seeded from the decode taxonomy, NOT yet calibrated against a real
-`perf report -F period,symbol` of gzippy-native / gzippy-isal / rapidgzip.
-
-Closure catches TWO mis-calibration modes (an over-broad pattern matching two
-roles REFUSES as an ambiguous partition; an uncaught symbol FLAGS via the
-uncategorized bucket) but it does NOT catch the third — a symbol charged to
-exactly ONE WRONG category. That mis-attribution conserves perfectly (the total
-is unchanged) while corrupting the per-category SPLIT, which is the actual
-deliverable ("where do gzippy's +2.8B excess instructions go"). A green/
-CONSERVED ledger is therefore NECESSARY-BUT-NOT-SUFFICIENT for a correct split
-(`selftests/test_insn.py` pins this). Getting each symbol into its TRUE bucket
-is the calibration's responsibility — it cannot be claimed "safe unrefined."
-
-How to calibrate (supervisor run on <BENCH_HOST>/<BENCH_HOST>, frozen box):
-`GzippyAdapter.calibration_capture_cmds(binary, corpus)` emits the exact
-`perf stat` + `perf record/report -F period,symbol` capture pair per binary;
-diff the report symbols against the category patterns and reassign any
-single-wrong-bucket symbol; also choose the per-byte volume denominator
-(uncompressed corpus size). Until that runs, the per-category numbers are
-UNCALIBRATED and must not be quoted as the answer.
+**~~Remaining sub-item: CALIBRATION NEEDED~~ — CALIBRATED (2026-06-13):**
+INSN_CATEGORIES in `adapters/gzippy.py` calibrated against real `perf report
+-F period,symbol` captures of gzippy-native-debug / gzippy-isal-debug /
+rapidgzip v0.16.0 on <BENCH_HOST> (AMD EPYC 7282, silesia.gz T8, taskset -c 0-7).
+Three ambiguous-partition errors fixed; 12 categories covering >94% of
+categorized insns; 60+ symbol→category pins in `selftests/test_insn_calib.py`
+(85 checks, all PASS). The "42% marker" claim was REFUTED: calibrated split is
+29.7% marker-emit (gz-native), 30.9% (gz-isal); the biggest excess vs rapidgzip
+is finalize (40%) + kernel (29%) + segmented_ring (24%). See plans/ for full
+numbers.
 
 **Residual threshold at scale (documented limit):** the FLAG threshold is 5%
 of the measured total (`insn.DEFAULT_THRESHOLD_PCT`). At a 2.8B-instruction
