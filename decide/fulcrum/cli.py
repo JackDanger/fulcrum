@@ -21,6 +21,17 @@ gzippy ships one):
        [--b-stat F --b-report F [--b-bytes N] [--b-label L]]
        [--tol PCT] [--threshold PCT] [--feature FEAT]
       CLOSED instruction-accounting ledger (INSN-CLOSURE-OR-NO-LEDGER):
+  cycles --a-stat F [--a-label L]
+         [--b-stat F [--b-label L]]
+         [--tol PCT]
+      TMA top-down stall-breakdown (TMA-CLOSURE-OR-NO-BREAKDOWN): ingest a
+      `perf stat` capture with topdown-retiring/bad-spec/fe-bound/be-bound and
+      topdown.slots; assert the four L1 categories close on the slot total;
+      emit per-bucket FRACTIONS (intensive, frequency-invariant). Optionally
+      adds a backend split (memory-bound vs core-bound) when
+      cycle_activity.stalls_mem_any and cycles are present. A second (--b-stat)
+      capture adds the fraction DELTA table ('where does native stall that
+      ISA-L/rg does not?').
       ingest a `perf stat` total + a `perf report -F period,symbol` capture,
       role-match symbols into categories from the adapter, and emit per-
       category insn (and insn/byte) totals that MUST close on the measured
@@ -292,6 +303,77 @@ def insn_main(argv):
     report_mod.print_insn(result)
 
 
+def cycles_main(argv):
+    """`fulcrum cycles --a-stat F [--a-label L] [--b-stat F [--b-label L]]
+    [--tol PCT] [--selftest]`.
+
+    TMA top-down stall-breakdown (TMA-CLOSURE-OR-NO-BREAKDOWN). Ingests a
+    `perf stat` capture with topdown-retiring/bad-spec/fe-bound/be-bound plus
+    topdown.slots; asserts the four L1 categories close on the slot total;
+    emits per-bucket FRACTIONS (intensive, frequency-invariant). Backend split
+    (memory-bound vs core-bound) added when stalls_mem_any + cycles present.
+    Optional B capture adds the fraction DELTA table."""
+    from .core import cycles as cycles_mod
+
+    if "--selftest" in argv:
+        from .selftests import test_cycles
+        rc, _, _ = test_cycles.run()
+        sys.exit(rc)
+
+    opts = {}
+    tol = cycles_mod.DEFAULT_TOL_PCT
+    known = "--a-stat --a-label --b-stat --b-label --tol [--selftest]"
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--a-stat", "--a-label", "--b-stat", "--b-label"):
+            opts[a.lstrip("-")] = _flag_value(argv, i, "cycles"); i += 2; continue
+        if a == "--tol":
+            tol = float(_flag_value(argv, i, "cycles")); i += 2; continue
+        if a.startswith("--"):
+            _die_unknown_flag("cycles", a, known)
+        print(f"cycles: unexpected positional {a!r}; inputs are named. "
+              f"Known: {known}", file=sys.stderr)
+        sys.exit(2)
+
+    if not opts.get("a-stat"):
+        print("cycles: --a-stat is required (the A binary's `perf stat` "
+              "capture with TMA events).\n"
+              f"      usage: fulcrum cycles {known}", file=sys.stderr)
+        sys.exit(2)
+
+    def _read(path, kind):
+        import os as _os
+        if not _os.path.exists(path):
+            print(f"cycles: no such {kind} capture: {path}", file=sys.stderr)
+            sys.exit(2)
+        with open(path) as f:
+            return f.read()
+
+    _trust_banner()
+    try:
+        tma_a = cycles_mod.tma_from_text(
+            _read(opts["a-stat"], "perf stat"),
+            label=opts.get("a-label", "A"), tol_pct=tol)
+    except tr.InstrumentError as e:
+        print(f"\n[INSTRUMENT REFUSED] {e}")
+        sys.exit(2)
+
+    tma_b = None
+    cmp = None
+    if opts.get("b-stat"):
+        try:
+            tma_b = cycles_mod.tma_from_text(
+                _read(opts["b-stat"], "perf stat"),
+                label=opts.get("b-label", "B"), tol_pct=tol)
+        except tr.InstrumentError as e:
+            print(f"\n[INSTRUMENT REFUSED (B)] {e}")
+            sys.exit(2)
+        cmp = cycles_mod.compare_tma(tma_a, tma_b)
+
+    report_mod.print_tma(tma_a, tma_b=tma_b, compare=cmp)
+
+
 def ledger_main(rest):
     """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
     verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
@@ -392,6 +474,8 @@ def main(argv=None):
         locate_main(rest)
     elif cmd == "insn":
         insn_main(rest)
+    elif cmd == "cycles":
+        cycles_main(rest)
     elif cmd == "selftest":
         from .selftests import run_all
         sys.exit(run_all())

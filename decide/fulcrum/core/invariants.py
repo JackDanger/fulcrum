@@ -162,6 +162,35 @@ INVARIANTS = (
                     "compatibility filter",
     ),
     Invariant(
+        name="TMA-CLOSURE-OR-NO-BREAKDOWN",
+        rule="A TMA top-down breakdown (`fulcrum cycles`) must CLOSE on the "
+             "hardware-reported slot total: retiring + bad-speculation + "
+             "frontend-bound + backend-bound == slots (within tolerance, default "
+             "1.5%). Four structural impossibilities REFUSE outright: (TMA-NO-SLOTS) "
+             "the slots denominator is absent — fractions are undefined; "
+             "(TMA-PARTIAL-LEVEL1) fewer than 3 of the 4 L1 categories are present "
+             "— cannot close; (TMA-CLOSURE) the sum deviates beyond tolerance — "
+             "signals a wrong event group, hardware multiplexing error, or mismatched "
+             "capture; (TMA-BACKEND-INCOHERENT) stalls_mem_any > cycles — physically "
+             "impossible, the backend-split events are from a corrupt or mismatched "
+             "capture. The backend split (memory-bound vs core-bound) is an "
+             "APPROXIMATION using Intel's stalls_mem_any/slots formula — clearly "
+             "labeled, no closure assertion. Only FRACTIONS (intensive ratios) are "
+             "reported, never wall absolutes, so the discrimination is "
+             "frequency-invariant (the same slot ratios whether from a capped or "
+             "turbo run).",
+        scar="The campaign's two live wall hypotheses (memory-BW bound vs core-IPC "
+             "bound) predict different TMA buckets; reading raw perf stat numbers "
+             "without a closure guard can manufacture the preferred hypothesis "
+             "exactly the way hand-built instruction ledgers manufactured the 690M "
+             "double-count — a wrong event group or multiplexed capture whose "
+             "fractions happen to sum plausibly is never caught without the guard.",
+        enforcement="cycles.build_tma TMA-NO-SLOTS / TMA-PARTIAL-LEVEL1 / "
+                    "TMA-CLOSURE / TMA-BACKEND-INCOHERENT refusals; "
+                    "selftests/test_cycles.py (refusals asserted BY NAME + "
+                    "frequency-invariance + cross-binary delta checks)",
+    ),
+    Invariant(
         name="INSN-CLOSURE-OR-NO-LEDGER",
         rule="An instruction ledger (`fulcrum insn`) must CLOSE on the measured "
              "retired-instruction total: measured_total (perf stat) == "
