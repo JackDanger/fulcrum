@@ -526,6 +526,24 @@ pub fn hex32(d: &[u8; 32]) -> String {
     s
 }
 
+/// Compute sha256 of any [`std::io::Read`] source, streaming in 64 KiB chunks
+/// so large decompressed files do not need to be loaded into memory.
+///
+/// Used by [`crate::score`] to sha-verify sink files that may be multi-GB
+/// without a full read.
+pub fn sha256_reader<R: std::io::Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finish())
+}
+
 /// Self-contained SHA-256 (FIPS 180-4). Verified against known vectors in the
 /// module tests; used only to compare run outputs, never for security.
 struct Sha256 {

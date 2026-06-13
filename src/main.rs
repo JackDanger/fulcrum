@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, spans, sweep, trace,
-    validate, vs, vs_sweep, xtool,
+    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, score, spans, sweep,
+    trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -47,6 +47,11 @@ USAGE:\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
+  fulcrum score --arch-os <arch-os> --threads <N> --mask <cpu-mask> --corpus <name>\n\
+              --corpus-path <path> --corpus-pin <sha256> --decomp-pin <sha256>\n\
+              --native <path> --isal <path> --rg <path>\n\
+              --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
+              [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
@@ -2001,6 +2006,22 @@ fn main() -> ExitCode {
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
+        "score" => {
+            match score::args_from_cli(rest) {
+                Ok(a) => {
+                    if let Err(e) = score::run_score(&a) {
+                        eprintln!("fulcrum score: {e}");
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
+                    ExitCode::from(2)
+                }
+            }
+        }
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

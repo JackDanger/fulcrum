@@ -52,6 +52,7 @@ pub mod provenance;
 pub mod rank;
 pub mod region_hw;
 pub mod schedule;
+pub mod score;
 pub mod spans;
 pub mod sweep;
 pub mod trace;
