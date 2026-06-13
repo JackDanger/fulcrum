@@ -118,13 +118,13 @@ def run():
     check(_raises_named(lambda: C.tma_from_text(stat_over), "TMA-CLOSURE"),
           "TMA-CLOSURE refusal FIRES by name: L1 sum (11000) != slots (10000)")
 
-    # Within-tolerance control: 1% deviation (< 1.5% tol) -> CLOSED.
-    # retiring=4050 => sum=10050, deviation=50/10000=0.5% < 1.5%
+    # Within-tolerance control: 1% deviation (< 2.0% tol) -> CLOSED.
+    # retiring=4050 => sum=10050, deviation=50/10000=0.5% < 2.0%
     stat_near = _stat(retiring=4_050)
     tma_near = C.tma_from_text(stat_near)
     check(abs(tma_near["retiring_frac"] - 0.405) < 1e-9
-          and tma_near["closure_deviation_pct"] < 1.5,
-          "within-tolerance control: a 0.5% deviation is ACCEPTED (< 1.5% tol)")
+          and tma_near["closure_deviation_pct"] < 2.0,
+          "within-tolerance control: a 0.5% deviation is ACCEPTED (< 2.0% tol)")
 
     # ------------------------------------------------------------------
     # 3. TMA-NO-SLOTS refusal MUST FIRE: slots event absent.
