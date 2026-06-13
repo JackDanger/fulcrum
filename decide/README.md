@@ -40,6 +40,7 @@ named for the scar that made it law, and
 | EFFECT-VERIFIED-OR-FLAGGED | a kill-switch A/B is causal only if a counter proves the switch flipped |
 | SELF-TEST-OR-NO-TRUST | the engine refuses trust until its self-tests (incl. corruption-fires tests) pass at this source version |
 | CONSERVATION-OR-NO-LOCATE | `locate` must close its wall ledger (wall == on-path compute + on-path wait + residual); unlocated wall above threshold FLAGS every row, an overlapping path is refused |
+| INSN-CLOSURE-OR-NO-LEDGER | `insn` must close its instruction ledger (measured_total == categorized + uncategorized + report-residual, each symbol charged once); an over-count or an ambiguous category partition (the double-count source) is refused, an unaccounted residual above threshold FLAGS every row |
 | FINGERPRINT-OR-NO-COMPARE | every number carries {sink, mask, freeze, binary sha, corpus sha, protocol, comparator version, host identity}; cross-fingerprint ratios are refused |
 
 Supporting disciplines the tool executes:
@@ -104,12 +105,14 @@ fulcrum/
                (supersede/pending-reconcile + hash chain), invariants,
                decision engine, report   (stdlib-only, no project knowledge)
   core/locate  closed-wall-ledger positive localizer (CONSERVATION-OR-NO-LOCATE)
+  core/insn    closed-instruction-ledger localizer (INSN-CLOSURE-OR-NO-LEDGER)
   adapters/    base.ProjectAdapter + one module per project
-  selftests/   5 suites: trace engine, decision engine, invariant
+  selftests/   6 suites: trace engine, decision engine, invariant
                enforcement (named regression cases for the historical
                phantoms), adapter pluggability (the toy second project),
-               locate (closed-wall-ledger localizer)
-  cli.py       fulcrum analyze/total/locate/selftest/invariants/ledger
+               locate (closed-wall-ledger localizer), insn (closed-
+               instruction-ledger localizer)
+  cli.py       fulcrum analyze/total/locate/insn/selftest/invariants/ledger
 docs/
   SCHEMA.md        the artifact-dir + run-dict + row contracts
   CASE-STUDIES.md  the measurement failures behind the invariants
@@ -122,6 +125,8 @@ cd decide/
 python3 -m fulcrum.cli selftest     # must pass before any number is trusted
 python3 -m fulcrum.cli analyze <art-dir>   # re-render from pulled artifacts
 python3 -m fulcrum.cli locate <trace.json> # positive localization (closed wall ledger)
+python3 -m fulcrum.cli insn --a-stat a.stat --a-report a.report \
+    --b-stat b.stat --b-report b.report  # where do the excess instructions go (closed insn ledger)
 python3 -m fulcrum.cli invariants   # the enforced rule set, with scars
 python3 -m fulcrum.cli ledger       # banked results + fingerprints + chain check
 python3 -m fulcrum.cli ledger supersede --key K --retire RUNID --promote RUNID --reason "..."
@@ -132,8 +137,8 @@ Host projects typically front this with a thin wrapper (gzippy uses
 itself is host-repo policy (it needs a bench box and freeze
 infrastructure).
 
-`analyze`, `total`, `locate`, `selftest`, `invariants` and `ledger` are pure
-package functionality and run anywhere.
+`analyze`, `total`, `locate`, `insn`, `selftest`, `invariants` and `ledger`
+are pure package functionality and run anywhere.
 
 ## Writing an adapter
 
