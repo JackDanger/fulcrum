@@ -161,6 +161,93 @@ def _print_ledger(led):
             print(f"    {n:>16,}  {sym}")
 
 
+def _pct(frac):
+    """Format a fraction as a percentage string, or 'n/a' if None."""
+    return f"{frac * 100.0:6.2f}%" if frac is not None else "    n/a"
+
+
+def print_tma(tma_a, *, tma_b=None, compare=None):
+    """The cycles report: TMA L1 breakdown(s) + optional fraction-delta table.
+
+    Emits FRACTIONS (intensive, frequency-invariant), never wall absolutes.
+    Named refusals (TMA-CLOSURE etc.) are already handled upstream in
+    cycles.build_tma; what reaches here is a clean, closed breakdown."""
+    print("=" * 100)
+    print("fulcrum cycles — TMA top-down stall-breakdown "
+          "(TMA-CLOSURE-OR-NO-BREAKDOWN)")
+    print("=" * 100)
+
+    def _print_one(tma):
+        label = tma.get("label", "binary")
+        slots = tma["slots"]
+        dev = tma["closure_deviation_pct"]
+        print(f"\nbinary: {label}  "
+              f"(slots: {slots:,}  closure deviation: {dev:.4f}%)")
+        print(f"-- TMA L1 BREAKDOWN (closed; fracs of slots) --")
+        print(f"  retiring        : {_pct(tma['retiring_frac'])}  "
+              f"({tma['retiring']:,} slots)")
+        print(f"  bad-speculation : {_pct(tma['bad_spec_frac'])}  "
+              f"({tma['bad_spec']:,} slots)")
+        print(f"  frontend-bound  : {_pct(tma['fe_bound_frac'])}  "
+              f"({tma['fe_bound']:,} slots)")
+        print(f"  backend-bound   : {_pct(tma['be_bound_frac'])}  "
+              f"({tma['be_bound']:,} slots)")
+        total_frac = (tma["retiring_frac"] + tma["bad_spec_frac"]
+                      + tma["fe_bound_frac"] + tma["be_bound_frac"])
+        print(f"  sum             :  {total_frac * 100.0:6.2f}%  "
+              f"(CONSERVED — closure guard passed)")
+        if tma["backend_split_available"]:
+            print(f"-- BACKEND SPLIT ({tma['backend_split_note']}) --")
+            print(f"  memory-bound    : {_pct(tma['memory_bound_frac'])}  "
+                  f"(stalls_mem_any / slots; capped at be-bound)")
+            print(f"  core-bound      : {_pct(tma['core_bound_frac'])}  "
+                  f"(be-bound - memory-bound; approximation)")
+            cycles = tma.get("cycles") or 0
+            ms = tma.get("mem_stall") or 0
+            if cycles:
+                print(f"  stall/cycle     : {_pct(ms / cycles)}  "
+                      f"({ms:,} stall-cycles / {cycles:,} cycles)")
+        else:
+            print(f"-- BACKEND SPLIT: unavailable ({tma['backend_split_note']}) --")
+            print("  capture with `cycle_activity.stalls_mem_any` + `cycles` "
+                  "to get the memory vs core split")
+        # Cache-miss hierarchy if present
+        hier = [(tma.get("stalls_l1d_frac"), "stalls-L1D"),
+                (tma.get("stalls_l2_frac"),  "stalls-L2"),
+                (tma.get("stalls_l3_frac"),  "stalls-L3")]
+        if any(f is not None for f, _ in hier):
+            print(f"-- CACHE-MISS HIERARCHY (fracs of cycles) --")
+            for f, name in hier:
+                print(f"  {name:<16}: {_pct(f)}")
+            if tma.get("l3_miss_loads") is not None:
+                print(f"  L3-miss-loads   : {tma['l3_miss_loads']:,} (count)")
+
+    _print_one(tma_a)
+    if tma_b:
+        _print_one(tma_b)
+
+    if compare:
+        print("\n" + "-" * 100)
+        print(f"-- TMA FRACTION DELTA  ({compare['a_label']} - {compare['b_label']})  "
+              f"ranked by |delta| = where {compare['a_label']} stalls more --")
+        print(f"  {'bucket':<38} {'A':>9} {'B':>9} {'delta':>9}")
+        for r in compare["rows"]:
+            if r["delta"] is None:
+                continue  # skip rows where one side has no data
+            line = (f"  {r['label']:<38} "
+                    f"{_pct(r['a']):>9} {_pct(r['b']):>9} "
+                    f"{r['delta'] * 100.0:>+8.2f}pp")
+            print(line)
+
+    print("\n" + "=" * 100)
+    print("VERDICT GUIDE: BACKEND-MEMORY-BOUND fraction > BACKEND-CORE-BOUND "
+          "=> workload is cache/BW limited (u8-direct port GO-worthy). "
+          "BACKEND-CORE-BOUND dominates => execution-port / latency bottleneck "
+          "(deeper asm/IPC is the lever). Frontend-bound or bad-spec dominant "
+          "=> kernel layout / branch prediction story.")
+    print("=" * 100)
+
+
 def print_insn(result, max_rows=20):
     """The insn report: per-binary closed ledger(s) + (if two) the role-matched
     delta table answering 'where do the excess instructions go'."""
