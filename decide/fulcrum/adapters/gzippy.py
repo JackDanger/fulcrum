@@ -540,8 +540,11 @@ class GzippyAdapter(ProjectAdapter):
     def reverify_trace(self, ck, run, feature):
         # The host front door is scripts/fulcrum (gzippy's wrapper, which
         # forwards here via FULCRUM_HOME); `total` is the trace analyzer
-        # subcommand. (NOT scripts/fulcrum_total.py — that legacy shim was
-        # removed when the engine moved into this package.)
+        # subcommand. Prefer it over the scripts/fulcrum_total.py shim: the
+        # shim still exists (a FULCRUM_HOME-repointed forwarder, gzippy
+        # 869f8dd3) and `scripts/fulcrum total` in fact execs it, but the
+        # `fulcrum` wrapper is the documented front door (sets FULCRUM_LEDGER,
+        # listed in `fulcrum --help`).
         return (f"scripts/fulcrum total "
                 f"<artdir>/cell_{ck[0]}_T{ck[1]}/trace.json "
                 f"--feature {feature}")
