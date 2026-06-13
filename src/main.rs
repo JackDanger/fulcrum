@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, model, provenance, rank, region_hw, schedule, score, spans, sweep,
-    trace, validate, vs, vs_sweep, xtool,
+    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, schedule, score, spans,
+    sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -821,6 +821,7 @@ fn cmd_alloc(args: &[String]) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
 
 /// Pull residual counters out of the trace. gzippy emits them as instant
 /// events named `rusage.region` carrying `tid`-implied + counter args; we read
@@ -1967,6 +1968,63 @@ fn cmd_audit(args: &[String]) -> ExitCode {
     }
 }
 
+/// memlife: cross-tool, per-buffer ATTRIBUTED memory-lifecycle breakdown.
+///
+///   fulcrum memlife <run.json>                 single-run per-component table
+///   fulcrum memlife vs <A.json> <B.json>       cross-tool A vs B vs Δ (per-MB)
+///   fulcrum memlife growth <T1.json> <T8.json> one tool, T1→T8 written growth
+///
+/// `<run.json>` is the schema emitted by gzippy's `decompress::parallel::memlife`
+/// (GZIPPY_MEMLIFE=/path.json) and by the rapidgzip-side LD_PRELOAD counter +
+/// source-derived in-place-resolve term (same fields).
+fn cmd_memlife(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let load = |p: &str| match memlife::MemlifeRun::load(p) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("memlife: {e}");
+            None
+        }
+    };
+    match pos.first().copied() {
+        Some("vs") => {
+            let (Some(ap), Some(bp)) = (pos.get(1), pos.get(2)) else {
+                eprintln!("memlife vs needs <A.json> <B.json>");
+                return ExitCode::from(2);
+            };
+            let (Some(a), Some(b)) = (load(ap), load(bp)) else {
+                return ExitCode::FAILURE;
+            };
+            print!("{}", memlife::render_vs(&a, &b));
+            ExitCode::SUCCESS
+        }
+        Some("growth") => {
+            let (Some(ap), Some(bp)) = (pos.get(1), pos.get(2)) else {
+                eprintln!("memlife growth needs <T1.json> <T8.json>");
+                return ExitCode::from(2);
+            };
+            let (Some(a), Some(b)) = (load(ap), load(bp)) else {
+                return ExitCode::FAILURE;
+            };
+            print!("{}", memlife::render_growth(&a, &b));
+            ExitCode::SUCCESS
+        }
+        Some(p) => {
+            let Some(run) = load(p) else {
+                return ExitCode::FAILURE;
+            };
+            print!("{}", memlife::render_single(&run));
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!(
+                "memlife: <run.json> | vs <A.json> <B.json> | growth <T1.json> <T8.json>"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// mech-caps: report this host's cross-arch HW-counter availability.
 fn cmd_mech_caps(_args: &[String]) -> ExitCode {
     let caps = mech_arch::MechCaps::detect();
@@ -1988,6 +2046,7 @@ fn main() -> ExitCode {
         "consumer" => cmd_consumer(rest),
         "spans" => cmd_spans(rest),
         "schedule" => cmd_schedule(rest),
+        "memlife" => cmd_memlife(rest),
         "decompose" => cmd_decompose(rest),
         "alloc" => cmd_alloc(rest),
         "model" => cmd_model(rest),
