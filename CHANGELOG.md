@@ -53,6 +53,25 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ### Added
 
+- **`fulcrum insn` — closed instruction-accounting ledger**
+  (`decide/fulcrum/core/insn.py`, INSN-CLOSURE-OR-NO-LEDGER): ingests a
+  `perf stat` total + a `perf report -F period,symbol` capture, role-matches
+  symbols into adapter categories, and closes
+  `measured_total == categorized + uncategorized + report-residual` with each
+  symbol charged once. REFUSES an over-count (symbols summing past the measured
+  total — the campaign's 690M double-count class) or an ambiguous category
+  partition (the double-count source); FLAGS an unaccounted residual above
+  `--threshold`. A second `--b-*` capture adds the role-matched, conservation-
+  asserted DELTA table ("where do the excess instructions go"). New invariant,
+  `selftests/test_insn.py` (23 firing checks), `insn` CLI subcommand,
+  `report.print_insn`, and a provisional gzippy decode-role category map.
+
+- **CLI fails loud on agent footguns**: a missing/unreadable/malformed trace
+  file is a clean `[INSTRUMENT REFUSED]` (was a raw traceback); `total`/`analyze`
+  no longer silently swallow unknown `--flags` (a mistyped `--feature` was
+  ignored => wrong analysis); a flag given no value is a clean message (was an
+  IndexError). All such paths exit 2.
+
 - **`fulcrum locate` — positive localization via a closed wall ledger**
   (`decide/fulcrum/core/locate.py`): consumes GZIPPY_TIMELINE-style Chrome
   traces and emits a critical path (longest-busy-path v1 approximation over

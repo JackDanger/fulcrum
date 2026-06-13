@@ -17,14 +17,23 @@ not certified at capture time. Wanted: the runner reads the binary's own
 self-witness and the fingerprint refuses a flavor mismatch (a `DERIVED-MISMATCH`
 for binary flavor, governed by the derivation like sink/mask/freeze are today).
 
-## `fulcrum insn` mode with category-accounting closure
-The governing model is "wall delta == CPU-instruction delta vs the comparator."
-There is no instruction-ledger mode that accounts retired instructions by
-category and asserts the categories **close** on the measured total (the same
-conservation discipline `locate` applies to wall time, applied to instructions).
-Wanted: an `insn` view that partitions retired instructions per region/category
-and FLAGS an unaccounted residual, so an instruction-count divergence can be
-positively located rather than narrated.
+## ~~`fulcrum insn` mode with category-accounting closure~~ — BUILT (2026-06-12)
+Shipped: `core/insn.py` + the `insn` CLI subcommand + the
+INSN-CLOSURE-OR-NO-LEDGER invariant + `selftests/test_insn.py` (firing
+over-count / ambiguous-partition / under-coverage / percentage-only / delta-
+closure tests). It ingests a `perf stat` total + a `perf report -F
+period,symbol` capture, role-matches symbols into adapter categories, and
+closes `measured_total == categorized + uncategorized + report-residual`,
+refusing an over-count (the 690M class) or an ambiguous partition (the double-
+count source) and flagging an unaccounted residual above threshold. A second
+capture adds the conservation-asserted role-matched delta table.
+**Remaining sub-item (needs real hardware):** the gzippy decode-role category
+patterns in `adapters/gzippy.py::insn_categories` are PROVISIONAL — seeded from
+the decode taxonomy, not yet calibrated against a real `perf report -F
+period,symbol` of gzippy-native / gzippy-isal / rapidgzip. They are safe
+unrefined (an over-broad pattern REFUSES, an uncaught symbol FLAGS — neither
+silently mis-buckets), but tightening them against a real capture (and choosing
+the per-byte volume denominator) is a supervisor run on <BENCH_HOST>/<BENCH_HOST>.
 
 ## Calibration-reference store
 TSC-cycle numbers drift with core-clock/frequency state (the bank-divergence
