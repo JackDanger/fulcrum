@@ -4,7 +4,7 @@
 //! Given the 3 staged binaries + freeze proof, it:
 //!
 //! 1. Asserts the corpus sha == pin (STRIKE-5).
-//! 2. Asserts the comparator is a native ELF (--version < 15 ms).
+//! 2. Asserts the comparator is a native ELF (--version < 50 ms).
 //! 3. Asserts the host is frozen (or EXPLICITLY acknowledged via `--freeze-acknowledged`).
 //! 4. Asserts gzippy-native has 0 `isal_inflate` symbols (pure-Rust build).
 //! 5. Asserts gzippy-isal has >0 `isal_inflate` symbols (ISA-L build).
@@ -14,7 +14,7 @@
 //!
 //! Named invariants (abort with the invariant name in the error):
 //!   `SCORE-PROVENANCE-SHA`          corpus sha != pin
-//!   `SCORE-PROVENANCE-COMPARATOR`   rapidgzip --version >= 15 ms (wheel-suspect)
+//!   `SCORE-PROVENANCE-COMPARATOR`   rapidgzip --version >= 50 ms (wheel-suspect)
 //!   `SCORE-PROVENANCE-FREEZE`       readable thawed governor or no_turbo
 //!   `SCORE-PROVENANCE-FLAVOR-N`     gzippy-native has ISA-L inflate symbols
 //!   `SCORE-PROVENANCE-FLAVOR-I`     gzippy-isal has 0 ISA-L inflate symbols
@@ -100,7 +100,7 @@ impl Default for ScoreArgs {
 pub enum ScoreError {
     /// `SCORE-PROVENANCE-SHA`: corpus sha != pin (STRIKE-5).
     ProvenanceSha { actual: String, expected: String },
-    /// `SCORE-PROVENANCE-COMPARATOR`: rapidgzip --version >= 15 ms (wheel-suspect).
+    /// `SCORE-PROVENANCE-COMPARATOR`: rapidgzip --version >= 50 ms (wheel-suspect).
     ProvenanceComparator { version_ms: f64 },
     /// `SCORE-PROVENANCE-FREEZE`: readable thawed governor or no_turbo.
     ProvenanceFreeze { detail: String },
@@ -141,7 +141,7 @@ impl std::fmt::Display for ScoreError {
             ),
             ScoreError::ProvenanceComparator { version_ms } => write!(
                 f,
-                "{}: rapidgzip --version took {version_ms:.0}ms >= 15ms \
+                "{}: rapidgzip --version took {version_ms:.0}ms >= 50ms \
                  — wheel-suspect, not a native ELF. Set --rg to the native binary.",
                 self.invariant_name()
             ),
@@ -220,9 +220,12 @@ pub fn check_corpus_sha(actual_sha: &str, pin: &str) -> Result<(), ScoreError> {
 
 /// `SCORE-PROVENANCE-COMPARATOR` — check --version wall.
 ///
-/// Pass the measured millisecond wall; this pure function enforces the < 15 ms bar.
+/// Pass the measured millisecond wall; this pure function enforces the < 50 ms bar.
+/// Python wheels take 100-500ms; native ELFs take 2-20ms even cold. 50ms gives
+/// sufficient headroom for cold-cache LXC process-spawn overhead without allowing
+/// Python interpreter startup.
 pub fn check_comparator_native(version_ms: f64) -> Result<(), ScoreError> {
-    if version_ms >= 15.0 {
+    if version_ms >= 50.0 {
         Err(ScoreError::ProvenanceComparator { version_ms })
     } else {
         Ok(())
@@ -344,7 +347,7 @@ pub fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
 
 /// Measure the `--version` wall of a binary. Returns milliseconds.
 ///
-/// Used by [`run_score`] to enforce the < 15 ms comparator-native check;
+/// Used by [`run_score`] to enforce the < 50 ms comparator-native check;
 /// the raw float is then passed to [`check_comparator_native`].
 pub fn measure_version_wall(binary: &Path) -> f64 {
     let t0 = Instant::now();
@@ -818,7 +821,7 @@ pub fn run_score(args: &ScoreArgs) -> Result<(), ScoreError> {
     // 2. Comparator native check.
     let ver_ms = measure_version_wall(&args.rg);
     check_comparator_native(ver_ms)?;
-    eprintln!("## SCORE-PROVENANCE-COMPARATOR: OK (--version {ver_ms:.0}ms < 15ms)");
+    eprintln!("## SCORE-PROVENANCE-COMPARATOR: OK (--version {ver_ms:.0}ms < 50ms)");
 
     // 3. Freeze check.
     let acknowledged = args.freeze_readback.trim() == "acknowledged";
@@ -1137,7 +1140,7 @@ mod tests {
 
     #[test]
     fn provenance_comparator_fires_on_slow() {
-        let result = check_comparator_native(20.0);
+        let result = check_comparator_native(100.0);
         assert!(
             matches!(result, Err(ScoreError::ProvenanceComparator { .. })),
             "expected ProvenanceComparator"
@@ -1149,14 +1152,15 @@ mod tests {
     }
 
     #[test]
-    fn provenance_comparator_fires_at_exactly_15ms() {
-        assert!(check_comparator_native(15.0).is_err(), "exactly 15ms must fire");
+    fn provenance_comparator_fires_at_exactly_50ms() {
+        assert!(check_comparator_native(50.0).is_err(), "exactly 50ms must fire");
     }
 
     #[test]
-    fn provenance_comparator_passes_under_15ms() {
+    fn provenance_comparator_passes_under_50ms() {
         assert!(check_comparator_native(3.0).is_ok());
         assert!(check_comparator_native(14.9).is_ok());
+        assert!(check_comparator_native(49.9).is_ok());
     }
 
     #[test]
