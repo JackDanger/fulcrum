@@ -85,6 +85,31 @@ GZIPPY_TAXONOMY = Taxonomy(
 
 
 # ---------------------------------------------------------------------------
+# Instruction-ledger role categories (fulcrum insn). LOWERCASE substring
+# patterns matched against perf-report symbols of BOTH gzippy (Rust) and
+# rapidgzip (C++) so each category lines up by decode ROLE. MUST be a partition
+# (a symbol matching two => `insn` refuses). PROVISIONAL until calibrated
+# against a real `perf report -F period,symbol`; see GzippyAdapter.insn_categories.
+# ---------------------------------------------------------------------------
+
+INSN_CATEGORIES = [
+    ("huffman_decode", ("decode_huffman", "read_token", "readtoken",
+                        "litlentable", "disttable", "huffmancoding",
+                        "huffman_table", "build_huffman", "decodeblock")),
+    ("marker_resolve", ("replace_marker", "replacemarker", "resolve_marker",
+                        "markerring", "marker_ring", "apply_window",
+                        "applywindow", "window_apply")),
+    ("lz_copy", ("lz77", "copy_match", "copymatch", "back_reference",
+                 "backreference", "resolvebackref", "copy_run")),
+    ("crc", ("crc32", "crc_", "_crc", "checksum")),
+    ("memops", ("memcpy", "memmove", "memset", "__memmove", "__memcpy")),
+    ("alloc", ("malloc", "free", "operator new", "_alloc", "dealloc",
+               "calloc", "realloc")),
+    ("io_output", ("writev", "pwrite", "fwrite", "__write", "write_buffered")),
+    ("bitreader", ("bit_reader", "bitreader", "read_bits", "readbits",
+                   "peek_bits", "refill")),
+]
+
 # Counter sidecar patterns -- the WINDOW-ABSENT / SEEDING / ORACLE guard data.
 # ---------------------------------------------------------------------------
 
@@ -493,6 +518,22 @@ class GzippyAdapter(ProjectAdapter):
             return (True, f"base arm slab auto-engaged (hits+installs={bc}); "
                           f"force-off arm 0 — gate + kill-switch effective")
         return (False, f"unknown predicate '{pred}'")
+
+    # ---- instruction accounting (fulcrum insn) -------------------------------
+    def insn_categories(self, feature=None):
+        """Role-matched decode categories for the gzippy↔rapidgzip instruction
+        ledger. Patterns are LOWERCASE substrings matched against perf-report
+        symbols of BOTH binaries (Rust mangled names + rapidgzip C++ names), so
+        a category lines up by ROLE across the two.
+
+        PROVISIONAL — these patterns are seeded from the decode taxonomy, NOT
+        yet calibrated against a real `perf report -F period,symbol` capture of
+        each binary. That is SAFE by construction: an over-broad pattern that
+        matches two roles makes `insn` REFUSE (ambiguous partition), and any
+        symbol no pattern catches inflates the uncategorized bucket until the
+        ledger FLAGS — neither path can silently mis-bucket. Tighten against a
+        real capture; see the note in decide/docs/MISSING.md."""
+        return INSN_CATEGORIES
 
     # ---- micro-profile --------------------------------------------------------
     def parse_microprofile(self, text):

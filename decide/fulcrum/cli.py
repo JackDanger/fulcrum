@@ -17,6 +17,19 @@ gzippy ships one):
       FLAGGED when the residual exceeds --threshold (default 2%%, tie to the
       instrument self-test spread). Each row carries the recommended
       exemption-probe falsifier design (text; the sweep itself is not v1).
+  insn --a-stat F --a-report F [--a-bytes N] [--a-label L]
+       [--b-stat F --b-report F [--b-bytes N] [--b-label L]]
+       [--tol PCT] [--threshold PCT] [--feature FEAT]
+      CLOSED instruction-accounting ledger (INSN-CLOSURE-OR-NO-LEDGER):
+      ingest a `perf stat` total + a `perf report -F period,symbol` capture,
+      role-match symbols into categories from the adapter, and emit per-
+      category insn (and insn/byte) totals that MUST close on the measured
+      retired total — categorized + uncategorized + report-residual ==
+      measured_total. REFUSES an over-count (symbols sum past the measured
+      total) or an ambiguous category partition (the double-count source);
+      FLAGS when the unaccounted fraction exceeds --threshold. A second
+      (--b-*) capture adds the role-matched DELTA table ('where do the
+      excess instructions go'), conservation-asserted itself.
   selftest
       Run every suite (trace engine, decision engine, invariant enforcement);
       writes the SELF-TEST-OR-NO-TRUST stamp on success.
@@ -212,6 +225,73 @@ def locate_main(argv):
     report_mod.print_locate(result)
 
 
+def insn_main(argv):
+    """`fulcrum insn --a-stat F --a-report F [--a-bytes N] [--a-label L]
+    [--b-stat F --b-report F [--b-bytes N] [--b-label L]]
+    [--tol PCT] [--threshold PCT] [--feature FEAT]`.
+
+    Closed instruction-accounting ledger (INSN-CLOSURE-OR-NO-LEDGER). One
+    (stat, report) pair closes a per-binary category ledger; a second pair
+    adds the role-matched delta table ('where do the excess instructions
+    go'). --feature selects the adapter's category flavor."""
+    from .core import insn as insn_mod
+
+    if "--selftest" in argv:
+        from .selftests import test_insn
+        rc, _, _ = test_insn.run()
+        sys.exit(rc)
+
+    opts = {}
+    feature = None
+    tol = insn_mod.DEFAULT_TOL_PCT
+    threshold = insn_mod.DEFAULT_THRESHOLD_PCT
+    known = ("--a-stat --a-report --a-bytes --a-label "
+             "--b-stat --b-report --b-bytes --b-label "
+             "--tol --threshold --feature [--selftest]")
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--a-stat", "--a-report", "--a-bytes", "--a-label",
+                 "--b-stat", "--b-report", "--b-bytes", "--b-label"):
+            opts[a.lstrip("-")] = _flag_value(argv, i, "insn"); i += 2; continue
+        if a == "--tol":
+            tol = float(_flag_value(argv, i, "insn")); i += 2; continue
+        if a == "--threshold":
+            threshold = float(_flag_value(argv, i, "insn")); i += 2; continue
+        if a == "--feature":
+            feature = _flag_value(argv, i, "insn"); i += 2; continue
+        if a.startswith("--"):
+            _die_unknown_flag("insn", a, known)
+        print(f"insn: unexpected positional argument {a!r}; inputs are named "
+              f"(--a-stat/--a-report/...). Known: {known}", file=sys.stderr)
+        sys.exit(2)
+
+    if not opts.get("a-stat") or not opts.get("a-report"):
+        print("insn: --a-stat and --a-report are required (the A binary's "
+              "`perf stat` total and `perf report -F period,symbol` capture).\n"
+              f"      usage: fulcrum insn {known}", file=sys.stderr)
+        sys.exit(2)
+
+    def _bytes(key):
+        v = opts.get(key)
+        return int(v) if v is not None else None
+
+    _trust_banner()
+    adapter = GzippyAdapter()
+    categories = adapter.insn_categories(feature)
+    try:
+        result = insn_mod.insn_from_files(
+            opts["a-stat"], opts["a-report"], categories,
+            a_label=opts.get("a-label"), a_bytes=_bytes("a-bytes"),
+            b_stat=opts.get("b-stat"), b_report=opts.get("b-report"),
+            b_label=opts.get("b-label"), b_bytes=_bytes("b-bytes"),
+            tol_pct=tol, threshold_pct=threshold)
+    except tr.InstrumentError as e:
+        print(f"\n[INSTRUMENT REFUSED] {e}")
+        sys.exit(2)
+    report_mod.print_insn(result)
+
+
 def ledger_main(rest):
     """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
     verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
@@ -310,6 +390,8 @@ def main(argv=None):
         total_main(rest)
     elif cmd == "locate":
         locate_main(rest)
+    elif cmd == "insn":
+        insn_main(rest)
     elif cmd == "selftest":
         from .selftests import run_all
         sys.exit(run_all())

@@ -118,3 +118,94 @@ def print_locate(result, max_path_entries=40, max_rows=15):
     if n_more > 0:
         print(f"\n  ... {n_more} smaller rows elided ...")
     print("\n" + "=" * 100)
+
+
+def _fmt_pb(x):
+    return f"{x:10.3f}" if x is not None else "       n/a"
+
+
+def _print_ledger(led):
+    """One binary's closed instruction ledger."""
+    mt = led["measured_total"]
+    print(f"\nbinary: {led['label']}  "
+          f"(measured retired instructions: {mt:,}"
+          + (f", volume {led['volume_bytes']:,} B"
+             if led["volume_bytes"] else "") + ")")
+    print(f"-- INSTRUCTION LEDGER (INSN-CLOSURE-OR-NO-LEDGER; over-count tol "
+          f"{led['tol_pct']:.1f}%, unaccounted flag {led['threshold_pct']:.1f}%) --")
+    has_pb = led["volume_bytes"] is not None
+    hdr = f"  {'category':<22} {'instructions':>16} {'%total':>8}"
+    if has_pb:
+        hdr += f" {'insn/byte':>12}"
+    print(hdr)
+    for r in led["categories"]:
+        line = (f"  {r['category']:<22} {r['insns']:>16,} "
+                f"{r['pct_of_total']:>7.1f}%")
+        if has_pb:
+            line += f" {r['insn_per_byte']:>12.3f}"
+        print(line)
+    print(f"  {'(uncategorized)':<22} {led['uncategorized']:>16,} "
+          f"{led['uncategorized'] / mt * 100.0:>7.1f}%")
+    print(f"  {'(report-residual)':<22} {led['residual']:>16,} "
+          f"{led['residual_pct']:>7.1f}%   "
+          f"(stat total minus what perf report sampled)")
+    closed = (led["categorized"] + led["uncategorized"] + led["residual"])
+    status = ("CONSERVED" if not led["flagged"]
+              else f"FLAGGED [INSN-CLOSURE] {led['flag_reason']}")
+    print(f"  closure           : categorized + uncategorized + residual "
+          f"= {closed:,}  == measured {mt:,}  => {status}")
+    if led["flagged"] and led["uncategorized_symbols"]:
+        print("  top uncategorized symbols (charge them to a category or "
+              "accept the flag):")
+        for sym, n in led["uncategorized_symbols"][:8]:
+            print(f"    {n:>16,}  {sym}")
+
+
+def print_insn(result, max_rows=20):
+    """The insn report: per-binary closed ledger(s) + (if two) the role-matched
+    delta table answering 'where do the excess instructions go'."""
+    print("=" * 100)
+    print("fulcrum insn — closed instruction-accounting ledger "
+          "(INSN-CLOSURE-OR-NO-LEDGER)")
+    print("=" * 100)
+    _print_ledger(result["a"])
+    if result["b"]:
+        _print_ledger(result["b"])
+    cmp = result.get("compare")
+    if cmp:
+        print("\n" + "-" * 100)
+        print(f"-- INSTRUCTION DELTA  ({cmp['a_label']} - {cmp['b_label']})  "
+              f"ranked by |delta| = where the excess instructions go --")
+        total = cmp["total_delta"]
+        print(f"  total measured delta: {total:+,} instructions"
+              + (f"   ({total / cmp['volume_a']:+.3f} insn/byte over "
+                 f"{cmp['volume_a']:,} B)" if cmp["both_volume"]
+                 and not cmp["volume_mismatch"] else ""))
+        if cmp["volume_mismatch"]:
+            print("  !! VOLUME MISMATCH: the two captures processed different "
+                  "byte volumes; raw insn deltas are NOT comparable — read the "
+                  "insn/byte columns (or re-capture on the same corpus).")
+        has_pb = cmp["both_volume"]
+        hdr = f"  {'category':<22} {'A insns':>16} {'B insns':>16} {'delta':>16}"
+        if has_pb:
+            hdr += f" {'delta/byte':>12}"
+        print(hdr)
+        for r in cmp["rows"][:max_rows]:
+            line = (f"  {r['category']:<22} {r['a_insns']:>16,} "
+                    f"{r['b_insns']:>16,} {r['delta']:>+16,}")
+            if has_pb and r["delta_pb"] is not None:
+                line += f" {r['delta_pb']:>+12.3f}"
+            print(line)
+        ok = "CLOSES" if cmp["delta_closes"] else "DOES NOT CLOSE"
+        print(f"  delta ledger: Σ row deltas == total delta  => {ok} "
+              f"(the hand-built double-count cannot reappear)")
+    print("\n" + "=" * 100)
+    flagged = result["a"]["flagged"] or (result["b"] and result["b"]["flagged"])
+    if flagged:
+        print("NOTE: a ledger is FLAGGED — unaccounted instructions exceed the "
+              "threshold; the divergence can still hide there. Refine the "
+              "category patterns or accept the explicit residual.")
+    else:
+        print("All ledgers CONSERVED: every measured instruction is charged to "
+              "a category, uncategorized, or the explicit report-residual.")
+    print("=" * 100)

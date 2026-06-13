@@ -95,6 +95,19 @@ class ProjectAdapter:
         EFFECT-UNVERIFIED label (never silently trusted)."""
         return (None, f"unknown predicate '{pred}'")
 
+    # -- instruction accounting (fulcrum insn) --------------------------------
+    def insn_categories(self, feature=None):
+        """Ordered [(category, (substring,...))] for role-matching perf-report
+        symbols across binaries (the comparator and the tool-under-test share
+        ROLE names so their ledgers line up). Patterns MUST be a partition: a
+        symbol matching two categories is REFUSED (the double-count source).
+
+        The empty default means every symbol is uncategorized — the ledger
+        then FLAGS rather than silently bucketing (safe: it never invents a
+        category). `feature` lets an adapter return a build-flavor-specific
+        map."""
+        return ()
+
     # -- micro-profile (optional per-project engine counters) -----------------
     def parse_microprofile(self, text):
         """Profile-capture text -> opaque prof object, or None."""

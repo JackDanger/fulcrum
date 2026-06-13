@@ -161,6 +161,32 @@ INVARIANTS = (
         enforcement="fingerprint.assert_comparable; ledger.contradictions "
                     "compatibility filter",
     ),
+    Invariant(
+        name="INSN-CLOSURE-OR-NO-LEDGER",
+        rule="An instruction ledger (`fulcrum insn`) must CLOSE on the measured "
+             "retired-instruction total: measured_total (perf stat) == "
+             "categorized + uncategorized + report-residual, where each perf "
+             "symbol is charged to AT MOST ONE category. Two structural "
+             "impossibilities REFUSE outright: (1) OVER-COUNT — the per-symbol "
+             "report sums to MORE than the measured total beyond tolerance (the "
+             "symbols cannot retire more than the CPU did: a double-count, a "
+             "mixed-run pairing, or the wrong event); (2) AMBIGUOUS PARTITION — "
+             "a symbol matching more than one category (the double-count "
+             "SOURCE). An unaccounted (uncategorized + residual) fraction above "
+             "the threshold (default 5%) does not refuse but FLAGS every row — "
+             "the divergence can still hide outside the named categories. The "
+             "cross-binary DELTA ledger is itself conservation-asserted (Σ "
+             "category deltas + uncategorized delta + residual delta == total "
+             "delta).",
+        scar="The campaign's hand-built instruction ledger DOUBLE-COUNTED by "
+             "690M — a symbol's instructions assigned to two buckets, the "
+             "categories summed past the measured retired total, and the "
+             "residual was narrated away. Attribution by hand manufactures "
+             "instruction phantoms exactly the way it does for wall time.",
+        enforcement="insn.build_ledger over-count refusal + conservation "
+                    "assert; insn.resolve_category ambiguity refusal; "
+                    "insn.compare delta-closure assert; selftests/test_insn.py",
+    ),
 )
 
 

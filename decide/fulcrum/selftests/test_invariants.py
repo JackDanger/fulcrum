@@ -435,7 +435,8 @@ def run():
     expected = {"SINK-LAW", "FROZEN-OR-LABELED", "SHA-OR-VOID",
                 "SPREAD-RESOLUTION", "CAUSAL-OR-HYPOTHESIS",
                 "EFFECT-VERIFIED-OR-FLAGGED", "SELF-TEST-OR-NO-TRUST",
-                "CONSERVATION-OR-NO-LOCATE", "FINGERPRINT-OR-NO-COMPARE"}
+                "CONSERVATION-OR-NO-LOCATE", "FINGERPRINT-OR-NO-COMPARE",
+                "INSN-CLOSURE-OR-NO-LEDGER"}
     # EXACT set equality (not subset): adding an invariant without listing it
     # here FAILS (forces a firing-proof test alongside it), and removing one
     # FAILS too (a charter rule cannot silently disappear).
