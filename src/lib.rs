@@ -45,6 +45,7 @@ pub mod estimate;
 pub mod flow;
 pub mod mech;
 pub mod mech_arch;
+pub mod memlife;
 pub mod microbench;
 pub mod model;
 pub mod probe;
