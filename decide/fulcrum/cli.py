@@ -65,6 +65,22 @@ def _trust_banner():
         print(label)
 
 
+def _flag_value(argv, i, cmd):
+    """Value of the flag at argv[i]; fail loud (exit 2) if it is missing rather
+    than crashing with an IndexError traceback an agent cannot act on."""
+    if i + 1 >= len(argv):
+        print(f"{cmd}: {argv[i]} needs a value", file=sys.stderr)
+        sys.exit(2)
+    return argv[i + 1]
+
+
+def _die_unknown_flag(cmd, flag, known):
+    """A mistyped flag (e.g. --feat for --feature) must FAIL LOUD, never be
+    silently swallowed — a silently-ignored --feature is a wrong-answer path."""
+    print(f"{cmd}: unknown option {flag} (known: {known})", file=sys.stderr)
+    sys.exit(2)
+
+
 def total_main(argv=None):
     """The `total` trace-analyzer subcommand (whole-system trace analysis or a
     cross-tool delta)."""
@@ -81,14 +97,17 @@ def total_main(argv=None):
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--counters":
-            counters = argv[i + 1]; i += 2; continue
-        if a == "--T":
-            declared_T = argv[i + 1]; i += 2; continue
-        if a == "--feature":
-            feature = argv[i + 1]; i += 2; continue
-        if a.startswith("--"):
+        if a == "--selftest":
             i += 1; continue
+        if a == "--counters":
+            counters = _flag_value(argv, i, "total"); i += 2; continue
+        if a == "--T":
+            declared_T = _flag_value(argv, i, "total"); i += 2; continue
+        if a == "--feature":
+            feature = _flag_value(argv, i, "total"); i += 2; continue
+        if a.startswith("--"):
+            _die_unknown_flag("total", a,
+                              "--counters --T --feature [--selftest]")
         files.append(a); i += 1
 
     if not files:
@@ -132,12 +151,16 @@ def decide_main(argv=None):
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--feature":
-            feature = argv[i + 1]; i += 2; continue
-        if a == "--ledger":
-            ledger_path = argv[i + 1]; i += 2; continue
-        if a.startswith("--"):
+        if a in ("--allow-thaw", "--no-ledger", "--selftest"):
             i += 1; continue
+        if a == "--feature":
+            feature = _flag_value(argv, i, "analyze"); i += 2; continue
+        if a == "--ledger":
+            ledger_path = _flag_value(argv, i, "analyze"); i += 2; continue
+        if a.startswith("--"):
+            _die_unknown_flag("analyze", a,
+                              "--feature --ledger --allow-thaw --no-ledger "
+                              "[--selftest]")
         dirs.append(a); i += 1
     if not dirs:
         print(__doc__)
@@ -168,12 +191,11 @@ def locate_main(argv):
     while i < len(argv):
         a = argv[i]
         if a == "--wall-ms":
-            wall_ms = float(argv[i + 1]); i += 2; continue
+            wall_ms = float(_flag_value(argv, i, "locate")); i += 2; continue
         if a == "--threshold":
-            threshold = float(argv[i + 1]); i += 2; continue
+            threshold = float(_flag_value(argv, i, "locate")); i += 2; continue
         if a.startswith("--"):
-            print(f"locate: unknown option {a}")
-            sys.exit(2)
+            _die_unknown_flag("locate", a, "--wall-ms --threshold")
         files.append(a); i += 1
     if not files:
         print(__doc__)
