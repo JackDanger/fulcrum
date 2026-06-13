@@ -3,7 +3,7 @@
 
 def print_report(rep, tie_bar=0.99):
     print("=" * 100)
-    print("fulcrum decide — ONE-RUN decision table (plans/fulcrum-product.md)")
+    print("fulcrum decide — ONE-RUN decision table")
     print("=" * 100)
     for h in rep["header"]:
         print(h)

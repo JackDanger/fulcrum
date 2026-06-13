@@ -56,7 +56,7 @@ class ProjectAdapter:
     def load_run(self, art_dir):
         """Load one measurement-run artifact directory into the run dict the
         decision engine consumes. The default implements the documented
-        schema (tools/fulcrum/docs/SCHEMA.md); a project with its own
+        schema (decide/docs/SCHEMA.md); a project with its own
         artifact layout overrides this and maps to the same run-dict shape
         (also documented there)."""
         from ..core.decide import load_run_documented

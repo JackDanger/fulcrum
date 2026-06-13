@@ -1,7 +1,6 @@
-"""Trace-engine self-tests (ported wholesale from scripts/fulcrum_total.py
---selftest; every original check retained). Synthetic traces with KNOWN
-structure validate every guarantee, including assertion-fires-on-corruption
-(non-tautology) tests."""
+"""Trace-engine self-tests. Synthetic traces with KNOWN structure validate
+every guarantee, including assertion-fires-on-corruption (non-tautology)
+tests."""
 
 import json
 import os
@@ -283,5 +282,20 @@ def run():
     check(ct == (1, 1) and method == "consumer-frame-owner",
           "consumer picked by consumer.iter OWNERSHIP even when a worker "
           "spans wider")
+
+    # --- 12. CAUSAL-OR-HYPOTHESIS banner: print_bundle MUST mark its self-time
+    #         ranking DESCRIPTIVE != CAUSAL (a SELF rank is a hypothesis, never
+    #         a binder verdict). The enforcement is the printed banner; assert
+    #         it fires so the banner cannot be silently dropped. ---
+    import contextlib
+    import io
+    from ..core.trace import print_bundle
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_bundle(pb2)
+    out = buf.getvalue()
+    check("DESCRIPTIVE != CAUSAL" in out and "HYPOTHESIS GENERATOR" in out,
+          "print_bundle prints the DESCRIPTIVE!=CAUSAL banner "
+          "(CAUSAL-OR-HYPOTHESIS — a self-time rank is never a binder verdict)")
 
     return check.finish("trace-engine selftest")

@@ -114,13 +114,14 @@ This repo holds two complementary layers:
   `model`, `vs`, `rank`, `validate`, hardware-counter joins, provenance).
   It turns raw traces into attributed, reconciled numbers.
 - **Python decision engine ([`decide/`](decide/))** — the *judgment layer*
-  that consumes measurements: it enforces eight scar-named measurement
+  that consumes measurements: it enforces nine scar-named measurement
   invariants (SINK-LAW, FROZEN-OR-LABELED, SHA-OR-VOID, SPREAD-RESOLUTION,
   CAUSAL-OR-HYPOTHESIS, EFFECT-VERIFIED-OR-FLAGGED, SELF-TEST-OR-NO-TRUST,
-  FINGERPRINT-OR-NO-COMPARE), stamps every number with a measurement
-  fingerprint, keeps a hash-chained contradiction ledger, and emits ranked,
-  re-verifiable decision briefs through a pluggable `ProjectAdapter`
-  interface. See [decide/README.md](decide/README.md).
+  CONSERVATION-OR-NO-LOCATE, FINGERPRINT-OR-NO-COMPARE), stamps every number
+  with a measurement fingerprint, keeps a hash-chained contradiction ledger,
+  positively localizes wall time with a closed ledger (`fulcrum locate`), and
+  emits ranked, re-verifiable decision briefs through a pluggable
+  `ProjectAdapter` interface. See [decide/README.md](decide/README.md).
 
 A profiler tells you where the time went; the Rust layer tells you what
 would move the wall; the `decide/` layer refuses to let a broken

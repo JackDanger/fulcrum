@@ -191,19 +191,19 @@ class Ledger:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
     def supersede(self, key, retire_runid, reason, promote_runid=None):
-        if not str(reason).strip():
-            raise ValueError("reason must be a non-empty justification")
         """Append a supersede record retiring (key, retire_runid) as an
         anchor, optionally promoting a pending-reconcile row to active."""
+        if not str(reason).strip():
+            raise ValueError("reason must be a non-empty justification")
         self.append({"kind": "supersede", "key": key,
                      "retire_runid": retire_runid,
                      "promote_runid": promote_runid, "reason": reason})
 
     def invalidate(self, key, target_runid, reason):
-        if not str(reason).strip():
-            raise ValueError("reason must be a non-empty justification")
         """Append an invalid record retiring (key, target_runid) — the row
         was a measurement error and is never an anchor again."""
+        if not str(reason).strip():
+            raise ValueError("reason must be a non-empty justification")
         self.append({"kind": "invalid", "key": key,
                      "target_runid": target_runid, "reason": reason})
 
