@@ -88,8 +88,12 @@ GZIPPY_TAXONOMY = Taxonomy(
 # Instruction-ledger role categories (fulcrum insn). LOWERCASE substring
 # patterns matched against perf-report symbols of BOTH gzippy (Rust) and
 # rapidgzip (C++) so each category lines up by decode ROLE. MUST be a partition
-# (a symbol matching two => `insn` refuses). PROVISIONAL until calibrated
-# against a real `perf report -F period,symbol`; see GzippyAdapter.insn_categories.
+# (a symbol matching two => `insn` refuses). PROVISIONAL — CALIBRATION NEEDED:
+# closure catches an ambiguous (two-match) or uncovered (zero-match) symbol,
+# but NOT a symbol landed in one WRONG bucket (that conserves while corrupting
+# the split). Getting each symbol into its TRUE bucket is this list's job and
+# requires a real `perf report -F period,symbol` capture of each binary; see
+# GzippyAdapter.insn_categories + decide/docs/MISSING.md.
 # ---------------------------------------------------------------------------
 
 INSN_CATEGORIES = [
@@ -528,12 +532,48 @@ class GzippyAdapter(ProjectAdapter):
 
         PROVISIONAL — these patterns are seeded from the decode taxonomy, NOT
         yet calibrated against a real `perf report -F period,symbol` capture of
-        each binary. That is SAFE by construction: an over-broad pattern that
-        matches two roles makes `insn` REFUSE (ambiguous partition), and any
-        symbol no pattern catches inflates the uncategorized bucket until the
-        ledger FLAGS — neither path can silently mis-bucket. Tighten against a
-        real capture; see the note in decide/docs/MISSING.md."""
+        each binary. Two mis-calibration modes ARE caught by the ledger's
+        closure guards: an over-broad pattern matching two roles makes `insn`
+        REFUSE (ambiguous partition), and a symbol no pattern catches inflates
+        the uncategorized bucket until the ledger FLAGS.
+
+        But a THIRD mode is NOT — and cannot be — caught by closure: a symbol
+        charged to exactly ONE WRONG category. That mis-attribution conserves
+        perfectly (the total is unchanged) while corrupting the per-category
+        split; a green/CONSERVED ledger does NOT certify the split is correct
+        (selftests/test_insn.py pins this as necessary-but-not-sufficient).
+        Getting each symbol into its TRUE bucket is THIS calibration's
+        responsibility — it is the reason these patterns must be validated
+        against a real capture, not a property closure provides for free.
+        CALIBRATION NEEDED (supervisor <BENCH_HOST>/<BENCH_HOST> run): see
+        decide/docs/MISSING.md and `calibration_capture_cmds` below."""
         return INSN_CATEGORIES
+
+    def calibration_capture_cmds(self, binary, corpus, *, threads=8,
+                                 feature="native"):
+        """The exact capture commands a SUPERVISOR runs on <BENCH_HOST>/<BENCH_HOST> to
+        CALIBRATE `insn_categories` against real symbols (the per-category split
+        is only trustworthy after this — closure does not provide it). Cheap
+        entry point: returns the stat+report capture pair for one binary so the
+        operator can diff `perf report -F period,symbol` symbols against the
+        category patterns and reassign any single-WRONG-bucket symbol.
+
+        NOT run here — this only emits the commands; it needs the frozen box.
+        """
+        stat = (f"perf stat -e instructions,cycles -- "
+                f"{binary} -d -c -p {threads} {corpus} >/dev/null")
+        report = (f"perf record -e instructions:u -- "
+                  f"{binary} -d -c -p {threads} {corpus} >/dev/null && "
+                  f"perf report --stdio -F period,symbol")
+        return {
+            "feature": feature,
+            "stat": stat,
+            "report": report,
+            "note": ("diff the report symbols against insn_categories; a symbol "
+                     "in the WRONG single bucket conserves silently — reassign "
+                     "it (closure will not flag it). Pick --a-bytes = "
+                     "uncompressed corpus size for insn/byte."),
+        }
 
     # ---- micro-profile --------------------------------------------------------
     def parse_microprofile(self, text):
