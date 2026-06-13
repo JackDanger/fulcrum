@@ -92,43 +92,65 @@ DEFAULT_TOL_PCT = 1.5
 # ---------------------------------------------------------------------------
 
 #: Slot events — the denominator for all L1 fractions.
+#: On Intel hybrid (Raptor Lake) the P-core PMU prefix is cpu_core/.../.
 _SLOTS_ALIASES = frozenset({
     "topdown.slots", "topdown-slots", "topdown_slots",
     "slots",
+    "cpu_core/topdown.slots/",             # explicit hybrid PMU form
+    "cpu_core/topdown-slots/",
 })
 
 #: L1 TMA category events.
+#: On Intel hybrid (Raptor Lake), perf may emit `cpu_core/topdown-*/` prefixed
+#: forms for the P-core PMU.
 _RETIRING_ALIASES = frozenset({
     "topdown-retiring", "topdown_retiring",
     "topdown.retiring", "retiring",
+    "cpu_core/topdown-retiring/", "cpu_core/topdown_retiring/",
 })
 _BAD_SPEC_ALIASES = frozenset({
     "topdown-bad-spec", "topdown_bad_spec",
     "topdown.bad-spec", "topdown.bad_spec",
     "bad-speculation", "bad_speculation",
+    "cpu_core/topdown-bad-spec/", "cpu_core/topdown_bad_spec/",
 })
 _FE_BOUND_ALIASES = frozenset({
     "topdown-fe-bound", "topdown_fe_bound",
     "topdown.fe-bound", "topdown.fe_bound",
     "frontend-bound", "frontend_bound",
+    "cpu_core/topdown-fe-bound/", "cpu_core/topdown_fe_bound/",
 })
 _BE_BOUND_ALIASES = frozenset({
     "topdown-be-bound", "topdown_be_bound",
     "topdown.be-bound", "topdown.be_bound",
     "backend-bound", "backend_bound",
+    "cpu_core/topdown-be-bound/", "cpu_core/topdown_be_bound/",
 })
 
-#: Backend split events.
+#: Backend split events — memory-stall proxy.
+#: Preference: stalls_mem_any (classic Intel TMAM) — cycles where the core
+#: is stalled due to any pending D-cache miss.  When absent, fall through to
+#: stalls_l1d_miss (Raptor Lake / newer Intel — cycles stalled with ANY
+#: outstanding L1D miss; semantically equivalent to stalls_mem_any on hybrid
+#: cores with the cpu_core PMU) or cycles_mem_any (cycles with ANY pending
+#: memory op — slightly broader, still a valid proxy).
+#: All three aliases are checked; whichever is present is used.
 _MEM_STALL_ALIASES = frozenset({
     "cycle_activity.stalls_mem_any",
     "cycle-activity-stalls-mem-any",
+    "cycle_activity.stalls_l1d_miss",      # Raptor Lake / newer Intel
+    "cycle-activity.stalls-l1d-miss",
+    "cycle_activity.cycles_mem_any",       # cycles-with-pending-loads proxy
+    "cycle-activity.cycles-mem-any",
 })
 _CYCLES_ALIASES = frozenset({
     "cycles", "cpu-cycles", "cpu_cycles",
+    "cpu_core/cycles/",                    # hybrid PMU explicit form
 })
 _STALLS_L1D_ALIASES = frozenset({
     "cycle_activity.stalls_l1d_miss",
     "cycle-activity.stalls-l1d-miss",
+    "memory_activity.stalls_l1d_miss",     # alternate Intel naming
 })
 _STALLS_L2_ALIASES = frozenset({
     "cycle_activity.stalls_l2_miss",
@@ -289,13 +311,17 @@ def build_tma(events, *, label=None, tol_pct=DEFAULT_TOL_PCT):
     fe_bound_frac = frac(fe_bound)
     be_bound_frac = frac(be_bound)
 
-    # Backend split (optional — requires stalls_mem_any + cycles).
+    # Backend split (optional — requires a memory-stall proxy + cycles).
+    # Identify the actual event name that matched for the note.
     mem_stall = _lookup(events, _MEM_STALL_ALIASES)
+    mem_stall_event = next(
+        (k for k in events
+         if _canon_event(k) in _MEM_STALL_ALIASES), None)
     cycles = _lookup(events, _CYCLES_ALIASES)
     memory_bound_frac = None
     core_bound_frac = None
     backend_split_available = False
-    backend_split_note = "stalls_mem_any and/or cycles not captured"
+    backend_split_note = "memory-stall event and/or cycles not captured"
 
     if mem_stall is not None and cycles is not None:
         if cycles <= 0:
@@ -303,17 +329,21 @@ def build_tma(events, *, label=None, tol_pct=DEFAULT_TOL_PCT):
         elif mem_stall > cycles:
             raise InvariantViolation(
                 "TMA-BACKEND-INCOHERENT",
-                f"stalls_mem_any ({mem_stall:,}) > cycles ({cycles:,}) — "
+                f"memory-stall proxy ({mem_stall_event or 'unknown'}, "
+                f"count {mem_stall:,}) > cycles ({cycles:,}) — "
                 f"physically impossible (cannot stall for memory on more cycles "
                 f"than elapsed).  The backend-split events are from a different "
                 f"or corrupt capture.  REFUSING backend split.")
         else:
             # Intel TMA approximation: memory stall cycles / slots
-            # (slots ≈ N * cycles; stalls_mem_any / slots absorbs the width N)
+            # (slots ≈ N * cycles; stalls / slots absorbs the pipeline width N)
             memory_bound_frac = min(frac(mem_stall), be_bound_frac)
             core_bound_frac = max(0.0, be_bound_frac - memory_bound_frac)
             backend_split_available = True
-            backend_split_note = "approximate (stalls_mem_any/slots, Intel TMA v4)"
+            ev_label = mem_stall_event or "mem-stall-proxy"
+            backend_split_note = (
+                f"approximate ({ev_label}/slots, Intel TMA v4 formula; "
+                f"capped at be_bound_frac)")
 
     # Cache-miss hierarchy (optional, informational).
     stalls_l1d = _lookup(events, _STALLS_L1D_ALIASES)
