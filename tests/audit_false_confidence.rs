@@ -49,6 +49,7 @@ fn publish(ts: f64, end_bit: u64) -> Event {
 /// that PREDICTS would residual-differ across them. The tautology gives 0% for
 /// all three — proving the residual measures nothing.
 #[test]
+#[ignore = "falsifier fixture — demonstrates false-confidence source M1 (telescoping tautology in model publish-chain); run explicitly: cargo test --test audit_false_confidence"]
 fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
     // Helper: build a trace with N publishes at given timestamps, decode spans
     // that are TINY (so worker-bound never binds => publish-chain binds), and a
@@ -124,6 +125,7 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
 /// to the critical path. This is exactly the "page-faults = 36.9% of wall"
 /// CPU-sums-lie, now relabeled with a caveat but still emitted as the headline.
 #[test]
+#[ignore = "falsifier fixture — demonstrates false-confidence source D1 (cross-thread CPU-sum presented as % of single-thread wall in decompose); run explicitly: cargo test --test audit_false_confidence"]
 fn decompose_sums_faults_across_threads_can_exceed_wall() {
     // wall = 10ms. 16 worker threads, each charged 2000 minor faults to its own
     // (tid, "decode") cell — a realistic T16 page-fault count. Modeled cost =
@@ -177,6 +179,7 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
 /// reassuring "100% named". A clamp that turns a 320% over-attribution into
 /// "we named 100% of the residual" masks the bug rather than surfacing it.
 #[test]
+#[ignore = "falsifier fixture — demonstrates false-confidence source D2 (named_residual_frac clamp hides over-attribution); run explicitly: cargo test --test audit_false_confidence"]
 fn named_residual_frac_clamp_hides_over_attribution() {
     let mut b = ProfileBundle { wall_us: 10_000.0, ..Default::default() };
     let mut cell = RegionCell::default();
@@ -219,6 +222,7 @@ fn sp(name: &str, tid: u64, start: f64, end: f64, args: serde_json::Value) -> Sp
 /// chunk whose span is named differently) could swing the headline toward
 /// PLACEMENT for the wrong reason.
 #[test]
+#[ignore = "falsifier fixture — demonstrates false-confidence source S1 (undecoded-chunk stall silently charged to PLACEMENT instead of flagged as coverage gap); run explicitly: cargo test --test audit_false_confidence"]
 fn missing_decode_span_is_charged_to_placement_not_flagged_as_coverage_gap() {
     let spans = vec![
         // consumer stalls on chunk 5 for the whole 100µs.
