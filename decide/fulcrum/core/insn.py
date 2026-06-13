@@ -20,8 +20,14 @@ sample). The ledger is conservation-asserted:
 
     measured_total (perf stat) == categorized + uncategorized + residual
 
-and it REFUSES — does not render — two structural impossibilities:
+and it REFUSES — does not render — three structural impossibilities:
 
+  0. EVENT MISMATCH (the denominator-mismatch class): the per-symbol `perf
+     report` was sampled on a DIFFERENT event than the `perf stat` total it is
+     closed against (e.g. cycles vs instructions). Charging one event's periods
+     against the other's total "conserves" on the wrong denominator and yields a
+     meaningless per-category shape — the 2.7-insn/byte hallucination. REFUSED
+     (INSN-EVENT-MISMATCH) whenever both event headers are known and disagree.
   1. OVER-COUNT (the 690M class): the per-symbol report sums to MORE than the
      measured retired total beyond tolerance. The symbols claim more
      instructions than the CPU retired — a double-count, a mixed-run pairing,
@@ -29,6 +35,13 @@ and it REFUSES — does not render — two structural impossibilities:
   2. AMBIGUOUS PARTITION (the double-count SOURCE): a symbol matches more than
      one category's patterns. A non-partition would silently charge the same
      instructions to two buckets. REFUSED before any number is produced.
+
+CLOSURE IS NECESSARY BUT NOT SUFFICIENT FOR THE PER-CATEGORY ANSWER. The
+guards above protect the TOTAL and forbid double-counting; they do NOT catch a
+symbol charged to exactly ONE WRONG category — that mis-attribution conserves
+perfectly (the total is unchanged) while corrupting the per-category split.
+Correct bucketing is the CALIBRATION's job (the adapter's category patterns,
+validated against a real capture), never something a green ledger certifies.
 
 A residual/uncategorized fraction above the threshold does not refuse but
 FLAGS every row (CONSERVATION discipline: the divergence can still hide in the
@@ -58,7 +71,8 @@ INPUTS
 
 import re
 
-from .trace import InstrumentError
+from .invariants import InvariantViolation
+from .trace import InstrumentError  # noqa: F401  (re-exported failure type)
 
 #: Over-count refusal tolerance: the per-symbol report may slightly exceed the
 #: stat total from sampling rounding; beyond this it is a structural over-count.
@@ -71,6 +85,23 @@ DEFAULT_THRESHOLD_PCT = 5.0
 #: pseudo-category names used in the delta ledger so it visibly closes.
 UNCATEGORIZED = "(uncategorized)"
 RESIDUAL = "(report-residual)"
+
+#: perf-event name aliases that denote the SAME logical event under different
+#: spellings, so the stat<->report event cross-check (INSN-EVENT-MISMATCH) does
+#: not false-refuse on a benign alias. Extend conservatively — only true
+#: synonyms belong here.
+_EVENT_ALIASES = {"inst_retired.any": "instructions",
+                  "inst_retired.any_p": "instructions"}
+
+
+def _canon_event(ev):
+    """Canonicalize a perf-event name for the stat<->report cross-check: lower,
+    drop the `:u`/`:k`/`:upp` modifier, then map known synonyms onto one name.
+    Returns None for a missing/blank event (cannot cross-check)."""
+    if not ev:
+        return None
+    base = ev.split(":")[0].strip().lower()
+    return _EVENT_ALIASES.get(base, base) or None
 
 
 # ---------------------------------------------------------------------------
@@ -96,19 +127,43 @@ def parse_perf_stat(text):
         count = int(m.group(1).replace(",", ""))
         event = m.group(2).split(":")[0].lower()
         # last write wins is fine; perf prints each event once
-        if "instructions" in event or event == "inst_retired.any":
+        if "instructions" in event or event in ("inst_retired.any",
+                                                 "inst_retired.any_p"):
             out["instructions"] = count
+            # record the SPELLING of the anchor event so the report can be
+            # cross-checked against it (INSN-EVENT-MISMATCH).
+            out["instructions_event"] = _canon_event(event)
         elif event in ("cycles", "cpu-cycles") or "cycles" in event:
             out.setdefault("cycles", count)
         else:
             out.setdefault(event, count)
     if "instructions" not in out:
-        raise InstrumentError(
+        raise InvariantViolation(
+            "INSN-NO-INSTRUCTIONS",
             "perf stat capture has no retired-instructions line "
             "(`instructions` / `instructions:u`). An instruction ledger needs "
             "the measured total as its anchor. Capture with "
             "`perf stat -e instructions,cycles -- <cmd>`.")
     return out
+
+
+def parse_perf_report_event(text):
+    """Extract the EVENT a `perf report` was sampled on from its header
+    (`# Samples: 4K of event 'instructions:u'`). Returns the canonical event
+    name, or None when the header is absent (no cross-check possible — many
+    hand-written / synthetic reports omit it).
+
+    This is the GAP-2 denominator guard's left hand: a report sampled on a
+    DIFFERENT event than the stat (e.g. cycles vs instructions) whose periods
+    sum within tolerance closes silently and yields a WRONG per-category shape
+    — exactly the denominator-mismatch class behind the prior 2.7-insn/byte
+    hallucination. `build_ledger` refuses (INSN-EVENT-MISMATCH) when this
+    disagrees with the stat's anchor event."""
+    for line in text.splitlines():
+        m = re.search(r"Samples:.*?\bof events?\s+'([^']+)'", line)
+        if m:
+            return _canon_event(m.group(1))
+    return None
 
 
 def parse_perf_report(text):
@@ -142,12 +197,14 @@ def parse_perf_report(text):
             rows.append((sym, count))
     if not rows:
         if saw_percent:
-            raise InstrumentError(
+            raise InvariantViolation(
+                "INSN-PERCENT-ONLY",
                 "perf report is percentage-only (`-F overhead`); there is no "
                 "absolute per-symbol count to close an instruction ledger on. "
                 "Re-capture with `perf report --stdio -F period,symbol` "
                 "(absolute periods).")
-        raise InstrumentError(
+        raise InvariantViolation(
+            "INSN-EMPTY-REPORT",
             "no parseable `<count> [.] <symbol>` rows in the perf report "
             "(the 'instrument emitted empty output' class). Capture with "
             "`perf report --stdio -F period,symbol`.")
@@ -170,11 +227,12 @@ def resolve_category(symbol, categories):
     hits = [name for name, pats in categories
             if any(p.lower() in low for p in pats)]
     if len(hits) > 1:
-        raise InstrumentError(
-            f"AMBIGUOUS CATEGORY PARTITION: symbol {symbol!r} matches "
-            f"categories {hits} -- a non-partition would charge the same "
-            f"instructions to >1 bucket (the double-count source). REFUSING. "
-            f"Make the category patterns mutually exclusive.")
+        raise InvariantViolation(
+            "INSN-AMBIGUOUS-PARTITION",
+            f"symbol {symbol!r} matches categories {hits} -- a non-partition "
+            f"would charge the same instructions to >1 bucket (the double-count "
+            f"source). REFUSING. Make the category patterns mutually "
+            f"exclusive.")
     return hits[0] if hits else None
 
 
@@ -184,23 +242,52 @@ def resolve_category(symbol, categories):
 
 def build_ledger(measured_total, symbols, categories, *, label=None,
                  volume_bytes=None, tol_pct=DEFAULT_TOL_PCT,
-                 threshold_pct=DEFAULT_THRESHOLD_PCT):
+                 threshold_pct=DEFAULT_THRESHOLD_PCT,
+                 stat_event=None, report_event=None):
     """Close an instruction ledger for one binary. Returns the ledger dict.
 
-    REFUSES (InstrumentError) on an over-count or an ambiguous partition;
-    FLAGS (does not refuse) when the unaccounted fraction exceeds the
-    threshold."""
+    REFUSES (InvariantViolation) on a stat<->report EVENT mismatch, an
+    over-count, or an ambiguous partition; FLAGS (does not refuse) when the
+    unaccounted fraction exceeds the threshold.
+
+    NOTE ON SCOPE (the load-bearing limit — GAP 1): closure is NECESSARY but
+    NOT SUFFICIENT for the per-CATEGORY answer. The guards here (event match,
+    over-count, ambiguity) catch a wrong TOTAL and a symbol charged to >1
+    bucket. They do NOT — cannot — catch a symbol charged to exactly ONE WRONG
+    bucket: that mis-attribution conserves perfectly (the total is unchanged)
+    yet corrupts the per-category split. Correct bucketing is the CATEGORY
+    CALIBRATION's responsibility (adapter `insn_categories`, validated against a
+    real `perf report`), never something a green ledger certifies."""
     if measured_total <= 0:
-        raise InstrumentError(
+        raise InvariantViolation(
+            "INSN-NONPOSITIVE-TOTAL",
             f"measured instruction total must be positive, got {measured_total} "
             f"(a zero/negative perf-stat total cannot anchor a ledger).")
+
+    # REFUSAL 0 — EVENT MISMATCH (the denominator-mismatch / GAP-2 class): the
+    # per-symbol report must be sampled on the SAME event as the stat total it
+    # is being closed against. A report on `cycles` whose periods happen to sum
+    # within tolerance of an `instructions` stat conserves silently and yields a
+    # wrong per-category shape (the 2.7-insn/byte hallucination). Only fires when
+    # BOTH events are known; an absent report header cannot be cross-checked.
+    se, re_ = _canon_event(stat_event), _canon_event(report_event)
+    if se and re_ and se != re_:
+        raise InvariantViolation(
+            "INSN-EVENT-MISMATCH",
+            f"perf report sampled on event {re_!r} but the stat total is event "
+            f"{se!r}. Charging {re_!r} periods against an {se!r} total is a "
+            f"denominator mismatch — the ledger would 'conserve' on the wrong "
+            f"event and the per-category split would be meaningless. Re-capture "
+            f"the report with `perf report -F period,symbol` on the SAME event "
+            f"the stat measured.")
 
     cat_insns = {name: 0 for name, _ in categories}
     uncategorized = 0
     uncat_syms = []
     for sym, n in symbols:
         if n < 0:
-            raise InstrumentError(
+            raise InvariantViolation(
+                "INSN-NEGATIVE-COUNT",
                 f"negative per-symbol count for {sym!r} ({n}) -- corrupt "
                 f"perf report.")
         cat = resolve_category(sym, categories)
@@ -217,8 +304,9 @@ def build_ledger(measured_total, symbols, categories, *, label=None,
     # instructions than the CPU retired beyond tolerance.
     over = report_total - measured_total
     if over > measured_total * tol_pct / 100.0:
-        raise InstrumentError(
-            f"INSN-CLOSURE over-count: perf report sums to {report_total:,} "
+        raise InvariantViolation(
+            "INSN-CLOSURE",
+            f"over-count: perf report sums to {report_total:,} "
             f"instructions but perf stat measured only {measured_total:,} "
             f"(+{over:,}, {over / measured_total * 100.0:.2f}% > tol "
             f"{tol_pct:.1f}%). The symbols cannot retire more than the CPU did "
@@ -226,10 +314,19 @@ def build_ledger(measured_total, symbols, categories, *, label=None,
             f"REFUSING to render a ledger.")
 
     residual = measured_total - report_total
-    # CONSERVATION (asserted, not assumed): the ledger MUST close on the
-    # measured total by construction.
+    # TRIPWIRE, not a guard: `residual` is DEFINED as measured_total -
+    # report_total, so categorized + uncategorized + residual == measured_total
+    # is an algebraic identity that can never fire here. It is kept only as a
+    # defensive assertion against a future refactor that recomputes one of these
+    # terms independently. The REAL closure guards are above: event-match,
+    # over-count, and the ambiguity refusal in resolve_category — they are what
+    # make the total trustworthy. (They do NOT make the per-category SPLIT
+    # trustworthy; see the build_ledger docstring.)
     if abs((categorized + uncategorized + residual) - measured_total) > 1:
-        raise InstrumentError("insn: ledger does not close (internal)")
+        raise InvariantViolation(
+            "INSN-INTERNAL",
+            "ledger does not close (internal — algebraic identity violated, "
+            "a recompute bug)")
 
     unaccounted = uncategorized + max(residual, 0)
     unaccounted_pct = unaccounted / measured_total * 100.0
@@ -337,8 +434,9 @@ def compare(led_a, led_b):
     delta_sum = sum(r["delta"] for r in rows)
     delta_closes = abs(delta_sum - total_delta) <= 1
     if not delta_closes:
-        raise InstrumentError(
-            f"insn compare: delta ledger does not close "
+        raise InvariantViolation(
+            "INSN-DELTA-CLOSURE",
+            f"delta ledger does not close "
             f"(Σ row deltas {delta_sum:,} != total delta {total_delta:,}) "
             f"— internal accounting error.")
 
@@ -363,9 +461,12 @@ def insn_from_text(stat_text, report_text, categories, *, label=None,
     """Parse a stat+report capture pair and close one ledger."""
     stat = parse_perf_stat(stat_text)
     symbols = parse_perf_report(report_text)
+    report_event = parse_perf_report_event(report_text)
     return build_ledger(stat["instructions"], symbols, categories,
                         label=label, volume_bytes=volume_bytes,
-                        tol_pct=tol_pct, threshold_pct=threshold_pct)
+                        tol_pct=tol_pct, threshold_pct=threshold_pct,
+                        stat_event=stat.get("instructions_event"),
+                        report_event=report_event)
 
 
 def insn_from_files(a_stat, a_report, categories, *, a_label=None,
@@ -377,14 +478,16 @@ def insn_from_files(a_stat, a_report, categories, *, a_label=None,
     # Validate the B pairing BEFORE any file IO so a half-specified comparison
     # fails on the args, not deep inside a read.
     if (b_stat or b_report) and not (b_stat and b_report):
-        raise InstrumentError(
+        raise InvariantViolation(
+            "INSN-HALF-PAIR",
             "the B binary needs BOTH --b-stat and --b-report (a stat "
             "without a report, or vice versa, cannot close a ledger).")
 
     def _read(path, kind):
         import os
         if not os.path.exists(path):
-            raise InstrumentError(f"no such {kind} capture: {path}")
+            raise InvariantViolation(
+                "INSN-NO-CAPTURE", f"no such {kind} capture: {path}")
         with open(path) as f:
             return f.read()
 
