@@ -15,12 +15,12 @@ from . import stamp as _stamp
 
 
 def run_all(write_stamp=True):
-    from . import (test_adapter, test_decide, test_insn, test_invariants,
-                   test_locate, test_total)
+    from . import (test_adapter, test_decide, test_insn, test_insn_calib,
+                   test_invariants, test_locate, test_total)
     total_fail = 0
     counts = {}
     for mod in (test_total, test_decide, test_invariants, test_adapter,
-                test_locate, test_insn):
+                test_locate, test_insn, test_insn_calib):
         rc, n_checks, n_fail = mod.run()
         counts[mod.__name__.rsplit(".", 1)[-1]] = {"checks": n_checks,
                                                    "failures": n_fail}

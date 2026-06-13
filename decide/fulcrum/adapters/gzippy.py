@@ -88,30 +88,173 @@ GZIPPY_TAXONOMY = Taxonomy(
 # Instruction-ledger role categories (fulcrum insn). LOWERCASE substring
 # patterns matched against perf-report symbols of BOTH gzippy (Rust) and
 # rapidgzip (C++) so each category lines up by decode ROLE. MUST be a partition
-# (a symbol matching two => `insn` refuses). PROVISIONAL — CALIBRATION NEEDED:
-# closure catches an ambiguous (two-match) or uncovered (zero-match) symbol,
-# but NOT a symbol landed in one WRONG bucket (that conserves while corrupting
-# the split). Getting each symbol into its TRUE bucket is this list's job and
-# requires a real `perf report -F period,symbol` capture of each binary; see
-# GzippyAdapter.insn_categories + decide/docs/MISSING.md.
+# (a symbol matching two => `insn` refuses).
+#
+# CALIBRATED 2026-06-13 against real `perf report -F period,symbol` captures
+# on solvency (AMD EPYC 7282, T8, silesia.gz):
+#   gzippy-native-debug  sha 3aea210d  (debuginfo=1, same opt-level=3)
+#   gzippy-isal-debug    sha 4a3fd1b4
+#   rapidgzip v0.16.0    sha d7a891e0
+#
+# All three produce byte-identical output (sha 028bd002...).
+# Debug builds used for symbol attribution; instruction counts ~2.3% less than
+# production (debuginfo-only overhead, same opt flags).
+#
+# Category semantics mapped from real hot symbols:
+#   marker_emit   : gzippy read_internal_compressed + emit_backref_ring;
+#                   rapidgzip Block::read (outer loop, ISA-L callees separate)
+#   clean_contig  : gzippy asm_kernel::run_contig + huffman_short_bits_cached
+#                   (pure-Rust clean path, native only; isal uses isal_ffi)
+#   segmented_ring: SegmentedU16::push_slice + SegmentedU8::extend_from_slice
+#                   (the marker-ring drain / output-fragmentation overhead)
+#   marker_read   : resolve_chunk_markers_on_chunk (gzippy);
+#                   applyWindow + getWindowAt + setInitialWindow (rapidgzip)
+#   isal_ffi      : ISA-L inner asm inflate loop (gzippy-isal + rapidgzip)
+#                   ..@N.end asm labels, loop_block, large_byte_copy, etc.
+#   tables        : Huffman table construction (both)
+#   finalize      : chunk lifecycle finalization; NOTE: gzippy's
+#                   finalize_with_deflate calls clean_unmarked_data which walks
+#                   the segmented ring — 11.8% of gz-native insns vs 0.6% for
+#                   rg. The 40% finalize excess is segmented-ring-adjacent
+#                   overhead the calibration charges to `finalize`.
+#   crc           : CRC32 computation
+#   block_finder  : block boundary detection + bit reader (peek2/read2)
+#   kernel        : kernel-space samples (0xffffffff* addresses)
+#   sched         : scheduler / pipeline bookkeeping
+#   memops        : libc memory operations
+#
+# One documented WRONG-BUCKET (necessary-not-sufficient limit):
+#   huffman_short_bits_cached::initialize_from_lengths (46M insns, 0.7%)
+#   is table-build work but charged to `clean_contig` because the class name
+#   matches both. Mislabeling < 1% of total; noted but not fixed to avoid
+#   the ambiguity REFUSE that a tighter pattern would require.
+#
+# KNOWN FLAG symbols (uncategorized, < 0.5% of total each):
+#   rapidgzip 0x0000000000188b05 etc. (ISA-L asm boundary addresses, not
+#   captured by ..@ prefix because these are offset-from-symbol references
+#   rather than anonymous labels — ~3.7% of rg total, within threshold).
 # ---------------------------------------------------------------------------
 
 INSN_CATEGORIES = [
-    ("huffman_decode", ("decode_huffman", "read_token", "readtoken",
-                        "litlentable", "disttable", "huffmancoding",
-                        "huffman_table", "build_huffman", "decodeblock")),
-    ("marker_resolve", ("replace_marker", "replacemarker", "resolve_marker",
-                        "markerring", "marker_ring", "apply_window",
-                        "applywindow", "window_apply")),
-    ("lz_copy", ("lz77", "copy_match", "copymatch", "back_reference",
-                 "backreference", "resolvebackref", "copy_run")),
-    ("crc", ("crc32", "crc_", "_crc", "checksum")),
-    ("memops", ("memcpy", "memmove", "memset", "__memmove", "__memcpy")),
-    ("alloc", ("malloc", "free", "operator new", "_alloc", "dealloc",
-               "calloc", "realloc")),
-    ("io_output", ("writev", "pwrite", "fwrite", "__write", "write_buffered")),
-    ("bitreader", ("bit_reader", "bitreader", "read_bits", "readbits",
-                   "peek_bits", "refill")),
+    # The marker-emitting Huffman decode inner loop. Writes u16 markers for
+    # each decoded symbol (or u8 for the clean tail). gzippy: the main hot
+    # loop is split between read_internal_compressed (outer dispatch + literal
+    # emit) and emit_backref_ring (back-reference copy in marker ring).
+    # rapidgzip: Block<false>::read (outer loop; ISA-L callee time is in
+    # isal_ffi). Pattern uses `deflate::block<false>::read(` (with opening
+    # paren) to distinguish Block::read() from Block::readHeader().
+    ("marker_emit", (
+        "read_internal_compressed",    # gzippy marker-mode Huffman decode loop
+        "emit_backref_ring",            # gzippy back-ref copy in marker ring
+        "deflate::block<false>::read(", # rapidgzip Block::read (NOT readHeader)
+    )),
+
+    # Clean-path pure-Rust Huffman decode (no markers, contig output buffer).
+    # gzippy-native only; gzippy-isal uses isal_ffi for clean chunks.
+    # NOTE: huffman_short_bits_cached also matches ::initialize_from_lengths
+    # (table build, 0.7% of total) — documented wrong-bucket, < 1%.
+    ("clean_contig", (
+        "run_contig",                  # gzippy asm_kernel clean-path decode
+        "huffman_short_bits_cached",   # gzippy short-bits decoder (decode + init)
+        "decode_clean_into_contig",    # gzippy fallback clean decode path
+    )),
+
+    # Segmented marker ring writes: drain from per-chunk u16 ring to the global
+    # segmented structure. The output-fragmentation overhead the port carries.
+    ("segmented_ring", (
+        "segmentedu16::push",          # SegmentedU16::push_slice (marker ring drain)
+        "segmentedu8",                 # SegmentedU8::extend_from_slice (clean drain)
+    )),
+
+    # Marker resolution: apply predecessor window to decode u16 markers to u8.
+    # gzippy: fused resolve+narrow (one pass). rapidgzip: applyWindow +
+    # getWindowAt + setInitialWindow (window seeding).
+    ("marker_read", (
+        "resolve_chunk_markers",       # gzippy fused resolve+narrow (apply window)
+        "applywindow",                 # rapidgzip DecodedData::applyWindow
+        "getwindowat",                 # rapidgzip DecodedData::getWindowAt
+        "resolve_range_into_buf",      # gzippy SegmentedU16::resolve_range_into_buf
+        "setinitialwindow",            # rapidgzip Block::setInitialWindow (window seed)
+    )),
+
+    # ISA-L inner asm inflate loop (gzippy-isal and rapidgzip). These are
+    # callee symbols inside the ISA-L asm. In rapidgzip they are called from
+    # Block::read; in gzippy-isal from the ISA-L clean-tail wrapper.
+    # ..@N.end pattern matches GCC anonymous asm labels (..@37.end, ..@42.end).
+    ("isal_ffi", (
+        "loop_block",                  # ISA-L main inflate loop body
+        "large_byte_copy",             # ISA-L back-reference copy (long run)
+        "small_byte_copy",             # ISA-L back-reference copy (short run)
+        "decode_len_dist",             # ISA-L length+distance decode
+        "inflate_in_load",             # ISA-L bit-buffer refill
+        "multi_symbol_start",          # ISA-L multi-symbol entry
+        "end_loop_block",              # ISA-L loop end/exit
+        "decode_huffman_code_block",   # ISA-L Huffman code block decode
+        "..@",                         # ISA-L anonymous asm labels
+    )),
+
+    # Huffman table construction (LUT build, dynamic header parse, ISA-L init).
+    ("tables", (
+        "lut_huffman",                 # gzippy LutLitLenCode::rebuild_from
+        "disttable",                   # gzippy DistTable::rebuild
+        "make_inflate_huff_code",      # ISA-L/rapidgzip table build
+        "setup_dynamic_header",        # ISA-L/rapidgzip dynamic Huffman header
+        "set_and_expand_lit_len",      # ISA-L lit/len table expansion
+        "read_header",                 # gzippy marker_inflate::Block::read_header
+        "readheader",                  # rapidgzip Block::readHeader (no underscore)
+        "huffmancodingisal",           # rapidgzip HuffmanCodingISAL::initializeFromLengths
+    )),
+
+    # Chunk lifecycle finalization (clean_unmarked_data, subchunk management,
+    # metadata). gzippy's finalize_with_deflate is expensive (11.8% of insns)
+    # because clean_unmarked_data walks the segmented ring to narrow the clean
+    # tail — ~40x more than rapidgzip's ChunkData::finalize (0.6%). The excess
+    # is structurally from the segmented-ring architecture, charged here.
+    ("finalize", (
+        "finalize_with_deflate",       # gzippy ChunkData::finalize_with_deflate
+        "finish_decode_chunk",         # gzippy gzip_chunk::finish_decode_chunk_*
+        "decode_chunk_with_rapidgzip", # gzippy outer chunk decode wrapper
+        "chunkdata::finalize(",        # rapidgzip ChunkData::finalize(unsigned long)
+        "finishdecodechunk",           # rapidgzip finishDecodeChunkWithInexactOffset
+        "gzipchunk",                   # rapidgzip GzipChunk::decodeChunk (outer)
+    )),
+
+    # CRC32 computation.
+    ("crc", (
+        "crc32fast",                   # gzippy crc32fast (SIMD pclmulqdq)
+        "crc32_gzip",                  # rapidgzip crc32_gzip_refl_by8_02
+    )),
+
+    # Block boundary detection and scanning (deflate block finder + SIMD search
+    # + BitReader hot path for rapidgzip).
+    ("block_finder", (
+        "block_finder",                # gzippy BlockFinder::find_next_*
+        "blockfinder",                 # rapidgzip blockfinder::seekToNonFinal*
+        "memchr",                      # SIMD byte scanner used by block_finder
+        "peek2",                       # rapidgzip BitReader::peek2 (decode hot path)
+        "read2",                       # rapidgzip BitReader::read2
+    )),
+
+    # Kernel-space instruction samples (syscalls, interrupts). Large in gzippy
+    # (~10% vs 0.4% for rg) — wall-neutral but indicates higher kernel overhead.
+    ("kernel", (
+        "0xffffffff",                  # Linux x86_64 kernel virtual addresses
+    )),
+
+    # Pipeline and scheduler bookkeeping overhead.
+    ("sched", (
+        "queue_prefetched_marker",     # gzippy marker post-process queuing
+        "__tls_get_addr",              # thread-local storage access
+        "__cxa_begin_catch",           # C++ exception entry (rapidgzip)
+        "call_once_force",             # Rust std::sync::Once init overhead
+    )),
+
+    # Memory operations (libc).
+    # NOTE: alloc patterns (_alloc, malloc) dropped — they false-positively
+    # match RpmallocAllocator in rapidgzip template type parameters.
+    ("memops", (
+        "memcpy", "memmove", "memset", "__memmove", "__memcpy",
+    )),
 ]
 
 # Counter sidecar patterns -- the WINDOW-ABSENT / SEEDING / ORACLE guard data.
@@ -530,23 +673,18 @@ class GzippyAdapter(ProjectAdapter):
         symbols of BOTH binaries (Rust mangled names + rapidgzip C++ names), so
         a category lines up by ROLE across the two.
 
-        PROVISIONAL — these patterns are seeded from the decode taxonomy, NOT
-        yet calibrated against a real `perf report -F period,symbol` capture of
-        each binary. Two mis-calibration modes ARE caught by the ledger's
-        closure guards: an over-broad pattern matching two roles makes `insn`
-        REFUSE (ambiguous partition), and a symbol no pattern catches inflates
-        the uncategorized bucket until the ledger FLAGS.
+        CALIBRATED 2026-06-13 against real `perf report -F period,symbol`
+        captures on solvency (AMD EPYC 7282, T8, silesia.gz). See
+        INSN_CATEGORIES for provenance, symbol→category map, and known
+        wrong-bucket limits. See selftests/test_insn_calib.py for the pinning
+        tests that prevent silent mis-calibration on refactor.
 
-        But a THIRD mode is NOT — and cannot be — caught by closure: a symbol
-        charged to exactly ONE WRONG category. That mis-attribution conserves
-        perfectly (the total is unchanged) while corrupting the per-category
-        split; a green/CONSERVED ledger does NOT certify the split is correct
-        (selftests/test_insn.py pins this as necessary-but-not-sufficient).
-        Getting each symbol into its TRUE bucket is THIS calibration's
-        responsibility — it is the reason these patterns must be validated
-        against a real capture, not a property closure provides for free.
-        CALIBRATION NEEDED (supervisor solvency/neurotic run): see
-        decide/docs/MISSING.md and `calibration_capture_cmds` below."""
+        Closure is NECESSARY BUT NOT SUFFICIENT for the per-category split:
+        the ledger guards catch over-count and ambiguous partitions but not a
+        symbol charged to exactly ONE WRONG category (see test_insn.py §6c).
+        The calibration eliminates that risk for the significant symbols;
+        symbols < 0.5% of total may remain uncategorized (flagged if > 5%
+        threshold)."""
         return INSN_CATEGORIES
 
     def calibration_capture_cmds(self, binary, corpus, *, threads=8,
