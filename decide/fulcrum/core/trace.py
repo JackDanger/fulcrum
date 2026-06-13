@@ -95,8 +95,25 @@ class Taxonomy:
 
 def load_events(path):
     """Load a Chrome-trace JSON array, tolerating a trailing comma / no close ]."""
-    with open(path) as f:
-        s = f.read().strip()
+    if not os.path.exists(path):
+        raise InstrumentError(
+            f"no such trace file: {path} -- nothing to analyze. Pass the path "
+            f"to a Chrome-trace JSON capture (e.g. <artdir>/cell_*/trace.json).")
+    try:
+        with open(path) as f:
+            s = f.read().strip()
+    except OSError as e:
+        raise InstrumentError(f"cannot read trace file {path}: {e}")
+    try:
+        return _parse_trace_text(s, path)
+    except json.JSONDecodeError as e:
+        raise InstrumentError(
+            f"malformed trace JSON in {path}: {e}. Expected a Chrome-trace "
+            f"array of B/E span events (the streamed, possibly-unclosed array "
+            f"the probe emits).")
+
+
+def _parse_trace_text(s, path):
     if not s:
         raise InstrumentError(
             f"EMPTY trace file: {path} -- the capture produced no events (the "
