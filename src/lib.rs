@@ -43,6 +43,7 @@ pub mod coz_jsonl;
 pub mod critpath;
 pub mod decompose;
 pub mod estimate;
+pub mod finding;
 pub mod flow;
 pub mod mech;
 pub mod mech_arch;

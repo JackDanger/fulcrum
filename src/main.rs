@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, rg_verbose, scaling,
-    schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    finding, flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, rg_verbose,
+    scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -54,6 +54,7 @@ USAGE:\n\
               --native <path> --isal <path> --rg <path>\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
+  fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
@@ -2306,6 +2307,204 @@ fn cmd_compare(args: &[String]) -> ExitCode {
 /// Exit nonzero if the witness contradicts the declared features (e.g. a
 /// pure-rust-inflate build that still links isal_inflate) or is UNKNOWN — so a
 /// CI/harness step cannot silently measure the wrong decoder.
+/// `fulcrum finding` — the FINDING STORE: the single citable surface for
+/// conclusions. Subcommands: add | cite | consult | list.
+fn cmd_finding(args: &[String]) -> ExitCode {
+    use finding::{
+        CitationRequest, CiteOutcome, EvidenceTier, Finding, GitSrcOracle, Scope, SrcChangeOracle,
+        Store, Strength, Threads, Verdict,
+    };
+
+    let finding_usage = || {
+        eprintln!(
+            "fulcrum finding — the citable finding store (supersedes banked prose)\n\
+\n\
+USAGE:\n\
+  fulcrum finding add --region R --claim \"...\" --commit SHA \\\n\
+        --corpus C --arch A --threads N --sink S --n N --spread F \\\n\
+        --tier <perturbation|oracle|frozen-matrix|self-validated-tool|source-read|whole-program-attribution> \\\n\
+        --verdict <located|refuted|win|tie|loss|survives|...> --value V --dim <ms|ratio|x|pct> \\\n\
+        --method \"...\" [--date YYYY-MM-DD] [--repo PATH] [--store PATH]\n\
+  fulcrum finding cite <cell_id> --as <strong|hypothesis|weak> \\\n\
+        [--for-corpus C] [--for-arch A] [--for-threads N] [--repo PATH] [--store PATH]\n\
+  fulcrum finding consult --region R [--for-corpus C] [--for-arch A] [--for-threads N] \\\n\
+        [--repo PATH] [--store PATH]\n\
+  fulcrum finding list [--repo PATH] [--store PATH]\n\
+\n\
+The store is an append-only JSONL ledger ($FULCRUM_FINDING_STORE or\n\
+<repo>/.fulcrum/findings.jsonl). `cite` REFUSES a stale/out-of-scope/\n\
+under-tiered citation; `consult` is the consult-FIRST surface to query before\n\
+any new hypothesis work. --repo is the PROJECT repo whose src/ decay is\n\
+checked (default: current dir)."
+        );
+    };
+
+    let Some(action) = args.first().map(|s| s.as_str()) else {
+        finding_usage();
+        return ExitCode::from(2);
+    };
+    let rest = &args[1..];
+
+    let repo = std::path::PathBuf::from(flag(rest, "--repo").unwrap_or("."));
+    let store_path = flag(rest, "--store")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Store::default_path(&repo));
+    let oracle = GitSrcOracle::new(repo.clone());
+
+    let mut store = match Store::load(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fulcrum finding: cannot load store {}: {e}", store_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match action {
+        "add" => {
+            let req = |name: &str| flag(rest, name);
+            let (Some(region), Some(claim), Some(commit)) =
+                (req("--region"), req("--claim"), req("--commit"))
+            else {
+                eprintln!("finding add: --region, --claim, --commit are required");
+                finding_usage();
+                return ExitCode::from(2);
+            };
+            let Some(tier) = req("--tier").and_then(EvidenceTier::parse) else {
+                eprintln!("finding add: --tier missing or unknown");
+                return ExitCode::from(2);
+            };
+            let scope = Scope::new(
+                req("--corpus").unwrap_or("*"),
+                req("--arch").unwrap_or("*"),
+                Threads::parse(req("--threads").unwrap_or("*")),
+            );
+            let parse_f = |n: &str, d: f64| req(n).and_then(|s| s.parse::<f64>().ok()).unwrap_or(d);
+            let parse_u = |n: &str, d: usize| req(n).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+            let f = Finding::new(
+                region,
+                claim,
+                commit,
+                scope,
+                req("--sink").unwrap_or("regular-file"),
+                parse_u("--n", 0),
+                parse_f("--spread", 0.0),
+                tier,
+                Verdict::parse(req("--verdict").unwrap_or("other")),
+                parse_f("--value", 0.0),
+                req("--dim").unwrap_or(""),
+                req("--method").unwrap_or(""),
+                req("--date").unwrap_or(""),
+            );
+            let id = f.cell_id.clone();
+            match store.append(&store_path, f) {
+                Ok(true) => {
+                    println!("ADDED {id}  → {}", store_path.display());
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!("EXISTS {id} (same fingerprint already in the store — no-op)");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("finding add: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "cite" => {
+            let pos = positional(rest);
+            let Some(cell_id) = pos.first() else {
+                eprintln!("finding cite: needs <cell_id>");
+                return ExitCode::from(2);
+            };
+            let Some(as_strength) = flag(rest, "--as").and_then(Strength::parse) else {
+                eprintln!("finding cite: --as <strong|hypothesis|weak> required");
+                return ExitCode::from(2);
+            };
+            let claim_scope = Scope::new(
+                flag(rest, "--for-corpus").unwrap_or("*"),
+                flag(rest, "--for-arch").unwrap_or("*"),
+                Threads::parse(flag(rest, "--for-threads").unwrap_or("*")),
+            );
+            let req = CitationRequest {
+                as_strength,
+                claim_scope: claim_scope.clone(),
+            };
+            match store.cite(cell_id, &req, &oracle) {
+                CiteOutcome::Granted {
+                    finding,
+                    freshness,
+                    granted_as,
+                } => {
+                    println!(
+                        "GRANTED as {} [{}] (freshness {})\n  {}\n  claim: {}",
+                        granted_as.label(),
+                        finding.evidence_tier.label(),
+                        freshness.label(),
+                        finding.summary(),
+                        finding.claim
+                    );
+                    ExitCode::SUCCESS
+                }
+                CiteOutcome::Refused { cell_id, reason } => {
+                    println!("{}  (cell {cell_id})", reason.explain());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "consult" => {
+            let region = flag(rest, "--region").unwrap_or("");
+            let scope_filter = if flag(rest, "--for-corpus").is_some()
+                || flag(rest, "--for-arch").is_some()
+                || flag(rest, "--for-threads").is_some()
+            {
+                Some(Scope::new(
+                    flag(rest, "--for-corpus").unwrap_or("*"),
+                    flag(rest, "--for-arch").unwrap_or("*"),
+                    Threads::parse(flag(rest, "--for-threads").unwrap_or("*")),
+                ))
+            } else {
+                None
+            };
+            let hits = store.consult(region, scope_filter.as_ref(), &oracle);
+            if hits.is_empty() {
+                println!(
+                    "CONSULT: nothing known about region '{region}' in {} \
+                     — clear to form a fresh hypothesis (no prior ledger entry to re-derive).",
+                    store_path.display()
+                );
+            } else {
+                println!(
+                    "CONSULT region '{region}': {} known finding(s) (strongest+freshest first) — \
+                     READ THESE before re-deriving in prose:",
+                    hits.len()
+                );
+                for h in &hits {
+                    println!("  {}", h.render());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        "list" => {
+            if store.findings.is_empty() {
+                println!("(store empty: {})", store_path.display());
+            } else {
+                println!("{} finding(s) in {}:", store.findings.len(), store_path.display());
+                for f in &store.findings {
+                    let fresh = oracle.src_changed_since(&f.commit_sha);
+                    println!("  [{}] {}", fresh.label(), f.summary());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("finding: unknown action '{other}'");
+            finding_usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn cmd_provenance(args: &[String]) -> ExitCode {
     let pos = positional(args);
     let Some(bin) = pos.first() else {
@@ -2666,6 +2865,7 @@ fn main() -> ExitCode {
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
         "sixstage" => cmd_sixstage(rest),
+        "finding" => cmd_finding(rest),
         "score" => {
             match score::args_from_cli(rest) {
                 Ok(a) => {
