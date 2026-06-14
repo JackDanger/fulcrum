@@ -438,7 +438,8 @@ def run():
                 "CONSERVATION-OR-NO-LOCATE", "FINGERPRINT-OR-NO-COMPARE",
                 "INSN-CLOSURE-OR-NO-LEDGER",
                 "TMA-CLOSURE-OR-NO-BREAKDOWN", "PROVENANCE-OR-VOID",
-                "QUANTITY-DIMENSION-OR-REFUSE"}
+                "QUANTITY-DIMENSION-OR-REFUSE",
+                "PERTURBATION-OR-NO-LEVER"}
     # EXACT set equality (not subset): adding an invariant without listing it
     # here FAILS (forces a firing-proof test alongside it), and removing one
     # FAILS too (a charter rule cannot silently disappear).

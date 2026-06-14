@@ -149,6 +149,47 @@ INVARIANTS = (
                     "selftests/test_locate.py",
     ),
     Invariant(
+        name="PERTURBATION-OR-NO-LEVER",
+        rule="The word 'lever' / 'fund the fix' is a GATED OUTPUT of a causal "
+             "perturbation, never a sentence emitted from an attribution. A "
+             "region R is promoted to evidence_tier=perturbation/LEVER ONLY if "
+             "its pre-registered slow-injection (busy-spin at t={10,20,30}% of "
+             "R's own measured self-time) produces a MONOTONIC + PROPORTIONAL + "
+             "SIGNIFICANT (|Δwall| > 2× inter-run spread, N≥9) wall response "
+             "AND a frequency-neutral SLEEP control reproduces it (a busy-spin "
+             "alone can depress all-core turbo and inflate the delta — the "
+             "spin-only response is an ARTIFACT, not a lever). A FLAT response "
+             "in both arms is the equally-STRONG SLACK verdict (R is provably "
+             "off the critical path). A removal-oracle measures the speed-up "
+             "CEILING only — a bound is NOT a carrier, so a CEILING-ONLY cell "
+             "(oracle without a confirming slow-inject) can NEVER license a "
+             "build (slow-down slope != speed-up ceiling). A control baseline "
+             "that swings > spread between A/A runs VOIDs the cell. The CELL "
+             "exposes the claim through PerturbCell.lever_sentence(), which "
+             "RAISES LeverClaimRefused for any non-(perturbation/LEVER) cell — "
+             "the structural chokepoint that makes an attribution-voiced lever "
+             "impossible to type.",
+        scar="~12 of 17 false conclusions in one campaign were 'X is THE lever' "
+             "voiced from a span/share/counter/annotate BEFORE any region "
+             "removal or slow-injection confirmed the wall responds: "
+             "fix-clean-path-overhead (a function-annotate 1.10x clean share — "
+             "the clean path was SLACK at the wall), build-the-window-fix (an "
+             "oracle CEILING read as a build mandate before the carrier was "
+             "isolated), ring→drain 'THE ACTUAL LEVER' (a code-read), the "
+             "B-width flip-rate counter, the one-tax-explains-both phantom. "
+             "Each conserved as a story while the wall never moved.",
+        enforcement="perturb.analyze_sweep verdict gate (LEVER requires busy "
+                    "RESPONDS ∧ sleep RESPONDS; SLACK both FLAT; ARTIFACT "
+                    "busy-RESPONDS ∧ sleep-FLAT; CEILING-ONLY oracle-only; VOID "
+                    "on baseline swing / non-monotone); perturb.PerturbCell."
+                    "lever_sentence raises LeverClaimRefused; "
+                    "report.print_perturb routes ALL prose through the gated "
+                    "methods; selftests/test_perturb.py (KNOWN lever / KNOWN "
+                    "slack / A/A / spin-artifact / unstable-baseline / "
+                    "non-monotone / underpowered / ceiling-only + the refusal "
+                    "fires)",
+    ),
+    Invariant(
         name="FINGERPRINT-OR-NO-COMPARE",
         rule="Every stored number carries {sink, mask, freeze, binary sha, "
              "corpus sha, protocol version, comparator version, host "

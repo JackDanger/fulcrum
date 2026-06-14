@@ -227,6 +227,72 @@ is deliberately NOT implemented in v1):
 > sleep-primary, frequency-witnessed
 
 
+## `fulcrum perturb` — the causal perturbation harness (PERTURBATION-OR-NO-LEVER)
+
+`fulcrum perturb <sweep-dir> [--feature F] [--allow-thaw]` consumes a
+pre-registered slow-injection **sweep** and converts a HYPOTHESIS into a
+deterministic STRONG verdict. It is the keystone gate: the word "lever" /
+"fund the fix" is reachable ONLY through a `perturbation/LEVER` cell.
+
+**The sweep-artifact layout (what the project's runner produces).**
+
+```
+<sweep-dir>/
+  meta.txt              # key=value, required:
+                        #   region=<name>            human region id
+                        #   region_self_ms=<float>   region's OWN measured
+                        #                             self-time — the injection
+                        #                             denominator (t% of THIS)
+                        #   perturb_cmd=<str>         the exact pre-registered
+                        #                             sweep command (cited in
+                        #                             every refusal)
+                        #   sha_ok=0|1               SHA-OR-VOID: a perturbed
+                        #                             arm with wrong bytes VOIDs
+                        #   cell_id=<str>            (optional) CELL id
+                        #   freeze_state=frozen|...   FROZEN-OR-LABELED gate
+                        #   quiet_state=quiet|...
+  baseline.txt          # t=0 wall samples (decimal SECONDS, ws-separated,
+                        #   interleaved capture, warm-up dropped) — N>=9
+  baseline_recheck.txt  # a SECOND independent baseline block (A/A): a swing
+                        #   > spread between the two VOIDs the cell
+  spin/t10.txt          # BUSY-SPIN injector, +10% of region_self_ms, wall s
+  spin/t20.txt          #   +20%
+  spin/t30.txt          #   +30%
+  sleep/t10.txt         # SLEEP injector (yields the core) — the frequency-
+  sleep/t20.txt         #   neutral CONTROL; same three levels
+  sleep/t30.txt
+  oracle_removed.txt    # optional — region-elided wall samples (the speed-up
+                        #   CEILING; a bound, NOT the promotion criterion)
+```
+
+Sample-file format is identical to the wall-sample convention above (decimal
+seconds, whitespace/newline separated, interleaved, warm-up dropped).
+
+**The verdict (deterministic).** Per injector arm, the harness fits the
+dose-response delta(t) = min(wall@t) - min(wall@0) against injected(t) =
+(t/100)·region_self_ms:
+
+- **LEVER** (`evidence_tier=perturbation`, STRONG): the BUSY arm is MONOTONIC +
+  PROPORTIONAL (interior points within 2×spread of the slope·injected line) +
+  SIGNIFICANT (|Δ@30%| > 2× inter-run spread, N≥9) AND the SLEEP control
+  reproduces it. The only verdict that unlocks "fund the fix".
+- **SLACK** (`evidence_tier=perturbation`, STRONG): both arms FLAT (|Δ| within
+  the 2×spread band). R is provably off the critical path.
+- **ARTIFACT** (HYPOTHESIS): BUSY responds, SLEEP flat — a busy-spin turbo
+  artifact, not a lever (rule 2).
+- **CEILING-ONLY** (`evidence_tier=oracle`, STRONG bound): only the removal
+  oracle was supplied. A ceiling is NOT a carrier — `may_claim_lever=False`.
+- **INCONCLUSIVE** (HYPOTHESIS): underpowered (N<9 / a missing level).
+- **VOID** (REFUSED): A/A baseline swing > spread, sha mismatch, or a
+  significant-but-non-monotone busy arm (instrument inconsistency).
+
+**The refusal API.** `PerturbCell.lever_sentence()` returns the lever claim ONLY
+for a `perturbation/LEVER` cell and RAISES `LeverClaimRefused`
+(PERTURBATION-OR-NO-LEVER) otherwise, naming the perturbation that would test
+the claim. `report.print_perturb` routes ALL prose through the cell's gated
+methods (`lever_sentence` / `hypothesis_sentence`), so the renderer physically
+cannot emit "lever" for a non-LEVER row.
+
 ## `fulcrum insn` — the closed instruction ledger (INSN-CLOSURE-OR-NO-LEDGER)
 
 ```

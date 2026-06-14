@@ -50,6 +50,16 @@ gzippy ships one):
       a function-share promoted to a wall claim, a volume claim with no
       validated counter. --algebra prints the legal/illegal table; --demo
       replays the worked #11 refutation.
+  perturb <sweep-dir> [--threshold PCT] [--feature F] [--allow-thaw]
+      The causal perturbation harness (PERTURBATION-OR-NO-LEVER): consume a
+      pre-registered slow-inject sweep (busy-spin @ t={10,20,30}% of the
+      region's own self-time + a frequency-neutral SLEEP control + a removal
+      ORACLE) and convert a HYPOTHESIS into a STRONG verdict — LEVER (the ONLY
+      verdict that licenses 'fund the fix'), SLACK (provably off the critical
+      path), ARTIFACT (spin-only response = frequency phantom), CEILING-ONLY
+      (oracle bound, not a carrier), INCONCLUSIVE (N<9), or VOID (baseline
+      swing / non-monotone). The word 'lever' is reachable ONLY through a
+      perturbation/LEVER cell.
   selftest
       Run every suite (trace engine, decision engine, invariant enforcement);
       writes the SELF-TEST-OR-NO-TRUST stamp on success.
@@ -420,6 +430,64 @@ def quantity_main(argv):
     print(q_mod.render_legal_algebra())
 
 
+def perturb_main(argv):
+    """`fulcrum perturb <sweep-dir> [--threshold PCT] [--feature F]
+    [--allow-thaw] [--selftest]`.
+
+    The causal perturbation harness (PERTURBATION-OR-NO-LEVER). Consumes a
+    pre-registered slow-inject sweep (busy @ t={10,20,30}% + sleep control +
+    removal oracle, see decide/docs/SCHEMA.md) and converts a HYPOTHESIS into a
+    STRONG verdict: LEVER (only this licenses 'fund the fix'), SLACK, ARTIFACT
+    (spin-phantom), CEILING-ONLY (oracle bound, not a carrier), INCONCLUSIVE, or
+    VOID. The word 'lever' is reachable ONLY through a perturbation/LEVER cell."""
+    from .core import perturb as pmod
+    from .core import report as report_mod
+
+    if "--selftest" in argv:
+        from .selftests import test_perturb
+        rc, _, _ = test_perturb.run()
+        sys.exit(rc)
+
+    allow_thaw = "--allow-thaw" in argv
+    feature = None
+    dirs = []
+    i = 0
+    known = "--threshold --feature --allow-thaw [--selftest]"
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--allow-thaw", "--selftest"):
+            i += 1; continue
+        if a == "--feature":
+            feature = _flag_value(argv, i, "perturb"); i += 2; continue
+        if a == "--threshold":
+            _flag_value(argv, i, "perturb"); i += 2; continue  # reserved
+        if a.startswith("--"):
+            _die_unknown_flag("perturb", a, known)
+        dirs.append(a); i += 1
+    if not dirs:
+        print("perturb: a sweep-artifact dir is required.\n"
+              f"      usage: fulcrum perturb <sweep-dir> {known}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    _trust_banner()
+    try:
+        sweep, meta = pmod.load_sweep(dirs[0])
+    except tr.InstrumentError as e:
+        print(f"\n[INSTRUMENT REFUSED] {e}")
+        sys.exit(2)
+    frozen = pmod.frozen_ok(meta)
+    if not frozen and not allow_thaw:
+        print("\n[INSTRUMENT REFUSED] perturb sweep NOT frozen/quiet "
+              f"(freeze_state={meta.get('freeze_state')}, "
+              f"quiet_state={meta.get('quiet_state')}) — REFUSING to verdict "
+              "wall numbers. Pass --allow-thaw to label instead. "
+              "[FROZEN-OR-LABELED]")
+        sys.exit(2)
+    cell = pmod.analyze_sweep(sweep)
+    report_mod.print_perturb(cell, frozen=frozen)
+
+
 def ledger_main(rest):
     """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
     verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
@@ -551,6 +619,8 @@ def main(argv=None):
         cycles_main(rest)
     elif cmd == "quantity":
         quantity_main(rest)
+    elif cmd == "perturb":
+        perturb_main(rest)
     elif cmd == "selftest":
         from .selftests import run_all
         sys.exit(run_all())
