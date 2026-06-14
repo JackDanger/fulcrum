@@ -285,6 +285,18 @@ fn window_present_by_startbit(events: &[Event]) -> BTreeMap<u64, bool> {
     m
 }
 
+/// True for span names that are INLINE DECODE work when seen on the consumer
+/// thread (the T1 case, where there are no separate worker threads). These are
+/// the same-mechanism counterpart of the `productive-decode` WAIT at T>1.
+fn is_inline_decode_name(name: &str) -> bool {
+    name.starts_with("worker.")
+        || name.contains("inflate")
+        || name.contains("decode")
+        || name.contains("bootstrap")
+        || name.contains("block_body")
+        || name.contains("block_header")
+}
+
 fn arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
     match args.get(key) {
         Some(serde_json::Value::Number(n)) => n.as_u64(),
@@ -398,6 +410,74 @@ fn classify_wait(ctx: &WaitCtx, start_bit: u64, ts_start: f64, ts_end: f64) -> &
     "productive-decode"
 }
 
+/// Resolve the awaited start_bit (the universal join key) for a wait span's
+/// args. Prefers an explicit bit offset (`awaited_offset` / `offset` /
+/// `start_bit`), falling back to a real (non-sentinel) chunk_id mapped through
+/// the decode index. `None` ⇒ the wait carries no join key (surfaced as
+/// `wait-unclassified`; the precise missing arg is named in the gzippy-side
+/// emission addition).
+fn resolve_wait_startbit(args: &serde_json::Value, decodes: &DecodeIndex) -> Option<u64> {
+    arg_u64(args, "awaited_offset")
+        .or_else(|| arg_u64(args, "offset"))
+        .or_else(|| arg_u64(args, "start_bit"))
+        .or_else(|| {
+            arg_u64(args, "chunk_id")
+                .filter(|c| *c != SENTINEL_CHUNK_ID)
+                .and_then(|c| decodes.chunkid_to_startbit.get(&c).copied())
+        })
+}
+
+/// Subdivide the consumer WAIT total into mechanism buckets by EXCLUSIVE
+/// self-time, via a B/E stack over the consumer thread. Each closing WAIT span
+/// contributes its self-time (inclusive − child-inclusive) to its mechanism, so
+/// nested umbrella+leaf waits are never double-counted and Σ(buckets) equals the
+/// consumer WAIT class total. Returns mechanism → µs.
+fn subdivide_wait_excl(
+    events: &[Event],
+    consumer: (u64, u64),
+    cfg: &Config,
+    ctx: &WaitCtx,
+    decodes: &DecodeIndex,
+) -> BTreeMap<&'static str, f64> {
+    let mut out: BTreeMap<&'static str, f64> = BTreeMap::new();
+    // Frame: (name, ts_start, args, accumulated child-inclusive).
+    let mut stack: Vec<(String, f64, serde_json::Value, f64)> = Vec::new();
+    let is_wait = |name: &str| {
+        name.starts_with("wait.")
+            || name.ends_with(".wait")
+            || name.contains("rx_recv")
+            || name.ends_with(".recv")
+            || name.ends_with("_recv_block")
+            || cfg.consumer.wait.matches(name)
+    };
+    for e in events {
+        if (e.pid, e.tid) != consumer {
+            continue;
+        }
+        match e.ph.as_str() {
+            "B" => stack.push((e.name.clone(), e.ts, e.args.clone(), 0.0)),
+            "E" => {
+                if let Some((name, ts0, args, child_busy)) = stack.pop() {
+                    let dur = e.ts - ts0;
+                    let selfd = (dur - child_busy).max(0.0);
+                    if let Some(parent) = stack.last_mut() {
+                        parent.3 += dur;
+                    }
+                    if is_wait(&name) {
+                        let bucket = match resolve_wait_startbit(&args, decodes) {
+                            Some(sb) => classify_wait(ctx, sb, ts0, e.ts),
+                            None => "wait-unclassified",
+                        };
+                        *out.entry(bucket).or_default() += selfd;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Partition one trace's wall into the bucket set. `t_override` (from the
 /// `--at T:` spec) wins over the trace-detected parallelization.
 pub fn partition(events: &[Event], cfg: &Config, t_override: Option<u64>) -> WallPartition {
@@ -413,7 +493,26 @@ pub fn partition(events: &[Event], cfg: &Config, t_override: Option<u64>) -> Wal
     let consumer_serial =
         *cr.by_class.get("COMPUTE").unwrap_or(&0.0) + *cr.by_class.get("OUTPUT").unwrap_or(&0.0);
     let consumer_idle = *cr.by_class.get("IDLE").unwrap_or(&0.0);
-    let unknown = *cr.by_class.get("UNKNOWN").unwrap_or(&0.0);
+
+    // At T1 the decode runs INLINE on the consumer thread, so its self-time is
+    // classified UNKNOWN (its span names are `worker.*`, not `consumer.*`). At
+    // T>1 the SAME physical decode work appears as a `productive-decode` WAIT
+    // (the consumer blocks on a worker). To keep the decode MECHANISM named
+    // consistently across thread counts — so the per-bucket scaling comparison
+    // is apples-to-apples — fold consumer-thread inline-decode self-time into
+    // `productive-decode`. Everything else UNKNOWN stays surfaced.
+    let mut inline_decode = 0.0;
+    let mut unknown = 0.0;
+    for s in &cr.spans {
+        if s.class != consumer::Class::Unknown {
+            continue;
+        }
+        if is_inline_decode_name(&s.name) {
+            inline_decode += s.self_us;
+        } else {
+            unknown += s.self_us;
+        }
+    }
 
     // Subdivide WAIT into mechanisms. We classify the consumer thread's raw WAIT
     // spans, accumulate their durations per mechanism, then PRO-RATE the
@@ -432,50 +531,27 @@ pub fn partition(events: &[Event], cfg: &Config, t_override: Option<u64>) -> Wal
         t,
     };
 
-    let mut mech_dur: BTreeMap<&'static str, f64> = BTreeMap::new();
-    let mut total_wait_dur = 0.0;
-    for s in &spans {
-        if (s.pid, s.tid) != cr.consumer {
-            continue;
-        }
-        if !s.is_wait() && !cfg.consumer.wait.matches(&s.name) {
-            continue;
-        }
-        // Resolve the awaited start_bit (the universal join key). Prefer an
-        // explicit bit offset (`awaited_offset` / `offset` / `start_bit`); fall
-        // back to a real chunk_id mapped through the decode index. A wait that
-        // carries NO join key (e.g. block_finder_get / try_take_prefetched as
-        // emitted today) is `wait-unclassified` — surfaced, and the precise
-        // missing arg is named in the gzippy-side emission addition.
-        let start_bit = s
-            .arg_u64("awaited_offset")
-            .or_else(|| s.arg_u64("offset"))
-            .or_else(|| s.arg_u64("start_bit"))
-            .or_else(|| {
-                s.arg_u64("chunk_id")
-                    .filter(|c| *c != SENTINEL_CHUNK_ID)
-                    .and_then(|c| decodes.chunkid_to_startbit.get(&c).copied())
-            });
-        let bucket = match start_bit {
-            Some(sb) => classify_wait(&ctx, sb, s.ts_start, s.ts_end),
-            None => "wait-unclassified",
-        };
-        *mech_dur.entry(bucket).or_default() += s.dur;
-        total_wait_dur += s.dur;
-    }
+    // Subdivide the consumer WAIT total into mechanisms by EXCLUSIVE self-time
+    // (a B/E stack over the consumer thread, mirroring consumer.rs). Exclusive
+    // self-time is essential: a wait UMBRELLA (e.g. `consumer.try_take_prefetched`)
+    // wraps the actual blocking receive (`ttp.rx_recv_block`) for the same
+    // duration, so a raw-INCLUSIVE sum double-counts them and an UN-keyed
+    // umbrella steals share from its keyed child. With exclusive self-time the
+    // umbrella contributes ~0 and the leaf receive (which carries the
+    // `awaited_offset` join key) gets the time. Σ(mechanisms) == WAIT total by
+    // construction (every wait span counted once at its self-time), so the whole
+    // partition still reconciles to the wall.
+    let mech_excl = subdivide_wait_excl(events, cr.consumer, cfg, &ctx, &decodes);
+    let _ = wait_total;
 
     let mut buckets: BTreeMap<String, f64> = BTreeMap::new();
     for b in BUCKETS {
         buckets.insert((*b).to_string(), 0.0);
     }
-    // Pro-rate the reconciled WAIT total across mechanisms.
-    if total_wait_dur > 0.0 {
-        for (mech, dur) in &mech_dur {
-            *buckets.get_mut(*mech).unwrap() += wait_total * (dur / total_wait_dur);
-        }
-    } else if wait_total > 0.0 {
-        *buckets.get_mut("wait-unclassified").unwrap() += wait_total;
+    for (mech, us) in &mech_excl {
+        *buckets.get_mut(*mech).unwrap() += *us;
     }
+    *buckets.get_mut("productive-decode").unwrap() += inline_decode;
     *buckets.get_mut("consumer-serial").unwrap() += consumer_serial;
     *buckets.get_mut("consumer-idle").unwrap() += consumer_idle;
     *buckets.get_mut("unknown").unwrap() += unknown;
@@ -942,6 +1018,35 @@ mod tests {
         let wpres = BTreeMap::new();
         let ctx = ctx_of(&decodes, &idle, &wpub, &wpres, 8);
         assert_eq!(classify_wait(&ctx, 4096, 100.0, 200.0), "wait-unclassified");
+    }
+
+    /// T1 inline decode (worker.* self-time ON the consumer thread) must be
+    /// folded into `productive-decode`, not left as `unknown` — so the decode
+    /// mechanism is named consistently with the T>1 productive-decode WAIT.
+    #[test]
+    fn t1_inline_decode_folds_into_productive() {
+        let events: Vec<Event> = serde_json::from_value(json!([
+            {"name":"drive","ph":"B","ts":0.0,"pid":1,"tid":1,"args":{"parallelization":1}},
+            {"name":"consumer.iter","ph":"B","ts":0.0,"pid":1,"tid":1},
+            // inline decode work on the consumer thread (the T1 reality).
+            {"name":"worker.block_body","ph":"B","ts":0.0,"pid":1,"tid":1},
+            {"name":"worker.block_body","ph":"E","ts":800.0,"pid":1,"tid":1},
+            {"name":"consumer.write_data","ph":"B","ts":800.0,"pid":1,"tid":1},
+            {"name":"consumer.write_data","ph":"E","ts":900.0,"pid":1,"tid":1},
+            {"name":"consumer.iter","ph":"E","ts":900.0,"pid":1,"tid":1},
+            {"name":"drive","ph":"E","ts":900.0,"pid":1,"tid":1}
+        ]))
+        .unwrap();
+        let p = partition(&events, &Config::gzippy(), None);
+        assert!(p.reconciled, "residual {}", p.residual_us);
+        assert_eq!(p.t, 1);
+        assert!(
+            (p.get("productive-decode") - 800.0).abs() < 1.0,
+            "inline worker.block_body must land in productive-decode, got {}",
+            p.get("productive-decode")
+        );
+        assert!(p.get("unknown") < 1.0, "nothing should be left unknown");
+        assert!((p.get("consumer-serial") - 100.0).abs() < 1.0); // write_data OUTPUT
     }
 
     /// End-to-end: a hand-built trace partitions and reconciles to the wall.
