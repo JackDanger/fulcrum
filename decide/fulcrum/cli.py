@@ -41,6 +41,15 @@ gzippy ships one):
       FLAGS when the unaccounted fraction exceeds --threshold. A second
       (--b-*) capture adds the role-matched DELTA table ('where do the
       excess instructions go'), conservation-asserted itself.
+  quantity [--algebra] [--demo] [--selftest]
+      The DIMENSIONED-QUANTITY evaluator (QUANTITY-DIMENSION-OR-REFUSE): a
+      typed algebra over {wall_s, cpu_s, byte, cycle, insn} that REFUSES
+      dimensionally/statistically invalid derivations — share × wall asserted
+      as bytes (the #11 decode-volume phantom), an unlicensed time→bytes
+      conversion, a Δ<spread 'win' (forced TIE) or N<9 'win' (UNDERPOWERED),
+      a function-share promoted to a wall claim, a volume claim with no
+      validated counter. --algebra prints the legal/illegal table; --demo
+      replays the worked #11 refutation.
   selftest
       Run every suite (trace engine, decision engine, invariant enforcement);
       writes the SELF-TEST-OR-NO-TRUST stamp on success.
@@ -374,6 +383,36 @@ def cycles_main(argv):
     report_mod.print_tma(tma_a, tma_b=tma_b, compare=cmp)
 
 
+def quantity_main(argv):
+    """`fulcrum quantity [--algebra] [--demo] [--selftest]`.
+
+    The DIMENSIONED-QUANTITY evaluator (QUANTITY-DIMENSION-OR-REFUSE): a typed
+    algebra over the base units {wall_s, cpu_s, byte, cycle, insn} that REFUSES
+    dimensionally/statistically invalid derivations — share × wall asserted as
+    bytes, an unlicensed time→bytes conversion, a Δ<spread 'win', a function-
+    share promoted to a wall claim, a volume claim with no validated counter.
+    --algebra prints the legal/illegal table; --demo replays the worked #11
+    refutation; --selftest runs the named-refusal suite. The evaluator is a
+    pure library consumed by decide.analyze_run (see quantity.py INTEGRATION)."""
+    from .core import quantity as q_mod
+
+    if "--selftest" in argv:
+        from .selftests import test_quantity
+        rc, _, _ = test_quantity.run()
+        sys.exit(rc)
+
+    known = "[--algebra] [--demo] [--selftest]"
+    for a in argv:
+        if a not in ("--algebra", "--demo"):
+            _die_unknown_flag("quantity", a, known)
+
+    if "--demo" in argv:
+        print(q_mod.render_demo())
+        return
+    # default + --algebra both render the table.
+    print(q_mod.render_legal_algebra())
+
+
 def ledger_main(rest):
     """`fulcrum ledger [path]` listing + the supersede/invalidate verbs."""
     verb = rest[0] if rest and rest[0] in ("supersede", "invalidate") else None
@@ -476,6 +515,8 @@ def main(argv=None):
         insn_main(rest)
     elif cmd == "cycles":
         cycles_main(rest)
+    elif cmd == "quantity":
+        quantity_main(rest)
     elif cmd == "selftest":
         from .selftests import run_all
         sys.exit(run_all())
