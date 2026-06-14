@@ -384,3 +384,51 @@ conservation-asserted: `Σ category deltas + uncategorized delta + residual
 delta == total measured delta`. A volume mismatch (different byte volumes
 between captures) is flagged: raw insn deltas are not comparable across
 different workloads, only the insn/byte columns are.
+
+## The unified CELL contract (`core/cell.py` ↔ `src/finding.rs`)
+
+Every refusal gate reads and writes ONE cell so a measurement that leaves one
+gate enters the next — across the Rust↔Python boundary. The canonical wire form
+is the Rust `finding.rs::Finding` serde JSON; `core/cell.py::Cell` is its
+byte-identical Python twin (`selftests/test_cell_roundtrip.py` proves both
+directions and that the `cell_id` re-derives identically in either language).
+
+CANONICAL FIELDS:
+
+| field | meaning |
+|---|---|
+| `cell_id` | derived content hash `F-<12 hex of sha256(fingerprint)>`; NEVER user-set |
+| `commit_sha` | src commit the measurement was taken at (the decay anchor) |
+| `corpus`, `arch` | measured coordinate (carried under `scope` in JSON) |
+| `threads_T` | measured thread cell — JSON `scope.threads` = `{"Fixed":N}` \| `"Auto"` \| `"Any"` |
+| `sink` | output sink (the SINK-LAW axis) |
+| `n` | best-of-N sample count |
+| `inter_run_spread` | max/min − 1 (the significance noise floor) |
+| `evidence_tier` | provenance class — JSON variant `Perturbation`/`Oracle`/`FrozenMatrix`/`SelfValidatedTool`/`SourceRead`/`WholeProgramAttribution` |
+| `verdict` | typed conclusion — JSON variant `Located`/`Refuted`/`Win`/`Tie`/`Loss`/`Survives`/`NarrowsToScope`/`False`/`{"Other":"…"}` |
+| `value` + `dimension` | the measured quantity and its unit |
+| `region`, `claim`, `method`, `created_utc` | Finding-side connective tissue (`claim` is EXCLUDED from the fingerprint, so re-wording prose never forks the id) |
+
+FINGERPRINT (the exact string both languages sha256, using LABEL forms — tier
+`oracle`, verdict `LOCATED`, threads `t4`, value canonicalised to 6 sig-figs):
+
+```
+v1|region=…|commit=…|arch=…|corpus=…|threads=t4|sink=…|n=…|tier=oracle|verdict=LOCATED|value=247|dim=ms|method=…
+```
+
+## The composed pipeline (`core/pipeline.py`)
+
+`run_pipeline(PipelineInput)` runs the five gates in order:
+
+```
+PROVENANCE → DIMENSIONED-QUANTITY → PERTURBATION → COMPARABILITY → FINDING-STORE
+```
+
+Gates 1–3 are in-process Python (`provenance.run_gate`, the caller's
+`quantity_check`, `perturb.analyze_sweep`); gates 4–5 drive the Rust `fulcrum`
+binary's `comparability` and `finding add`/`cite` subcommands. The flow returns
+a `PipelineResult` (a CERTIFIED `Cell` banked with a `cell_id`) or the FIRST
+`PipelineRefusal` — `{gate, sub_check, reason, resolving_measurement}`. The word
+"lever" is reachable only through a PERTURBATION/LEVER cell; a CERTIFIED bank is
+reachable only through all five. `selftests/test_pipeline.py` is the end-to-end
+proof (known-good banks; six known-bad each refuse at the named gate).

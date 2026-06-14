@@ -70,6 +70,13 @@ gzippy ships one):
       instrument-firing checks: consumer / oracle-fired / sink-symmetric /
       sha-current / comparator-present) for a run, without ranking. A
       sink-asymmetry refusal exits non-zero.
+  pipeline [--selftest]
+      The composed five-gate flow (PROVENANCE → DIMENSIONED-QUANTITY →
+      PERTURBATION → COMPARABILITY → FINDING-STORE) over the unified
+      core.cell.Cell. A measurement flows to a CERTIFIED banked finding with a
+      cell_id or is stopped at the first gate it fails with a typed refusal
+      naming the gate. --selftest runs the end-to-end known-good + per-gate
+      known-bad suite.
   ledger [path]
       Summarize the results ledger (anchors, pending-reconcile rows,
       supersede/invalid resolutions).
@@ -603,6 +610,27 @@ def provenance_main(argv):
     sys.exit(0 if gate.run_verdict in (prov_mod.OK, prov_mod.INCOMPLETE) else 1)
 
 
+def pipeline_main(argv):
+    """`fulcrum pipeline --selftest`.
+
+    The composed five-gate flow (PROVENANCE → DIMENSIONED-QUANTITY →
+    PERTURBATION → COMPARABILITY → FINDING-STORE) over the unified
+    `core.cell.Cell`. A measurement either flows to a CERTIFIED banked finding
+    with a cell_id or is stopped at the FIRST gate it fails with a typed refusal
+    naming the gate + the resolving measurement (see core/pipeline.py). The
+    runner half that POPULATES the captures for a live gzippy-vs-rg run is
+    project policy (scripts/bench/*); --selftest runs the end-to-end known-good
+    + per-gate known-bad suite."""
+    if "--selftest" in argv:
+        from .selftests import test_pipeline
+        rc, _, _ = test_pipeline.run()
+        sys.exit(rc)
+    print(pipeline_main.__doc__)
+    print("\nThis subcommand is driven programmatically (core.pipeline."
+          "run_pipeline) or via --selftest; a live runner that emits the gate "
+          "captures is project policy.")
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     cmd = argv[0] if argv else "help"
@@ -629,6 +657,8 @@ def main(argv=None):
         print(render())
     elif cmd == "provenance":
         provenance_main(rest)
+    elif cmd == "pipeline":
+        pipeline_main(rest)
     elif cmd == "ledger":
         ledger_main(rest)
     else:
