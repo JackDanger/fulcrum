@@ -120,6 +120,53 @@ def print_locate(result, max_path_entries=40, max_rows=15):
     print("\n" + "=" * 100)
 
 
+def print_perturb(cell, *, frozen=True):
+    """The perturb report: the CELL + its verdict + the GATED claim.
+
+    The verdict prose is produced ONLY through the cell's own gated methods
+    (lever_sentence / hypothesis_sentence) so this renderer physically cannot
+    emit 'lever' for a non-(perturbation/LEVER) cell."""
+    print("=" * 100)
+    print("fulcrum perturb — causal perturbation harness "
+          "(PERTURBATION-OR-NO-LEVER)")
+    print("=" * 100)
+    print(f"region        : {cell.region}")
+    print(f"cell_id       : {cell.cell_id}")
+    print(f"verdict       : {cell.verdict}   evidence_tier={cell.evidence_tier}")
+    if not frozen:
+        print("box           : NOT frozen/quiet — [UNFROZEN] verdict labeled, "
+              "do not bank")
+    print("-- DOSE-RESPONSE (busy slow-inject @ t={10,20,30}% of region "
+          "self-time; sleep = frequency-neutral control) --")
+    if cell.criticality is not None:
+        print(f"  criticality (busy slope d wall/d injected): "
+              f"{cell.criticality:.3f}  (CI lower bound {cell.criticality_lo:.3f})")
+    if cell.delta_ms is not None:
+        print(f"  Δwall at strongest level                  : "
+              f"{cell.delta_ms:+.2f} ms")
+    if cell.spread_ms is not None:
+        print(f"  inter-run spread (noise floor)            : "
+              f"{cell.spread_ms:.2f} ms   "
+              f"(significance bar = {2.0:.0f}× = "
+              f"{2.0 * cell.spread_ms:.2f} ms)")
+    if cell.oracle_ceiling_ms is not None:
+        print(f"  removal-oracle ceiling (bound, not carrier): "
+              f"{cell.oracle_ceiling_ms:+.2f} ms")
+    if cell.n is not None:
+        nn = f" (need ≥{cell.n_needed})" if cell.n_needed else ""
+        print(f"  N (interleaved, min over sets)            : {cell.n}{nn}")
+    for note in cell.notes:
+        print(f"  note          : {note}")
+    print("\n-- VERDICT (the only legal sentence; lever/fund is gated) --")
+    if cell.may_claim_lever:
+        print(f"  {cell.lever_sentence()}")
+    else:
+        print(f"  {cell.hypothesis_sentence()}")
+        print(f"  may_claim_lever = False — the word 'lever'/'fund the fix' is "
+              f"UNREACHABLE for this row (PERTURBATION-OR-NO-LEVER).")
+    print("=" * 100)
+
+
 def _fmt_pb(x):
     return f"{x:10.3f}" if x is not None else "       n/a"
 

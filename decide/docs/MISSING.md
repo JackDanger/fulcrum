@@ -80,11 +80,35 @@ happens-before edges keyed by chunk/item id (so the path follows the true
 producer→consumer dependency, not the latest-ending segment), plus a spin-vs-
 park-vs-blocked classification so busy-wait spin is not credited as compute.
 
-## Perturbation harness
-Every tier-2 HYPOTHESIS row and every `locate` row carries a **textual**
-falsifier (the slow-inject / exempt-and-extrapolate probe design), but fulcrum
-does not **run** the perturbation — the causal conversion is still manual.
-Wanted: a harness that executes the pre-registered slow-injection at
-t={10,20,30}%, runs the frequency-neutral sleep control, measures the
-interleaved wall response, and converts a HYPOTHESIS row into a causal verdict
-(or a refutation) automatically.
+## ~~Perturbation harness~~ — BUILT (analyzer half, 2026-06-14)
+Shipped: `core/perturb.py` + the `fulcrum perturb <sweep-dir>` CLI + the
+PERTURBATION-OR-NO-LEVER invariant + `selftests/test_perturb.py` (KNOWN-lever /
+KNOWN-slack / A/A / spin-artifact / unstable-baseline / non-monotone /
+underpowered / ceiling-only + the refusal-fires test). It ingests a
+pre-registered slow-inject **sweep** (busy-spin at t={10,20,30}% of the
+region's own self-time, a frequency-neutral SLEEP control, and a removal
+ORACLE — see `docs/SCHEMA.md` "perturb sweep") and converts a HYPOTHESIS into a
+deterministic STRONG verdict: **LEVER** (busy dose-response is monotonic +
+proportional + significant AND the sleep control reproduces it — the ONLY
+verdict that licenses "fund the fix"), **SLACK** (both arms flat — provably off
+the critical path), **ARTIFACT** (busy-only response = a turbo/spin phantom),
+**CEILING-ONLY** (oracle bound, not a carrier — gates "build before isolating"),
+**INCONCLUSIVE** (N<9), or **VOID** (A/A baseline swing > spread, or
+significant-but-non-monotone). The word "lever"/"fund the fix" is reachable
+ONLY through `PerturbCell.lever_sentence()`, which RAISES `LeverClaimRefused`
+for any non-(perturbation/LEVER) cell — the structural chokepoint.
+
+**Remaining sub-items (NOT yet built):**
+- **The runner half.** Fulcrum analyzes the sweep; it does not yet *launch* the
+  binary under freeze/mask/sink/sha discipline to PRODUCE the sweep. The
+  reference runner (gzippy: `scripts/bench/oracle.sh --kind perturb` with the
+  `GZIPPY_SLOW_MODE` / `GZIPPY_SLOW_KIND=spin|sleep` knobs + a region-elide
+  oracle) must emit the documented `<sweep-dir>` layout. The injection knob
+  itself (slow_knob.rs) exists in the host repo; wiring it to write the
+  baseline/baseline_recheck/spin/sleep/oracle sample files is the open work.
+- **Ledger banking + decide integration.** A perturb CELL is not yet banked to
+  the results ledger, and `decide.analyze_run` does not yet consume a banked
+  LEVER/SLACK to PROMOTE a tier-2 HYPOTHESIS row to tier-1 (or DEMOTE it to a
+  proven-SLACK row). The hook: `build_brief`'s tier-2 branch should look up a
+  perturb cell for the row's region and, if present, replace the "run the
+  perturbation" text with the cell's gated verdict sentence.
