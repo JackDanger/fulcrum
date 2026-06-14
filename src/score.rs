@@ -669,7 +669,7 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
 
     let decomp_pin_short = &args.decomp_pin[..8.min(args.decomp_pin.len())];
 
-    format!(
+    let body = format!(
         "{score_line}\n\
          \n\
          ```yaml\n\
@@ -799,7 +799,43 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
         isal_path = args.isal.display(),
         rg_path = args.rg.display(),
         src_sha = args.src_sha,
-    )
+    );
+
+    format!("{body}\n{}", comparability_section(args, capture))
+}
+
+/// Build the `## COMPARABILITY` section for a score cell. This makes the
+/// comparability gate LIVE in the score path: it reframes a per-cell PASS so it
+/// can never be silently read as a "settled tie" (predicate 4 — score measures
+/// only rg + the two gzippy builds; igzip/libdeflate/zlib-ng are unmeasured, so
+/// "settled" is VOID), and stamps the cross-arch tier as HYPOTHESIS (predicate 3
+/// — one capture is one arch). PROTOTYPED.
+pub fn comparability_section(args: &ScoreArgs, capture: &CaptureResult) -> String {
+    use crate::comparability as cg;
+    let cell_id = format!("{}/t{}/{}", args.arch_os, args.threads, args.corpus);
+    let cap = cg::Capture::score_like(
+        &cell_id,
+        &args.src_sha,
+        &args.corpus,
+        &args.arch_os,
+        crate::compare::ThreadCell::Fixed(args.threads),
+        capture.samples,
+        capture.rg.wall_ms,
+        capture.native.wall_ms,
+        capture.isal.wall_ms,
+        capture.native.spread_ms / capture.native.wall_ms.max(1e-9),
+        capture.isal.spread_ms / capture.isal.wall_ms.max(1e-9),
+    );
+    // The "settled" reading of a PASS — gated against the full field-tool roster.
+    let settled = cg::evaluate(
+        &cap,
+        &cg::GateClaim::Settled {
+            subject: "gzippy-native".to_string(),
+            field_tools: cg::FIELD_TOOL_ROSTER.iter().map(|s| s.to_string()).collect(),
+            tie_bar: 0.99,
+        },
+    );
+    cg::render_block(&[settled])
 }
 
 // ─── Top-level entry point ────────────────────────────────────────────────────
@@ -1072,6 +1108,17 @@ mod tests {
             first_line.contains("lever=none"),
             "lever wrong: {first_line}"
         );
+    }
+
+    #[test]
+    fn score_cell_carries_comparability_gate_voiding_settled() {
+        // The score cell must embed the COMPARABILITY GATE and refuse to let a
+        // per-cell PASS be read as a "settled tie": score measures only rg + the
+        // two gzippy builds, so igzip/libdeflate/zlib-ng are unmeasured ⇒ VOID.
+        let cell = emit_cell(&test_args(), &test_capture());
+        assert!(cell.contains("## COMPARABILITY"), "comparability section missing");
+        assert!(cell.contains("SETTLED-VOIDED"), "settled must be voided in score cell");
+        assert!(cell.contains("igzip"), "unmeasured field tool must be named");
     }
 
     #[test]

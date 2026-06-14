@@ -33,6 +33,7 @@ pub mod alloc;
 pub mod audit;
 pub mod bundle;
 pub mod causal;
+pub mod comparability;
 pub mod compare;
 pub mod compare_cli;
 pub mod config;

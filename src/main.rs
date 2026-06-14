@@ -47,6 +47,8 @@ USAGE:\n\
   fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
   fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
+  fulcrum comparability --capture cap.json [--capture ...] --claim subject-specific|settled|law\n\
+              [--subject id --contrast id --counter name] [--field-tools a,b,c] [--statement \"...\"]\n\
   fulcrum score --arch-os <arch-os> --threads <N> --mask <cpu-mask> --corpus <name>\n\
               --corpus-path <path> --corpus-pin <sha256> --decomp-pin <sha256>\n\
               --native <path> --isal <path> --rg <path>\n\
@@ -2384,6 +2386,186 @@ fn cmd_audit(args: &[String]) -> ExitCode {
     }
 }
 
+/// comparability: the COMPARABILITY GATE — refuse a specificity/settled/law
+/// claim unless the required comparison arms are present + self-test clean.
+///
+///   fulcrum comparability --capture cap.json --claim subject-specific \
+///       --subject gzippy-native --contrast rapidgzip [--counter marker_count] [--equal-spread 0.05]
+///   fulcrum comparability --capture cap.json --claim settled \
+///       --subject gzippy-native [--field-tools rapidgzip,igzip,libdeflate,zlib-ng] [--tie-bar 0.99]
+///   fulcrum comparability --capture amd.json --capture intel.json --claim law \
+///       --statement "decode kernel gates the wall"
+///
+/// Exit 0 = ADMITTED, nonzero = REFUSED (so CI can gate a banked claim).
+fn cmd_comparability(args: &[String]) -> ExitCode {
+    use fulcrum::comparability as cg;
+
+    // --capture may be given multiple times (law needs ≥2 arches).
+    let cap_paths: Vec<&str> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            if a == "--capture" {
+                args.get(i + 1).map(|s| s.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if cap_paths.is_empty() {
+        eprintln!("comparability needs at least one --capture cap.json");
+        return usage();
+    }
+    let Some(kind) = flag(args, "--claim") else {
+        eprintln!("comparability needs --claim subject-specific|settled|law");
+        return usage();
+    };
+
+    let mut captures = Vec::new();
+    for p in &cap_paths {
+        match std::fs::read_to_string(p).ok().and_then(|s| parse_capture(&s)) {
+            Some(c) => captures.push(c),
+            None => {
+                eprintln!("comparability: could not parse capture {p}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let outcome = match kind {
+        "law" => {
+            let stmt = flag(args, "--statement").unwrap_or("(unstated)");
+            let refs: Vec<&cg::Capture> = captures.iter().collect();
+            cg::evaluate_law(&refs, stmt)
+        }
+        "subject-specific" => {
+            let (Some(subject), Some(contrast)) = (flag(args, "--subject"), flag(args, "--contrast"))
+            else {
+                eprintln!("subject-specific needs --subject and --contrast");
+                return usage();
+            };
+            let claim = cg::GateClaim::SubjectSpecific {
+                subject: subject.to_string(),
+                contrast: contrast.to_string(),
+                counter: flag(args, "--counter").map(String::from),
+                equal_spread: flag(args, "--equal-spread")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.05),
+            };
+            cg::evaluate(&captures[0], &claim)
+        }
+        "settled" => {
+            let Some(subject) = flag(args, "--subject") else {
+                eprintln!("settled needs --subject");
+                return usage();
+            };
+            let field_tools: Vec<String> = flag(args, "--field-tools")
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                .unwrap_or_else(|| cg::FIELD_TOOL_ROSTER.iter().map(|s| s.to_string()).collect());
+            let claim = cg::GateClaim::Settled {
+                subject: subject.to_string(),
+                field_tools,
+                tie_bar: flag(args, "--tie-bar")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.99),
+            };
+            cg::evaluate(&captures[0], &claim)
+        }
+        other => {
+            eprintln!("comparability: unknown --claim '{other}'");
+            return usage();
+        }
+    };
+
+    print!("{}", cg::render(&outcome));
+    if outcome.verdict.admitted() {
+        ExitCode::SUCCESS
+    } else {
+        // A refusal is the WHOLE POINT — nonzero so CI gates the over-claim.
+        ExitCode::FAILURE
+    }
+}
+
+/// Parse a [`fulcrum::comparability::Capture`] from the JSON wire format.
+/// Kept in the CLI layer so the gate core stays serde-free (repo convention:
+/// `compare::Cell`/`ThreadCell` are not serde types).
+fn parse_capture(json: &str) -> Option<fulcrum::comparability::Capture> {
+    use fulcrum::comparability::{ArmPresence, Capture, WorkCounter};
+    use fulcrum::compare::{BinaryKind, ThreadCell};
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+
+    let threads = match v.get("threads").and_then(|t| t.as_str()).unwrap_or("T1") {
+        s if s.eq_ignore_ascii_case("auto") => ThreadCell::Auto,
+        s => ThreadCell::Fixed(
+            s.trim_start_matches(['T', 't']).parse::<usize>().unwrap_or(1),
+        ),
+    };
+
+    let parse_kind = |s: &str| -> BinaryKind {
+        let l = s.to_ascii_lowercase();
+        if l == "native" {
+            BinaryKind::Native
+        } else if let Some(rest) = l.strip_prefix("interpreted:") {
+            BinaryKind::Interpreted(rest.to_string())
+        } else if l == "interpreted" {
+            BinaryKind::Interpreted("script".to_string())
+        } else {
+            BinaryKind::Unknown
+        }
+    };
+
+    let mut arms = Vec::new();
+    if let Some(arr) = v.get("arms").and_then(|a| a.as_array()) {
+        for a in arr {
+            arms.push(ArmPresence {
+                id: a.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                measured: a.get("measured").and_then(|x| x.as_bool()).unwrap_or(false),
+                binary_kind: a
+                    .get("binary_kind")
+                    .and_then(|x| x.as_str())
+                    .map(parse_kind)
+                    .unwrap_or(BinaryKind::Unknown),
+                aa_ratio: a.get("aa_ratio").and_then(|x| x.as_f64()),
+                aa_spread: a.get("aa_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                wall_ms: a.get("wall_ms").and_then(|x| x.as_f64()),
+                require_native_elf: a
+                    .get("require_native_elf")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+    }
+
+    let mut counters = Vec::new();
+    if let Some(arr) = v.get("counters").and_then(|a| a.as_array()) {
+        for c in arr {
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut per_arm = std::collections::BTreeMap::new();
+            if let Some(obj) = c.get("per_arm").and_then(|x| x.as_object()) {
+                for (k, val) in obj {
+                    if let Some(f) = val.as_f64() {
+                        per_arm.insert(k.clone(), f);
+                    }
+                }
+            }
+            counters.push(WorkCounter { name, per_arm });
+        }
+    }
+
+    Some(Capture {
+        cell_id: v.get("cell_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        commit_sha: v.get("commit_sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        corpus: v.get("corpus").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        arch: v.get("arch").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        threads,
+        sink: v.get("sink").and_then(|x| x.as_str()).unwrap_or("regular-file").to_string(),
+        n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        inter_run_spread: v.get("inter_run_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        arms,
+        counters,
+    })
+}
+
 /// memlife: cross-tool, per-buffer ATTRIBUTED memory-lifecycle breakdown.
 ///
 ///   fulcrum memlife <run.json>                 single-run per-component table
@@ -2479,6 +2661,7 @@ fn main() -> ExitCode {
         "sweep" => cmd_sweep(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
+        "comparability" => cmd_comparability(rest),
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
