@@ -46,6 +46,11 @@ gzippy ships one):
       writes the SELF-TEST-OR-NO-TRUST stamp on success.
   invariants
       Render the enforced invariant set with scars.
+  provenance <art-dir>
+      Render the PROVENANCE-OR-VOID gate verdict (the five derived
+      instrument-firing checks: consumer / oracle-fired / sink-symmetric /
+      sha-current / comparator-present) for a run, without ranking. A
+      sink-asymmetry refusal exits non-zero.
   ledger [path]
       Summarize the results ledger (anchors, pending-reconcile rows,
       supersede/invalid resolutions).
@@ -161,11 +166,13 @@ def decide_main(argv=None):
     fingerprint + ledger options."""
     argv = sys.argv[1:] if argv is None else argv
     if "--selftest" in argv:
-        from .selftests import test_adapter, test_decide, test_invariants
+        from .selftests import (test_adapter, test_decide, test_invariants,
+                                test_provenance)
         rc1, _, f1 = test_decide.run()
         rc2, _, f2 = test_invariants.run()
         rc3, _, f3 = test_adapter.run()
-        sys.exit(0 if (f1 + f2 + f3) == 0 else 1)
+        rc4, _, f4 = test_provenance.run()
+        sys.exit(0 if (f1 + f2 + f3 + f4) == 0 else 1)
 
     allow_thaw = "--allow-thaw" in argv
     no_ledger = "--no-ledger" in argv
@@ -462,6 +469,33 @@ def ledger_main(rest):
               f"bin={str(fp.get('bin_sha', '?'))[:12]}")
 
 
+def provenance_main(argv):
+    """`fulcrum provenance <art-dir>`: render the PROVENANCE-OR-VOID gate
+    verdict for a run (the five derived instrument-firing checks) without
+    ranking. A DERIVED-SINK-SYMMETRIC refusal exits non-zero."""
+    from .core import provenance as prov_mod
+    from .core.invariants import InvariantViolation
+    dirs = [a for a in argv if not a.startswith("-")]
+    if not dirs:
+        print("provenance: need an artifact dir", file=sys.stderr)
+        sys.exit(2)
+    run = load_run(dirs[0], GzippyAdapter())
+    prov = prov_mod.from_manifest(run["manifest"])
+    try:
+        gate = prov_mod.run_gate(prov)
+    except InvariantViolation as e:
+        print(f"REFUSED {e}")
+        sys.exit(1)
+    stamp = gate.stamp(prov.commit_sha)
+    print(f"PROVENANCE-OR-VOID — {dirs[0]}")
+    print(f"  cell verdict : {stamp['provenance_verdict']} "
+          f"(evidence_tier={stamp['evidence_tier']}, "
+          f"commit_sha={stamp['commit_sha']})")
+    for c in gate.checks:
+        print(f"  [{c.verdict:10s}] {c.name:22s} {c.scope:18s} {c.reason}")
+    sys.exit(0 if gate.run_verdict in (prov_mod.OK, prov_mod.INCOMPLETE) else 1)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     cmd = argv[0] if argv else "help"
@@ -482,6 +516,8 @@ def main(argv=None):
     elif cmd == "invariants":
         from .core.invariants import render
         print(render())
+    elif cmd == "provenance":
+        provenance_main(rest)
     elif cmd == "ledger":
         ledger_main(rest)
     else:

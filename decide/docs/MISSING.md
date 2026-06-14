@@ -6,6 +6,22 @@ trusting a stale promise elsewhere in the tree. Nothing here is implemented;
 when one of these lands, give it a firing self-test and move it out of this
 file.
 
+## ~~Runner-enforced provenance / instrument-firing gate~~ — BUILT (2026-06-14)
+Shipped: the PROVENANCE-OR-VOID invariant + `core/provenance.py` + the
+`provenance` CLI subcommand + the `analyze` integration +
+`selftests/test_provenance.py`. Five DERIVED capture-time checks refuse a
+number that tested the wrong thing on the wrong binary: DERIVED-CONSUMER (an
+env knob with zero grep-confirmed src/ consumers VOIDs its A/B),
+DERIVED-ORACLE-FIRED (an ON arm whose counters don't differ from OFF / don't
+reach expected VOIDs — the env-var-no-op'd + hardcoded-false-predicate
+classes), DERIVED-SINK-SYMMETRIC (a wall A/B whose arms differ in sink, or
+differ from the comparator's sink, REFUSES — the shared-floor file-sink that
+penalized the faster arm), DERIVED-SHA-CURRENT (a src tree moved since the
+captured commit STALE-stamps the cell), COMPARATOR-PRESENT (an absent
+comparator or an A/A != 1.0 VOIDs — the absent rg ELF / wheel-vs-ELF class).
+Graceful: an uncaptured field is INCOMPLETE, never refused. The binary-FLAVOR
+self-witness below is the one remaining provenance gap.
+
 ## Runner-enforced provenance / binary-flavor checks
 The fingerprint records `bin_sha` and the manifest can self-report a build
 `feature` (gzippy-native vs gzippy-isal), but nothing **derives** the binary's

@@ -63,6 +63,32 @@ cell is labeled FP-INCOMPLETE and never banked):
 | `host_cpu_model`, `host_kernel`, `host_id` | DERIVED host identity → fingerprint `host` = `cpu|kernel|id`; all three or `unknown` |
 | comparator version | adapter probe (`comparator_version(manifest)`); the gzippy adapter normalizes `rg_version=` — supply your comparator's version under a key your adapter reads (default key: `comparator_version`) |
 
+Provenance / instrument-firing fields (PROVENANCE-OR-VOID; all optional —
+missing ⇒ that sub-check is INCOMPLETE/non-citable, never refused — only a
+present-but-wrong capture VOIDs/REFUSES/STALEs). The runner DERIVES each at
+capture time (grep against the staged src/, the on/off counters, `stat` of
+the sink targets, `git diff`, a comparator A/A run):
+
+| key | check | meaning |
+|---|---|---|
+| `commit_sha` | DERIVED-SHA-CURRENT | the src commit the run was captured at |
+| `head_sha` | DERIVED-SHA-CURRENT | HEAD at analysis time; `== commit_sha` ⇒ current |
+| `src_changed_since_commit` | DERIVED-SHA-CURRENT | runner `git diff --quiet <commit>..HEAD -- src/`: `0` clean / `1` changed (governs over `head_sha`); changed ⇒ cell STALE (non-citable as current, not dropped) |
+| `knob_consumer_<ENV>` | DERIVED-CONSUMER | count of src/ files that grep-confirm consume `<ENV>` at `commit_sha` (`grep -rlF`); `0` ⇒ the knob's A/B is VOID (it altered nothing) |
+| `oracle_<name>_on` / `_off` / `_expected` | DERIVED-ORACLE-FIRED | the oracle's firing counter in the ON arm / OFF arm / the count the ON arm must reach; ON `0`, ON `==` OFF, or ON `!=` expected ⇒ VOID (the ON arm ran the normal path under the oracle label) |
+| `ab_sink_<abid>_<arm>` | DERIVED-SINK-SYMMETRIC | sink class of each A/B arm (`arm` ∈ base/knob/gz/rg); arms on different sinks, or `!=` `comparator_sink`, ⇒ REFUSED (the shared-floor phantom) |
+| `comparator_sink` | DERIVED-SINK-SYMMETRIC | the comparator's sink target (all wall-A/B arms must match it) |
+| `comparator_present` | COMPARATOR-PRESENT | `0|1` — the named comparator exists on the box; `0` ⇒ VOID (ratio formed against nothing) |
+| `comparator_path` | COMPARATOR-PRESENT | path probed (for the refusal message) |
+| `comparator_aa_ratio` / `comparator_aa_spread_pct` | COMPARATOR-PRESENT | the comparator's binary-vs-itself A/A ratio + its own spread; `|ratio-1.0| > spread` ⇒ VOID (wrong artifact — e.g. wheel-vs-ELF startup tax) |
+
+The gate stamps each CELL with `commit_sha`, `provenance_verdict`
+(CERTIFIED / STALE / VOID / REFUSED / PROVENANCE-INCOMPLETE), an
+`evidence_tier`, and the per-check verdicts. `fulcrum provenance <art-dir>`
+renders the verdict standalone; the gate also runs inside `fulcrum analyze`
+(REFUSED aborts, VOID drops the affected cell/knob, STALE labels + blocks
+banking). See `core/provenance.py` + `selftests/test_provenance.py`.
+
 Context (rendered in the header, cross-checked where derivable): `feature`,
 `rg_version`, `governor`, `no_turbo`, `runnable_avg`, `n`, `knob_n`,
 `started`, `finished`. Optional records: `knob_done=...`,
