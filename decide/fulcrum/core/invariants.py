@@ -262,6 +262,53 @@ INVARIANTS = (
                     "(refusals asserted BY NAME + the necessary-not-sufficient "
                     "single-wrong-bucket pin)",
     ),
+    Invariant(
+        name="QUANTITY-DIMENSION-OR-REFUSE",
+        rule="Every value carries a DIMENSION (an exponent vector over the "
+             "independent base units wall_s, cpu_s, byte, cycle, insn; the "
+             "tags share/ratio/utilization/wall_seconds/cpu_seconds/bytes/"
+             "cycles/instructions/cyc_per_byte/ipc). Arithmetic is dimensioned: "
+             "× adds dims, ÷ subtracts, +/- and any comparison REQUIRE identical "
+             "dims. Six structural refusals fire: (DIMENSION-REFUSED) a "
+             "derivation asserted to a dimension it does not have — the canonical "
+             "case share × wall_seconds asserted as `bytes` (its true dim is "
+             "wall_seconds), and add/ratio of unlike dims; (LICENSE-REFUSED) a "
+             "dimension-CHANGING conversion (time→bytes) with no MEASURED "
+             "licensing factor, a factor that does not bridge the dims, or a "
+             "cross-arm volume ratio whose rate-equality witness is not a "
+             "RESOLVED tie (the begged question); (SHARE-RANGE) a `share` ∉ "
+             "[0,1]; (FUNCTION-SHARE-LEAKAGE) a function-scope perf-annotate "
+             "share promoted to a wall/whole-rate claim without an isolated "
+             "whole-rate A/B that RESOLVED — inline-attribution leakage is "
+             "ASSUMED until the isolation bench disproves it; "
+             "(SIGNIFICANCE-UNDERPOWERED / forced-TIE) a win/loss is only "
+             "emittable when |Δ| > 2×inter_run_spread with N≥9 — |Δ|≤spread is "
+             "FORCED to TIE and N<9 is UNDERPOWERED, and there is NO bare-float "
+             "comparator (a verdict is a TYPE that only Comparison(quantity, "
+             "spread, n) mints); (VOLUME-COUNTER-UNVALIDATED) a bytes/volume "
+             "claim before the direct volume counter self-tested to 1.000 "
+             "against output at T1.",
+        scar="Conclusion #11, the decode-volume phantom: a CPU-busy-SHARE was "
+             "multiplied by a WALL-time and read as DECODED BYTES — '1.33x more "
+             "bytes' — a quantity with no volume counter anywhere in it, and a "
+             "CIRCULAR cross-tool ratio (= 1.33 × rate_gz/rate_rg, = 1.33 only "
+             "if the rates are equal, the very thing it was invoked to prove). "
+             "Plus the recurring Δ<spread 'win' and the function-level "
+             "perf-annotate share promoted to a whole-rate wall claim "
+             "(instruction-anchoring). All three are invalid ARITHMETIC on "
+             "valid captures — the dimension/significance type system makes them "
+             "unrepresentable.",
+        enforcement="quantity.require_dim / add / ratio (DIMENSION-REFUSED); "
+                    "quantity.bridge + LicensingAssertion (LICENSE-REFUSED); "
+                    "quantity.Quantity __post_init__ (SHARE-RANGE); "
+                    "quantity.promote_function_share_to_wall "
+                    "(FUNCTION-SHARE-LEAKAGE); quantity.Comparison + "
+                    "significance_verdict (BARE-COMPARISON / "
+                    "SIGNIFICANCE-UNDERPOWERED / forced-TIE); "
+                    "quantity.assert_volume_counter_selftest + volume_ratio "
+                    "(VOLUME-COUNTER-UNVALIDATED); selftests/test_quantity.py "
+                    "(every refusal asserted BY NAME + the worked #11 refutation)",
+    ),
 )
 
 
