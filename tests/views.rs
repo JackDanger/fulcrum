@@ -185,7 +185,7 @@ fn flow_overlapped_decode_is_slack_not_wall_critical() {
     let decode = r
         .stages
         .iter()
-        .find(|s| s.name == "2·worker bootstrap (window-absent)")
+        .find(|s| s.name == "3·decode")
         .expect("decode stage present");
     assert!((decode.total_busy_us - 172.0).abs() < 1e-6, "busy = 2×86us");
     assert!(
@@ -220,7 +220,7 @@ fn flow_whatif_credits_only_wall_critical() {
     let r = flow::analyze_flow(&e, &cfg, &cfg.inner_blockers);
     // 2× faster decode: saves half of the ~90us wall-critical (≈45us), not half
     // of the 172us busy.
-    let (_, saved) = flow::whatif(&r, "2·worker bootstrap (window-absent)", 2.0).unwrap();
+    let (_, saved) = flow::whatif(&r, "3·decode", 2.0).unwrap();
     assert!(saved > 40.0 && saved < 46.0, "saved {saved}us");
 }
 

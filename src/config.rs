@@ -536,79 +536,131 @@ impl Config {
                     "ttp.take_prefetch",
                 ]),
             },
+            // SIX canonical stages, mapped 1:1 to rapidgzip's pipeline so the
+            // cross-tool table (`fulcrum sixstage`) can align them with
+            // rapidgzip `--verbose`. The earlier 5-row layout conflated
+            // block-find into dispatch (stage 1) and window-publication into
+            // marker-resolve (stage 4) — the two stages "we've only been
+            // looking at" that this restructure splits out. Envelope spans
+            // (worker.decode_chunk / chunk_phase / decode / scan_run, pool.run_task,
+            // consumer.iter) stay in `·umbrella` so leaf-span busy is not
+            // double-counted; pure consumer WAITS stay in `·wait` (idle, not
+            // busy) and reach their owning stage via critpath blocked-on blame.
             stages: vec![
                 StageDef {
-                    name: "1·dispatch (upstream)".to_string(),
+                    // 1 · block-find  ↔ rapidgzip findDeflateBlocks / "block finder"
+                    // block-find LEAF work only. worker.scan_candidate /
+                    // scan_run are ENVELOPES (a full trial-decode attempt at a
+                    // candidate offset wraps worker.block_header/block_body), so
+                    // they live in ·umbrella — counting them here would
+                    // double-count the speculative trial decode that is already
+                    // attributed to stage 3. (gzippy's speculative boundary
+                    // search therefore shows up as decode busy, which is the
+                    // honest cross-tool comparison: it IS decode-engine CPU,
+                    // whereas rapidgzip's findDeflateBlocks confirms boundaries
+                    // far more cheaply — visible as rg block-find ≈ 0.005s.)
+                    name: "1·block-find".to_string(),
+                    matcher: Matcher::exact_of(&[
+                        "consumer.block_finder_get",
+                        "worker.seed_first",
+                    ]),
+                },
+                StageDef {
+                    // 2 · partition + dispatch ↔ rapidgzip chunk dispatch / thread pool
+                    // dispatch WORK only. consumer.try_take_prefetched is a
+                    // consumer WAIT (it wraps ttp.rx_recv_block — the in-order
+                    // block on the next chunk) and pool.pick.wait is a pool-lock
+                    // WAIT; both live in ·wait so they are NOT counted as busy
+                    // (they are starvation, surfaced in the ·residual). pool.pick
+                    // is the pick envelope → ·umbrella.
+                    name: "2·dispatch".to_string(),
                     matcher: m(
                         &[
-                            "pool.submit",
                             "consumer.process_prefetches",
-                            "consumer.block_finder_get",
-                            "consumer.try_take_prefetched",
+                            "consumer.queue_prefetched_postproc",
+                            "consumer.drive_prefetch_on_hit",
+                            "ttp.get_if_available",
+                            "ttp.take_prefetch",
                         ],
-                        &["coord.", "pool.pick"],
+                        &["coord.", "cache."],
                         &[],
                         &[],
                     ),
                 },
                 StageDef {
-                    name: "2·worker bootstrap (window-absent)".to_string(),
+                    // 3 · speculative (window-absent) + clean decode ↔ rapidgzip decodeBlock
+                    name: "3·decode".to_string(),
                     matcher: m(
                         &[
                             "worker.bootstrap",
                             "worker.block_body",
                             "worker.block_header",
+                            "worker.stream_inflate",
+                            "worker.isal_stream_inflate",
+                            "worker.absorb_isal_tail",
+                            "worker.append_markered",
                         ],
-                        &["worker.block_body."],
+                        &["worker.block_body.", "worker.block_header."],
                         &[],
                         &[],
                     ),
                 },
                 StageDef {
-                    name: "3·worker clean decode tail".to_string(),
-                    matcher: Matcher::exact_of(&[
-                        "worker.stream_inflate",
-                        "worker.isal_stream_inflate",
-                        "worker.absorb_isal_tail",
-                    ]),
-                },
-                StageDef {
-                    name: "5·consumer resolve (markers/window)".to_string(),
+                    // 4 · window publication (tail-window chain) ↔ rapidgzip getLastWindow
+                    name: "4·window-publish".to_string(),
                     matcher: m(
                         &[
-                            "consumer.wait_replaced_markers",
+                            "consumer.get_last_window",
                             "consumer.publish_windows",
-                            "consumer.dispatch_post_process",
-                            "consumer.dispatch_recv",
                         ],
-                        &["consumer.window_", "post_process."],
+                        &["consumer.window_"],
                         &[],
                         &[],
                     ),
                 },
                 StageDef {
-                    name: "6·consumer write (output)".to_string(),
-                    // The trailing `consumer.` prefix catches any other
-                    // consumer self-work as output (matches the original
-                    // fall-through). It is LAST so the more-specific stages win.
+                    // 5 · marker resolution / apply_window ↔ rapidgzip applyWindow
+                    name: "5·marker-resolve".to_string(),
                     matcher: m(
                         &[
-                            "consumer.write_data",
-                            "consumer.write_narrowed",
-                            "consumer.combine_crc",
-                            "consumer.drain",
-                            "consumer.arc_take_or_clone",
+                            "consumer.dispatch_post_process",
+                            "consumer.eager_postproc",
                         ],
-                        &["consumer."],
+                        &["post_process."],
                         &[],
                         &[],
                     ),
+                },
+                StageDef {
+                    // 6 · finalize / consumer / output ↔ rapidgzip future::get + writeAll
+                    name: "6·output".to_string(),
+                    // Enumerated, NOT a `consumer.` catch-all: the catch-all
+                    // grabbed the `consumer.iter` umbrella envelope (which is
+                    // declared later) and double-counted it as output busy. Any
+                    // unlisted consumer span now surfaces as UNCLASSIFIED (loud)
+                    // rather than silently inflating output.
+                    matcher: Matcher::exact_of(&[
+                        "consumer.write_data",
+                        "consumer.write_narrowed",
+                        "consumer.writev",
+                        "consumer.write_buffered",
+                        "consumer.combine_crc",
+                        "consumer.drain",
+                        "consumer.arc_take_or_clone",
+                    ]),
                 },
                 StageDef {
                     name: "·wait".to_string(),
                     matcher: m(
-                        &["ttp.rx_recv_block", "future.recv"],
-                        &["wait.", "ttp.", "chan_recv"],
+                        &[
+                            "ttp.rx_recv_block",
+                            "future.recv",
+                            "consumer.try_take_prefetched",
+                            "consumer.wait_replaced_markers",
+                            "consumer.dispatch_recv",
+                            "consumer.future_recv",
+                        ],
+                        &["wait.", "chan_recv"],
                         &[],
                         &[".wait"],
                     ),
@@ -620,10 +672,17 @@ impl Config {
                             "consumer.iter",
                             "drive",
                             "pool.run_task",
+                            "pool.submit",
+                            "pool.pick",
                             "worker.decode_chunk",
-                            "worker.seed_first",
+                            "worker.decode",
+                            "worker.decode_mode",
+                            "worker.chunk_phase",
+                            "worker.try_to_decode",
+                            "worker.scan_run",
+                            "worker.scan_candidate",
                         ],
-                        &["lock.", "worker.scan"],
+                        &["lock.", "causal.", "pool.pick"],
                         &[],
                         &[],
                     ),

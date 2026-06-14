@@ -77,12 +77,15 @@ impl Role {
 /// non-stage tags (`·wait`, `·umbrella`) — consumer-wait is derived separately
 /// from the critical path's residual, not from a busy stage.
 pub fn role_of_stage(stage: &str) -> Option<Role> {
+    // The six-stage canonical layout (Config::gzippy) folds bootstrap + clean
+    // tail into one `3·decode` stage (to align 1:1 with rapidgzip decodeBlock);
+    // the role taxonomy keeps both decode variants for back-compat, but the
+    // stage→role map can only reach WindowAbsentDecode now (decode is one stage).
     match stage {
-        "1·dispatch (upstream)" => Some(Role::Dispatch),
-        "2·worker bootstrap (window-absent)" => Some(Role::WindowAbsentDecode),
-        "3·worker clean decode tail" => Some(Role::CleanDecode),
-        "5·consumer resolve (markers/window)" => Some(Role::MarkerResolve),
-        "6·consumer write (output)" => Some(Role::ConsumerWrite),
+        "1·block-find" | "2·dispatch" => Some(Role::Dispatch),
+        "3·decode" => Some(Role::WindowAbsentDecode),
+        "4·window-publish" | "5·marker-resolve" => Some(Role::MarkerResolve),
+        "6·output" => Some(Role::ConsumerWrite),
         _ => None,
     }
 }
@@ -599,11 +602,13 @@ mod tests {
             role_of_stage(flow::classify("worker.bootstrap", &Config::gzippy().stages).unwrap()),
             Some(Role::WindowAbsentDecode)
         );
+        // Clean tail now folds into the single `3·decode` stage (= rapidgzip
+        // decodeBlock), so it maps to the decode role.
         assert_eq!(
             role_of_stage(
                 flow::classify("worker.isal_stream_inflate", &Config::gzippy().stages).unwrap()
             ),
-            Some(Role::CleanDecode)
+            Some(Role::WindowAbsentDecode)
         );
         assert_eq!(
             role_of_stage(

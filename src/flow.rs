@@ -312,7 +312,7 @@ mod tests {
         let decode = r
             .stages
             .iter()
-            .find(|s| s.name == "2·worker bootstrap (window-absent)")
+            .find(|s| s.name == "3·decode")
             .expect("decode stage present");
         // busy = two 86us spans = 172us
         assert!((decode.total_busy_us - 172.0).abs() < 1e-6);

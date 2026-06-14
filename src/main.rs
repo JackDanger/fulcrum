@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, scaling, schedule, score,
-    spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, rg_verbose, scaling,
+    schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -172,6 +172,199 @@ fn cmd_critpath(args: &[String]) -> ExitCode {
     let cp = critpath::analyze(&events, heavy_ms * 1000.0, &preferred_blockers(&cfg));
     print_critpath(&cp);
     ExitCode::SUCCESS
+}
+
+/// `fulcrum sixstage <gzippy_trace.json> --rg-verbose <rg.log> [--label L]`
+///
+/// THE cross-tool six-stage table. Left side: gzippy's six canonical pipeline
+/// stages from a GZIPPY_TIMELINE trace (busy-share + wall-critical-share, via
+/// [`flow`]). Right side: rapidgzip's `--verbose` profiling folded into the
+/// SAME six stages (busy-share, via [`rg_verbose`]). The deviant stage — where
+/// gzippy's busy-share materially exceeds rapidgzip's — is flagged, with a
+/// confidence tier per rapidgzip stage (DIRECT vs hypothesis). G0: the gzippy
+/// wall-critical shares are reconciled against the observed wall.
+fn cmd_sixstage(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    let Some(gz_trace) = pos.first() else {
+        eprintln!("usage: fulcrum sixstage <gzippy_trace.json> --rg-verbose <rg.log> [--label L]");
+        return ExitCode::FAILURE;
+    };
+    let cfg = Config::gzippy();
+    let events = match trace::load_events(Path::new(gz_trace)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fulcrum: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut preferred = preferred_blockers(&cfg);
+    preferred.extend(cfg.inner_blockers.iter().cloned());
+    let report = flow::analyze_flow(&events, &cfg, &preferred);
+
+    // rapidgzip side (optional — without it we print gzippy-only six rows).
+    let rg = flag(args, "--rg-verbose")
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|s| rg_verbose::parse(&s));
+    let label = flag(args, "--label").unwrap_or("(run)").to_string();
+
+    // The six canonical stage names, in order (must match Config::gzippy).
+    const STAGES: [&str; 6] = [
+        "1·block-find",
+        "2·dispatch",
+        "3·decode",
+        "4·window-publish",
+        "5·marker-resolve",
+        "6·output",
+    ];
+
+    // --- gzippy per-stage busy + wall-critical ---
+    let mut gz_busy = [0.0f64; 6];
+    let mut gz_wc = [0.0f64; 6];
+    for (i, name) in STAGES.iter().enumerate() {
+        if let Some(s) = report.stages.iter().find(|s| &s.name == name) {
+            gz_busy[i] = s.total_busy_us;
+            gz_wc[i] = s.wall_critical_us;
+        }
+    }
+    let gz_busy_tot: f64 = gz_busy.iter().sum();
+    let gz_wc_tot: f64 = gz_wc.iter().sum();
+    let wall = report.wall_us;
+
+    // --- rapidgzip per-stage cpu (seconds) ---
+    let rg_stages = rg.as_ref().filter(|v| v.parsed).map(|v| v.six_stages());
+    let rg_tot: f64 = rg_stages.map(|s| s.iter().map(|x| x.cpu_s).sum()).unwrap_or(0.0);
+
+    println!("\nFULCRUM sixstage — cross-tool wall decomposition  [{label}]");
+    println!("gzippy trace: {gz_trace}");
+    if rg.as_ref().map(|v| v.parsed).unwrap_or(false) {
+        println!("rapidgzip --verbose: parsed (pool-efficiency {:.1}%, replaced-markers {:.1}%)",
+            rg.as_ref().unwrap().pool_efficiency_pct, rg.as_ref().unwrap().replaced_marker_pct);
+    } else {
+        println!("rapidgzip --verbose: NOT supplied / not parsed (gzippy-only view)");
+    }
+    println!();
+    println!(
+        "  {:<18} {:>10} {:>10} {:>10} {:>10} {:>8}  {}",
+        "stage", "gz busy%", "gz wall%", "rg busy%", "gz/rg", "deviant", "rg confidence"
+    );
+    println!("  {}", "-".repeat(90));
+
+    for (i, name) in STAGES.iter().enumerate() {
+        let gzb = pct(gz_busy[i], gz_busy_tot);
+        let gzw = pct(gz_wc[i], wall);
+        let (rgb, conf) = match rg_stages {
+            Some(s) => (pct(s[i].cpu_s, rg_tot), if s[i].direct { "DIRECT" } else { "hypoth" }),
+            None => (f64::NAN, "—"),
+        };
+        let ratio = if rgb > 0.0 && rgb.is_finite() { gzb / rgb } else { f64::NAN };
+        // Deviant: gzippy busy-share materially exceeds rapidgzip's (>1.3x AND
+        // an absolute gap >5 percentage points), OR the gz wall-critical share
+        // is the dominant stage. We mark on busy-share excess (the comparable).
+        let deviant = if ratio.is_finite() && ratio > 1.3 && (gzb - rgb) > 5.0 {
+            "◄ YES"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<18} {:>9.1} {:>9.1} {:>9} {:>9} {:>8}  {}",
+            name,
+            gzb,
+            gzw,
+            if rgb.is_finite() { format!("{rgb:.1}") } else { "—".to_string() },
+            if ratio.is_finite() { format!("{ratio:.2}x") } else { "—".to_string() },
+            deviant,
+            conf,
+        );
+    }
+    println!("  {}", "-".repeat(90));
+
+    // --- G0 reconciliation ---
+    let wc_residual = wall - gz_wc_tot;
+    let waits_and_umbrella = report
+        .unclassified
+        .iter()
+        .map(|(_, d)| d)
+        .sum::<f64>();
+    let rpct = pct(wc_residual, wall);
+    println!(
+        "\n  G0 RECONCILE (gzippy wall-critical):  wall {:.2}ms  =  Σ6-stage wall-crit {:.2}ms  +  ·residual {:.2}ms ({:.1}%)",
+        wall / 1000.0,
+        gz_wc_tot / 1000.0,
+        wc_residual / 1000.0,
+        rpct,
+    );
+    // The equation ALWAYS balances (residual is the named 7th bucket =
+    // consumer-wall not pinned to a producing stage = in-order STARVATION,
+    // typically waiting during the speculative boundary-scan phase). G0 is
+    // about whether the SIX stages capture the wall: tight (<5%) ⇒ they do;
+    // a large residual is itself a finding (starvation-bound, e.g. the
+    // low-redundancy nasa corpus), not a tracing bug.
+    let tier = if wc_residual < -1.0 {
+        "INVALID ✗ — negative residual (B/E pairing unsound)"
+    } else if rpct < 5.0 {
+        "TIGHT ✓ — the 6 stages capture the wall"
+    } else if rpct < 15.0 {
+        "OK ✓ — minor starvation residual"
+    } else {
+        "LOOSE ⚠ — large ·residual = consumer STARVATION (in-order wait the 6 stages don't pin; a finding, not a bug)"
+    };
+    println!("  G0 STATUS: {tier}");
+    // Surface the dominant unattributed consumer waits driving a large residual.
+    if rpct >= 5.0 {
+        let spans = trace::pair_spans(&events);
+        let mut waits: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+        for s in &spans {
+            let n = s.name.as_str();
+            if n.starts_with("wait.")
+                || n.starts_with("ttp.rx_recv")
+                || n.ends_with(".wait")
+                || n == "consumer.dispatch_recv"
+                || n == "consumer.future_recv"
+            {
+                *waits.entry(n).or_default() += s.dur;
+            }
+        }
+        let mut w: Vec<(&str, f64)> = waits.into_iter().collect();
+        w.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top: Vec<String> = w.iter().take(4).map(|(n, d)| format!("{n}={:.0}ms", d / 1000.0)).collect();
+        println!("  ·residual dominated by consumer waits: {}", top.join(", "));
+    }
+    println!(
+        "  gzippy busy total {:.2}ms across {} threads; unclassified span time {:.2}ms",
+        gz_busy_tot / 1000.0,
+        events
+            .iter()
+            .map(|e| (e.pid, e.tid))
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        waits_and_umbrella / 1000.0,
+    );
+    if !report.unclassified.is_empty() {
+        let top: Vec<String> = report
+            .unclassified
+            .iter()
+            .take(5)
+            .map(|(n, d)| format!("{n}={:.0}us", d))
+            .collect();
+        println!("  UNCLASSIFIED spans (should be empty for a complete trace): {}", top.join(", "));
+    }
+    if let Some(v) = rg.as_ref().filter(|v| v.parsed) {
+        println!(
+            "\n  rapidgzip CPU totals (s): block-find {:.4}  decode {:.4}  apply-window {:.4}  alloc+copy {:.4}  crc {:.4}  future::get {:.4}",
+            v.block_finder_s, v.custom_inflate_s + v.inflate_wrapper_s + v.isal_s, v.apply_window_s, v.alloc_copy_s, v.checksum_s, v.future_get_s,
+        );
+        println!("  NOTE: rg busy% are CPU-time SHARES (thread-summed), comparable to gz busy%; rg stages 2/4/6 are hypothesis-tier (see rg_verbose.rs notes).");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Percentage helper: `num / den * 100`, 0 when den is 0.
+fn pct(num: f64, den: f64) -> f64 {
+    if den > 0.0 {
+        100.0 * num / den
+    } else {
+        0.0
+    }
 }
 
 /// `fulcrum flow <trace.json> [--whatif STAGE:FACTOR]`
@@ -2289,6 +2482,7 @@ fn main() -> ExitCode {
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),
+        "sixstage" => cmd_sixstage(rest),
         "score" => {
             match score::args_from_cli(rest) {
                 Ok(a) => {
