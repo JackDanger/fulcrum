@@ -52,6 +52,7 @@ pub mod probe;
 pub mod provenance;
 pub mod rank;
 pub mod region_hw;
+pub mod scaling;
 pub mod schedule;
 pub mod score;
 pub mod spans;
