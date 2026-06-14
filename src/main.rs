@@ -24,8 +24,8 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, schedule, score, spans,
-    sweep, trace, validate, vs, vs_sweep, xtool,
+    flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, scaling, schedule, score,
+    spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -59,6 +59,8 @@ USAGE:\n\
   fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
   fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]   span atlas (excl-self + wall-crit)\n\
   fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
+  fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...] [--config gzippy]\n\
+              SCALING-DEFICIT DECOMPOSITION: why the parallel decode scales worse as T grows\n\
   fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
   fulcrum alloc <trace.json>   per-(tid,region) fault localization (needs --features rpmalloc-stats)\n\
   fulcrum memlife <run.json>   cross-tool per-buffer memory-lifecycle attribution\n\
@@ -746,6 +748,188 @@ fn cmd_schedule(args: &[String]) -> ExitCode {
     };
     println!("  VERDICT: {win}-dominant. {note}");
     ExitCode::SUCCESS
+}
+
+/// `fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...]`
+///
+/// THE SCALING-DEFICIT DECOMPOSITION. Ingests one parallel-SM trace per thread
+/// count, partitions each run's wall into mutually-exclusive named mechanism
+/// buckets (productive-decode / head-of-line / window-serial / load-imbalance /
+/// spec-invalid / consumer-serial / consumer-idle), then decomposes the
+/// scaling deficit (excess over ideal-linear) per bucket — so the reason the
+/// decoder scales worse than its reference is one command away, no
+/// interpretation. Optional `--rg-wall T:ms` supplies the reference tool's wall
+/// per thread count as the near-ideal-scaling witness.
+fn cmd_scaling(args: &[String]) -> ExitCode {
+    // Collect repeatable --at T:trace.json and --rg-wall T:ms.
+    let mut at_specs: Vec<String> = Vec::new();
+    let mut rg_specs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => {
+                if let Some(v) = args.get(i + 1) {
+                    at_specs.push(v.clone());
+                }
+                i += 2;
+            }
+            "--rg-wall" => {
+                if let Some(v) = args.get(i + 1) {
+                    rg_specs.push(v.clone());
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    if at_specs.is_empty() {
+        eprintln!(
+            "usage: fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...] [--config gzippy]\n  \
+             (one parallel-SM trace per thread count; the smallest T is the base.\n   \
+             --rg-wall gives the reference tool's wall per T as the near-ideal witness.)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let cfg = load_config(args);
+
+    // Parse partitions.
+    let mut parts = Vec::new();
+    for spec in &at_specs {
+        let Some((tstr, path)) = spec.split_once(':') else {
+            eprintln!("fulcrum scaling: bad --at '{spec}' (want T:trace.json)");
+            return ExitCode::FAILURE;
+        };
+        let Ok(t) = tstr.trim_start_matches('T').trim_start_matches('t').parse::<u64>() else {
+            eprintln!("fulcrum scaling: bad thread count in '{spec}'");
+            return ExitCode::FAILURE;
+        };
+        let events = match trace::load_events(Path::new(path)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fulcrum scaling: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        parts.push(scaling::partition(&events, &cfg, Some(t)));
+    }
+
+    // Parse rg walls (ms → µs).
+    let mut rg_walls = Vec::new();
+    for spec in &rg_specs {
+        let Some((tstr, msstr)) = spec.split_once(':') else {
+            eprintln!("fulcrum scaling: bad --rg-wall '{spec}' (want T:ms)");
+            return ExitCode::FAILURE;
+        };
+        let Ok(t) = tstr.trim_start_matches('T').trim_start_matches('t').parse::<u64>() else {
+            eprintln!("fulcrum scaling: bad thread count in '{spec}'");
+            return ExitCode::FAILURE;
+        };
+        let Ok(ms) = msstr.parse::<f64>() else {
+            eprintln!("fulcrum scaling: bad ms in '{spec}'");
+            return ExitCode::FAILURE;
+        };
+        rg_walls.push((t, ms * 1000.0));
+    }
+
+    let report = scaling::analyze(parts, rg_walls);
+    print_scaling(&report);
+    if report.valid {
+        ExitCode::SUCCESS
+    } else {
+        // Honest output: a non-reconciling partition or a closure failure means
+        // the verdict is NOT trustworthy — fail loudly rather than print a
+        // fabricated number.
+        ExitCode::FAILURE
+    }
+}
+
+fn print_scaling(r: &scaling::ScalingReport) {
+    println!("FULCRUM scaling — SCALING-DEFICIT DECOMPOSITION  (why parallel decode scales worse as T grows)");
+    let base = &r.base;
+    println!(
+        "\n  base T{}  wall {:.1}ms  ({} chunks)   buckets (sum to wall):",
+        base.t,
+        base.wall_us / 1000.0,
+        base.n_chunks
+    );
+    for b in scaling::BUCKETS {
+        let v = base.get(b);
+        if v.abs() < 1.0 {
+            continue;
+        }
+        println!(
+            "    {:<20} {:>9.2}ms  {:>5.1}%",
+            b,
+            v / 1000.0,
+            100.0 * v / base.wall_us.max(1.0)
+        );
+    }
+    if !base.reconciled {
+        println!(
+            "    !! base partition does NOT reconcile (Σbuckets−wall {:.1}µs)",
+            base.residual_us
+        );
+    }
+
+    // Per-T deficit decomposition.
+    for d in &r.deficits {
+        println!(
+            "\n  ── T{}  wall {:.1}ms   self-speedup {:.2}× (ideal {:.0}×)   excess-over-ideal {:.1}ms ──",
+            d.t,
+            d.wall_us / 1000.0,
+            d.speedup,
+            d.ideal_speedup,
+            d.excess_us / 1000.0,
+        );
+        if let Some((rg_sp, rg_ex)) = scaling::rg_excess(&r.rg_walls, r.base.t, d.t) {
+            println!(
+                "     reference (rg): self-speedup {:.2}×   excess {:.1}ms   ⇒ gzippy gives up {:.1}ms of scaling vs rg",
+                rg_sp,
+                rg_ex / 1000.0,
+                (d.excess_us - rg_ex) / 1000.0
+            );
+        }
+        if !d.closure_ok {
+            println!(
+                "     !! CLOSURE FAILED (Σexcess_b − excess = {:.3}µs) — verdict NOT trustworthy",
+                d.closure_residual_us
+            );
+            continue;
+        }
+        let contribs = d.loss_contributors();
+        if contribs.is_empty() || d.excess_us < 1.0 {
+            println!("     no scaling deficit at T{} (scales ~ideally).", d.t);
+            continue;
+        }
+        println!("     scaling loss attributed to:");
+        let maxv = contribs.first().map(|c| c.1).unwrap_or(1.0).max(1.0);
+        for (name, us, frac) in &contribs {
+            let bar_w = ((us / maxv) * 22.0).round() as usize;
+            println!(
+                "       {:<20} {:>8.1}ms  {:>5.1}%  {}",
+                name,
+                us / 1000.0,
+                100.0 * frac,
+                "█".repeat(bar_w)
+            );
+        }
+        // One-line verdict naming the top mechanism(s).
+        let verdict: Vec<String> = contribs
+            .iter()
+            .take(3)
+            .filter(|(_, _, f)| *f >= 0.08)
+            .map(|(n, _, f)| format!("{:.0}% {}", 100.0 * f, n))
+            .collect();
+        println!("     VERDICT: T{} scaling loss = {}", d.t, verdict.join(" + "));
+    }
+
+    if !r.valid {
+        println!("\n  ⚠ REPORT INVALID — not all partitions reconciled / closure held:");
+        for p in &r.problems {
+            println!("      - {p}");
+        }
+        println!("  (refusing to bless a verdict from an unsound decomposition.)");
+    }
 }
 
 /// `fulcrum decompose <trace.json>` — NAME the model residual.
@@ -2085,6 +2269,7 @@ fn main() -> ExitCode {
         "consumer" => cmd_consumer(rest),
         "spans" => cmd_spans(rest),
         "schedule" => cmd_schedule(rest),
+        "scaling" => cmd_scaling(rest),
         "memlife" => cmd_memlife(rest),
         "decompose" => cmd_decompose(rest),
         "alloc" => cmd_alloc(rest),
