@@ -27,6 +27,7 @@ from . import trace as tr
 from .causal import knob_verdict
 from .fingerprint import Fingerprint, assert_comparable, incompatibilities
 from .ledger import PENDING, make_record
+from . import provenance as prov_mod
 from .stats import bimodal, dist_health_str, read_samples, resolution, sample_stats
 
 # ---------------------------------------------------------------------------
@@ -296,6 +297,33 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
     # the DERIVED values are the ones the fingerprints below are built from).
     anomalies.extend(derived_mismatches(man))
 
+    # ---- PROVENANCE-OR-VOID gate (instrument-firing / right-binary) ----------
+    # The runner's DERIVED capture must prove the instrument tested the right
+    # thing on the right binary BEFORE a number becomes a CELL. A
+    # DERIVED-SINK-SYMMETRIC failure RAISES here (the shared-floor phantom),
+    # mirroring SINK-LAW; VOID/STALE are carried and applied below. An
+    # uncaptured field is INCOMPLETE (non-citable, never refused) so
+    # pre-provenance artifacts stay analyzable.
+    provenance = prov_mod.from_manifest(man)
+    gate = prov_mod.run_gate(provenance)        # may raise InvariantViolation
+    prov_stamp = gate.stamp(provenance.commit_sha)
+    prov_voided = gate.voided_scopes
+    comparator_void = any(
+        c.verdict == prov_mod.VOID and c.name == prov_mod.COMPARATOR_PRESENT
+        for c in gate.checks)
+    run_stale = any(c.verdict == prov_mod.STALE for c in gate.checks)
+    for c in gate.checks:
+        if c.verdict in (prov_mod.VOID, prov_mod.STALE):
+            anomalies.append(
+                f"[{prov_mod.INVARIANT}/{c.name}] {c.scope}: {c.reason}")
+    if comparator_void:
+        prov_cell_label = " [COMPARATOR-VOID — ratio not citable]"
+    elif run_stale:
+        prov_cell_label = " [STALE — not citable as current]"
+    else:
+        prov_cell_label = ""
+    prov_block_bank = comparator_void or run_stale
+
     proto = man.get("protocol", "unknown")
     proto_tag = "" if proto == PROTOCOL_VERSION else \
         f" [protocol={proto} != analyzer {PROTOCOL_VERSION}]"
@@ -344,7 +372,9 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
                           "gap_ms": delta_s * 1000.0, "resolution": res,
                           "n_needed": n_need, "verdict": verdict,
                           "fp_gz": fp_gz, "fp_rg": fp_rg,
-                          "fp_label": fp_label}
+                          "fp_label": fp_label,
+                          "provenance": prov_stamp,
+                          "prov_label": prov_cell_label}
         scoreboard.append(
             f"  {fmt_cell(ck):13s} gz={sg['min']*1000:7.1f}ms "
             f"rg={sr['min']*1000:7.1f}ms "
@@ -352,6 +382,7 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             + (f"(N->{n_need})" if n_need else "")
             + f" spread gz={sg['spread_pct']:.1f}%/rg={sr['spread_pct']:.1f}%"
             + (f" BIMODAL[{bm}]" if bm else "")
+            + prov_cell_label
             + fp_label)
 
     # ---- ledger: contradiction scan + banking (FINGERPRINT-aware) --------------
@@ -361,8 +392,9 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
         n_banked = 0
         n_pending = 0
         for ck, w in sorted(cell_walls.items()):
-            if w["fp_label"] or not ok_frozen:
-                continue   # incomplete fingerprint / unfrozen: never banked
+            if w["fp_label"] or not ok_frozen or prov_block_bank:
+                continue   # incomplete fingerprint / unfrozen / provenance
+                           # VOID|STALE: never banked as a current anchor
             recs = [
                 make_record(man.get("runid"), adapter.name, "cell",
                             f"{fmt_cell(ck)}:gz", w["gz"]["min"] * 1000,
@@ -435,6 +467,17 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
             kn = adapter.knobs.get(kname)
             envkv, pred, desc = (kn.env, kn.pred, kn.desc) if kn \
                 else ("?", "none", kname)
+            # PROVENANCE-OR-VOID: a knob whose env has no grep-confirmed
+            # consumer, or an oracle that did not fire, is dropped from the
+            # causal tier (its A/B altered nothing / measured the normal path).
+            env_var = str(envkv).split("=", 1)[0]
+            if (f"knob:{env_var}" in prov_voided
+                    or f"oracle:{kname}" in prov_voided):
+                anomalies.append(
+                    f"[{prov_mod.INVARIANT}] knob.{kname}: VOID (env {env_var} "
+                    f"has no src consumer / oracle did not fire) — A/B dropped "
+                    f"from the causal tier")
+                continue
             v = knob_verdict(kdata["base"], kdata["knob"])
             if v.get("status") == "NO-DATA":
                 continue
@@ -536,7 +579,12 @@ def analyze_run(run, adapter, allow_thaw=False, feature=None, ledger=None):
 
     return {"header": header + ledger_notes, "scoreboard": scoreboard,
             "rows": rows, "anomalies": anomalies, "do_next": do_next,
-            "brief": brief, "cell_walls": cell_walls}
+            "brief": brief, "cell_walls": cell_walls,
+            "provenance": {"stamp": prov_stamp,
+                           "run_verdict": gate.run_verdict,
+                           "voided_scopes": sorted(gate.voided_scopes),
+                           "checks": [(c.name, c.verdict, c.scope, c.reason)
+                                      for c in gate.checks]}}
 
 
 def build_brief(rows, cell_walls, man, adapter, ok_frozen):

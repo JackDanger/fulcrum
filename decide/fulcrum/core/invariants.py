@@ -191,6 +191,40 @@ INVARIANTS = (
                     "frequency-invariance + cross-binary delta checks)",
     ),
     Invariant(
+        name="PROVENANCE-OR-VOID",
+        rule="A measurement is not emitted as a CELL unless the runner's "
+             "DERIVED capture proves the instrument tested the right thing on "
+             "the right binary. Five deterministic sub-checks: (DERIVED-CONSUMER) "
+             "every env knob set for a run has a grep-confirmed consumer in src/ "
+             "at the captured commit_sha — a knob with zero consumers VOIDs its "
+             "A/B (it altered nothing); (DERIVED-ORACLE-FIRED) an 'oracle ON' arm "
+             "produces counters that DIFFER from OFF and reach the expected "
+             "firing count — else the ON arm ran the NORMAL path under the oracle "
+             "label and is VOID; (DERIVED-SINK-SYMMETRIC) both arms of a wall A/B "
+             "sink to the SAME target and that target == the comparator's target "
+             "— a mismatched/file sink is REFUSED (the shared-floor phantom); "
+             "(DERIVED-SHA-CURRENT) cell.commit_sha == HEAD via `git diff "
+             "<sha>..HEAD -- src/` — a moved src tree STALE-stamps the cell "
+             "(non-citable as current, not dropped); (COMPARATOR-PRESENT) the "
+             "named comparator exists on the box and self-tests A/A == 1.0 +/- "
+             "its own spread — absent or A/A-off VOIDs the ratio. Graceful: an "
+             "uncaptured field is INCOMPLETE (non-citable, never refused); only a "
+             "present-but-wrong capture VOIDs/REFUSES.",
+        scar="The campaign's most expensive bias (>=5 errors): a file-output "
+             "sink penalized the faster A/B arm (phantom 'shared floor'); an "
+             "oracle env var no-op'd to the normal path (opposite-sign "
+             "irreproducibility); a tracer gated on the wrong env var was inert "
+             "all session; `pred_available` was hardcoded false; the rg "
+             "comparator ELF was absent on a box unnoticed. Every one was a "
+             "number that LOOKED measured but tested the wrong thing / binary / "
+             "nothing.",
+        enforcement="provenance.run_gate (raise InvariantViolation for "
+                    "DERIVED-SINK-SYMMETRIC; VOID/STALE carried in GateReport); "
+                    "decide.analyze_run provenance gate (drop voided scopes, "
+                    "stamp CELL provenance fields); selftests/test_provenance.py "
+                    "(one fixture per sub-check, each deliberately tripping it)",
+    ),
+    Invariant(
         name="INSN-CLOSURE-OR-NO-LEDGER",
         rule="An instruction ledger (`fulcrum insn`) must CLOSE on the measured "
              "retired-instruction total: measured_total (perf stat) == "
