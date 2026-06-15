@@ -46,15 +46,18 @@
 //!
 //! THE DIMENSION SYSTEM (five independent base units)
 //! ==================================================
+//! ```text
 //!     wall_s   wall-clock seconds
 //!     cpu_s    CPU (busy) seconds   — DISTINCT from wall_s on purpose
 //!     byte     bytes of volume
 //!     cycle    CPU cycles
 //!     insn     retired instructions
+//! ```
 //!
 //! THE REFUSALS (each a distinct `.refusal` token under the umbrella invariant
 //! `QUANTITY-DIMENSION-OR-REFUSE`)
 //! ==========================================================
+//! ```text
 //!   DIMENSION-REFUSED          computed Dim of a derivation ≠ asserted Dim.
 //!   LICENSE-REFUSED            dimension-CHANGING conversion with no measured
 //!                              license, a non-bridging factor, or a cross-arm
@@ -67,6 +70,7 @@
 //!   BARE-COMPARISON            a comparison without spread + N.
 //!   VOLUME-COUNTER-UNVALIDATED a volume (bytes) claim before the direct volume
 //!                              counter self-tested to 1.000 against output at T1.
+//! ```
 //!
 //! PROTOTYPED vs SPECCED
 //! =====================
