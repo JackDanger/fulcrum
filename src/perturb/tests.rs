@@ -480,3 +480,167 @@ fn lever_cell_projects_to_a_citable_located_finding() {
     assert_eq!(f.verdict, FVerdict::Located);
     assert_eq!(f.evidence_tier, EvidenceTier::Perturbation);
 }
+
+// ── 13. KEYSTONE: a lone outlier must NOT manufacture a STRONG SLACK ────────
+//
+// Regression guard for the dispersion defect: the inter-run spread used to be
+// max(max−min) (outlier-sensitive) while the delta was a central statistic, so
+// ONE slow sample inflated the 2×spread bar without moving the delta → a real
+// criticality-1.0 region read "not significant" → both arms FLAT → a STRONG,
+// false Verdict::Slack ("do NOT fund a fix here") from a single noisy run. The
+// fix (robust IQR spread + median-to-median delta) makes the bar immune to a
+// lone tail outlier. These tests are RED on the pre-fix code and GREEN after.
+
+/// A clean evenly-spaced set with ONE high outlier appended — a single noisy
+/// run (scheduling hiccup) on an otherwise clean set. min unchanged; the
+/// outlier sits beyond Q3 so a robust IQR ignores it, but max−min explodes.
+fn samples_with_hiccup(minval: f64, spread_s: f64, n: usize, hiccup_s: f64) -> Vec<f64> {
+    let mut v = samples_n(minval, spread_s, n);
+    v.push(minval + hiccup_s);
+    v
+}
+
+#[test]
+fn lone_baseline_hiccup_does_not_manufacture_slack() {
+    // criticality 1.0, ~30ms wall response in BOTH arms, ONE +60ms hiccup in
+    // the baseline set. Pre-fix: bar = 2×60ms = 120ms ≫ 30ms delta → FLAT/FLAT
+    // → STRONG SLACK. Post-fix: IQR ignores the hiccup → significant → LEVER.
+    let mut sw = base_sweep();
+    sw.baseline = samples_with_hiccup(1.000, 0.002, 9, 0.060);
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert_ne!(
+        cell.verdict,
+        Verdict::Slack,
+        "a lone baseline hiccup must NEVER yield a STRONG SLACK"
+    );
+    assert!(
+        matches!(cell.verdict, Verdict::Lever | Verdict::Inconclusive),
+        "expected LEVER or INCONCLUSIVE, got {:?}",
+        cell.verdict
+    );
+    // The strongest carrier reading: this clean-but-for-one-sample sweep should
+    // recover the lever, not merely dodge the false slack.
+    assert_eq!(cell.verdict, Verdict::Lever);
+    assert!(cell.may_claim_lever());
+}
+
+#[test]
+fn lone_perturbed_arm_hiccup_does_not_manufacture_slack() {
+    // Same region, but the +60ms hiccup is in the perturbed arm's OWN strongest
+    // (t=30%) spin sample — the perturbed arm's jitter, not the baseline's.
+    let mut sw = base_sweep();
+    let mut spin = linear_arm(1.0);
+    spin.insert(
+        30,
+        samples_with_hiccup(1.0 + 1.0 * (0.30 * SELF_S), 0.002, 9, 0.060),
+    );
+    sw.spin = spin;
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert_ne!(
+        cell.verdict,
+        Verdict::Slack,
+        "a lone spin-arm hiccup must NEVER yield a STRONG SLACK"
+    );
+    assert!(
+        matches!(cell.verdict, Verdict::Lever | Verdict::Inconclusive),
+        "expected LEVER or INCONCLUSIVE, got {:?}",
+        cell.verdict
+    );
+    assert_eq!(cell.verdict, Verdict::Lever);
+}
+
+#[test]
+fn clean_true_slack_still_reads_slack() {
+    // True-negative preserved: a genuinely flat region with clean, well-powered
+    // samples STILL reads a STRONG SLACK (the gate must not become useless).
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Slack);
+    assert_eq!(cell.evidence_tier, Tier::Perturbation);
+    assert!(!cell.may_claim_lever());
+    // and the SLACK is justified by POWER, not just a flat reading.
+    assert!(cell.notes.iter().any(|n| n.contains("POWERED")));
+}
+
+#[test]
+fn clean_criticality_one_still_reads_lever() {
+    // True-positive preserved: a clean criticality-1.0 sweep STILL reads LEVER.
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Lever);
+    assert_eq!(cell.evidence_tier, Tier::Perturbation);
+    assert!((cell.criticality.unwrap() - 1.0).abs() < 0.05);
+}
+
+#[test]
+fn underpowered_spread_reads_inconclusive_not_slack() {
+    // Symmetric conservativeness: a region whose inter-run spread is too wide to
+    // resolve even a criticality-1.0 response (inj(30%) ≤ 2×spread) must read
+    // INCONCLUSIVE, NEVER a STRONG SLACK — the SLACK side is now as conservative
+    // as the LEVER side. Tiny region_self_ms shrinks inj(30%) below the bar.
+    let mut sw = base_sweep();
+    sw.region_self_ms = 1.0; // self_s=0.001 → inj(30%)=0.0003 s ≪ 2×IQR(=~0.002 s)
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert_ne!(
+        cell.verdict,
+        Verdict::Slack,
+        "an underpowered sweep must NEVER yield a STRONG SLACK"
+    );
+    assert_eq!(cell.verdict, Verdict::Inconclusive);
+}
+
+// ── 14. The robust statistic primitives behave as documented ────────────────
+
+#[test]
+fn iqr_spread_is_immune_to_a_lone_tail_outlier() {
+    // The crux: a clean set and the same set + one big outlier have nearly equal
+    // IQR (robust), whereas their max−min differ by the whole outlier (fragile).
+    let clean = samples_n(1.000, 0.002, 9);
+    let dirty = samples_with_hiccup(1.000, 0.002, 9, 0.060);
+    let iqr_clean = sample_stats(&clean).unwrap().iqr;
+    let iqr_dirty = sample_stats(&dirty).unwrap().iqr;
+    assert!(
+        (iqr_dirty - iqr_clean).abs() < 0.001,
+        "IQR must barely move with a lone outlier: clean={iqr_clean} dirty={iqr_dirty}"
+    );
+    let range_clean = {
+        let s = sample_stats(&clean).unwrap();
+        s.max - s.min
+    };
+    let range_dirty = {
+        let s = sample_stats(&dirty).unwrap();
+        s.max - s.min
+    };
+    assert!(
+        range_dirty > range_clean + 0.05,
+        "the OLD max−min measure DOES explode with the outlier (that was the bug)"
+    );
+}
+
+#[test]
+fn median_delta_equals_min_delta_for_clean_evenly_spaced_sets() {
+    // The robust delta is backward-compatible on clean data: median-to-median
+    // equals the old min-to-min because the per-set median offset cancels.
+    let base = samples_n(1.000, 0.002, 9);
+    let arm = samples_n(1.030, 0.002, 9);
+    let sb = sample_stats(&base).unwrap();
+    let sa = sample_stats(&arm).unwrap();
+    let median_delta = sa.med - sb.med;
+    let min_delta = sa.min - sb.min;
+    assert!(
+        (median_delta - min_delta).abs() < 1e-9,
+        "median_delta={median_delta} min_delta={min_delta}"
+    );
+}

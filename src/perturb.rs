@@ -232,13 +232,34 @@ pub fn bimodal(xs: &[f64], k: f64) -> bool {
     g > k * med_other && left >= 2 && right >= 2
 }
 
-/// Inter-run spread (absolute seconds) = the widest (max-min) across the
-/// supplied sample sets. The noise floor every delta is judged against.
+/// Robust inter-run spread (absolute seconds) = the widest INTERQUARTILE RANGE
+/// (IQR = Q3−Q1) across the supplied sample sets. The noise floor every delta is
+/// judged against.
+///
+/// WHY IQR, NOT max−min (the KEYSTONE correctness fix). The prior measure was
+/// the full range (max−min) — the single most outlier-sensitive statistic
+/// possible. The delta it was compared against is a CENTRAL statistic
+/// (median-to-median; formerly min-to-min), so the two were INCONSISTENT: one
+/// slow sample in ANY set inflated the `2×spread` significance bar without
+/// moving the delta, so a genuinely critical region (e.g. a criticality-1.0,
+/// 30 ms wall response in both arms) with a lone +60 ms baseline hiccup read
+/// "not significant" → both arms FLAT → a STRONG, false `Verdict::Slack` ("do
+/// NOT fund a fix here") from a single noisy run — the exact failure this gate
+/// exists to prevent. It was asymmetric: the LEVER side stayed conservative
+/// (`slope_lo > 0`), only the SLACK side was anti-conservative.
+///
+/// IQR discards the top and bottom quartiles, so a lone outlier in EITHER tail
+/// leaves it unchanged. Paired with the median-to-median delta (also robust),
+/// both sides of the significance test now use CONSISTENT central, robust
+/// statistics: a single noisy sample can neither suppress a real LEVER nor
+/// manufacture a SLACK. (MAD would be an equally valid robust choice; IQR is
+/// preferred here because `SampleStats` already computes it with the same
+/// linear-interpolation quantiles as the Python oracle, keeping ONE arithmetic.)
 fn spread_s(sets: &[&[f64]]) -> f64 {
     let mut sp = 0.0_f64;
     for xs in sets {
         if let Some(st) = sample_stats(xs) {
-            sp = sp.max(st.max - st.min);
+            sp = sp.max(st.iqr);
         }
     }
     sp
@@ -324,7 +345,14 @@ pub fn arm_response(
                 let st = sample_stats(xs).unwrap();
                 ns.push(st.n);
                 sets.push(xs.as_slice());
-                pts.push((pct, (pct as f64 / 100.0) * region_self_s, st.min - b.min));
+                // ROBUST delta = median-to-median (was min-to-min). The median is
+                // a central statistic, CONSISTENT with the robust IQR spread it is
+                // judged against, so a lone outlier in either tail of any set
+                // moves neither the delta nor the noise floor. (For clean,
+                // evenly-distributed samples this equals the old min-to-min delta
+                // because the per-set median offset cancels between baseline and
+                // arm.)
+                pts.push((pct, (pct as f64 / 100.0) * region_self_s, st.med - b.med));
             }
             _ => {
                 let n = *ns.iter().min().unwrap();
@@ -367,14 +395,29 @@ pub fn arm_response(
         }
     }
 
+    // POWER (the symmetric-conservativeness fix). A FLAT reading is only
+    // trustworthy as SLACK if the experiment COULD have resolved a meaningful
+    // response. The largest plausible response at the strongest dose is a fully
+    // serial region: delta ≈ inj_top (criticality ≈ 1.0). If even that would
+    // fall inside the significance band (inj_top ≤ SIGMA_K·spread), a flat
+    // reading is uninformative — we literally could not have told slack from a
+    // criticality-1.0 lever — so the arm is UNDERPOWERED (→ INCONCLUSIVE), NOT
+    // FLAT. This mirrors the LEVER side's conservatism (which already requires
+    // delta > SIGMA_K·spread): a noisy region now reads INCONCLUSIVE on BOTH
+    // sides, never a STRONG SLACK.
+    let resolvable = inj_top > SIGMA_K * spread;
     let kind = if n < MIN_N {
         ArmKind::Underpowered
-    } else if !significant {
+    } else if significant {
+        if monotonic && linear && slope_lo > 0.0 {
+            ArmKind::Responds
+        } else {
+            ArmKind::Noisy
+        }
+    } else if resolvable {
         ArmKind::Flat
-    } else if monotonic && linear && slope_lo > 0.0 {
-        ArmKind::Responds
     } else {
-        ArmKind::Noisy
+        ArmKind::Underpowered
     };
 
     let bm = sets.iter().any(|xs| bimodal(xs, BIMODAL_K));
@@ -390,7 +433,14 @@ pub fn arm_response(
         significant,
         n,
         bimodal: bm,
-        n_needed: if n < MIN_N { Some(MIN_N) } else { None },
+        // Underpowered for EITHER reason (too few samples, or spread too wide to
+        // resolve a full-criticality response) signals "collect more / tighten
+        // the box": at least MIN_N samples.
+        n_needed: if kind == ArmKind::Underpowered {
+            Some(MIN_N)
+        } else {
+            None
+        },
         reason: None,
     }
 }
@@ -486,12 +536,14 @@ impl PerturbCell {
             Verdict::Slack => format!(
                 "SLACK [cell {}]: {} is provably NOT a wall binder — both busy and \
                  sleep arms FLAT (|\u{0394}wall(30%)|={}ms \u{2264} {:.0}\u{00d7}spread \
-                 ={}ms). Do NOT fund a fix here.",
+                 ={}ms) AND the sweep had the POWER to resolve a criticality-1.0 \
+                 response (inj(30%) > {:.0}\u{00d7}spread). Do NOT fund a fix here.",
                 self.cell_id,
                 self.region,
                 f1(self.delta_ms),
                 SIGMA_K,
                 f1(self.spread_ms),
+                SIGMA_K,
             ),
             Verdict::Artifact => format!(
                 "ARTIFACT [cell {}]: {}'s busy-spin response did NOT survive the \
@@ -628,10 +680,15 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
     let base_spread = if sr.is_some() {
         spread_s(&[&sweep.baseline, &sweep.baseline_recheck])
     } else {
-        sb.max - sb.min
+        sb.iqr
     };
     if let Some(sr) = sr {
-        let swing = (sb.min - sr.min).abs();
+        // ROBUST A/A swing = median-to-median (was min-to-min), CONSISTENT with
+        // the robust IQR `base_spread`. A min-based swing was sensitive to a lone
+        // FAST outlier in either baseline block — the mirror image of the SLACK
+        // bug: it could VOID a perfectly good cell. Median drift vs IQR floor
+        // detects a genuine box-state shift without being moved by one sample.
+        let swing = (sb.med - sr.med).abs();
         if swing > base_spread {
             let mut c = cell(Verdict::Void, Tier::Hypothesis);
             c.spread_ms = Some(base_spread * 1000.0);
@@ -707,8 +764,10 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
         c.n_needed = Some(MIN_N);
         c.spread_ms = Some(spread_ms);
         notes.push(
-            "an arm is underpowered (N<9) or missing a level — cannot resolve a \
-             dose-response"
+            "an arm is underpowered (N<9, OR inter-run spread too wide to resolve \
+             even a criticality-1.0 response: inj(30%) \u{2264} 2\u{00d7}spread) or is \
+             missing a level — cannot resolve a dose-response; a FLAT reading here \
+             is INCONCLUSIVE, not SLACK"
                 .to_string(),
         );
         c.notes = notes;
@@ -747,7 +806,10 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
         c.oracle_ceiling_ms = ceil_ms;
         c.n = Some(busy.n.min(slp.n));
         notes.push(
-            "both arms FLAT: \u{0394}wall within the significance band at every level".to_string(),
+            "both arms FLAT and the sweep was POWERED (inj(30%) > 2\u{00d7}spread, so a \
+             criticality-1.0 response WOULD have been significant): \u{0394}wall within \
+             the significance band at every level — a trustworthy SLACK"
+                .to_string(),
         );
         c.notes = notes;
         return c;
