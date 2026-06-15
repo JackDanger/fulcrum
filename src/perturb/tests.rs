@@ -1,0 +1,482 @@
+//! perturb self-tests — the harness must reproduce a KNOWN lever and a KNOWN
+//! slack before any of its verdicts count (SELF-TEST-OR-NO-TRUST applied to the
+//! keystone gate).
+//!
+//! A 1:1 port of `decide/fulcrum/selftests/test_perturb.py` — every `check(...)`
+//! in the Python reference becomes one `#[test]` here, with the SAME asserted
+//! verdict/refusal so the Rust harness is faithful to the verified oracle.
+
+use super::*;
+use std::collections::BTreeMap;
+
+const SELF_MS: f64 = 100.0; // region self-time: 100ms → injected 10/20/30ms
+const SELF_S: f64 = SELF_MS / 1000.0;
+
+/// n samples with min=minval, max=minval+spread_s (deterministic spread).
+fn samples_n(minval: f64, spread_s: f64, n: usize) -> Vec<f64> {
+    if n == 1 {
+        return vec![minval];
+    }
+    (0..n)
+        .map(|i| minval + spread_s * i as f64 / (n as f64 - 1.0))
+        .collect()
+}
+
+/// samples() with the Python defaults (spread_s=0.002, n=9).
+fn samples(minval: f64) -> Vec<f64> {
+    samples_n(minval, 0.002, 9)
+}
+
+/// Arm levels with delta(t) = crit · injected(t). crit=1.0 → fully critical;
+/// crit=0 → flat (slack).
+fn linear_arm_n(crit: f64, base: f64, spread_s: f64, n: usize) -> BTreeMap<u32, Vec<f64>> {
+    let mut out = BTreeMap::new();
+    for pct in [10u32, 20, 30] {
+        let inj = (pct as f64 / 100.0) * SELF_S;
+        out.insert(pct, samples_n(base + crit * inj, spread_s, n));
+    }
+    out
+}
+
+fn linear_arm(crit: f64) -> BTreeMap<u32, Vec<f64>> {
+    linear_arm_n(crit, 1.000, 0.002, 9)
+}
+
+fn base_sweep() -> Sweep {
+    Sweep {
+        region: Some("test.region".to_string()),
+        perturb_cmd: Some("oracle.sh --region R sweep".to_string()),
+        cell_id: Some("perturb_test".to_string()),
+        region_self_ms: SELF_MS,
+        sha_ok: Some("1".to_string()),
+        baseline: samples(1.000),
+        baseline_recheck: samples(1.0001),
+        spin: BTreeMap::new(),
+        sleep: BTreeMap::new(),
+        oracle_removed: None,
+    }
+}
+
+// ── 1. KNOWN LEVER — criticality 1.0, busy AND sleep dose-respond ───────────
+
+#[test]
+fn known_lever_verdict_is_perturbation_lever() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Lever);
+    assert_eq!(cell.evidence_tier, Tier::Perturbation);
+}
+
+#[test]
+fn known_lever_criticality_is_one_and_ci_excludes_zero() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert!((cell.criticality.unwrap() - 1.0).abs() < 0.05);
+    assert!(cell.criticality_lo.unwrap() > 0.0);
+}
+
+#[test]
+fn known_lever_may_claim_lever_true() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert!(cell.may_claim_lever());
+}
+
+#[test]
+fn known_lever_sentence_emits_gated_claim_and_oracle_ceiling() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    let sent = cell
+        .lever_sentence()
+        .expect("LEVER cell must emit a sentence");
+    assert!(sent.contains("LEVER"));
+    assert!(sent.contains("Funding a fix here is licensed"));
+    assert!(sent.contains("oracle ceiling"));
+}
+
+#[test]
+fn arm_response_criticality_one_is_responds() {
+    let sw_spin = linear_arm(1.0);
+    let ar = arm_response(&samples(1.000), &sw_spin, SELF_S);
+    assert_eq!(ar.kind, ArmKind::Responds);
+    assert!(ar.monotonic);
+    assert!(ar.linear);
+    assert!(ar.significant);
+}
+
+// ── 2. KNOWN SLACK — flat both arms (the fix-clean-path #14 shape) ──────────
+
+#[test]
+fn known_slack_verdict_is_perturbation_slack() {
+    let mut sw = base_sweep();
+    sw.region = Some("clean-path decode loop (annotate 1.10x share)".to_string());
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Slack);
+    assert_eq!(cell.evidence_tier, Tier::Perturbation);
+}
+
+#[test]
+fn known_slack_may_claim_lever_false() {
+    let mut sw = base_sweep();
+    sw.region = Some("clean-path decode loop (annotate 1.10x share)".to_string());
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert!(!cell.may_claim_lever());
+}
+
+#[test]
+fn arm_response_criticality_zero_is_flat() {
+    let sw_spin = linear_arm(0.0);
+    let ar0 = arm_response(&samples(1.000), &sw_spin, SELF_S);
+    assert_eq!(ar0.kind, ArmKind::Flat);
+    assert!(!ar0.significant);
+}
+
+// ── 3. A/A — perturbed == baseline → reads 1.0±spread (slope ~0) ────────────
+
+#[test]
+fn a_a_identical_arms_read_slack_within_spread() {
+    let mut sw = base_sweep();
+    let flat: BTreeMap<u32, Vec<f64>> = [10u32, 20, 30]
+        .into_iter()
+        .map(|p| (p, samples(1.000)))
+        .collect();
+    sw.spin = flat.clone();
+    sw.sleep = flat;
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Slack);
+    assert!(cell.delta_ms.unwrap().abs() <= cell.spread_ms.unwrap());
+}
+
+#[test]
+fn a_a_criticality_is_zero() {
+    let mut sw = base_sweep();
+    let flat: BTreeMap<u32, Vec<f64>> = [10u32, 20, 30]
+        .into_iter()
+        .map(|p| (p, samples(1.000)))
+        .collect();
+    sw.spin = flat.clone();
+    sw.sleep = flat;
+    let cell = analyze_sweep(&sw);
+    assert!(cell.criticality.unwrap().abs() < 0.05);
+}
+
+// ── 4. SPIN ARTIFACT — busy responds, sleep FLAT ───────────────────────────
+
+#[test]
+fn spin_artifact_verdict() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Artifact);
+}
+
+#[test]
+fn spin_artifact_may_claim_lever_false() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    assert!(!cell.may_claim_lever());
+}
+
+// ── 5. UNSTABLE BASELINE — A/A swing > spread VOIDs the cell ────────────────
+
+#[test]
+fn unstable_baseline_swing_voids() {
+    let mut sw = base_sweep();
+    sw.baseline = samples(1.000);
+    sw.baseline_recheck = samples(1.050);
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Void);
+    assert!(cell.notes.iter().any(|n| n.contains("swung")));
+}
+
+// ── 6. NON-MONOTONE — busy significant but t20 < t10 → VOID ─────────────────
+
+#[test]
+fn non_monotone_voids_instrument() {
+    let nonmono: BTreeMap<u32, Vec<f64>> = [
+        (10u32, samples(1.030)),
+        (20, samples(1.005)),
+        (30, samples(1.030)),
+    ]
+    .into_iter()
+    .collect();
+    let mut sw = base_sweep();
+    sw.spin = nonmono.clone();
+    sw.sleep = nonmono;
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Void);
+    assert!(cell
+        .notes
+        .iter()
+        .any(|n| n.to_uppercase().contains("MONOTON")));
+}
+
+// ── 7. UNDERPOWERED — N<9 → INCONCLUSIVE + N-needed ────────────────────────
+
+#[test]
+fn underpowered_is_inconclusive_with_n_needed() {
+    let mut sw = base_sweep();
+    sw.baseline = samples_n(1.000, 0.002, 5);
+    sw.baseline_recheck = samples_n(1.0001, 0.002, 5);
+    sw.spin = linear_arm_n(1.0, 1.000, 0.002, 5);
+    sw.sleep = linear_arm_n(1.0, 1.000, 0.002, 5);
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::Inconclusive);
+    assert_eq!(cell.n_needed, Some(9));
+}
+
+// ── 8. CEILING-ONLY — only the removal oracle ──────────────────────────────
+
+#[test]
+fn ceiling_only_verdict_and_tier() {
+    let mut sw = base_sweep();
+    sw.region = Some("window-absent bootstrap bundle".to_string());
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert_eq!(cell.verdict, Verdict::CeilingOnly);
+    assert_eq!(cell.evidence_tier, Tier::Oracle);
+}
+
+#[test]
+fn ceiling_only_ceiling_is_100ms() {
+    let mut sw = base_sweep();
+    sw.region = Some("window-absent bootstrap bundle".to_string());
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert!((cell.oracle_ceiling_ms.unwrap() - 100.0).abs() < 1.0);
+}
+
+#[test]
+fn ceiling_only_may_claim_lever_false() {
+    let mut sw = base_sweep();
+    sw.region = Some("window-absent bootstrap bundle".to_string());
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    assert!(!cell.may_claim_lever());
+}
+
+// ── 9. THE REFUSAL FIRES ───────────────────────────────────────────────────
+
+fn refusal_cases() -> Vec<(&'static str, PerturbCell)> {
+    let mut slack = base_sweep();
+    slack.spin = linear_arm(0.0);
+    slack.sleep = linear_arm(0.0);
+
+    let mut artifact = base_sweep();
+    artifact.spin = linear_arm(1.0);
+    artifact.sleep = linear_arm(0.0);
+
+    let mut ceiling = base_sweep();
+    ceiling.oracle_removed = Some(samples(0.900));
+
+    let mut void = base_sweep();
+    void.baseline = samples(1.000);
+    void.baseline_recheck = samples(1.050);
+    void.spin = linear_arm(1.0);
+    void.sleep = linear_arm(1.0);
+
+    vec![
+        ("SLACK", analyze_sweep(&slack)),
+        ("ARTIFACT", analyze_sweep(&artifact)),
+        ("CEILING", analyze_sweep(&ceiling)),
+        ("VOID", analyze_sweep(&void)),
+    ]
+}
+
+#[test]
+fn refusal_raises_for_every_non_lever_cell() {
+    for (name, cell) in refusal_cases() {
+        assert!(
+            cell.lever_sentence().is_err(),
+            "{name} cell must refuse a lever sentence"
+        );
+    }
+}
+
+#[test]
+fn refusal_message_names_the_perturbation() {
+    for (name, cell) in refusal_cases() {
+        let err = cell.lever_sentence().unwrap_err();
+        assert!(
+            err.message.contains("perturbation that would test this is"),
+            "{name} refusal must name the perturbation"
+        );
+    }
+}
+
+// ── 10. LOADER round-trip + renderer routes prose through the gate ──────────
+
+fn write_sweep_dir(d: &std::path::Path, sweep: &Sweep, freeze: bool) {
+    use std::io::Write;
+    std::fs::create_dir_all(d).unwrap();
+    let w = |path: std::path::PathBuf, xs: &[f64]| {
+        let s = xs
+            .iter()
+            .map(|x| format!("{x:.6}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(path, s).unwrap();
+    };
+    let mut meta = std::fs::File::create(d.join("meta.txt")).unwrap();
+    if let Some(r) = &sweep.region {
+        writeln!(meta, "region={r}").unwrap();
+    }
+    if let Some(p) = &sweep.perturb_cmd {
+        writeln!(meta, "perturb_cmd={p}").unwrap();
+    }
+    if let Some(c) = &sweep.cell_id {
+        writeln!(meta, "cell_id={c}").unwrap();
+    }
+    writeln!(meta, "region_self_ms={}", sweep.region_self_ms).unwrap();
+    if let Some(s) = &sweep.sha_ok {
+        writeln!(meta, "sha_ok={s}").unwrap();
+    }
+    if freeze {
+        writeln!(meta, "freeze_state=frozen").unwrap();
+        writeln!(meta, "quiet_state=quiet").unwrap();
+    }
+    drop(meta);
+    w(d.join("baseline.txt"), &sweep.baseline);
+    w(d.join("baseline_recheck.txt"), &sweep.baseline_recheck);
+    for (arm, levels) in [("spin", &sweep.spin), ("sleep", &sweep.sleep)] {
+        let ad = d.join(arm);
+        std::fs::create_dir_all(&ad).unwrap();
+        for (pct, xs) in levels {
+            w(ad.join(format!("t{pct}.txt")), xs);
+        }
+    }
+    if let Some(orc) = &sweep.oracle_removed {
+        w(d.join("oracle_removed.txt"), orc);
+    }
+}
+
+fn unique_tmp(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("fulcrum_perturb_{tag}_{nanos}"))
+}
+
+#[test]
+fn loader_round_trips_to_lever_with_freeze_meta() {
+    let d = unique_tmp("loader");
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    write_sweep_dir(&d, &sw, true);
+    let (loaded, meta) = load_sweep(&d).expect("load");
+    let cell = analyze_sweep(&loaded);
+    assert_eq!(cell.verdict, Verdict::Lever);
+    assert_eq!(meta.get("freeze_state").map(String::as_str), Some("frozen"));
+    assert!(frozen_ok(&meta));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn render_lever_prints_invariant_and_gated_sentence() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    let out = render_perturb(&cell, true);
+    assert!(out.contains("PERTURBATION-OR-NO-LEVER"));
+    assert!(out.contains("Funding a fix here is licensed"));
+    assert!(out.contains("criticality"));
+}
+
+#[test]
+fn render_slack_omits_lever_sentence_and_marks_unreachable() {
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let cell = analyze_sweep(&sw);
+    let out = render_perturb(&cell, true);
+    assert!(!out.contains("Funding a fix here is licensed"));
+    assert!(out.contains("UNREACHABLE"));
+    assert!(out.contains("SLACK"));
+}
+
+// ── 11. WORKED EXAMPLE #14 — fix-clean-path-overhead → SLACK, un-voiceable ──
+
+#[test]
+fn worked_14_fix_clean_path_is_slack_and_unvoiceable() {
+    let mut sw = base_sweep();
+    sw.region = Some("clean-path decode overhead (function-annotate 1.10x)".to_string());
+    sw.perturb_cmd =
+        Some("oracle.sh --region clean_path --inject {10,20,30} --sleep-ctl".to_string());
+    sw.spin = linear_arm(0.0);
+    sw.sleep = linear_arm(0.0);
+    let c14 = analyze_sweep(&sw);
+    assert_eq!(c14.verdict, Verdict::Slack);
+    let raised = c14.lever_sentence().unwrap_err();
+    assert!(raised.message.contains("clean-path"));
+}
+
+// ── 12. WORKED EXAMPLE #6 — build-the-window-fix → CEILING-ONLY, gated ──────
+
+#[test]
+fn worked_6_build_window_fix_is_ceiling_only_and_gated() {
+    let mut sw = base_sweep();
+    sw.region = Some("window-absent bootstrap (oracle ceiling read)".to_string());
+    sw.perturb_cmd =
+        Some("oracle.sh --region window_absent --inject {10,20,30} --sleep-ctl".to_string());
+    sw.oracle_removed = Some(samples(0.880));
+    let c6 = analyze_sweep(&sw);
+    assert_eq!(c6.verdict, Verdict::CeilingOnly);
+    assert!(!c6.may_claim_lever());
+    assert!(c6.lever_sentence().is_err());
+}
+
+#[test]
+fn worked_6_only_legal_sentence_states_ceiling_is_not_a_carrier() {
+    let mut sw = base_sweep();
+    sw.region = Some("window-absent bootstrap (oracle ceiling read)".to_string());
+    sw.oracle_removed = Some(samples(0.880));
+    let c6 = analyze_sweep(&sw);
+    assert!(c6.hypothesis_sentence().to_lowercase().contains("carrier"));
+}
+
+// ── Projection onto the canonical Finding CELL ─────────────────────────────
+
+#[test]
+fn lever_cell_projects_to_a_citable_located_finding() {
+    use crate::finding::{EvidenceTier, Scope, Threads, Verdict as FVerdict};
+    let mut sw = base_sweep();
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    sw.oracle_removed = Some(samples(0.900));
+    let cell = analyze_sweep(&sw);
+    let f = cell.to_finding(
+        "abc1234",
+        Scope::new("silesia", "amd-zen2", Threads::Fixed(8)),
+        "regular-file",
+        "2026-06-14",
+    );
+    assert!(f.is_citable().is_ok());
+    assert_eq!(f.verdict, FVerdict::Located);
+    assert_eq!(f.evidence_tier, EvidenceTier::Perturbation);
+}
