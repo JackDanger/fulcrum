@@ -267,21 +267,47 @@ Invariants every iteration must keep green:
   None/missing-line/empty-value → `unknown`; sentinel → parse None). 547 tests /
   0-fail / 0-ignored · clippy 0-new · fmt clean.
 
-- **[TODO — relay #13 candidate, HIGH VoI]** UNQUIET single-competitor blind-spot
-  at low k. `effective_occupancy_min` relativizes the floor by the cell's MEDIAN
-  occupancy, so a >50%-preempted cell (median itself depressed) lets UNIFORM
-  contention pass the occupancy + CONTAMINATION arms — the cell then leans ENTIRELY
-  on UNQUIET/DRIFT. UNQUIET fires only when `procs_running_med > k + PROCS_RUNNING_SLACK`
-  (slack k+1). Deterministically stress whether a realistic "1–2 steady competing
-  procs" actually pushes `procs_running_med` over k+1 at LOW k (k=1: one competitor
-  → run-queue ~2 ≤ 2, MISS; k=2: ~3 ≤ 3, MISS). If a single sustained competitor at
-  k=1 stays under the bar AND occupancy is relativized away, the contention is
-  admitted with NO arm firing — that is a real silent-pass hole. Build the
-  red-before/green-after around a CellBoxStats with depressed median occupancy +
-  procs_running_med just under k+1, and decide whether the floor should key on an
-  ABSOLUTE occupancy bar (not only the relativized one) or UNQUIET slack should
-  shrink at low k. (Relay #12 confirmed the WRONG-MASK/readback arm; this is the
-  next self-validation arm to falsify.)
+- **[DONE — relay #13, 0fd1025]** UNQUIET single-competitor blind-spot at k=1,
+  CLOSED via the PREEMPTED-K1 absolute occupancy backstop. Confirmed the silent
+  pass: a k=1 cell sharing its ONE pinned core with a single steady competitor
+  dodged ALL arms — CONTAMINATION (occupancy relativized to the depressed median
+  ≈0.5 ⇒ floor 0.45 ⇒ 0 rejected), UNQUIET (run-queue ≈2 == k+1=2, strict `>` ⇒
+  miss), DRIFT (steady). Chose the ABSOLUTE-occupancy fix over shrinking the
+  UNQUIET slack because (a) it fixes the ROOT (occupancy relativization hiding
+  uniform preemption of OUR workload), and (b) procs_running is SYSTEM-WIDE —
+  other tenants on OTHER cores inflate it without contending for our pinned core,
+  so tightening UNQUIET would FALSE-VOID a quiet cell on a shared box (the
+  over-correction). Scoped to k == 1 ONLY: at k≥2 a serial-by-design parallel cell
+  legitimately reads aggregate occ < 1 with no preemption, so the relativized
+  floor MUST be preserved there; at k==1 there is no parallelism, so sub-saturation
+  can only be off-core preemption. Backstop: `k==1 && 0 < occupancy_med <
+  OCCUPANCY_MIN(0.90)` ⇒ VOID. Degrades to a no-op when occupancy uncaptured
+  (occ_med == 0.0 — a running thread can never use zero CPU). Test
+  `provenance::box_valid_tests::preempted_k1_voids_red_before_green_after`
+  (RED-before proven: contended cell certified OK pre-fix) + 4 GREEN controls
+  (quiet k=1; occ AT the 0.90 floor; serial-by-design k=4 @ occ 0.5 keeps the
+  relativized floor; occ_med==0.0 no-op). 548 / 0 / 0 · clippy 0-new · fmt clean.
+  **GATE-BEHAVIOR CHANGE — banked cells:** this is a STORED-DATA gate change (cells
+  are re-evaluated from stored occupancy), so it CAN retroactively reclassify a
+  banked **T1 (k=1)** cell whose stored `occupancy_med` is in (0.0, 0.90) — that
+  cell now VOIDs where it previously certified. T1 cells with stored occ ≥ 0.90,
+  and ALL k≥2 cells, are UNAFFECTED. The leader should re-run the gate over banked
+  <BENCH_HOST> T1 cells (it is a shared/noisy box) to surface any now-VOID T1 cells.
+
+- **[TODO — relay #14 candidate, MEDIUM VoI]** Generalize PREEMPTED-K1 to k≥2
+  WITHOUT false-VOIDing serial-by-design cells. The k==1 backstop closes the worst
+  case (one competitor = 100% of the core), but a single sustained competitor on a
+  k≥2 cell is STILL admitted: UNQUIET misses it (run-queue k+1 == bar) and the
+  relativized occupancy floor hides it. The discriminator that separates "serial
+  fraction" from "off-core preemption" at k≥2 is not occupancy alone (both depress
+  it). Candidate witnesses to investigate deterministically: (i) the per-sample
+  occupancy DISTRIBUTION shape — a serial bootstrap depresses occupancy SMOOTHLY/
+  uniformly, whereas a competitor that round-robins on/off our cores leaves a
+  BIMODAL per-sample occupancy (already have `bimodal()` in perturb.rs); (ii)
+  cross-checking occupancy_med against the THEORETICAL serial-fraction ceiling if
+  the cell's serial fraction is independently known. Pre-register the falsifier
+  before coding; do NOT ship a k≥2 absolute floor (it false-VOIDs every
+  serial-bootstrap parallel cell — the exact thing the relativization protects).
 
 - **[WATCH — relay #11, item 2 RESOLVED]** (2) [RESOLVED — relay #11, see
   the OVERSUBSCRIBED-SMT DONE entry above] SMT-sibling oversubscription is now
