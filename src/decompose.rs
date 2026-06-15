@@ -68,12 +68,24 @@ pub const C_RSS_DELTA: &str = "rss_delta_bytes";
 #[derive(Debug, Clone)]
 pub struct ResidualTerm {
     pub name: &'static str,
-    /// Modeled time cost, µs.
+    /// WALL-RELEVANT modeled time cost, µs. This is the raw cross-thread CPU
+    /// cost (`cpu_us`) normalized by the run's parallelism, so it is
+    /// comparable to the single-thread wall. NEVER store an un-normalized
+    /// cross-thread CPU sum here — that is the D1 lie (a 320%-of-wall headline).
     pub modeled_us: f64,
+    /// Raw cross-thread CPU cost, µs (Σ over all (tid,region) cells × per-event
+    /// cost). This is CPU-seconds, NOT a wall fraction: at T>1 the work runs in
+    /// parallel, so `cpu_us` can legitimately exceed the wall. Kept for honest
+    /// reporting as CPU-µs; it must not be rendered as "% of wall".
+    pub cpu_us: f64,
     /// Raw event count / bytes (for context).
     pub raw: f64,
     /// Whether the contributing counter values were pure (per the join).
     pub pure: bool,
+    /// Whether the per-event cost that produced `modeled_us` is CALIBRATED.
+    /// `false` => a fabricated/conservative midpoint constant (e.g. the 1µs/
+    /// minor-fault guess) that must NOT drive an authoritative headline.
+    pub calibrated: bool,
 }
 
 /// The decompose result.
@@ -91,13 +103,30 @@ pub struct Decomposition {
 }
 
 impl Decomposition {
-    /// Fraction of the residual that we managed to NAME.
+    /// Fraction of the residual that the named terms account for.
+    ///
+    /// NOT clamped. A value > 1.0 is a CONSERVATION VIOLATION: the named
+    /// mechanisms model MORE wall than the residual contains — i.e. the
+    /// count→time model OVER-attributes (commonly because a per-event cost is
+    /// an un-calibrated guess). Clamping this to 1.0 (the old `.min(1.0)`)
+    /// laundered an 8× over-attribution into a reassuring "100% explained";
+    /// callers must instead surface the violation (see
+    /// [`Decomposition::conservation_violated`]).
     pub fn named_residual_frac(&self) -> f64 {
-        if self.residual_us <= 0.0 {
-            return 1.0;
-        }
         let named: f64 = self.terms.iter().map(|t| t.modeled_us).sum();
-        (named / self.residual_us).min(1.0)
+        if self.residual_us <= 0.0 {
+            // Nothing to explain. If we still modeled named cost over a
+            // zero/negative residual, that itself is a conservation violation.
+            return if named > 0.0 { f64::INFINITY } else { 1.0 };
+        }
+        named / self.residual_us
+    }
+
+    /// True when the named terms sum to MORE than the residual — the model
+    /// attributed more wall than exists. This is a measurement/attribution
+    /// error to be FLAGGED, never rendered as "fully explained".
+    pub fn conservation_violated(&self) -> bool {
+        self.named_residual_frac() > 1.0 + 1e-9
     }
 }
 
@@ -137,46 +166,81 @@ pub fn decompose(bundle: &ProfileBundle, named_region_us: f64) -> Decomposition 
     let (runnable_ns, p5) = sum_counter(bundle, C_RUNNABLE_NS);
     let (rss_delta, p6) = sum_counter(bundle, C_RSS_DELTA);
 
-    if minflt > 0.0 {
+    // PARALLELISM normalization (the D1 fix). The counters above are summed
+    // ACROSS ALL producer threads, so `count × per-event-cost` is a cross-thread
+    // CPU sum. At T>1 that work overlaps on N cores; presenting it directly as
+    // "% of a single-thread wall" inflates without bound (T16 page-faults =
+    // 320% of a 10ms wall). The wall-relevant figure divides the CPU sum by the
+    // run's parallelism. `cpu_us` keeps the honest un-normalized CPU cost.
+    let parallelism = (bundle.n_threads.max(1)) as f64;
+    let push = |d: &mut Decomposition,
+                name: &'static str,
+                cpu_us: f64,
+                raw: f64,
+                pure: bool,
+                calibrated: bool| {
         d.terms.push(ResidualTerm {
-            name: "page-fault (minor)",
-            modeled_us: minflt * cost::MINFLT_US,
-            raw: minflt,
-            pure: p1,
+            name,
+            modeled_us: cpu_us / parallelism,
+            cpu_us,
+            raw,
+            pure,
+            calibrated,
         });
+    };
+
+    if minflt > 0.0 {
+        // fabricated 1µs/fault midpoint => un-calibrated.
+        push(
+            &mut d,
+            "page-fault (minor)",
+            minflt * cost::MINFLT_US,
+            minflt,
+            p1,
+            false,
+        );
     }
     if majflt > 0.0 {
-        d.terms.push(ResidualTerm {
-            name: "page-fault (major)",
-            modeled_us: majflt * cost::MAJFLT_US,
-            raw: majflt,
-            pure: p2,
-        });
+        push(
+            &mut d,
+            "page-fault (major)",
+            majflt * cost::MAJFLT_US,
+            majflt,
+            p2,
+            false,
+        );
     }
     if nivcsw > 0.0 {
-        d.terms.push(ResidualTerm {
-            name: "ctxsw (involuntary / blocked-on-host)",
-            modeled_us: nivcsw * cost::CTXSW_US,
-            raw: nivcsw,
-            pure: p4,
-        });
+        push(
+            &mut d,
+            "ctxsw (involuntary / blocked-on-host)",
+            nivcsw * cost::CTXSW_US,
+            nivcsw,
+            p4,
+            false,
+        );
     }
     if nvcsw > 0.0 {
-        d.terms.push(ResidualTerm {
-            name: "ctxsw (voluntary / blocked-on-lock-io)",
-            modeled_us: nvcsw * cost::CTXSW_US,
-            raw: nvcsw,
-            pure: p3,
-        });
+        push(
+            &mut d,
+            "ctxsw (voluntary / blocked-on-lock-io)",
+            nvcsw * cost::CTXSW_US,
+            nvcsw,
+            p3,
+            false,
+        );
     }
     if runnable_ns > 0.0 {
-        // schedstat runnable time is already a TIME (ns) — name it directly.
-        d.terms.push(ResidualTerm {
-            name: "runnable-waiting-for-cpu (queueing)",
-            modeled_us: runnable_ns / 1000.0,
-            raw: runnable_ns,
-            pure: p5,
-        });
+        // schedstat runnable time is a MEASURED time (ns), not a fabricated
+        // constant => calibrated. Still a cross-thread sum, so normalize.
+        push(
+            &mut d,
+            "runnable-waiting-for-cpu (queueing)",
+            runnable_ns / 1000.0,
+            runnable_ns,
+            p5,
+            true,
+        );
     }
     if rss_delta != 0.0 {
         // RSS growth in pages → minor-fault-equivalent zeroing cost. Reported
@@ -184,17 +248,19 @@ pub fn decompose(bundle: &ProfileBundle, named_region_us: f64) -> Decomposition 
         // present (they overlap), so flag it as informational by zeroing its
         // modeled cost when minflt already covers it.
         let pages = (rss_delta.abs() / 4096.0).round();
-        let modeled = if minflt > 0.0 {
+        let cpu_us = if minflt > 0.0 {
             0.0
         } else {
             pages * cost::MINFLT_US
         };
-        d.terms.push(ResidualTerm {
-            name: "rss-growth (alloc/zeroing, info)",
-            modeled_us: modeled,
-            raw: rss_delta,
-            pure: p6,
-        });
+        push(
+            &mut d,
+            "rss-growth (alloc/zeroing, info)",
+            cpu_us,
+            rss_delta,
+            p6,
+            false,
+        );
     }
 
     let named: f64 = d.terms.iter().map(|t| t.modeled_us).sum();
@@ -221,7 +287,7 @@ pub fn render(d: &Decomposition) -> String {
         100.0 * d.residual_us / wall
     ));
     out.push_str(
-        "  (the rusage counters below are summed ACROSS ALL THREADS, so a term can\n   exceed the consumer's own self-time — it NAMES the producer-side mechanism\n   the consumer waits on. % is of WALL.)\n",
+        "  (the rusage counters below are summed ACROSS ALL THREADS; the modeled µs\n   is normalized by the run's parallelism so it is comparable to the\n   single-thread wall. CPU-µs (un-normalized cross-thread cost) is shown\n   separately and is NOT a wall fraction.)\n",
     );
     if d.terms.is_empty() {
         out.push_str(
@@ -233,14 +299,34 @@ pub fn render(d: &Decomposition) -> String {
         let mut terms = d.terms.clone();
         terms.sort_by(|a, b| b.modeled_us.partial_cmp(&a.modeled_us).unwrap());
         for t in &terms {
-            let flag = if t.pure { "" } else { " [SMEARED]" };
+            let pct = 100.0 * t.modeled_us / wall;
+            // CLAMP + FLAG: a term whose NORMALIZED cost still exceeds the wall
+            // is a measurement/attribution error (a cross-thread CPU sum that
+            // cannot be a wall fraction). Show the clamp, never print 320%.
+            let (disp_pct, overflow_flag) = if pct > 100.0 {
+                (
+                    100.0,
+                    " [>100% of WALL — cross-thread CPU sum, NOT a wall fraction; measurement error]",
+                )
+            } else {
+                (pct, "")
+            };
+            let smear_flag = if t.pure { "" } else { " [SMEARED]" };
+            let calib_flag = if t.calibrated {
+                ""
+            } else {
+                " [un-calibrated cost]"
+            };
             out.push_str(&format!(
-                "    {:<38}: {:>8.2}ms ({:>4.1}% of wall)  raw={:.0}{}\n",
+                "    {:<38}: {:>8.2}ms ({:>4.1}% of wall, {:.2}ms CPU)  raw={:.0}{}{}{}\n",
                 t.name,
                 t.modeled_us / 1000.0,
-                100.0 * t.modeled_us / wall,
+                disp_pct,
+                t.cpu_us / 1000.0,
                 t.raw,
-                flag
+                smear_flag,
+                calib_flag,
+                overflow_flag
             ));
         }
         out.push_str(&format!(
@@ -249,13 +335,32 @@ pub fn render(d: &Decomposition) -> String {
             d.unnamed_residual_us / 1000.0,
             100.0 * d.unnamed_residual_us / wall
         ));
+        if d.conservation_violated() {
+            out.push_str(&format!(
+                "  CONSERVATION VIOLATION: named terms model {:.1}× the residual \
+                 (over-attribution) — the wall is NOT fully explained; treat the split as un-trustworthy.\n",
+                d.named_residual_frac()
+            ));
+        }
         let top = terms.first().unwrap();
-        out.push_str(&format!(
-            "  VERDICT: dominant NAMED mechanism = {} ({:.1}% of wall, {:.0} events).\n",
-            top.name,
-            100.0 * top.modeled_us / wall,
-            top.raw
-        ));
+        let top_pct = 100.0 * top.modeled_us / wall;
+        // REFUSE the authoritative headline when the leading candidate rests on
+        // an un-calibrated constant or overflows the wall — print the RANKING
+        // only, not a calibrated wall-fraction claim.
+        if !top.calibrated || top_pct > 100.0 {
+            out.push_str(&format!(
+                "  VERDICT: WITHHELD — leading residual candidate = {} ({:.0} events). \
+                 It rests on an un-calibrated cost constant and/or exceeds 100% of wall \
+                 (cross-thread CPU sum); reporting the RANKING only, not a calibrated \
+                 wall-fraction headline.\n",
+                top.name, top.raw
+            ));
+        } else {
+            out.push_str(&format!(
+                "  VERDICT: dominant NAMED mechanism = {} ({:.1}% of wall, {:.0} events).\n",
+                top.name, top_pct, top.raw
+            ));
+        }
     }
     out
 }
@@ -311,5 +416,75 @@ mod tests {
         let d = decompose(&b, 700.0);
         assert!(d.terms.is_empty());
         assert!((d.unnamed_residual_us - 300.0).abs() < 1e-6);
+    }
+
+    /// D1 guard: a cross-thread fault sum is normalized by parallelism so the
+    /// modeled (wall-relevant) cost never exceeds the wall, while the raw
+    /// CPU-µs is preserved un-normalized. Pre-fix this term modeled 320% of wall.
+    #[test]
+    fn parallel_fault_sum_is_normalized_not_a_wall_fraction() {
+        let mut b = ProfileBundle {
+            wall_us: 10_000.0,
+            n_threads: 16,
+            ..Default::default()
+        };
+        for tid in 1..=16u64 {
+            let mut cell = RegionCell::default();
+            cell.counters.insert(
+                C_MINFLT.to_string(),
+                AttributedValue {
+                    value: 2000.0,
+                    purity: 1.0,
+                },
+            );
+            b.cells.insert(
+                CellKey {
+                    tid,
+                    region: "decode".into(),
+                    partition_idx: Some(tid),
+                },
+                cell,
+            );
+        }
+        let d = decompose(&b, 4_000.0);
+        let pf = d
+            .terms
+            .iter()
+            .find(|t| t.name.contains("page-fault (minor)"))
+            .unwrap();
+        // raw cross-thread CPU cost is honestly 32ms...
+        assert!((pf.cpu_us - 32_000.0).abs() < 1e-6, "cpu_us={}", pf.cpu_us);
+        // ...but the wall-relevant modeled cost is normalized to 32/16 = 2ms.
+        assert!(
+            (pf.modeled_us - 2_000.0).abs() < 1e-6,
+            "modeled_us={}",
+            pf.modeled_us
+        );
+        assert!(100.0 * pf.modeled_us / d.wall_us <= 100.0);
+        // fabricated 1µs/fault => un-calibrated.
+        assert!(!pf.calibrated);
+    }
+
+    /// D2 guard: over-attribution surfaces as named_residual_frac > 1.0 and a
+    /// conservation violation — never laundered into "100% explained".
+    #[test]
+    fn over_attribution_is_a_conservation_violation_not_clamped() {
+        let b = bundle_with(&[(C_MINFLT, 50_000.0)], 10_000.0);
+        let d = decompose(&b, 4_000.0); // residual = 6ms, named = 50ms
+        assert!(d.named_residual_frac() > 1.0);
+        assert!(d.conservation_violated());
+        assert!(render(&d).contains("CONSERVATION VIOLATION"));
+    }
+
+    /// D1 render guard: an un-calibrated / overflowing dominant term WITHHOLDS
+    /// the authoritative VERDICT headline and never prints a >100% wall fraction.
+    #[test]
+    fn render_withholds_headline_for_uncalibrated_overflow() {
+        let b = bundle_with(&[(C_MINFLT, 50_000.0)], 10_000.0);
+        let d = decompose(&b, 4_000.0);
+        let r = render(&d);
+        assert!(r.contains("VERDICT: WITHHELD"), "{r}");
+        assert!(r.contains(">100% of WALL"), "{r}");
+        assert!(!r.contains("dominant NAMED mechanism"), "{r}");
     }
 }
