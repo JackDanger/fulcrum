@@ -182,6 +182,50 @@ Invariants every iteration must keep green:
 
 ## Newly-discovered (append as found)
 
+- **[DONE — branch `harden/post-removal-audit`]** Adversarial post-removal audit:
+  re-validated the standalone Rust `fulcrum` as self-sufficient now that the Python
+  `decide/` cross-check oracle is GONE. Five attack surfaces, all worked:
+  **S1 Dangling references — HELD.** Grepped the repo + all gzippy worktrees'
+  `scripts/` for stale `python3 -m fulcrum.cli`/`fulcrum_decide.py`/`decide/fulcrum`
+  invocations. The only remaining refs are HISTORICAL provenance doc-comments
+  (`//! faithful port of decide/fulcrum/core/X.py`) + the removal-documenting
+  CHANGELOG/Cargo/backlog notes — no build/CI/Makefile/script/test executes the
+  deleted tree. CLEANUP: removed the stale untracked `decide/` cruft left on disk
+  (54 files of `.pyc`/`__pycache__`/`.pytest_cache`/`.selftest-stamp.json`; all
+  gitignored, 0 tracked, nothing references them) so the removal is complete.
+  **S2 Self-sufficiency — GAP FOUND + FIXED.** The library engines are
+  well-covered, but the seam's most-used subcommands (`total`/`invariants`/
+  `quantity`/`decide`/`ledger`) had NO binary-level test — only the deleted Python
+  oracle ever ran the compiled binary across them, so a misrouting in `main.rs`'s
+  `match cmd { … }` would compile + pass `cargo test` yet break the front door.
+  Added `tests/seam_subcommands.rs` (6 subprocess tests via `CARGO_BIN_EXE_fulcrum`):
+  `invariants` renders the registry (4 named tokens), `quantity --demo` carries the
+  umbrella token with NO double-prefix (locks fix b at the binary level),
+  `total` analyzes a streamed `},\n]` trace + REFUSES a malformed one,
+  `decide` refuses a non-artifact dir without panicking, unknown subcommand exits
+  non-zero. **S3 The two cross-check fixes — CONFIRMED correct + non-regressing.**
+  (a) loader: `trace::load_events` and `parse_trace_text` now share a byte-identical
+  repair (prepend `[`, strip trailing `]`, strip trailing commas, re-close); verified
+  it parses all canonical shapes (flat/streamed-unclosed/`},\n]`) AND still REFUSES
+  genuinely-malformed JSON (missing interior comma) via BOTH loaders — added
+  `t_loaders_reject_genuinely_malformed_json` to lock the not-over-permissive
+  property. (b) quantity Display: emits `[QUANTITY-DIMENSION-OR-REFUSE] [<refusal>]
+  msg` exactly once per line; checked all render sites (`render_demo`/
+  `worked_example_11`/`render_legal_algebra` use only the Display impl, no manual
+  second prepend) — 0 double-prefixes in actual output. **S4 The gzippy seam — HELD.**
+  `scripts/fulcrum` (front door) + `scripts/bench/decide.sh` invoke `$FULCRUM_BIN`
+  correctly: `analyze`→`decide`, `selftest`→`cargo test`, catch-all 1:1; exercised
+  `invariants`/`total`/`analyze`(→decide refuses non-artifact)/`help` live — all sane.
+  Confirmed every front-door subcommand resolves in the binary. **S5 Merge re-pass —
+  HELD.** All per-fix markers present + enforced (BOX-VALID, effective_occupancy_min,
+  comparator_aa_argv, fractional aa_spread, FieldBaseline, run_and_gate_incremental,
+  pin_mask_pool); the 3 closure invariants (TMA-CLOSURE / INSN-CLOSURE /
+  VOLUME-COUNTER) are enforced-not-specced with by-name refusal tests; D1/D2/S1 live
+  (not `#[ignore]`); 0 actual `#[ignore]` in the tree; the 14-invariant registry is
+  locked by `full_registry_migrated_from_python_oracle`. Verified: `cargo test
+  --release` 543 / 0-fail / 0-ignored (536 + 7 new) · clippy 0-new (9 pre-existing
+  == 9) · `cargo fmt --check` clean · `make check-pipeline` green.
+
 - **[DONE — branch `harden/rg-aa-units`]** rapidgzip per-arm `aa_spread` UNIT
   mismatch (over-admission). The rg arm emitted its per-arm `aa_spread =
   spread_of(&a.wall)` in SECONDS while `aa_ok` compares `|aa_ratio−1|` against

@@ -1462,6 +1462,34 @@ mod tests {
         assert!((spans[0].dur - 5.0).abs() < 1e-9);
     }
 
+    // --- guard (post-oracle-removal): the unified trailing-comma repair must
+    //     NOT become over-permissive. It strips only a trailing `]` and trailing
+    //     structural commas; a GENUINELY malformed trace (missing interior comma)
+    //     must still be REFUSED by BOTH loaders — `load_events` (the io::Result
+    //     loader `locate` uses) and `load_events_checked` (the validating loader
+    //     `total` uses). With the Python cross-check gone, this locks the
+    //     "repair is faithful, not lax" property the oracle used to enforce.
+    #[test]
+    fn t_loaders_reject_genuinely_malformed_json() {
+        let d = tmpdir("malformed");
+        let p = d.join("trace_bad.json");
+        // Missing comma between the two object members — not a streaming artifact,
+        // a real syntax error the repair must NOT paper over.
+        std::fs::write(
+            &p,
+            "[{\"name\":\"a\" \"ph\":\"B\",\"ts\":0,\"pid\":1,\"tid\":1}]\n",
+        )
+        .unwrap();
+        assert!(
+            load_events(&p).is_err(),
+            "load_events must REFUSE malformed JSON (over-permissive repair regression)"
+        );
+        match load_events_checked(&p) {
+            Err(InstrumentError::Malformed(_)) => {}
+            other => panic!("expected InstrumentError::Malformed, got {other:?}"),
+        }
+    }
+
     // --- extra: fmt parity with core/trace.py::fmt (4dp seconds, 3dp ms).
     #[test]
     fn t_fmt_parity() {
