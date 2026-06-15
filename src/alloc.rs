@@ -295,6 +295,7 @@ mod tests {
             ts_end: b,
             dur: b - a,
             args: serde_json::json!({}),
+            depth: 0,
         };
         let spans = vec![
             mkspan("worker.decode_chunk", 7, 0.0, 100.0),

@@ -273,6 +273,7 @@ fn sp(name: &str, tid: u64, start: f64, end: f64, args: serde_json::Value) -> Sp
         ts_end: end,
         dur: end - start,
         args,
+        depth: 0,
     }
 }
 
