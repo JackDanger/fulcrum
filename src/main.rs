@@ -2509,13 +2509,24 @@ fn cmd_provenance(args: &[String]) -> ExitCode {
     let pos = positional(args);
     let Some(bin) = pos.first() else {
         eprintln!(
-            "provenance needs <gzippy-binary> [--features \"...\"] [--routing \"path=...\"]\n  \
-             [--rev <git-describe>] [--out provenance.json]\n\n  \
-             Reads the isal_inflate dynsym count from the binary (0=pure-rust, >0=ISA-L FFI)\n  \
-             and bakes the decoder identity into a header every report can print."
+            "provenance needs <art-dir>            (PROVENANCE-OR-VOID instrument-firing gate)\n  \
+             or      <gzippy-binary>         (decoder-identity witness)\n\n  \
+             GATE  <art-dir>: reads <art-dir>/manifest.txt (key=value) and runs the five\n  \
+             derived sub-checks (consumer / oracle-fired / sink-symmetric / sha-current /\n  \
+             comparator-present). Stamps the CELL provenance_verdict + evidence_tier; a\n  \
+             REFUSED sub-check (the shared-floor sink) exits non-zero.\n    \
+             [--repo <dir>] live `git diff <commit>..HEAD -- src/` differ (default cwd)\n\n  \
+             WITNESS <gzippy-binary>: reads the isal_inflate dynsym count (0=pure-rust,\n  \
+             >0=ISA-L FFI) and bakes the decoder identity into a report header.\n    \
+             [--features \"...\"] [--routing \"path=...\"] [--rev <git-describe>] [--out f.json]"
         );
         return usage();
     };
+    // Dispatch on the argument shape: a directory => the PROVENANCE-OR-VOID gate
+    // (the ported `core/provenance.py`); a file => the decoder-identity witness.
+    if Path::new(bin).is_dir() {
+        return cmd_provenance_gate(bin, args);
+    }
     let features = flag(args, "--features").unwrap_or("").to_string();
     let routing = flag(args, "--routing").unwrap_or("").to_string();
     let rev = flag(args, "--rev").unwrap_or("").to_string();
@@ -2547,6 +2558,66 @@ fn cmd_provenance(args: &[String]) -> ExitCode {
         }
         _ if prov.consistency_warning().is_some() => ExitCode::FAILURE,
         _ => ExitCode::SUCCESS,
+    }
+}
+
+/// `fulcrum provenance <art-dir>` — the PROVENANCE-OR-VOID instrument-firing
+/// gate (the ported `core/provenance.py`). Reads `<art-dir>/manifest.txt`,
+/// runs the five derived sub-checks, prints the per-check verdicts + the CELL
+/// stamp, and exits non-zero on a REFUSED sub-check (the shared-floor sink) —
+/// the hard stop that keeps a poisoned A/B from ever becoming a number.
+fn cmd_provenance_gate(art_dir: &str, args: &[String]) -> ExitCode {
+    let manifest_path = Path::new(art_dir).join("manifest.txt");
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "fulcrum: provenance gate: cannot read {}: {e}",
+                manifest_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let man = provenance::parse_manifest_text(&text);
+    let prov = provenance::from_manifest(&man);
+
+    // Live src/-diff differ, used only when the runner did not capture
+    // src_changed_since_commit and HEAD alone cannot decide currency.
+    let repo = flag(args, "--repo").unwrap_or(".").to_string();
+    let differ = provenance::git_src_differ(repo);
+
+    match provenance::run_gate(&prov, Some(&differ), true) {
+        Ok(report) => {
+            let stamp = report.stamp(&prov.commit_sha);
+            println!("======== PROVENANCE-OR-VOID gate: {art_dir} ========");
+            for c in &report.checks {
+                println!(
+                    "  [{:<10}] {:<22} {:<14} {}",
+                    c.verdict.label(),
+                    c.name,
+                    c.scope,
+                    c.reason
+                );
+            }
+            println!("  ----");
+            println!("  commit_sha:         {}", stamp.commit_sha);
+            println!("  provenance_verdict: {}", stamp.provenance_verdict);
+            println!("  evidence_tier:      {}", stamp.evidence_tier);
+            if !report.voided_scopes.is_empty() {
+                let v: Vec<&str> = report.voided_scopes.iter().map(|s| s.as_str()).collect();
+                println!("  voided_scopes:      {}", v.join(", "));
+            }
+            // A VOID run (absent comparator / stale-as-current) is not citable;
+            // surface it as a non-zero exit so a caller never banks it blindly.
+            match report.run_verdict {
+                provenance::CheckVerdict::Void => ExitCode::FAILURE,
+                _ => ExitCode::SUCCESS,
+            }
+        }
+        Err(violation) => {
+            eprintln!("fulcrum: {violation}");
+            ExitCode::FAILURE
+        }
     }
 }
 
