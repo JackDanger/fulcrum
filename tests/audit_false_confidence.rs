@@ -1,10 +1,20 @@
-//! Adversarial false-confidence audit (2026-06-01).
+//! Adversarial false-confidence audit (2026-06-01; defects fixed 2026-06-14).
 //!
-//! Each test here DEMONSTRATES a way a fulcrum view can emit an authoritative
-//! number that is algebraically forced (a tautology) or that presents a
-//! cross-thread CPU sum as a fraction of a single-thread wall. They are written
-//! to FAIL against the current code, documenting the lie. When a lie is fixed,
-//! the corresponding test should be flipped to assert the guarded behavior.
+//! Each test here originally DEMONSTRATED a way a fulcrum view emitted an
+//! authoritative number that was algebraically forced (a tautology) or that
+//! presented a cross-thread CPU sum as a fraction of a single-thread wall.
+//!
+//! D1, D2, S1 and M1 are now FIXED and these tests are FLIPPED to assert the
+//! GUARDED behavior (they are no longer `#[ignore]`'d):
+//!   - D1: cross-thread fault sum is normalized by parallelism; the wall-relevant
+//!     modeled cost never exceeds the wall (`decompose.rs`).
+//!   - D2: `named_residual_frac` is un-clamped; over-attribution surfaces as a
+//!     conservation violation (`decompose.rs`).
+//!   - S1: a stall with no decode span is a COVERAGE-GAP/UNKNOWN, never charged
+//!     to PLACEMENT and never able to swing `winner()` (`schedule.rs`).
+//!   - M1: the model's `L_resolve` is the INDEPENDENT publish-span duration, not
+//!     the inter-publish gap, so the residual is a genuine (falsifiable)
+//!     prediction — not a telescoping tautology (`model.rs`).
 
 use fulcrum::bundle::{AttributedValue, CellKey, ProfileBundle, RegionCell};
 use fulcrum::decompose::{self, C_MINFLT};
@@ -33,46 +43,29 @@ fn span(name: &str, mode: &str, tid: u64, t0: f64, t1: f64) -> [Event; 2] {
     ]
 }
 
-fn publish(ts: f64, end_bit: u64) -> Event {
-    Event {
-        name: "causal.window_publish".into(),
-        ph: "i".into(),
-        ts,
-        pid: 1,
-        tid: 1,
-        args: serde_json::json!({ "end_bit": end_bit, "site": "consumer" }),
-    }
-}
-
-/// FINDING M1 (CRITICAL — the telescoping tautology, reincarnated).
+/// FINDING M1 (CRITICAL — the telescoping tautology), now FIXED + flipped.
 ///
-/// When the publish-chain term binds, the model's `wall_pred` is FORCED to equal
-/// the observed wall by construction, so the residual is identically 0% and
-/// "MODEL CONFIRMED" prints regardless of the actual publish timings:
+/// The old defect: with `L_resolve = Σgaps / (N-1)` (the inter-publish gap), the
+/// publish-chain term telescoped — `wall_pred == observed` for ANY publish
+/// timings, so the residual was identically 0% and "MODEL CONFIRMED" predicted
+/// nothing. The fix (`model.rs`): `L_resolve` is the INDEPENDENT publish-span
+/// DURATION (only B/E spans with a measured duration count), so `wall_pred` is
+/// built from a quantity that does NOT reconstruct the wall.
 ///
-///   L_resolve   = Σgaps / (N-1)            ; Σgaps = last_pub - first_pub
-///   publish_chain = frontier + (N-1)·L_resolve
-///               = (first_pub - start) + (last_pub - first_pub)
-///               = last_pub - start
-///   wall_pred   = publish_chain + tail
-///               = (last_pub - start) + (start + wall - last_pub)
-///               = wall    ← EXACTLY, for ANY publish timings.
-///
-/// We feed two WILDLY different publish patterns (uniform vs front-loaded vs a
-/// single giant gap) with the SAME first/last publish and SAME wall. A model
-/// that PREDICTS would residual-differ across them. The tautology gives 0% for
-/// all three — proving the residual measures nothing.
+/// This flipped test proves the FIX: three patterns with the SAME publish
+/// endpoints (first=10ms, last=90ms) and SAME wall, differing ONLY in the
+/// independent resolve duration, now yield DISTINCT, materially-nonzero
+/// residuals — the model genuinely PREDICTS (is falsifiable), it is no longer a
+/// tautology.
 #[test]
-#[ignore = "falsifier fixture — demonstrates false-confidence source M1 (telescoping tautology in model publish-chain); run explicitly: cargo test --test audit_false_confidence"]
-fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
-    // Helper: build a trace with N publishes at given timestamps, decode spans
-    // that are TINY (so worker-bound never binds => publish-chain binds), and a
-    // drive span [0, wall] anchoring the observed wall.
-    fn trace_with(pub_ts: &[f64], wall: f64) -> Vec<Event> {
+fn model_residual_responds_to_independent_resolve_not_a_tautology() {
+    // Build a trace with N publishes as B/E SPANS carrying an independent resolve
+    // DURATION, tiny decode spans (so worker-bound << publish-chain ⇒ publish
+    // chain binds), and a drive span [0, wall] anchoring the observed wall.
+    fn trace_with(pub_ts: &[f64], pub_dur: f64, wall: f64) -> Vec<Event> {
         let mut ev = Vec::new();
-        // tiny decode spans, one per chunk, so worker-bound << publish-chain
         for (i, _) in pub_ts.iter().enumerate() {
-            let t0 = 1.0 + i as f64; // 1µs spans near the start
+            let t0 = 1.0 + i as f64; // 1µs decode spans near the start
             ev.extend(span(
                 "worker.decode",
                 "window_absent",
@@ -82,7 +75,26 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
             ));
         }
         for (i, &t) in pub_ts.iter().enumerate() {
-            ev.push(publish(t, 1000 + i as u64 * 100));
+            let eb = 1000 + i as u64 * 100;
+            let args = serde_json::json!({ "end_bit": eb, "site": "consumer" });
+            // publish as a B/E span: ts_start anchors order/frontier/tail; the
+            // span DURATION is the independent L_resolve the model now reads.
+            ev.push(Event {
+                name: "causal.window_publish".into(),
+                ph: "B".into(),
+                ts: t,
+                pid: 1,
+                tid: 1,
+                args: args.clone(),
+            });
+            ev.push(Event {
+                name: "causal.window_publish".into(),
+                ph: "E".into(),
+                ts: t + pub_dur,
+                pid: 1,
+                tid: 1,
+                args,
+            });
         }
         ev.push(Event {
             name: "drive".into(),
@@ -104,18 +116,19 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
     }
 
     let wall = 100_000.0; // 100ms
-                          // Pattern A: uniform publishes 10ms..90ms.
-    let a = trace_with(&[10_000.0, 30_000.0, 50_000.0, 70_000.0, 90_000.0], wall);
-    // Pattern B: same first(10ms)/last(90ms), but ALL the gap in one giant stall.
-    let b = trace_with(&[10_000.0, 11_000.0, 12_000.0, 13_000.0, 90_000.0], wall);
-    // Pattern C: same endpoints, front-loaded.
-    let c = trace_with(&[10_000.0, 87_000.0, 88_000.0, 89_000.0, 90_000.0], wall);
+    let pub_ts = [10_000.0, 30_000.0, 50_000.0, 70_000.0, 90_000.0];
+    // SAME endpoints (first=10ms, last=90ms) and SAME wall for all three; only
+    // the independent resolve duration differs. Under the OLD tautology these
+    // would have yielded the identical 0% residual.
+    let a = trace_with(&pub_ts, 1_000.0, wall);
+    let b = trace_with(&pub_ts, 5_000.0, wall);
+    let c = trace_with(&pub_ts, 9_000.0, wall);
 
     let pa = model::analyze(&a, "A", Some(4));
     let pb = model::analyze(&b, "B", Some(4));
     let pc = model::analyze(&c, "C", Some(4));
 
-    // All three must be publish-chain bound (tiny decode).
+    // All three are publish-chain bound (tiny decode ⇒ worker-bound is tiny).
     assert_eq!(pa.binding, model::Binding::PublishChain);
     assert_eq!(pb.binding, model::Binding::PublishChain);
     assert_eq!(pc.binding, model::Binding::PublishChain);
@@ -124,25 +137,17 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
     let rb = model::residual_frac(&pb).unwrap();
     let rc = model::residual_frac(&pc).unwrap();
 
-    // The lie: residual is ~0 for ALL THREE despite totally different publish
-    // dynamics. A genuine prediction (independent of the wall it predicts) could
-    // not be perfect on every pattern. We ASSERT the tautology to document it,
-    // then assert it WOULD be caught by a falsifiability check.
-    assert!(ra.abs() < 1e-9, "A residual not ~0: {ra}");
-    assert!(rb.abs() < 1e-9, "B residual not ~0: {rb}");
-    assert!(rc.abs() < 1e-9, "C residual not ~0: {rc}");
-
-    // THE FAILING ASSERTION (documents the bug): a non-tautological model must
-    // have at least one input pattern where wall_pred is built from quantities
-    // that DO NOT telescope back into the wall. Because L_resolve is defined as
-    // span/(N-1) and tail closes the remainder, wall_pred == observed always.
-    // This assertion FAILS today, proving the residual is unfalsifiable.
-    let predicts_independently = (ra - rb).abs() > 1e-6 || (rb - rc).abs() > 1e-6;
+    // GUARDED behavior: the residual is materially NONZERO (the model does not
+    // reconstruct the wall) ...
     assert!(
-        predicts_independently,
-        "TAUTOLOGY CONFIRMED: model residual is 0% for every publish pattern \
-         (A={ra}, B={rb}, C={rc}); wall_pred reconstructs the wall by construction \
-         => 'MODEL CONFIRMED' predicts nothing."
+        ra.abs() > 1e-3 && rb.abs() > 1e-3 && rc.abs() > 1e-3,
+        "residual must be materially nonzero (no tautology): A={ra}, B={rb}, C={rc}"
+    );
+    // ... and it RESPONDS to the independent L_resolve: different resolve
+    // durations ⇒ different residuals. A telescoping tautology could not.
+    assert!(
+        (ra - rb).abs() > 1e-3 && (rb - rc).abs() > 1e-3,
+        "model must respond to independent L_resolve (not telescope): A={ra}, B={rb}, C={rc}"
     );
 }
 
@@ -157,7 +162,6 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
 /// to the critical path. This is exactly the "page-faults = 36.9% of wall"
 /// CPU-sums-lie, now relabeled with a caveat but still emitted as the headline.
 #[test]
-#[ignore = "falsifier fixture — demonstrates false-confidence source D1 (cross-thread CPU-sum presented as % of single-thread wall in decompose); run explicitly: cargo test --test audit_false_confidence"]
 fn decompose_sums_faults_across_threads_can_exceed_wall() {
     // wall = 10ms. 16 worker threads, each charged 2000 minor faults to its own
     // (tid, "decode") cell — a realistic T16 page-fault count. Modeled cost =
@@ -197,18 +201,20 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
         .expect("minor page-fault term");
     let pct_of_wall = 100.0 * pf.modeled_us / d.wall_us;
 
-    // The render VERDICT line prints exactly this "% of wall". Demonstrate it
-    // exceeds 100% — a physically impossible "fraction of wall" that a reader
-    // would take as "page faults dominate the wall".
+    // GUARDED: the WALL-RELEVANT modeled cost is normalized by parallelism, so it
+    // can never exceed the wall (pre-fix this was 320% — a cross-thread CPU sum
+    // presented as a single-thread wall fraction). The honest un-normalized CPU
+    // cost lives in `cpu_us` and is reported separately, never as "% of wall".
     assert!(
         pct_of_wall <= 100.0,
-        "CPU-SUM LIE CONFIRMED: decompose reports page-faults as {pct_of_wall:.0}% of a \
+        "D1 REGRESSION: decompose reports page-faults as {pct_of_wall:.0}% of a \
          single-thread wall (modeled {:.0}µs over a {:.0}µs wall) — a cross-thread CPU sum \
-         presented as a wall fraction. The VERDICT line prints this >100% number as the \
-         'dominant NAMED mechanism (% of wall)'.",
+         presented as a wall fraction.",
         pf.modeled_us,
         d.wall_us
     );
+    // The un-normalized cross-thread CPU cost is preserved (32ms across 16 threads).
+    assert!((pf.cpu_us - 32_000.0).abs() < 1e-6, "cpu_us={}", pf.cpu_us);
 }
 
 /// FINDING D2 (MEDIUM — named_residual_frac clamps the over-attribution).
@@ -219,7 +225,6 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
 /// reassuring "100% named". A clamp that turns a 320% over-attribution into
 /// "we named 100% of the residual" masks the bug rather than surfacing it.
 #[test]
-#[ignore = "falsifier fixture — demonstrates false-confidence source D2 (named_residual_frac clamp hides over-attribution); run explicitly: cargo test --test audit_false_confidence"]
 fn named_residual_frac_clamp_hides_over_attribution() {
     let mut b = ProfileBundle {
         wall_us: 10_000.0,
@@ -250,13 +255,19 @@ fn named_residual_frac_clamp_hides_over_attribution() {
         "setup: should over-attribute, got {raw_ratio}"
     );
 
-    // The reported frac is clamped to 1.0, hiding that we modeled 8x the residual.
+    // GUARDED: the clamp is gone. Over-attribution surfaces honestly — the
+    // reported fraction is the true (>1.0) ratio AND is flagged as a
+    // conservation violation, never laundered into a reassuring "100% explained".
     assert!(
-        d.named_residual_frac() < 1.0,
-        "CLAMP-MASKS-BUG CONFIRMED: named_residual_frac()={} (clamped to 1.0) hides that the \
-         model attributed {raw_ratio:.1}x the actual residual — over-attribution is rendered as \
-         'fully explained' instead of being flagged.",
+        (d.named_residual_frac() - raw_ratio).abs() < 1e-9,
+        "named_residual_frac()={} must equal the true over-attribution ratio {raw_ratio} (un-clamped)",
         d.named_residual_frac()
+    );
+    assert!(
+        d.named_residual_frac() > 1.0 && d.conservation_violated(),
+        "over-attribution must be a flagged CONSERVATION VIOLATION, got frac={} violated={}",
+        d.named_residual_frac(),
+        d.conservation_violated()
     );
 }
 
@@ -291,7 +302,6 @@ fn sp(name: &str, tid: u64, start: f64, end: f64, args: serde_json::Value) -> Sp
 /// chunk whose span is named differently) could swing the headline toward
 /// PLACEMENT for the wrong reason.
 #[test]
-#[ignore = "falsifier fixture — demonstrates false-confidence source S1 (undecoded-chunk stall silently charged to PLACEMENT instead of flagged as coverage gap); run explicitly: cargo test --test audit_false_confidence"]
 fn missing_decode_span_is_charged_to_placement_not_flagged_as_coverage_gap() {
     let spans = vec![
         // consumer stalls on chunk 5 for the whole 100µs.
@@ -308,18 +318,30 @@ fn missing_decode_span_is_charged_to_placement_not_flagged_as_coverage_gap() {
     ];
     let v = schedule::classify_stalls(&spans);
     assert_eq!(v.n_stalls, 1);
-    // The lie: with no decode span, the whole stall is PLACEMENT.
-    // A sound view would refuse to classify (coverage gap) or default to RATE
-    // (we cannot prove ready work was unused if we never saw the decode).
+    // GUARDED: a stall on a chunk with NO decode span is a COVERAGE-GAP/UNKNOWN.
+    // It is NOT classified PLACEMENT, contributes 0 to placement_us, and cannot
+    // swing winner() to PLACEMENT (the verdict is INCONCLUSIVE when nothing was
+    // classifiable).
+    assert_eq!(
+        v.stalls[0].class,
+        StallClass::CoverageGap,
+        "a missing decode span must be a coverage gap, got {:?}",
+        v.stalls[0].class
+    );
     assert_ne!(
         v.stalls[0].class,
         StallClass::Placement,
-        "COVERAGE-GAP-AS-PLACEMENT CONFIRMED: a stall on a chunk with NO decode span \
-         (placement_us={:.0} of dur={:.0}) is classified {:?} — a missing measurement \
-         is rendered as a confident PLACEMENT verdict. winner={}",
-        v.placement_us,
-        v.stalls[0].dur_us,
-        v.stalls[0].class,
+        "a missing measurement must never be a confident PLACEMENT verdict"
+    );
+    assert!(
+        v.placement_us < 1e-6,
+        "coverage gap leaked into placement_us={}",
+        v.placement_us
+    );
+    assert_ne!(
+        v.winner(),
+        "PLACEMENT",
+        "coverage gap must not swing winner() to PLACEMENT (got {})",
         v.winner()
     );
 }

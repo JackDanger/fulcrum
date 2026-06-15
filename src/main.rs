@@ -970,13 +970,24 @@ fn cmd_schedule(args: &[String]) -> ExitCode {
             100.0 * v.speculation_us / v.total_stall_us.max(1.0)
         );
     }
+    if v.coverage_gap_us > 0.0 {
+        println!(
+            "    COVERAGE-GAP (unclassified)   : {:.2}ms ({:.1}%)  [no decode span — measurement blind spot, excluded from verdict]",
+            v.coverage_gap_us / 1000.0,
+            100.0 * v.coverage_gap_frac()
+        );
+    }
     let win = v.winner();
-    let note = if win == "PLACEMENT" {
-        "project_wall_is_consumer_critical_path WINS — port queuePrefetchedChunkPostProcessing (eager successor placement)"
-    } else {
-        "project_t8_saturated_pool_diag WINS — frontier is rate-bound; lever is decode speed (~15% bounded)"
+    let note = match win {
+        "PLACEMENT" => "project_wall_is_consumer_critical_path WINS — port queuePrefetchedChunkPostProcessing (eager successor placement)",
+        "RATE" => "project_t8_saturated_pool_diag WINS — frontier is rate-bound; lever is decode speed (~15% bounded)",
+        _ => "no stall had a decode span to classify — extend trace coverage before drawing a placement-vs-rate verdict",
     };
-    println!("  VERDICT: {win}-dominant. {note}");
+    if win == "INCONCLUSIVE" {
+        println!("  VERDICT: INCONCLUSIVE. {note}");
+    } else {
+        println!("  VERDICT: {win}-dominant. {note}");
+    }
     ExitCode::SUCCESS
 }
 

@@ -55,6 +55,12 @@ pub enum StallClass {
     Placement,
     /// The chunk's decode was speculative and invalidated; re-decode tax.
     SpeculationInvalid,
+    /// The stalled chunk has NO decode span anywhere in the trace — a
+    /// COVERAGE/MEASUREMENT gap (renamed span, missing instrumentation, or a
+    /// chunk that genuinely never decoded). We CANNOT prove ready work went
+    /// unused without seeing the decode, so this is UNKNOWN — it is never
+    /// charged to PLACEMENT (or RATE) and never swings `winner()`.
+    CoverageGap,
 }
 
 /// One classified consumer stall.
@@ -81,6 +87,10 @@ pub struct ScheduleVerdict {
     pub rate_us: f64,
     pub placement_us: f64,
     pub speculation_us: f64,
+    /// Stall µs we REFUSE to classify because the chunk had no decode span (a
+    /// coverage/measurement gap). Excluded from placement/rate and from
+    /// `winner()` — surfaced so a reader knows the verdict has blind spots.
+    pub coverage_gap_us: f64,
     pub stalls: Vec<Stall>,
 }
 
@@ -97,9 +107,22 @@ impl ScheduleVerdict {
         }
         self.rate_us / self.total_stall_us
     }
-    /// Which note wins, as a printable string.
+    /// Fraction of stall time we refused to classify (coverage gap).
+    pub fn coverage_gap_frac(&self) -> f64 {
+        if self.total_stall_us <= 0.0 {
+            return 0.0;
+        }
+        self.coverage_gap_us / self.total_stall_us
+    }
+    /// Which note wins, as a printable string. Compares only the CLASSIFIED
+    /// placement-vs-rate µs — coverage-gap (unknown) stalls are excluded and
+    /// can never swing this. If neither was classified (all coverage gap),
+    /// the verdict is INCONCLUSIVE rather than a confident default.
     pub fn winner(&self) -> &'static str {
-        if self.placement_frac() > self.rate_frac() {
+        if self.placement_us <= 0.0 && self.rate_us <= 0.0 {
+            return "INCONCLUSIVE";
+        }
+        if self.placement_us > self.rate_us {
             "PLACEMENT"
         } else {
             "RATE"
@@ -235,6 +258,31 @@ pub fn classify_stalls(spans: &[Span]) -> ScheduleVerdict {
         }
 
         let dec = decodes.get(&idx);
+
+        // COVERAGE GAP (the S1 fix): no decode span for this chunk anywhere in
+        // the trace. With decode_start/complete = +INF, the old code made the
+        // PLACEMENT window the WHOLE stall, so any idle worker turned a missing
+        // measurement into a confident "ready work unused / PLACEMENT" verdict
+        // (and could swing winner() to PLACEMENT for the wrong reason). We
+        // cannot prove ready work was unused if we never saw the decode, so we
+        // REFUSE to classify: it is an UNKNOWN coverage gap, excluded from
+        // placement/rate and from winner().
+        if dec.is_none() {
+            verdict.coverage_gap_us += dur;
+            verdict.total_stall_us += dur;
+            verdict.n_stalls += 1;
+            verdict.stalls.push(Stall {
+                partition_idx: idx,
+                ts_start: stall_start,
+                ts_end: stall_end,
+                dur_us: dur,
+                class: StallClass::CoverageGap,
+                idle_admissible_us: 0.0,
+                decode_lag_us: f64::NAN,
+            });
+            continue;
+        }
+
         // decode_complete(i): when did the in-order decode of i finish?
         let decode_complete = dec.map(|d| d.ts_end).unwrap_or(f64::INFINITY);
         // decode_start(i): when did the in-order decode of i BEGIN?
@@ -419,6 +467,35 @@ mod tests {
             v.placement_us
         );
         assert_eq!(v.winner(), "RATE");
+    }
+
+    /// COVERAGE GAP (S1 fix): a stall on a chunk with NO decode span must be
+    /// flagged as an unknown coverage gap — never charged to PLACEMENT, and it
+    /// must not swing winner() to PLACEMENT.
+    #[test]
+    fn missing_decode_span_is_coverage_gap_not_placement() {
+        let spans = vec![
+            sp(
+                "wait.block_fetcher_get",
+                1,
+                100.0,
+                200.0,
+                json!({"chunk_id": 5}),
+            ),
+            // NO worker.decode_chunk for chunk 5; an idle worker exists.
+            sp("pool.pick.wait", 3, 100.0, 200.0, json!({})),
+        ];
+        let v = classify_stalls(&spans);
+        assert_eq!(v.n_stalls, 1);
+        assert_eq!(v.stalls[0].class, StallClass::CoverageGap);
+        assert!(
+            v.placement_us < 1e-6,
+            "placement leaked: {}",
+            v.placement_us
+        );
+        assert!(v.rate_us < 1e-6, "rate leaked: {}", v.rate_us);
+        assert!((v.coverage_gap_us - 100.0).abs() < 1e-6);
+        assert_eq!(v.winner(), "INCONCLUSIVE");
     }
 
     /// SPECULATION-INVALID: chunk decoded speculatively but in-order decode
