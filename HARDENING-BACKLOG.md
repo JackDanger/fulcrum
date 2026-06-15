@@ -42,9 +42,20 @@ Invariants every iteration must keep green:
    HYPOTHESIS queue, excluding the disproven family). Design comes from a parallel
    agent.
 
-6. **[TODO — standing]** Adversarial self-review for new bugs; parser/locale
-   edge-cases (`cycles.rs` non-C-locale); the dry-run fixture-oracle (CLI
-   `GitSrcOracle` can't validate a synthetic commit); coverage.
+6. **[STANDING — in progress]** Adversarial self-review for new bugs; parser/locale
+   edge-cases (`cycles.rs` non-C-locale); coverage.
+   - **[DONE — branch `harden/dryrun-oracle`]** The dry-run fixture-oracle gap. The
+     gated CLI (`fulcrum run … --gate`, `src/main.rs`) hardcoded a live
+     `GitSrcOracle`, so a `--dry-run` over a SYNTHETIC/fixture commit could never
+     certify — the freshness gate refused with `UNKNOWN(commit … not in repo)`. Fix:
+     a public `FixedOracle` (always-FRESH) in `src/finding.rs` + an EXPLICIT
+     `--fixture-oracle` CLI flag (`cmd_run`) that routes the gated pipeline through
+     it; the choice is LOGGED, and `--fixture-oracle --live` is REFUSED at arg-parse
+     (exit 2) so the fixture oracle can never silently certify a real finding. A run
+     without the flag keeps the real `GitSrcOracle`. 3 self-tests in
+     `tests/run_dryrun_oracle.rs` (dry-run+`--fixture-oracle` BANKS a CERTIFIED `F-`
+     cell; `--gate` WITHOUT the flag STILL refuses a non-repo commit; `--live` +
+     `--fixture-oracle` exits 2). 518 tests / 0 / 0.
 
 ## Newly-discovered (append as found)
 

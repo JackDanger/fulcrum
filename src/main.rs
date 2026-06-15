@@ -58,8 +58,10 @@ USAGE:\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
   fulcrum quantity [--demo|--algebra]   dimensioned-quantity evaluator (refuses share×wall→bytes etc.)\n\
   fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
-  fulcrum run <spec.json> [--out DIR] [--dry-run|--live]   the live-capture RUNNER half:\n\
-              run a gzippy-vs-rg decode workload and emit the gate-input artifacts\n\
+  fulcrum run <spec.json> [--out DIR] [--dry-run|--live] [--gate] [--store P] [--fixture-oracle]   the live-capture RUNNER half:\n\
+              run a gzippy-vs-rg decode workload and emit the gate-input artifacts;\n\
+              --gate flows them through the in-process gates and banks CERTIFIED cells\n\
+              (--fixture-oracle certifies a synthetic/dry-run commit; refused with --live)\n\
               (--spec-help for the spec fields; --live-help for the frozen-box invocation)\n\
   fulcrum perturb <sweep-dir> [--allow-thaw]   causal perturbation harness (PERTURBATION-OR-NO-LEVER)\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
@@ -2916,8 +2918,13 @@ fn cmd_mech_caps(_args: &[String]) -> ExitCode {
 /// comparability captures, the unified finding cell) into an artifact dir the
 /// gated pipeline consumes.
 ///
-///   fulcrum run <spec.json> [--out DIR] [--dry-run | --live]
+///   fulcrum run <spec.json> [--out DIR] [--dry-run | --live] [--gate] [--store P] [--fixture-oracle]
 ///   fulcrum run --spec-help          # the run-spec field reference
+///
+/// `--gate` selects the freshness oracle for the in-process pipeline: an explicit
+/// `--fixture-oracle` routes through a [`fulcrum::finding::FixedOracle`] (always
+/// FRESH) so a synthetic/fixture commit can certify; otherwise the real
+/// `GitSrcOracle` is used. `--fixture-oracle --live` is refused (no silent leak).
 ///   fulcrum run --live-help          # the documented frozen-box invocation
 fn cmd_run(args: &[String]) -> ExitCode {
     use fulcrum::runner;
@@ -2934,6 +2941,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut store: Option<&str> = None;
     let mut mode = runner::Mode::Fixture;
     let mut gate = false;
+    let mut fixture_oracle = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2957,6 +2965,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 gate = true;
                 i += 1;
             }
+            "--fixture-oracle" => {
+                fixture_oracle = true;
+                i += 1;
+            }
             other if !other.starts_with("--") => {
                 spec_path = Some(other);
                 i += 1;
@@ -2974,6 +2986,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    // Fail fast on the one contradictory flag combo: the fixture oracle (always
+    // FRESH) must NEVER apply to a LIVE run, or it would falsely certify a real
+    // finding as fresh. Refused here, before any work, so it's unreachable past
+    // arg-parse regardless of what the live runner does.
+    if fixture_oracle && matches!(mode, runner::Mode::Live) {
+        eprintln!(
+            "run: REFUSED — --fixture-oracle cannot combine with --live \
+             (the fixture oracle would falsely certify a live finding as FRESH; \
+             drop --fixture-oracle for a real run, or use --dry-run)"
+        );
+        return ExitCode::from(2);
+    }
     let spec_txt = match std::fs::read_to_string(spec_path) {
         Ok(s) => s,
         Err(e) => {
@@ -3002,7 +3026,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
     // --gate: flow the emitted artifacts through the five in-process gates and
     // bank every CERTIFIED cell (no subprocess, no Python).
-    use fulcrum::finding::{GitSrcOracle, Store};
+    use fulcrum::finding::{FixedOracle, GitSrcOracle, SrcChangeOracle, Store};
     let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let store_path = store
         .map(std::path::PathBuf::from)
@@ -3014,8 +3038,28 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let oracle = GitSrcOracle::new(&repo);
-    match fulcrum::pipeline::run_from_artifacts(&dir, &mut store_obj, &store_path, &oracle) {
+    // Oracle selection (the freshness gate's source-of-truth). The fixture oracle
+    // (always FRESH) is the ONLY way a synthetic/fixture commit — which is not in
+    // any git repo, so the live `GitSrcOracle` answers UNKNOWN("commit … not in
+    // repo") and refuses — can clear the freshness gate. It is selected ONLY by an
+    // EXPLICIT `--fixture-oracle`, never implicitly; a run without the flag (live OR
+    // dry-run) keeps the real `GitSrcOracle`. The choice is logged. (The
+    // contradictory `--fixture-oracle --live` combo is refused at arg-parse above.)
+    let git_oracle;
+    let fixed_oracle;
+    let oracle: &dyn SrcChangeOracle = if fixture_oracle {
+        eprintln!(
+            "run --gate: FIXTURE oracle (always FRESH) — explicit --fixture-oracle, \
+             synthetic/dry-run commit; NOT a live freshness check"
+        );
+        fixed_oracle = FixedOracle::fresh();
+        &fixed_oracle
+    } else {
+        eprintln!("run --gate: LIVE GitSrcOracle (repo {})", repo.display());
+        git_oracle = GitSrcOracle::new(&repo);
+        &git_oracle
+    };
+    match fulcrum::pipeline::run_from_artifacts(&dir, &mut store_obj, &store_path, oracle) {
         Ok(results) => {
             let mut certified = 0usize;
             for (label, outcome) in &results {

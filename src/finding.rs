@@ -612,6 +612,33 @@ impl SrcChangeOracle for GitSrcOracle {
     }
 }
 
+/// A deterministic oracle that answers a FIXED [`SrcChange`] regardless of the
+/// queried commit. It exists so the CLI `run --dry-run --gate --fixture-oracle`
+/// path can certify a SYNTHETIC/fixture commit (which by construction is not in any
+/// git repo, so the live [`GitSrcOracle`] would answer `UNKNOWN("commit … not in
+/// repo")` and refuse at the freshness gate). NEVER select this on a LIVE run — the
+/// caller must keep real measurements on [`GitSrcOracle`] so a real finding's
+/// freshness is checked against actual `src/` changes. The choice MUST be explicit
+/// and logged.
+pub struct FixedOracle {
+    pub answer: SrcChange,
+}
+
+impl FixedOracle {
+    /// A fixture oracle that always answers FRESH (the dry-run certification case).
+    pub fn fresh() -> FixedOracle {
+        FixedOracle {
+            answer: SrcChange::Fresh,
+        }
+    }
+}
+
+impl SrcChangeOracle for FixedOracle {
+    fn src_changed_since(&self, _commit_sha: &str) -> SrcChange {
+        self.answer.clone()
+    }
+}
+
 // ─── Citation (the refusal-bearing read path) ─────────────────────────────────
 
 /// What a citation ASSERTS: the strength it wants to claim and the scope it
