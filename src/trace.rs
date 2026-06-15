@@ -253,6 +253,10 @@ pub enum InstrumentError {
     BusyIdleMismatch(String),
     /// Negative self-time on one or more spans (a double-count was detected).
     NegativeSelfTime(String),
+    /// A decision-engine refusal that carries a verbatim message (a missing
+    /// `manifest.txt`, an unfrozen run under FROZEN-OR-LABELED, …). Mirrors the
+    /// Python `decide` code raising the bare `InstrumentError(msg)`.
+    Refused(String),
 }
 
 impl stdfmt::Display for InstrumentError {
@@ -265,7 +269,8 @@ impl stdfmt::Display for InstrumentError {
             | InstrumentError::ZeroEvents(m)
             | InstrumentError::ZeroSpans(m)
             | InstrumentError::BusyIdleMismatch(m)
-            | InstrumentError::NegativeSelfTime(m) => m,
+            | InstrumentError::NegativeSelfTime(m)
+            | InstrumentError::Refused(m) => m,
         };
         write!(f, "{m}")
     }

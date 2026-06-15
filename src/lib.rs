@@ -29,6 +29,11 @@
 //! See the bundled `examples/toy_pipeline.rs` for an end-to-end, dependency-
 //! free demonstration.
 
+/// The measurement-protocol version. Protocol lineage is INDEPENDENT of the
+/// package version — banked artifacts key off this string; never re-sync it.
+/// Mirrors `decide/fulcrum/__init__.py::PROTOCOL_VERSION`.
+pub const PROTOCOL_VERSION: &str = "fulcrum-v3";
+
 pub mod alloc;
 pub mod audit;
 pub mod binloc;
@@ -43,6 +48,7 @@ pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
 pub mod cycles;
+pub mod decide;
 pub mod decompose;
 pub mod estimate;
 pub mod finding;
@@ -65,6 +71,7 @@ pub mod provenance;
 pub mod quantity;
 pub mod rank;
 pub mod region_hw;
+pub mod report;
 pub mod rg_verbose;
 pub mod runner;
 pub mod scaling;

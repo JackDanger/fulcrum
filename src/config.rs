@@ -803,6 +803,69 @@ pub trait ProjectAdapter {
     fn perturbations(&self) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+
+    // -- artifact loading -----------------------------------------------------
+    /// Load one measurement-run artifact directory into the [`crate::decide::Run`]
+    /// the decision engine consumes. The default implements the documented schema
+    /// (`decide/docs/SCHEMA.md`); a project with its own artifact layout overrides
+    /// this and maps to the same run shape. Mirrors
+    /// `adapters/base.py::ProjectAdapter.load_run`.
+    fn load_run(
+        &self,
+        art_dir: &Path,
+    ) -> Result<crate::decide::Run, crate::trace::InstrumentError> {
+        crate::decide::load_run_documented(art_dir, self)
+    }
+
+    // -- micro-profile (optional per-project engine counters) -----------------
+    /// Profile-capture text -> opaque [`Prof`], or `None`. Mirrors
+    /// `adapters/base.py::parse_microprofile`.
+    fn parse_microprofile(&self, _text: &str) -> Option<Prof> {
+        None
+    }
+
+    /// `(rows, anomalies)` for the decision table. Mirrors
+    /// `adapters/base.py::microprofile_rows` (default: nothing).
+    fn microprofile_rows(
+        &self,
+        _ck: &crate::decide::CellKey,
+        _prof: Option<&Prof>,
+        _gap_ms: f64,
+        _run: &crate::decide::Run,
+    ) -> (Vec<crate::decide::Row>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
+    // -- knobs ----------------------------------------------------------------
+    /// Prove the kill-switch actually flipped the feature. `(verified, note)`:
+    /// `None` = no in-tree counter => EFFECT-UNVERIFIED. Mirrors
+    /// `adapters/base.py::effect_check`.
+    fn effect_check(&self, pred: &str, _base_txt: &str, _knob_txt: &str) -> (Option<bool>, String) {
+        (None, format!("unknown predicate '{pred}'"))
+    }
+
+    // -- re-verify command surfaces -------------------------------------------
+    /// The exact re-run command for a knob A/B. Mirrors
+    /// `adapters/base.py::reverify_knob`.
+    fn reverify_knob(
+        &self,
+        ck: &crate::decide::CellKey,
+        kname: &str,
+        _run: &crate::decide::Run,
+    ) -> String {
+        format!("re-run the {kname} A/B on {}:T{}", ck.0, ck.1)
+    }
+
+    /// The exact re-analyze command for a cell trace. Mirrors
+    /// `adapters/base.py::reverify_trace`.
+    fn reverify_trace(
+        &self,
+        ck: &crate::decide::CellKey,
+        _run: &crate::decide::Run,
+        _feature: Option<&str>,
+    ) -> String {
+        format!("re-analyze the {}:T{} trace", ck.0, ck.1)
+    }
 }
 
 /// The bare base adapter: empty taxonomy, no guards (the honest "I don't know
@@ -1221,6 +1284,124 @@ impl ProjectAdapter for GzippyAdapter {
         );
         p
     }
+
+    fn parse_microprofile(&self, text: &str) -> Option<Prof> {
+        // gzippy's parser always yields a Prof (possibly with empty classes);
+        // the consumer (microprofile_rows) guards on `classes` being empty.
+        Some(parse_prof(text))
+    }
+
+    fn microprofile_rows(
+        &self,
+        ck: &crate::decide::CellKey,
+        prof: Option<&Prof>,
+        gap_ms: f64,
+        run: &crate::decide::Run,
+    ) -> (Vec<crate::decide::Row>, Vec<String>) {
+        use crate::decide::{fmt_cell, Row};
+        let mut rows = Vec::new();
+        let mut anomalies = Vec::new();
+        let Some(prof) = prof else {
+            return (rows, anomalies);
+        };
+        if prof.classes.is_empty() {
+            return (rows, anomalies);
+        }
+        for d in bank_divergence(ck, prof) {
+            anomalies.push(format!("{}:T{}: {d}", ck.0, ck.1));
+        }
+        let compute = self
+            .perturbations()
+            .get("compute")
+            .cloned()
+            .unwrap_or_default();
+        // Sorted by class share descending (stable on ties -> parse order).
+        let mut items: Vec<&(String, ProfClass)> = prof.classes.iter().collect();
+        items.sort_by(|a, b| {
+            b.1.share_pct
+                .partial_cmp(&a.1.share_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let bin = run.manifest.get("bin").unwrap_or("None");
+        for (cls_name, c) in items {
+            let bounded = gap_ms * c.share_pct / 100.0;
+            rows.push(Row {
+                component: format!("engine.{cls_name}"),
+                kind: "engine".to_string(),
+                perturb_cmd: Some(compute.clone()),
+                cells: format!("{}:T{}", ck.0, ck.1),
+                attrib: format!(
+                    "{:.1}% of classed cyc, {:.1} cyc/iter, iters={}",
+                    c.share_pct,
+                    c.cyc_iter,
+                    commas(c.iters),
+                ),
+                status: format!(
+                    "HYPOTHESIS: bounded ≤{bounded:.0}ms ESTIMATE (= cell rg-gap \
+                     {gap_ms:.0}ms × class share; a partition, not a promise). \
+                     Perturb: {compute}"
+                ),
+                dist: "prof=1-shot counters (unfrozen-counters label)".to_string(),
+                verify: format!(
+                    "GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> {bin} \
+                     -d -c -p {} <BENCH_ROOT>/{}.gz >/dev/null",
+                    ck.1, ck.0
+                ),
+                tier: 2,
+                rank_ms: bounded,
+                reverted: false,
+                rss: None,
+                effect_verified: None,
+                n_needed: None,
+            });
+            let _ = fmt_cell; // (fmt_cell reserved for parity with sibling rows)
+        }
+        if let Some(wc) = prof.wrapper_calls {
+            if wc != 0 {
+                anomalies.push(format!(
+                    "{}:T{}: WRAPPER calls={wc} (expected 0 — contig should be the \
+                     sole production engine)",
+                    ck.0, ck.1
+                ));
+            }
+        }
+        (rows, anomalies)
+    }
+
+    fn effect_check(&self, pred: &str, base_txt: &str, knob_txt: &str) -> (Option<bool>, String) {
+        effect_check_gzippy(pred, base_txt, knob_txt)
+    }
+
+    fn reverify_knob(
+        &self,
+        ck: &crate::decide::CellKey,
+        kname: &str,
+        run: &crate::decide::Run,
+    ) -> String {
+        format!(
+            "scripts/bench/decide.sh --cells {}:{} --knob-cells {}:{} --knobs \
+             {kname} --knob-n 21 --bin {}",
+            ck.0,
+            ck.1,
+            ck.0,
+            ck.1,
+            run.manifest.get("bin").unwrap_or("None"),
+        )
+    }
+
+    fn reverify_trace(
+        &self,
+        ck: &crate::decide::CellKey,
+        _run: &crate::decide::Run,
+        feature: Option<&str>,
+    ) -> String {
+        format!(
+            "scripts/fulcrum total <artdir>/cell_{}_T{}/trace.json --feature {}",
+            ck.0,
+            ck.1,
+            feature.unwrap_or("None"),
+        )
+    }
 }
 
 /// Find `needle` (a `key=` pattern) and parse the unsigned integer that must
@@ -1278,6 +1459,470 @@ fn parse_trailing_version(raw: &str) -> Option<String> {
         Some(cand)
     } else {
         None
+    }
+}
+
+// ===========================================================================
+// contig_prof parser + bank comparator + effect predicates (faithful port of
+// the gzippy-specific helpers in `adapters/gzippy.py`).
+// ===========================================================================
+
+/// One profiled class row from the `[contig-prof]` dump.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfClass {
+    pub iters: i64,
+    pub cyc: i64,
+    pub share_pct: f64,
+    pub cyc_iter: f64,
+}
+
+/// The CONTIG head line of the `[contig-prof]` dump.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfHead {
+    pub calls: i64,
+    pub total_cyc: i64,
+    pub classed_cyc: i64,
+    pub classed_pct: f64,
+}
+
+/// A parsed `[contig-prof]` stderr block (`contig_prof.rs:195-299`). Mirrors the
+/// dict `adapters/gzippy.py::parse_prof` returns. `classes` keeps PARSE ORDER (so
+/// a share-tie sort is deterministic the way the Python dict iteration is).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Prof {
+    pub classes: Vec<(String, ProfClass)>,
+    pub head: Option<ProfHead>,
+    pub disttbl: Option<(i64, i64)>,
+    pub wrapper_calls: Option<i64>,
+}
+
+impl Prof {
+    /// Look up a class by name (parity with the Python `prof["classes"][name]`).
+    pub fn class(&self, name: &str) -> Option<&ProfClass> {
+        self.classes.iter().find(|(n, _)| n == name).map(|(_, c)| c)
+    }
+}
+
+/// Parse leading ASCII digits at `start`; returns `(value, end_index)`.
+fn take_uint(s: &str, start: usize) -> Option<(i64, usize)> {
+    let b = s.as_bytes();
+    if start > b.len() {
+        return None;
+    }
+    let mut j = start;
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    s[start..j].parse::<i64>().ok().map(|n| (n, j))
+}
+
+/// Parse a leading `[\d.]+` float at `start`; returns `(value, end_index)`.
+fn take_float(s: &str, start: usize) -> Option<(f64, usize)> {
+    let b = s.as_bytes();
+    if start > b.len() {
+        return None;
+    }
+    let mut j = start;
+    while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') {
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    s[start..j].parse::<f64>().ok().map(|f| (f, j))
+}
+
+/// Faithful manual equivalent of a `re.search` for two contiguous unsigned
+/// counters: `<head>(\d+)<mid>(\d+)`. Returns the FIRST occurrence's `(n1, n2)`.
+fn pair_counter(txt: &str, head: &str, mid: &str) -> Option<(i64, i64)> {
+    let mut from = 0;
+    while let Some(rel) = txt[from..].find(head) {
+        let after = from + rel + head.len();
+        if let Some((n1, e1)) = take_uint(txt, after) {
+            if txt[e1..].starts_with(mid) {
+                let m = e1 + mid.len();
+                if let Some((n2, _)) = take_uint(txt, m) {
+                    return Some((n1, n2));
+                }
+            }
+        }
+        from = from + rel + head.len();
+    }
+    None
+}
+
+/// Parse the `[contig-prof]` block. Faithful port of `adapters/gzippy.py::parse_prof`.
+pub fn parse_prof(text: &str) -> Prof {
+    let mut classes = Vec::new();
+    for line in text.lines() {
+        if let Some(cls) = parse_prof_class_line(line) {
+            classes.push(cls);
+        }
+    }
+    Prof {
+        head: parse_prof_head(text),
+        classes,
+        disttbl: pair_counter(text, "disttbl: builds=", " reuses="),
+        wrapper_calls: parse_wrapper_calls(text),
+    }
+}
+
+/// `re.search(PROF_HEAD_RE)` over the whole text (first match).
+fn parse_prof_head(text: &str) -> Option<ProfHead> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("calls=") {
+        let i = from + rel;
+        let after = i + "calls=".len();
+        if let Some((calls, e)) = take_uint(text, after) {
+            if let Some(rest) = text[e..].strip_prefix(" total_cyc=") {
+                let p = e + " total_cyc=".len();
+                if let Some((total, e2)) = take_uint(text, p) {
+                    let _ = rest;
+                    if text[e2..].starts_with(" classed_cyc=") {
+                        let p2 = e2 + " classed_cyc=".len();
+                        if let Some((classed, e3)) = take_uint(text, p2) {
+                            if text[e3..].starts_with(" (") {
+                                let p3 = e3 + " (".len();
+                                if let Some((pct, e4)) = take_float(text, p3) {
+                                    if text[e4..].starts_with("% of total") {
+                                        return Some(ProfHead {
+                                            calls,
+                                            total_cyc: total,
+                                            classed_cyc: classed,
+                                            classed_pct: pct,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        from = i + "calls=".len();
+    }
+    None
+}
+
+/// `re.match(PROF_CLASS_RE)` against one line (the multiline `^\s+`).
+fn parse_prof_class_line(line: &str) -> Option<(String, ProfClass)> {
+    let trimmed = line.trim_start();
+    if trimmed.len() == line.len() {
+        return None; // ^\s+ requires ≥1 leading whitespace
+    }
+    let name = ["lit1", "litpack", "litchn", "backref"]
+        .into_iter()
+        .find(|n| trimmed.starts_with(n))?;
+    let mut rest = &trimmed[name.len()..];
+    rest = rest.trim_start(); // \s*
+    rest = rest.strip_prefix(':')?;
+    rest = rest.strip_prefix(" iters=")?;
+    rest = rest.trim_start(); // \s*
+    let (iters, e) = take_uint(rest, 0)?;
+    rest = &rest[e..];
+    rest = rest.strip_prefix(" cyc=")?;
+    rest = rest.trim_start(); // \s*
+    let (cyc, e) = take_uint(rest, 0)?;
+    rest = &rest[e..];
+    rest = rest.trim_start(); // \s+
+    let (share_pct, e) = take_float(rest, 0)?;
+    rest = &rest[e..];
+    rest = rest.strip_prefix("% of classed,")?;
+    rest = rest.trim_start(); // \s+
+    let (cyc_iter, e) = take_float(rest, 0)?;
+    rest = &rest[e..];
+    if !rest.starts_with(" cyc/iter") {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        ProfClass {
+            iters,
+            cyc,
+            share_pct,
+            cyc_iter,
+        },
+    ))
+}
+
+/// `re.search(PROF_WRAPPER_CALLS_RE)`: first `calls=` after the WRAPPER marker.
+fn parse_wrapper_calls(text: &str) -> Option<i64> {
+    let idx = text.find("[contig-prof] WRAPPER")?;
+    let rel = text[idx..].find("calls=")?;
+    let after = idx + rel + "calls=".len();
+    take_uint(text, after).map(|(n, _)| n)
+}
+
+/// Format an integer with thousands separators (Python `{n:,}`).
+pub(crate) fn commas(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.unsigned_abs().to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::new();
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+// -- banked comparators (provenance-pinned), `adapters/gzippy.py::BANK`. -------
+const BANK_SILESIA_T8_BACKREF_SHARE: f64 = 62.6;
+const BANK_SILESIA_T8_BACKREF_CYC: f64 = 34.9;
+const BANK_SILESIA_T8_LITCHN_SHARE: f64 = 22.9;
+const BANK_REL_TOL: f64 = 0.25;
+
+/// Compare a silesia T8 prof against the banked P3.5 comparator. Returns
+/// divergence strings (empty == consistent). Faithful port of
+/// `adapters/gzippy.py::bank_divergence`.
+pub fn bank_divergence(ck: &crate::decide::CellKey, prof: &Prof) -> Vec<String> {
+    let mut div = Vec::new();
+    if ck.0 != "silesia" || ck.1 != 8 || prof.classes.is_empty() {
+        return div;
+    }
+    let tol_pct = format!("{:.0}%", BANK_REL_TOL * 100.0);
+    if let Some(br) = prof.class("backref") {
+        let share_ok = (br.share_pct - BANK_SILESIA_T8_BACKREF_SHARE).abs()
+            / BANK_SILESIA_T8_BACKREF_SHARE
+            <= BANK_REL_TOL;
+        for (key, val) in [
+            ("share_pct", BANK_SILESIA_T8_BACKREF_SHARE),
+            ("cyc_iter", BANK_SILESIA_T8_BACKREF_CYC),
+        ] {
+            let got = if key == "share_pct" {
+                br.share_pct
+            } else {
+                br.cyc_iter
+            };
+            if val != 0.0 && (got - val).abs() / val > BANK_REL_TOL {
+                let mut msg = format!(
+                    "backref.{key}={got:.1} vs banked {} (>±{tol_pct}) — \
+                     DIVERGES-FROM-BANK",
+                    fmt_bank_val(val)
+                );
+                if key == "cyc_iter" && share_ok {
+                    msg.push_str(
+                        " [shares MATCH the bank => structure consistent; absolute \
+                         TSC-cyc/iter scales with core-clock state (TSC is \
+                         fixed-rate) — suspect a frequency-state mismatch between \
+                         captures (frozen no_turbo here vs the bank's capture), not \
+                         a code change]",
+                    );
+                }
+                div.push(msg);
+            }
+        }
+    }
+    if let Some(lc) = prof.class("litchn") {
+        let val = BANK_SILESIA_T8_LITCHN_SHARE;
+        if (lc.share_pct - val).abs() / val > BANK_REL_TOL {
+            div.push(format!(
+                "litchn.share={:.1} vs banked {} — DIVERGES-FROM-BANK",
+                lc.share_pct,
+                fmt_bank_val(val)
+            ));
+        }
+    }
+    div
+}
+
+/// Format a banked value the way Python `f"{val}"` does (62.6 -> "62.6").
+fn fmt_bank_val(v: f64) -> String {
+    let s = format!("{v}");
+    s
+}
+
+// -- effect predicates, `adapters/gzippy.py::GzippyAdapter.effect_check`. ------
+
+/// Sum of `slab_hits` + `slab_installs` if both counters are present.
+fn slab_counts(txt: &str) -> Option<i64> {
+    pair_counter(txt, "slab_hits=", " slab_installs=").map(|(h, i)| h + i)
+}
+
+/// Prove the kill-switch flipped the feature. Faithful port of
+/// `GzippyAdapter.effect_check`.
+fn effect_check_gzippy(pred: &str, base_txt: &str, knob_txt: &str) -> (Option<bool>, String) {
+    match pred {
+        "none" => (
+            None,
+            "no in-tree counter; A/B is wall-only (EFFECT-UNVERIFIED)".to_string(),
+        ),
+        "verbose_seeded" => match pair_counter(knob_txt, "seeded_block=", " seeded_wrapper=") {
+            None => (
+                Some(false),
+                "seeded_block counter line absent in knob arm".to_string(),
+            ),
+            Some((blk, wrp)) => {
+                if blk == 0 && wrp > 0 {
+                    (
+                        Some(true),
+                        format!(
+                            "knob arm: seeded_block=0, seeded_wrapper={wrp} (switch effective)"
+                        ),
+                    )
+                } else {
+                    (
+                        Some(false),
+                        format!("knob arm still seeded_block={blk} (switch INEFFECTIVE)"),
+                    )
+                }
+            }
+        },
+        "verbose_exact" => match pair_counter(knob_txt, "exact_block=", " exact_wrapper=") {
+            None => (
+                Some(false),
+                "exact_block counter line absent in knob arm".to_string(),
+            ),
+            Some((blk, wrp)) => {
+                if blk == 0 && wrp > 0 {
+                    (
+                        Some(true),
+                        format!("knob arm: exact_block=0, exact_wrapper={wrp} (switch effective)"),
+                    )
+                } else if blk == 0 && wrp == 0 {
+                    (
+                        None,
+                        "no until-exact chunks in this cell (predicate vacuous)".to_string(),
+                    )
+                } else {
+                    (
+                        Some(false),
+                        format!("knob arm still exact_block={blk} (switch INEFFECTIVE)"),
+                    )
+                }
+            }
+        },
+        "prof_dist" => {
+            let mb = pair_counter(base_txt, "disttbl: builds=", " reuses=");
+            let mk = pair_counter(knob_txt, "disttbl: builds=", " reuses=");
+            match (mb, mk) {
+                (Some((bb, br)), Some((kb, kr))) => {
+                    if bb == 0 && br == 0 {
+                        (
+                            None,
+                            "base arm never hit the amortized build path (no dynamic \
+                             blocks?) — predicate vacuous"
+                                .to_string(),
+                        )
+                    } else if kb == 0 && kr == 0 {
+                        (
+                            Some(true),
+                            format!(
+                                "base builds={bb}/reuses={br} alive, knob arm counters \
+                                 dead (P3.4 path bypassed — switch effective)"
+                            ),
+                        )
+                    } else {
+                        (
+                            Some(false),
+                            format!(
+                                "knob arm still on the amortized path (builds={kb} \
+                                 reuses={kr}) — switch INEFFECTIVE"
+                            ),
+                        )
+                    }
+                }
+                _ => (
+                    Some(false),
+                    "disttbl prof line absent (capture without GZIPPY_CONTIG_PROF?)".to_string(),
+                ),
+            }
+        }
+        "rpmalloc_stats" => {
+            let kc = slab_counts(knob_txt);
+            let bc = slab_counts(base_txt);
+            match kc {
+                None => (
+                    Some(false),
+                    "no slab_hits=/slab_installs= counters in knob arm — binary \
+                     predates the engagement counters or stats not captured"
+                        .to_string(),
+                ),
+                Some(0) => (
+                    Some(false),
+                    "slab counters ZERO in knob arm — slab never engaged \
+                     (threshold/feature mismatch?) — switch INEFFECTIVE"
+                        .to_string(),
+                ),
+                Some(kc) => {
+                    if bc.is_none() || bc.unwrap() > 0 {
+                        (
+                            Some(false),
+                            format!(
+                                "slab counters in BASE arm = {} (expected 0) — switch \
+                                 not exclusive or stats missing in base",
+                                repr_opt_i64(bc)
+                            ),
+                        )
+                    } else {
+                        (
+                            Some(true),
+                            format!(
+                                "knob arm slab engaged (hits+installs={kc}); base arm 0 \
+                                 — switch effective"
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        "rpmalloc_stats_off" => {
+            let kc = slab_counts(knob_txt);
+            let bc = slab_counts(base_txt);
+            match bc {
+                None => (
+                    Some(false),
+                    "no slab_hits=/slab_installs= counters in base arm — binary \
+                     predates the engagement counters or stats not captured"
+                        .to_string(),
+                ),
+                Some(0) => (
+                    None,
+                    "slab counters ZERO in base arm — auto gate not engaged on this \
+                     cell (T above GZIPPY_SLAB_MAX_T?) — predicate vacuous"
+                        .to_string(),
+                ),
+                Some(bc) => {
+                    if kc.is_none() || kc.unwrap() > 0 {
+                        (
+                            Some(false),
+                            format!(
+                                "slab counters in KNOB arm = {} (expected 0) — \
+                                 GZIPPY_SLAB_ALLOC=0 did NOT disable the slab",
+                                repr_opt_i64(kc)
+                            ),
+                        )
+                    } else {
+                        (
+                            Some(true),
+                            format!(
+                                "base arm slab auto-engaged (hits+installs={bc}); \
+                                 force-off arm 0 — gate + kill-switch effective"
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        _ => (Some(false), format!("unknown predicate '{pred}'")),
+    }
+}
+
+/// Python `repr()` of an `Option<i64>` (`None` or the bare number).
+fn repr_opt_i64(v: Option<i64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "None".to_string(),
     }
 }
 
@@ -1506,5 +2151,207 @@ mod adapter_tests {
         );
         assert!(!knobs["dist_amort"].reverted, "dist_amort is not reverted");
         assert_eq!(knobs["dist_amort"].env, "GZIPPY_DIST_AMORT=0");
+    }
+}
+
+#[cfg(test)]
+mod prof_effect_tests {
+    //! Value/token-parity port of the gzippy adapter checks in
+    //! `decide/fulcrum/selftests/test_decide.py` §5 (prof parser + bank
+    //! comparator) and §6 (effect predicates). Same inputs -> same parsed
+    //! values / `(verified, note-substring)` as `adapters/gzippy.py`.
+    use super::*;
+
+    const PROF_TXT: &str = concat!(
+        "[contig-prof] CONTIG (Block::decode_clean_into_contig):\n",
+        "  calls=1768 total_cyc=1000000 classed_cyc=900000 (90.0% of total; rest=careful+entry/exit+unchained tail)\n",
+        "  lit1   : iters=      100000 cyc=        90000   10.0% of classed,    0.9 cyc/iter\n",
+        "  litpack: iters=       50000 cyc=        45000    5.0% of classed,    0.9 cyc/iter, lits=120000\n",
+        "  litchn : iters=      200000 cyc=       206000   22.9% of classed,    1.0 cyc/iter, lits=500000\n",
+        "  backref: iters=       16140 cyc=       563400   62.6% of classed,   34.9 cyc/iter, bytes=900000 dist_long=3\n",
+        "  careful: cyc=50000 (5.0% of total) outer_iters=123\n",
+        "  disttbl: builds=1765 reuses=3 (P3.4 dynamic-block dist_table amortization)\n",
+        "[contig-prof] WRAPPER (decode_huffman_body_resumable):\n",
+        "  calls=0 total_cyc=0 classed_cyc=0 (0.0%)\n",
+    );
+
+    // §5: prof parser parses classes / cyc-iter / disttbl / wrapper exactly.
+    #[test]
+    fn prof_parser_exact() {
+        let p = parse_prof(PROF_TXT);
+        let br = p.class("backref").unwrap();
+        assert_eq!(br.cyc_iter, 34.9);
+        assert_eq!(br.share_pct, 62.6);
+        assert_eq!(br.iters, 16140);
+        assert_eq!(br.cyc, 563400);
+        assert_eq!(p.disttbl, Some((1765, 3)));
+        assert_eq!(p.wrapper_calls, Some(0));
+        let head = p.head.as_ref().unwrap();
+        assert_eq!(head.calls, 1768);
+        assert_eq!(head.total_cyc, 1000000);
+        assert_eq!(head.classed_cyc, 900000);
+        assert_eq!(head.classed_pct, 90.0);
+        // parse order preserved.
+        let names: Vec<&str> = p.classes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["lit1", "litpack", "litchn", "backref"]);
+    }
+
+    // §5: bank comparator — consistent vs >25% move vs <25% move.
+    #[test]
+    fn bank_divergence_parity() {
+        let ck = ("silesia".to_string(), 8u32);
+        let p = parse_prof(PROF_TXT);
+        assert!(
+            bank_divergence(&ck, &p).is_empty(),
+            "banked-consistent -> none"
+        );
+
+        let moved = parse_prof(
+            &PROF_TXT.replace("  62.6% of classed,   34.9", "  30.0% of classed,   34.9"),
+        );
+        assert!(
+            bank_divergence(&ck, &moved)
+                .iter()
+                .any(|d| d.contains("DIVERGES-FROM-BANK")),
+            ">25% share move -> DIVERGES-FROM-BANK"
+        );
+
+        let small = parse_prof(
+            &PROF_TXT.replace("  62.6% of classed,   34.9", "  60.0% of classed,   34.9"),
+        );
+        assert!(
+            bank_divergence(&ck, &small).is_empty(),
+            "4% share move NOT flagged"
+        );
+
+        // A non-silesia-T8 cell never diverges.
+        assert!(bank_divergence(&("silesia".to_string(), 1), &p).is_empty());
+    }
+
+    // §6: effect predicates (the full matrix).
+    #[test]
+    fn effect_predicates_parity() {
+        let ec = effect_check_gzippy;
+
+        assert_eq!(
+            ec("verbose_seeded", "", "seeded_block=0 seeded_wrapper=16 ").0,
+            Some(true)
+        );
+        assert_eq!(
+            ec("verbose_seeded", "", "seeded_block=16 seeded_wrapper=0 ").0,
+            Some(false)
+        );
+
+        let (okd, _) = ec(
+            "prof_dist",
+            "disttbl: builds=2790 reuses=7 ",
+            "disttbl: builds=0 reuses=0 ",
+        );
+        assert_eq!(okd, Some(true), "dist_amort off => P3.4 counters dead");
+        let (badd, _) = ec(
+            "prof_dist",
+            "disttbl: builds=2790 reuses=7 ",
+            "disttbl: builds=2790 reuses=7 ",
+        );
+        assert_eq!(badd, Some(false), "knob arm still amortized => CAUGHT");
+        let (vacd, _) = ec(
+            "prof_dist",
+            "disttbl: builds=0 reuses=0 ",
+            "disttbl: builds=0 reuses=0 ",
+        );
+        assert_eq!(vacd, None, "no dynamic blocks => predicate vacuous");
+
+        assert_eq!(
+            ec("none", "", "").0,
+            None,
+            "knob without counter => EFFECT-UNVERIFIED"
+        );
+
+        let (rp_ok, rp_note) = ec(
+            "rpmalloc_stats",
+            "[rpmalloc final] slab_hits=0 slab_installs=0\n[rpmalloc final] mapped_peak=48M",
+            "[rpmalloc final] slab_hits=14 slab_installs=15\n[rpmalloc final] mapped_peak=48M",
+        );
+        assert_eq!(rp_ok, Some(true));
+        assert!(rp_note.contains("29"), "hits+installs=29 in note");
+        assert_eq!(
+            ec(
+                "rpmalloc_stats",
+                "[rpmalloc final] slab_hits=3 slab_installs=2\n",
+                "[rpmalloc final] slab_hits=14 slab_installs=15\n"
+            )
+            .0,
+            Some(false),
+            "base arm engaged too => CAUGHT"
+        );
+        assert_eq!(
+            ec(
+                "rpmalloc_stats",
+                "[rpmalloc final] slab_hits=0 slab_installs=0\n",
+                "[rpmalloc final] slab_hits=0 slab_installs=0\n"
+            )
+            .0,
+            Some(false),
+            "knob arm counters zero => INEFFECTIVE CAUGHT"
+        );
+        assert_eq!(
+            ec("rpmalloc_stats", "base output", "knob output").0,
+            Some(false),
+            "no slab counters => CAUGHT"
+        );
+
+        let (off_ok, off_note) = ec(
+            "rpmalloc_stats_off",
+            "[rpmalloc final] slab_hits=14 slab_installs=15\n",
+            "[rpmalloc final] slab_hits=0 slab_installs=0\n",
+        );
+        assert_eq!(off_ok, Some(true));
+        assert!(off_note.contains("29"));
+        assert_eq!(
+            ec(
+                "rpmalloc_stats_off",
+                "[rpmalloc final] slab_hits=0 slab_installs=0\n",
+                "[rpmalloc final] slab_hits=0 slab_installs=0\n"
+            )
+            .0,
+            None,
+            "base not engaged => vacuous"
+        );
+        assert_eq!(
+            ec(
+                "rpmalloc_stats_off",
+                "[rpmalloc final] slab_hits=14 slab_installs=15\n",
+                "[rpmalloc final] slab_hits=3 slab_installs=1\n"
+            )
+            .0,
+            Some(false),
+            "knob arm still engaged => CAUGHT"
+        );
+    }
+
+    // verbose_exact: vacuous when no until-exact chunks.
+    #[test]
+    fn effect_verbose_exact_vacuous() {
+        assert_eq!(
+            effect_check_gzippy("verbose_exact", "", "exact_block=0 exact_wrapper=16 ").0,
+            Some(true)
+        );
+        assert_eq!(
+            effect_check_gzippy("verbose_exact", "", "exact_block=0 exact_wrapper=0 ").0,
+            None
+        );
+        assert_eq!(
+            effect_check_gzippy("verbose_exact", "", "exact_block=3 exact_wrapper=0 ").0,
+            Some(false)
+        );
+    }
+
+    // commas thousands separator.
+    #[test]
+    fn commas_separators() {
+        assert_eq!(commas(16140), "16,140");
+        assert_eq!(commas(1000000), "1,000,000");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(0), "0");
     }
 }

@@ -21,14 +21,15 @@
 //!                                    check vs configured ground truth (the gate)
 //!   plan --bin <path> [...]          print a coz/perf workflow for your binary
 
-use fulcrum::config::Config;
+use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
+use fulcrum::ledger::Ledger;
 use fulcrum::{
-    audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    finding, flow, invariants, mech, mech_arch, memlife, model, perturb, provenance, rank,
-    region_hw, rg_verbose, scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep,
-    xtool,
+    audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, cycles,
+    decide, decompose, finding, flow, insn, invariants, locate, mech, mech_arch, memlife, model,
+    perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule, score, spans,
+    sweep, trace, validate, vs, vs_sweep, xtool,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -3063,6 +3064,536 @@ fn cmd_invariants(_args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The default results-ledger path (`FULCRUM_LEDGER` env, else
+/// `<cwd>/artifacts/fulcrum/ledger.jsonl`). Mirrors `cli._default_ledger_path`.
+fn default_ledger_path(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        return PathBuf::from(p);
+    }
+    if let Ok(env) = std::env::var("FULCRUM_LEDGER") {
+        if !env.is_empty() {
+            return PathBuf::from(env);
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("artifacts")
+        .join("fulcrum")
+        .join("ledger.jsonl")
+}
+
+/// decide: artifact-dir -> ranked decision table + brief. Mirrors `cli.decide_main`.
+fn cmd_decide(args: &[String]) -> ExitCode {
+    let mut allow_thaw = false;
+    let mut no_ledger = false;
+    let mut feature: Option<String> = None;
+    let mut ledger_path: Option<String> = None;
+    let mut dirs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--allow-thaw" => allow_thaw = true,
+            "--no-ledger" => no_ledger = true,
+            "--feature" => {
+                feature = args.get(i + 1).cloned();
+                i += 2;
+                continue;
+            }
+            "--ledger" => {
+                ledger_path = args.get(i + 1).cloned();
+                i += 2;
+                continue;
+            }
+            other if other.starts_with("--") => {
+                eprintln!(
+                    "decide: unknown flag {other} (--feature --ledger --allow-thaw --no-ledger)"
+                );
+                return ExitCode::from(2);
+            }
+            _ => dirs.push(a.clone()),
+        }
+        i += 1;
+    }
+    let Some(dir) = dirs.first() else {
+        eprintln!(
+            "fulcrum decide <artifact-dir> [--feature F] [--ledger PATH] [--allow-thaw] [--no-ledger]"
+        );
+        return ExitCode::from(1);
+    };
+    let adapter = GzippyAdapter::new();
+    let led = if no_ledger {
+        None
+    } else {
+        Some(Ledger::new(default_ledger_path(ledger_path.as_deref())))
+    };
+    let run = match decide::load_run(Path::new(dir), &adapter) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match decide::analyze_run(&run, &adapter, allow_thaw, feature.as_deref(), led.as_ref()) {
+        Ok(rep) => {
+            report::print_report(&rep, adapter.tie_bar());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// total: the trace-analyzer subcommand (whole-system trace analysis or a
+/// cross-tool delta). Mirrors `cli.total_main`.
+fn cmd_total(args: &[String]) -> ExitCode {
+    let mut counters: Option<String> = None;
+    let mut declared_t: Option<u32> = None;
+    let mut feature: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--counters" => {
+                counters = args.get(i + 1).cloned();
+                i += 2;
+                continue;
+            }
+            "--T" => {
+                declared_t = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+                continue;
+            }
+            "--feature" => {
+                feature = args.get(i + 1).cloned();
+                i += 2;
+                continue;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("total: unknown flag {other} (--counters --T --feature)");
+                return ExitCode::from(2);
+            }
+            _ => files.push(a.clone()),
+        }
+        i += 1;
+    }
+    if files.is_empty() {
+        eprintln!("fulcrum total <trace.json> [trace2.json] [--counters F] [--T N] [--feature F]");
+        return ExitCode::from(1);
+    }
+    let adapter = GzippyAdapter::new();
+    let counter_path = counters.as_deref().map(Path::new);
+    let first = match trace::analyze(
+        Path::new(&files[0]),
+        &adapter,
+        counter_path,
+        declared_t,
+        feature.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let second = if files.len() >= 2 {
+        match trace::analyze(Path::new(&files[1]), &adapter, None, None, None) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                println!("\n[INSTRUMENT REFUSED] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    trace::print_bundle(&first);
+    if let Some(b) = &second {
+        trace::print_bundle(b);
+        trace::print_delta(&first, b);
+    }
+    ExitCode::SUCCESS
+}
+
+/// locate: closed-wall-ledger localization over a critical-path model.
+/// Mirrors `cli.locate_main`.
+fn cmd_locate(args: &[String]) -> ExitCode {
+    let mut wall_ms: Option<f64> = None;
+    let mut threshold = locate::DEFAULT_THRESHOLD_PCT;
+    let mut files: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--wall-ms" => {
+                wall_ms = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+                continue;
+            }
+            "--threshold" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    threshold = v;
+                }
+                i += 2;
+                continue;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("locate: unknown flag {other} (--wall-ms --threshold)");
+                return ExitCode::from(2);
+            }
+            _ => files.push(a.clone()),
+        }
+        i += 1;
+    }
+    if files.is_empty() {
+        eprintln!("fulcrum locate <trace.json> [...] [--wall-ms X] [--threshold pct]");
+        return ExitCode::from(1);
+    }
+    let adapter = GzippyAdapter::new();
+    let wait_names: Vec<&str> = adapter
+        .taxonomy()
+        .wait_prefixes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let paths: Vec<&Path> = files.iter().map(|f| Path::new(f.as_str())).collect();
+    match locate::locate(&paths, wall_ms, threshold, Some(&wait_names), None) {
+        Ok(result) => {
+            report::print_locate(&result);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// insn: closed instruction-accounting ledger (INSN-CLOSURE-OR-NO-LEDGER).
+/// Mirrors `cli.insn_main`.
+fn cmd_insn(args: &[String]) -> ExitCode {
+    let mut tol = insn::DEFAULT_TOL_PCT;
+    let mut threshold = insn::DEFAULT_THRESHOLD_PCT;
+    let mut a_stat: Option<String> = None;
+    let mut a_report: Option<String> = None;
+    let mut a_bytes: Option<i64> = None;
+    let mut a_label: Option<String> = None;
+    let mut b = insn::BInputs::default();
+    let known = "--a-stat --a-report --a-bytes --a-label --b-stat --b-report --b-bytes --b-label --tol --threshold --feature";
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let val = || args.get(i + 1).cloned();
+        match a.as_str() {
+            "--a-stat" => a_stat = val(),
+            "--a-report" => a_report = val(),
+            "--a-label" => a_label = val(),
+            "--b-stat" => b.stat = val(),
+            "--b-report" => b.report = val(),
+            "--b-label" => b.label = val(),
+            "--a-bytes" => a_bytes = val().and_then(|v| v.parse().ok()),
+            "--b-bytes" => b.bytes = val().and_then(|v| v.parse().ok()),
+            "--tol" => {
+                if let Some(v) = val().and_then(|v| v.parse().ok()) {
+                    tol = v;
+                }
+            }
+            "--threshold" => {
+                if let Some(v) = val().and_then(|v| v.parse().ok()) {
+                    threshold = v;
+                }
+            }
+            "--feature" => {} // gzippy has a single category map; --feature is a no-op
+            other => {
+                eprintln!("insn: unknown/unexpected argument {other}; known: {known}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 2;
+    }
+    let (Some(a_stat), Some(a_report)) = (a_stat, a_report) else {
+        eprintln!(
+            "insn: --a-stat and --a-report are required (the A binary's `perf stat` total \
+             and `perf report -F period,symbol` capture).\n      usage: fulcrum insn {known}"
+        );
+        return ExitCode::from(2);
+    };
+    match insn::insn_from_files(
+        &a_stat,
+        &a_report,
+        insn::INSN_CATEGORIES,
+        a_label.as_deref(),
+        a_bytes,
+        &b,
+        insn::Thresholds {
+            tol_pct: tol,
+            threshold_pct: threshold,
+        },
+    ) {
+        Ok(result) => {
+            report::print_insn(&result);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// cycles: TMA top-down stall-breakdown (TMA-CLOSURE-OR-NO-BREAKDOWN).
+/// Mirrors `cli.cycles_main`.
+fn cmd_cycles(args: &[String]) -> ExitCode {
+    let mut tol = cycles::DEFAULT_TOL_PCT;
+    let mut a_stat: Option<String> = None;
+    let mut a_label: Option<String> = None;
+    let mut b_stat: Option<String> = None;
+    let mut b_label: Option<String> = None;
+    let known = "--a-stat --a-label --b-stat --b-label --tol";
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let val = || args.get(i + 1).cloned();
+        match a.as_str() {
+            "--a-stat" => a_stat = val(),
+            "--a-label" => a_label = val(),
+            "--b-stat" => b_stat = val(),
+            "--b-label" => b_label = val(),
+            "--tol" => {
+                if let Some(v) = val().and_then(|v| v.parse().ok()) {
+                    tol = v;
+                }
+            }
+            other => {
+                eprintln!("cycles: unknown/unexpected argument {other}; known: {known}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 2;
+    }
+    let Some(a_stat) = a_stat else {
+        eprintln!(
+            "cycles: --a-stat is required (the A binary's `perf stat` capture with TMA \
+             events).\n      usage: fulcrum cycles {known}"
+        );
+        return ExitCode::from(2);
+    };
+    let tma_a = match cycles::tma_from_file(&a_stat, Some(a_label.as_deref().unwrap_or("A")), tol) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("\n[INSTRUMENT REFUSED] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut tma_b = None;
+    let mut cmp = None;
+    if let Some(bs) = b_stat {
+        match cycles::tma_from_file(&bs, Some(b_label.as_deref().unwrap_or("B")), tol) {
+            Ok(t) => {
+                cmp = Some(cycles::compare_tma(&tma_a, &t));
+                tma_b = Some(t);
+            }
+            Err(e) => {
+                println!("\n[INSTRUMENT REFUSED (B)] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    report::print_tma(&tma_a, tma_b.as_ref(), cmp.as_ref());
+    ExitCode::SUCCESS
+}
+
+/// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
+fn cmd_ledger(args: &[String]) -> ExitCode {
+    let verb = match args.first().map(String::as_str) {
+        Some(v @ ("supersede" | "invalidate")) => Some(v),
+        _ => None,
+    };
+    let rest = if verb.is_some() { &args[1..] } else { args };
+    let mut opts: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let a = &rest[i];
+        match a.as_str() {
+            "--key" | "--retire" | "--promote" | "--target" | "--reason" => {
+                let Some(v) = rest.get(i + 1) else {
+                    eprintln!("ledger {}: {a} needs a value", verb.unwrap_or(""));
+                    return ExitCode::from(2);
+                };
+                opts.insert(a.trim_start_matches('-').to_string(), v.clone());
+                i += 2;
+                continue;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("ledger: unknown option {other}");
+                return ExitCode::from(2);
+            }
+            _ => positional.push(a.clone()),
+        }
+        i += 1;
+    }
+    let path = positional
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_ledger_path(None));
+    let led = Ledger::new(path.clone());
+
+    if verb == Some("supersede") {
+        for k in ["key", "retire", "reason"] {
+            if !opts.contains_key(k) {
+                eprintln!("ledger supersede: missing --{k}");
+                return ExitCode::from(2);
+            }
+        }
+        if let Err(e) = led.supersede(
+            &opts["key"],
+            &opts["retire"],
+            &opts["reason"],
+            opts.get("promote").map(String::as_str),
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+        let promo = opts
+            .get("promote")
+            .map(|p| format!(" promoted={p}"))
+            .unwrap_or_default();
+        println!(
+            "superseded: key={} retired={}{promo} (appended to {})",
+            opts["key"],
+            opts["retire"],
+            path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    if verb == Some("invalidate") {
+        for k in ["key", "target", "reason"] {
+            if !opts.contains_key(k) {
+                eprintln!("ledger invalidate: missing --{k}");
+                return ExitCode::from(2);
+            }
+        }
+        if let Err(e) = led.invalidate(&opts["key"], &opts["target"], &opts["reason"]) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+        println!(
+            "invalidated: key={} target={} (appended to {})",
+            opts["key"],
+            opts["target"],
+            path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    print_ledger_listing(&led, &path);
+    ExitCode::SUCCESS
+}
+
+/// Render the ledger listing (mirrors the no-verb branch of `cli.ledger_main`).
+fn print_ledger_listing(led: &Ledger, path: &Path) {
+    use serde_json::Value;
+    let rs = |r: &serde_json::Map<String, Value>, k: &str| -> Option<String> {
+        r.get(k).and_then(|v| v.as_str()).map(String::from)
+    };
+    let rows = led.rows();
+    let anchor_ids: std::collections::HashSet<(String, String)> = led
+        .anchors(None)
+        .iter()
+        .map(|r| {
+            (
+                rs(r, "key").unwrap_or_default(),
+                rs(r, "runid").unwrap_or_default(),
+            )
+        })
+        .collect();
+    let breaks = led.verify_chain();
+    let n_chained = rows
+        .iter()
+        .filter(|r| !r.contains_key("_corrupt") && r.contains_key("chain"))
+        .count();
+    let chain_note = if !breaks.is_empty() {
+        format!("chain BROKEN ({} break(s))", breaks.len())
+    } else {
+        format!(
+            "chain intact ({n_chained}/{} rows chained; pre-chain rows are convention-only)",
+            rows.len()
+        )
+    };
+    println!(
+        "ledger: {} ({} rows, {} anchors, {chain_note})",
+        path.display(),
+        rows.len(),
+        anchor_ids.len()
+    );
+    for b in &breaks {
+        println!("  !! TAMPER-EVIDENCE: {b}");
+    }
+    for r in &rows {
+        if let Some(c) = rs(r, "_corrupt") {
+            println!("  [TORN ROW] {c}");
+            continue;
+        }
+        let kind = rs(r, "kind").unwrap_or_else(|| "?".to_string());
+        if kind == "supersede" {
+            println!(
+                "  {:20} [SUPERSEDE] {} retired={} promoted={} reason={}",
+                rs(r, "ts").unwrap_or_else(|| "?".to_string()),
+                rs(r, "key").unwrap_or_else(|| "?".to_string()),
+                rs(r, "retire_runid").unwrap_or_default(),
+                rs(r, "promote_runid").unwrap_or_else(|| "-".to_string()),
+                rs(r, "reason").unwrap_or_else(|| "?".to_string()),
+            );
+            continue;
+        }
+        if kind == "invalid" {
+            println!(
+                "  {:20} [INVALID]   {} target={} reason={}",
+                rs(r, "ts").unwrap_or_else(|| "?".to_string()),
+                rs(r, "key").unwrap_or_else(|| "?".to_string()),
+                rs(r, "target_runid").unwrap_or_default(),
+                rs(r, "reason").unwrap_or_else(|| "?".to_string()),
+            );
+            continue;
+        }
+        let fp = r.get("fingerprint").and_then(|v| v.as_object());
+        let fpf = |k: &str| -> String {
+            fp.and_then(|m| m.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let ident = (
+            rs(r, "key").unwrap_or_default(),
+            rs(r, "runid").unwrap_or_default(),
+        );
+        let tag = if anchor_ids.contains(&ident) {
+            "ANCHOR "
+        } else if rs(r, "status").as_deref() == Some("pending-reconcile") {
+            "PENDING"
+        } else {
+            "RETIRED"
+        };
+        let value_ms = r.get("value_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let n = r.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+        let bin = fpf("bin_sha");
+        println!(
+            "  {:20} {tag:7} {:28} {:24} {value_ms:9.1}ms n={:<3} sink={} freeze={} bin={}",
+            rs(r, "ts").unwrap_or_else(|| "?".to_string()),
+            rs(r, "runid").unwrap_or_else(|| "?".to_string()),
+            rs(r, "key").unwrap_or_else(|| "?".to_string()),
+            n,
+            fpf("sink"),
+            fpf("freeze"),
+            bin.chars().take(12).collect::<String>(),
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
@@ -3103,6 +3634,12 @@ fn main() -> ExitCode {
         "finding" => cmd_finding(rest),
         "run" => cmd_run(rest),
         "perturb" => cmd_perturb(rest),
+        "decide" => cmd_decide(rest),
+        "total" => cmd_total(rest),
+        "locate" => cmd_locate(rest),
+        "insn" => cmd_insn(rest),
+        "cycles" => cmd_cycles(rest),
+        "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
         "score" => match score::args_from_cli(rest) {
             Ok(a) => {
