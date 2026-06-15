@@ -219,9 +219,14 @@ pub const INVARIANTS: &[Invariant] = &[
         scar: "The campaign's hand-built instruction ledger DOUBLE-COUNTED by 690M — a \
            symbol assigned to two buckets, the categories summed past the measured \
            retired total, the residual narrated away.",
-        enforcement: "(SPECCED in Rust) — carried from Python insn.build_ledger until \
-                  ported; the event-mismatch + over-count + ambiguity refusals are \
-                  preserved by this registry.",
+        enforcement: "insn::build_ledger (INSN-CLOSURE over-count + INSN-EVENT-MISMATCH \
+                  raise; INSN-AMBIGUOUS-PARTITION via insn::resolve_category; \
+                  INSN-NONPOSITIVE-TOTAL / INSN-NEGATIVE-COUNT / INSN-DELTA-CLOSURE \
+                  guard the totals); insn::parse_perf_{stat,report} raise \
+                  INSN-NO-INSTRUCTIONS / INSN-PERCENT-ONLY / INSN-EMPTY-REPORT; \
+                  insn::tests (KNOWN composition / over-count / ambiguity / \
+                  under-coverage flag / event-mismatch + controls / \
+                  necessary-not-sufficient + the calibration pins).",
     },
     Invariant {
         name: "PROVENANCE-OR-VOID",
