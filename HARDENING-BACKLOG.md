@@ -294,20 +294,55 @@ Invariants every iteration must keep green:
   and ALL k≥2 cells, are UNAFFECTED. The leader should re-run the gate over banked
   <BENCH_HOST> T1 cells (it is a shared/noisy box) to surface any now-VOID T1 cells.
 
-- **[TODO — relay #14 candidate, MEDIUM VoI]** Generalize PREEMPTED-K1 to k≥2
-  WITHOUT false-VOIDing serial-by-design cells. The k==1 backstop closes the worst
-  case (one competitor = 100% of the core), but a single sustained competitor on a
-  k≥2 cell is STILL admitted: UNQUIET misses it (run-queue k+1 == bar) and the
-  relativized occupancy floor hides it. The discriminator that separates "serial
-  fraction" from "off-core preemption" at k≥2 is not occupancy alone (both depress
-  it). Candidate witnesses to investigate deterministically: (i) the per-sample
-  occupancy DISTRIBUTION shape — a serial bootstrap depresses occupancy SMOOTHLY/
-  uniformly, whereas a competitor that round-robins on/off our cores leaves a
-  BIMODAL per-sample occupancy (already have `bimodal()` in perturb.rs); (ii)
-  cross-checking occupancy_med against the THEORETICAL serial-fraction ceiling if
-  the cell's serial fraction is independently known. Pre-register the falsifier
-  before coding; do NOT ship a k≥2 absolute floor (it false-VOIDs every
-  serial-bootstrap parallel cell — the exact thing the relativization protects).
+- **[DONE — relay #14, branch `harden/preempted-k2-bimodal`]** Generalize
+  PREEMPTED-K1 to k≥2 WITHOUT false-VOIDing serial-by-design cells. Witness (i)
+  SHIPPED: the per-sample occupancy DISTRIBUTION SHAPE is the discriminator, NOT
+  an absolute floor (the trap relay #13 flagged). A serial-by-design parallel cell
+  depresses occupancy SMOOTHLY (UNIMODAL — a serial bootstrap idles k−1 cores); a
+  competitor round-robining on/off our pinned cores leaves a BIMODAL per-sample
+  occupancy. **Fix:** at k≥2, VOID (PREEMPTED-K≥2) iff occupancy is depressed
+  (`occupancy_med < OCCUPANCY_MIN`, the same gate that keeps a quiet occ≈1.0 cell
+  out) AND the per-sample distribution is `bimodal(&occupancy_samples, BIMODAL_K)`
+  (the existing perturb.rs helper, needs ≥5 samples). A UNIMODAL depressed cell
+  (serial-by-design) PASSES — the relativized floor is preserved. **New plumbing:**
+  added `CellBoxStats.occupancy_samples: Vec<f64>` (the SHAPE the median summarizes
+  away); runner `box_valid_record` now emits `;occ_samples=v1,v2,…` from the
+  clean-aligned `cell.occupancy`; `parse_box_valid_line` parses it back; both omit/
+  default to EMPTY when occupancy was not captured ⇒ the backstop no-ops (bimodal
+  needs ≥5 samples) — never a false VOID. Chose the HARD gate (not a WARN) because
+  the bimodality discriminator is conservative: it fires ONLY on a depressed AND
+  bimodal distribution, the over-correction controls all pass, and the runner's
+  IQR-fence does not pre-clip the modes (the relativized floor admits both). **Tests
+  (RED-before proven by `if false`-stubbing the block → bimodal cell certifies OK
+  while controls a/c/d stay green; GREEN-after VOIDs):**
+  `provenance::box_valid_tests::preempted_k2_bimodal_voids_red_before_green_after`
+  with 4 explicit controls — (a) serial-by-design k=4 UNIMODAL occ≈0.5 PASSES;
+  (b) k=4 competitor BIMODAL occ VOIDs; (c) fully-quiet k=4 occ≈1.0 PASSES;
+  (d) depressed k=4 with NO per-sample capture (empty) no-ops/PASSES — plus
+  `occ_samples_round_trip_drives_bimodal_void` (the runner's `;occ_samples=` line
+  parses back and VOIDs). 550 / 0-fail / 0-ignored · clippy 0-new · fmt clean.
+  **GATE-BEHAVIOR CHANGE — banked cells:** this re-evaluates from STORED per-sample
+  occupancy, BUT every artifact banked before this relay has NO `occ_samples`
+  field, so `occupancy_samples` parses EMPTY → `bimodal` returns false (len<5) →
+  the backstop is a no-op on all of them. **It does NOT retroactively reclassify
+  any banked k≥2 (T2/T4/T7) <BENCH_HOST> cell** — only FUTURE runs that capture the
+  per-sample distribution can trip it. (Contrast relay #13's PREEMPTED-K1, which
+  DID retroactively reclassify banked T1 cells off the already-stored
+  `occupancy_med`.)
+
+- **[TODO — relay #15 candidate, LOW/MEDIUM VoI]** PREEMPTED-K≥2 witness (ii):
+  cross-check `occupancy_med` against a THEORETICAL serial-fraction ceiling when
+  the cell's serial fraction is independently known (e.g. from a bootstrap-removed
+  oracle or a declared serial-section share), to catch a SUSTAINED (steady, NOT
+  round-robining) k≥2 competitor whose per-sample occupancy is UNIMODAL-but-too-low
+  — the one shape relay #14's bimodality backstop cannot see (a steady competitor
+  depresses occupancy as smoothly as a serial fraction does). Open question to
+  pre-register: is the serial fraction ever independently known at gate time? If
+  not, this likely lands as a NON-blocking WARN ("occ_med below serial-ceiling, but
+  unimodal — possible sustained k≥2 competitor"), NOT a hard VOID (a hard floor
+  here is the same relay-#13 trap). Also consider: short k≥2 cells (clean < 5)
+  silently no-op the bimodality backstop — a non-blocking WARN that the cell was
+  too short for the shape check would surface that blind spot to the supervisor.
 
 - **[WATCH — relay #11, item 2 RESOLVED]** (2) [RESOLVED — relay #11, see
   the OVERSUBSCRIBED-SMT DONE entry above] SMT-sibling oversubscription is now

@@ -2023,9 +2023,24 @@ fn box_valid_record(cell: &CapturedCell) -> String {
     } else {
         format!(";cpuphys={cpuphys}")
     };
+    // per-sample clean occupancy (the SHAPE the median summarizes away) — the
+    // PREEMPTED-K≥2 bimodality backstop needs the distribution, not just its
+    // median. Omitted when occupancy was not captured (fixture / BSD time) ⇒
+    // the k≥2 backstop degrades to a no-op (bimodal needs ≥5 samples).
+    let occ_samples_field = if cell.occupancy.is_empty() {
+        String::new()
+    } else {
+        let joined = cell
+            .occupancy
+            .iter()
+            .map(|x| fmt6(*x))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(";occ_samples={joined}")
+    };
     format!(
         "cell={}:{};k={};n_raw={};rejected={};clean={};escalated={};occ_med={};procs_med={};\
-         mask={};maskd={};ctrl_first={};ctrl_mid={};ctrl_last={};ctrl_spread={};ts_span={}{}",
+         mask={};maskd={};ctrl_first={};ctrl_mid={};ctrl_last={};ctrl_spread={};ts_span={}{}{}",
         cell.corpus,
         cell.threads,
         cell.threads,
@@ -2043,6 +2058,7 @@ fn box_valid_record(cell: &CapturedCell) -> String {
         fmt6(ctrl_spread),
         fmt6(ts_span),
         cpuphys_field,
+        occ_samples_field,
     )
 }
 
@@ -3250,6 +3266,7 @@ mod tests {
             clean: 15,
             escalated: false,
             occupancy_med: 0.99,
+            occupancy_samples: Vec::new(),
             procs_running_med: 2.0,
             mask_requested: "2,4".into(),
             mask_readback: "2".into(), // cpu 4 narrowed away

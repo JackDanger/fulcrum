@@ -419,6 +419,16 @@ pub struct CellBoxStats {
     pub escalated: bool,
     /// median per-sample occupancy of the clean set.
     pub occupancy_med: f64,
+    /// the per-sample occupancy values of the clean set (the SHAPE the median
+    /// summarizes away). The PREEMPTED-K≥2 backstop needs the DISTRIBUTION, not
+    /// just its median: a serial-by-design parallel cell depresses occupancy
+    /// SMOOTHLY (unimodal) while an off-core competitor that round-robins on/off
+    /// our pinned cores leaves a BIMODAL split — indistinguishable by the median
+    /// alone (both depress it). EMPTY ⇒ per-sample occupancy not captured
+    /// (fixture / non-Linux / pre-this-field artifact) ⇒ the k≥2 bimodality
+    /// backstop degrades to a no-op (`bimodal` needs ≥5 samples) — never a false
+    /// VOID.
+    pub occupancy_samples: Vec<f64>,
     /// median `/proc/stat procs_running` snapshot across the cell.
     pub procs_running_med: f64,
     /// the taskset mask requested (e.g. "2,4,8,10").
@@ -451,6 +461,7 @@ impl Default for CellBoxStats {
             clean: 0,
             escalated: false,
             occupancy_med: 0.0,
+            occupancy_samples: Vec::new(),
             procs_running_med: 0.0,
             mask_requested: String::new(),
             mask_readback: String::new(),
@@ -1226,6 +1237,58 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
             continue;
         }
 
+        // -- PREEMPTED-K≥2: bimodal-occupancy competitor backstop at k ≥ 2. -----
+        //    PREEMPTED-K1's ABSOLUTE floor is sound ONLY at k==1 (no parallelism
+        //    ⇒ sub-saturation can only be preemption). At k≥2 a serial-BY-DESIGN
+        //    parallel cell legitimately reads aggregate occupancy < OCCUPANCY_MIN
+        //    with NO preemption (a serial bootstrap section idles k−1 cores), so
+        //    an absolute floor here would FALSE-VOID every legitimately-serial
+        //    parallel cell — the exact thing the relativized floor protects. The
+        //    discriminator is therefore NOT the LEVEL of occupancy (both a serial
+        //    fraction and a competitor depress it) but its per-sample SHAPE: a
+        //    serial bootstrap depresses occupancy SMOOTHLY/uniformly (UNIMODAL),
+        //    whereas a competitor that round-robins on/off our pinned cores leaves
+        //    a BIMODAL per-sample occupancy — a high mode while we own the cores,
+        //    a low mode while preempted off them. So VOID only when occupancy is
+        //    depressed (med < OCCUPANCY_MIN — the same gate that keeps a quiet
+        //    occ≈1.0 cell out) AND the per-sample distribution is BIMODAL; a
+        //    UNIMODAL depressed cell (serial-by-design) PASSES. This is a SHAPE
+        //    gate, not an absolute floor — that is the trap relay #13 flagged.
+        //
+        //    Degrades to a no-op when the per-sample occupancy was not captured
+        //    (fixture / BSD time / a pre-this-field artifact): `bimodal` needs ≥5
+        //    samples and an empty/short set can never flag, so it is never a false
+        //    VOID. Bounded by occupancy_med > 0.0 for the same uncaptured-≡-0.0
+        //    reason as PREEMPTED-K1.
+        if c.k >= 2
+            && c.occupancy_med > 0.0
+            && c.occupancy_med < crate::perturb::OCCUPANCY_MIN
+            && crate::perturb::bimodal(&c.occupancy_samples, crate::perturb::BIMODAL_K)
+        {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Void,
+                scope,
+                format!(
+                    "PREEMPTED-K≥2: k={} cell median occupancy {:.2} < {} AND the per-sample \
+                     occupancy distribution is BIMODAL across {} clean samples — a competitor \
+                     round-robined on/off the {} pinned cores (a high mode while the cell owned \
+                     them, a low mode while preempted off them). A serial-by-design parallel cell \
+                     depresses occupancy SMOOTHLY (unimodal); a bimodal split is off-core \
+                     preemption that the relativized occupancy floor and the UNQUIET run-queue bar \
+                     both miss at k≥2. Re-run on a quiet window where the cell's per-sample \
+                     occupancy is unimodal (≥{}% of the wall on-core every sample)",
+                    c.k,
+                    c.occupancy_med,
+                    crate::perturb::OCCUPANCY_MIN,
+                    c.occupancy_samples.len(),
+                    c.k,
+                    (crate::perturb::OCCUPANCY_MIN * 100.0) as i64,
+                ),
+            ));
+            continue;
+        }
+
         // -- DRIFT: control bracket swing > K×floor OR end-to-end > PCT. ---------
         if let Some(d) = bracket_drift(&c.ctrl_medians) {
             let swing_bar = DRIFT_VOID_K * c.ctrl_spread;
@@ -1565,6 +1628,15 @@ pub fn parse_box_valid_line(v: &str) -> Option<CellBoxStats> {
             "clean" => c.clean = val.parse().unwrap_or(0),
             "escalated" => c.escalated = val == "1" || val.eq_ignore_ascii_case("true"),
             "occ_med" => c.occupancy_med = val.parse().unwrap_or(0.0),
+            // per-sample clean occupancy, comma-joined (e.g. "0.99,0.98,1.0").
+            // Malformed values are skipped; an empty/short set degrades the
+            // PREEMPTED-K≥2 bimodality backstop to a no-op (never a false VOID).
+            "occ_samples" => {
+                c.occupancy_samples = val
+                    .split(',')
+                    .filter_map(|x| x.trim().parse::<f64>().ok())
+                    .collect();
+            }
             "procs_med" => c.procs_running_med = val.parse().unwrap_or(0.0),
             "mask" => c.mask_requested = val.to_string(),
             "maskd" => c.mask_readback = val.to_string(),
@@ -2096,6 +2168,7 @@ mod box_valid_tests {
             clean: 15,
             escalated: false,
             occupancy_med: 0.99,
+            occupancy_samples: Vec::new(),
             procs_running_med: 4.0,
             mask_requested: "2,4,8,10".into(),
             mask_readback: "0-15".into(),
@@ -2425,6 +2498,7 @@ mod box_valid_tests {
             clean: 15,
             escalated: false,
             occupancy_med: 0.99, // a CPU-bound single thread saturates its core
+            occupancy_samples: Vec::new(),
             procs_running_med: 1.0,
             mask_requested: "0".into(),   // 1 core for k=1
             mask_readback: "0-15".into(), // pool ⊇ request → WRONG-MASK passes
@@ -2495,6 +2569,139 @@ mod box_valid_tests {
             verdict_of(&uncaptured).0,
             CheckVerdict::Ok,
             "no occupancy capture degrades PREEMPTED-K1 to a no-op"
+        );
+    }
+
+    // ── 4c. PREEMPTED-K≥2 (single-competitor blind-spot generalized to k≥2) ──
+    //    At k≥2 the absolute floor PREEMPTED-K1 uses is UNSAFE: a serial-by-
+    //    design parallel cell legitimately reads aggregate occupancy < 0.90 with
+    //    NO preemption (a serial bootstrap idles k−1 cores), so an absolute floor
+    //    would false-VOID it (the relativization exists to protect it). The
+    //    discriminator is the per-sample SHAPE, not the level: a serial fraction
+    //    depresses occupancy SMOOTHLY (unimodal); a competitor round-robining
+    //    on/off our pinned cores leaves a BIMODAL split. The backstop VOIDs only
+    //    when occupancy is depressed AND its per-sample distribution is bimodal.
+    //
+    //    RED-before/GREEN-after: with the PREEMPTED-K≥2 block stubbed `if false`,
+    //    the bimodal cell below returns OK (the silent-pass hole — every prior
+    //    arm passes: relativized occupancy ⇒ 0 rejected, run-queue ≤ k+1, no
+    //    drift); GREEN-after it VOIDs. The UNIMODAL serial-by-design control and
+    //    the quiet control must STILL certify (the over-correction guard the
+    //    backlog explicitly demands).
+
+    /// A k=4 cell whose per-sample occupancy is a SMOOTH unimodal depression
+    /// around `level` (a serial-by-design parallel cell — a serial bootstrap
+    /// section idles k−1 cores). NOT preemption: must PASS.
+    fn unimodal_k4_cell(level: f64) -> CellBoxStats {
+        // 14 tightly-clustered samples around `level` (spread ≪ the bimodal gap).
+        let samples: Vec<f64> = (0..14).map(|i| level + (i as f64 - 7.0) * 0.002).collect();
+        let mut c = clean_cell(); // k=4
+        c.n_raw = 14;
+        c.clean = 14;
+        c.rejected = 0;
+        c.occupancy_med = level;
+        c.occupancy_samples = samples;
+        c
+    }
+
+    #[test]
+    fn preempted_k2_bimodal_voids_red_before_green_after() {
+        // GREEN control (a): a serial-by-design k=4 cell with a SMOOTH unimodal
+        // depression at occ≈0.5 must STILL certify — the relativized floor is
+        // preserved at k≥2, no absolute-floor over-correction.
+        let serial = unimodal_k4_cell(0.5);
+        let (v, reason) = verdict_of(&serial);
+        assert_eq!(
+            v,
+            CheckVerdict::Ok,
+            "a serial-by-design (unimodal) depressed k≥2 cell must NOT false-VOID; reason: {reason}"
+        );
+
+        // RED-before / GREEN-after (b): a k=4 cell with a competitor that
+        // round-robins on/off the pinned cores ⇒ a BIMODAL per-sample occupancy
+        // (a low mode ≈0.3 while preempted, a high mode ≈1.0 while on-core).
+        // The relativized occupancy floor admits BOTH modes (0 rejected), the
+        // run-queue can sit at k+1 (UNQUIET miss), the contention is steady (no
+        // drift) — only the bimodality backstop can VOID it.
+        let mut comp = clean_cell(); // k=4
+        let mut samples = vec![0.30, 0.31, 0.29, 0.30, 0.32, 0.31, 0.30, 0.30];
+        samples.extend_from_slice(&[1.00, 0.99, 1.00, 0.98, 1.00, 0.99]);
+        comp.n_raw = 14;
+        comp.clean = 14;
+        comp.rejected = 0;
+        comp.occupancy_med = 0.305; // low mode dominates the median, < OCCUPANCY_MIN
+        comp.occupancy_samples = samples;
+        // sanity: the planted distribution really IS bimodal by the shipped helper.
+        assert!(
+            crate::perturb::bimodal(&comp.occupancy_samples, crate::perturb::BIMODAL_K),
+            "the planted competitor distribution must be bimodal"
+        );
+        let (v, reason) = verdict_of(&comp);
+        assert_eq!(
+            v,
+            CheckVerdict::Void,
+            "a bimodal-occupancy k≥2 cell (off-core competitor) VOIDs"
+        );
+        assert!(
+            reason.contains("PREEMPTED-K≥2"),
+            "names PREEMPTED-K≥2: {reason}"
+        );
+        assert!(
+            reason.contains("BIMODAL"),
+            "cites the bimodal witness: {reason}"
+        );
+        assert!(
+            reason.contains("Re-run"),
+            "names the resolving measurement: {reason}"
+        );
+
+        // GREEN control (c): a fully-quiet k=4 (occ≈1.0, unimodal) certifies —
+        // not depressed, so the backstop never even consults bimodality.
+        let quiet = unimodal_k4_cell(0.99);
+        assert_eq!(
+            verdict_of(&quiet).0,
+            CheckVerdict::Ok,
+            "a fully-quiet k≥2 cell certifies"
+        );
+
+        // GRACEFUL control (d): a depressed k=4 cell with NO per-sample
+        // occupancy captured (empty samples — fixture / BSD time / pre-this-field
+        // artifact) degrades to a no-op (bimodal needs ≥5 samples) — never a
+        // false VOID. This is exactly the shape a serial-by-design cell took
+        // before this field existed, so banked artifacts are NOT retroactively
+        // VOIDed.
+        let mut uncaptured = clean_cell(); // k=4
+        uncaptured.occupancy_med = 0.5;
+        uncaptured.occupancy_samples = Vec::new();
+        assert_eq!(
+            verdict_of(&uncaptured).0,
+            CheckVerdict::Ok,
+            "no per-sample occupancy capture degrades PREEMPTED-K≥2 to a no-op"
+        );
+    }
+
+    // ── round-trip: the runner's occ_samples field parses back into the gate ─
+    #[test]
+    fn occ_samples_round_trip_drives_bimodal_void() {
+        // A box_valid line carrying a BIMODAL per-sample occupancy (the exact
+        // `;occ_samples=` shape the runner emits) must parse and VOID at k≥2.
+        let line = "cell=silesia:4;k=4;n_raw=14;rejected=0;clean=14;escalated=0;\
+                    occ_med=0.305000;procs_med=5.0;mask=2,4,8,10;maskd=0-15;\
+                    ctrl_first=1.000000;ctrl_mid=1.000000;ctrl_last=1.000000;\
+                    ctrl_spread=0.001000;ts_span=14.0;\
+                    occ_samples=0.300000,0.310000,0.290000,0.300000,0.320000,0.310000,\
+                    0.300000,0.300000,1.000000,0.990000,1.000000,0.980000,1.000000,0.990000";
+        let c = parse_box_valid_line(line).expect("parses");
+        assert_eq!(c.occupancy_samples.len(), 14, "all 14 samples parsed");
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(
+            v,
+            CheckVerdict::Void,
+            "a round-tripped bimodal k≥2 capture VOIDs: {reason}"
+        );
+        assert!(
+            reason.contains("PREEMPTED-K≥2"),
+            "names the check: {reason}"
         );
     }
 
