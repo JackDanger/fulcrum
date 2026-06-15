@@ -70,8 +70,10 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::finding::{Finding, Scope, Threads, Verdict};
+use crate::finding::{Finding, Scope, SrcChangeOracle, Store, Threads, Verdict};
 use crate::perturb::{N_RAW, N_RAW_ESCALATED};
+use crate::pipeline;
+use std::ops::ControlFlow;
 
 /// Reference-control block size (subject decodes per FIRST/MID/LAST bracket).
 const CTRL_BLOCK_N: usize = 3;
@@ -463,6 +465,300 @@ pub fn run(spec: &RunSpec, out: &Path, mode: Mode) -> Result<PathBuf, String> {
     Ok(run_dir)
 }
 
+// ─── incremental run + gate (durable, monitorable) ────────────────────────────
+
+/// Pre-synthesized fixture cells indexed by `(corpus, threads)` for O(1) lookup
+/// during the incremental loop (fixture cells are all known up front).
+type FixtureCellIndex = BTreeMap<(String, usize), CapturedCell>;
+
+/// One completed cell's live progress record, produced AS the cell finishes so a
+/// `tail -f` watcher sees per-cell progress (not only the final summary) and a
+/// caller can react (ABORT) between cells. This is the unit of durability: the
+/// CERTIFIED cell behind it is already banked on disk by the time the reporter
+/// sees this record.
+#[derive(Debug, Clone)]
+pub struct CellProgress {
+    /// 1-based position in the run.
+    pub index: usize,
+    /// total cells planned (corpora × threads).
+    pub total: usize,
+    pub corpus: String,
+    pub threads: usize,
+    /// the artifact stem (e.g. `silesia_T4`).
+    pub label: String,
+    /// the banked `cell_id` when CERTIFIED (or the matched id on a resume skip);
+    /// `None` for a VOID cell.
+    pub cell_id: Option<String>,
+    /// the CERTIFIED verdict label, or the `gate/sub-check` token that VOIDed it.
+    pub verdict: String,
+    /// true ⇒ CERTIFIED + banked; false ⇒ VOID (refused) or SKIPPED.
+    pub cleared: bool,
+    /// true ⇒ the cell was SKIPPED (already CERTIFIED in the store, on resume).
+    pub skipped: bool,
+    /// the resolving reason / bank note (one short line).
+    pub reason: String,
+    /// the FULL multi-line render (the `=== cell ===` detail block).
+    pub render: String,
+}
+
+impl CellProgress {
+    /// The single greppable progress LINE a watcher tails (`FULCRUM_CELL …`).
+    pub fn line(&self) -> String {
+        let status = if self.skipped {
+            "SKIP".to_string()
+        } else if self.cleared {
+            format!("CERTIFIED {}", self.verdict)
+        } else {
+            format!("VOID {}", self.verdict)
+        };
+        format!(
+            "FULCRUM_CELL {i}/{n} corpus={c} T{t} {status} cell_id={id} :: {reason}",
+            i = self.index,
+            n = self.total,
+            c = self.corpus,
+            t = self.threads,
+            id = self.cell_id.as_deref().unwrap_or("-"),
+            reason = self.reason,
+        )
+    }
+}
+
+/// A per-cell reporter, invoked AFTER each cell is banked (or skipped). Returning
+/// [`ControlFlow::Break`] ABORTS the run before the next cell is measured — the
+/// k cells already banked survive on disk (this is what makes a long run robust
+/// to a context-death mid-run). The CLI implementation prints the line and
+/// flushes stdout so `tail -f` is live.
+pub trait CellReporter {
+    fn on_cell(&mut self, p: &CellProgress) -> ControlFlow<()>;
+}
+
+/// The outcome tally of an incremental run.
+#[derive(Debug, Clone)]
+pub struct IncSummary {
+    pub run_dir: PathBuf,
+    /// cells planned (corpora × threads).
+    pub total: usize,
+    /// cells measured + gated (not resume-skipped).
+    pub processed: usize,
+    /// CERTIFIED + banked cells.
+    pub certified: usize,
+    /// resume-skipped cells (already CERTIFIED in the store).
+    pub skipped: usize,
+    /// the reporter requested an ABORT (Break).
+    pub aborted: bool,
+}
+
+/// Run + gate one cell at a time, banking each CERTIFIED cell to the store
+/// IMMEDIATELY — before the next cell is measured — and reporting per-cell
+/// progress. The durable, monitorable replacement for "measure every cell, then
+/// bank in one batch at the end": a run that dies after cell k leaves k cells
+/// durably banked and retrievable from the store.
+///
+/// `resume` ⇒ a cell already CERTIFIED in the store for this
+/// (commit, corpus, arch, threads, sink) coordinate is SKIPPED (idempotent
+/// re-run; the expensive live measurement is not repeated). MEASUREMENT semantics
+/// are unchanged — the SAME five gates run over the SAME per-cell artifacts the
+/// batch path emits; only WHEN results are persisted + reported differs.
+#[allow(clippy::too_many_arguments)]
+pub fn run_and_gate_incremental(
+    spec: &RunSpec,
+    out: &Path,
+    mode: Mode,
+    resume: bool,
+    store: &mut Store,
+    store_path: &Path,
+    oracle: &dyn SrcChangeOracle,
+    reporter: &mut dyn CellReporter,
+) -> Result<IncSummary, String> {
+    let run_dir = out.join(&spec.runid);
+    fs::create_dir_all(&run_dir).map_err(|e| format!("mkdir {run_dir:?}: {e}"))?;
+
+    // The cell plan in stable corpora × threads order (matches the batch path).
+    let plan: Vec<(String, usize)> = spec
+        .corpora
+        .iter()
+        .flat_map(|c| spec.threads.iter().map(move |&t| (c.id.clone(), t)))
+        .collect();
+    let total = plan.len();
+
+    // Globals (cell-independent), plus the source of measured cells. Fixture is
+    // instant (all cells pre-synthesized, indexed by coordinate); live measures
+    // one cell at a time inside the loop, so durability spans the slow phase.
+    let (mut globals, fixture_cells): (Captured, Option<FixtureCellIndex>) = match mode {
+        Mode::Fixture => {
+            let mut cap = capture_fixture(spec);
+            flavor_check(spec, &cap)?;
+            let mut idx: FixtureCellIndex = BTreeMap::new();
+            for cell in std::mem::take(&mut cap.cells) {
+                idx.insert((cell.corpus.clone(), cell.threads), cell);
+            }
+            (cap, Some(idx))
+        }
+        Mode::Live => {
+            let mut g = capture_live_globals(spec)?;
+            flavor_check(spec, &g)?;
+            // sweeps are global; measure them up front so every per-cell dir
+            // reproduces the lever mint exactly as the batch path does.
+            let mut sweeps = Vec::new();
+            for p in &spec.perturbations {
+                sweeps.push(measure_sweep_live(spec, p)?);
+            }
+            g.sweeps = sweeps;
+            (g, None)
+        }
+    };
+
+    let mut summary = IncSummary {
+        run_dir: run_dir.clone(),
+        total,
+        processed: 0,
+        certified: 0,
+        skipped: 0,
+        aborted: false,
+    };
+
+    for (index, (corpus, t)) in plan.into_iter().enumerate() {
+        // RESUME: skip a cell already CERTIFIED for this coordinate (BEFORE the
+        // expensive live measurement).
+        if resume {
+            if let Some(id) = already_certified(
+                store,
+                &globals.commit_sha,
+                &spec.arch,
+                &corpus,
+                t,
+                &spec.sink,
+            ) {
+                let p = CellProgress {
+                    index: index + 1,
+                    total,
+                    corpus: corpus.clone(),
+                    threads: t,
+                    label: format!("{corpus}_T{t}"),
+                    cell_id: Some(id.clone()),
+                    verdict: "resume".into(),
+                    cleared: false,
+                    skipped: true,
+                    reason: format!("already CERTIFIED ({id}) — resume skip"),
+                    render: format!("[RESUME SKIP] {corpus} T{t} already banked as {id}"),
+                };
+                summary.skipped += 1;
+                if reporter.on_cell(&p).is_break() {
+                    summary.aborted = true;
+                    return Ok(summary);
+                }
+                continue;
+            }
+        }
+
+        // MEASURE one cell (fixture: pre-synthesized lookup; live: run the box).
+        let cell = match &fixture_cells {
+            Some(idx) => match idx.get(&(corpus.clone(), t)) {
+                Some(c) => c.clone(),
+                None => continue, // a declared coordinate with no fixture cell
+            },
+            None => {
+                let cspec = corpus_spec(spec, &corpus)
+                    .ok_or_else(|| format!("no corpus spec for {corpus}"))?;
+                measure_cell_live(spec, cspec, t, globals.corpus_sha.get(&corpus).cloned())?
+            }
+        };
+
+        // EMIT this one cell's artifacts to its own dir, then GATE it through the
+        // five in-process gates — which BANK a CERTIFIED cell to the store on disk
+        // immediately. Re-banking the same cell is a no-op (idempotent on id).
+        let cell_dir = run_dir.join(format!("cell_{corpus}_T{t}"));
+        globals.cells = vec![cell];
+        let emit_res = emit(spec, &globals, &cell_dir);
+        globals.cells = Vec::new();
+        emit_res?;
+
+        let outcomes = pipeline::run_from_artifacts(&cell_dir, store, store_path, oracle)?;
+        summary.processed += 1;
+
+        // Exactly one finding cell per single-cell dir.
+        let p = match outcomes.into_iter().next() {
+            Some((label, Ok(res))) => {
+                summary.certified += 1;
+                CellProgress {
+                    index: index + 1,
+                    total,
+                    corpus: corpus.clone(),
+                    threads: t,
+                    label,
+                    cell_id: Some(res.cell.cell_id.clone()),
+                    verdict: res.cell.verdict.label(),
+                    cleared: true,
+                    skipped: false,
+                    reason: res.bank_note.clone(),
+                    render: res.render(),
+                }
+            }
+            Some((label, Err(refusal))) => CellProgress {
+                index: index + 1,
+                total,
+                corpus: corpus.clone(),
+                threads: t,
+                label,
+                cell_id: None,
+                verdict: format!("{}/{}", refusal.gate, refusal.sub_check),
+                cleared: false,
+                skipped: false,
+                reason: refusal.reason.clone(),
+                render: refusal.render(),
+            },
+            None => CellProgress {
+                index: index + 1,
+                total,
+                corpus: corpus.clone(),
+                threads: t,
+                label: format!("{corpus}_T{t}"),
+                cell_id: None,
+                verdict: "NO-CELL".into(),
+                cleared: false,
+                skipped: false,
+                reason: "no finding emitted for this coordinate".into(),
+                render: "[NO CELL]".into(),
+            },
+        };
+        if reporter.on_cell(&p).is_break() {
+            summary.aborted = true;
+            return Ok(summary);
+        }
+    }
+    Ok(summary)
+}
+
+/// Resume predicate: is there already a CERTIFIED finding banked for this
+/// (commit, arch, corpus, threads, sink) coordinate? Tool-set is intentionally
+/// NOT matched — any CERTIFIED cell at the coordinate counts as done (see the
+/// backlog note). Returns the matching `cell_id`.
+fn already_certified(
+    store: &Store,
+    commit: &str,
+    arch: &str,
+    corpus: &str,
+    threads: usize,
+    sink: &str,
+) -> Option<String> {
+    store
+        .findings
+        .iter()
+        .find(|f| {
+            f.commit_sha == commit
+                && f.scope.arch == arch
+                && f.scope.corpus == corpus
+                && f.scope.threads == Threads::Fixed(threads)
+                && f.sink == sink
+        })
+        .map(|f| f.cell_id.clone())
+}
+
+/// The corpus spec for a corpus id (live measurement needs its path).
+fn corpus_spec<'a>(spec: &'a RunSpec, corpus: &str) -> Option<&'a CorpusSpec> {
+    spec.corpora.iter().find(|c| c.id == corpus)
+}
+
 /// The declared flavor from the cargo feature: anything mentioning `isal` is the
 /// ISA-L build, else `native`.
 fn declared_flavor(feature: &str) -> &'static str {
@@ -512,6 +808,7 @@ fn comparators(spec: &RunSpec) -> Vec<ComparatorSpec> {
 // ─── the intermediate capture (mode-independent emission input) ───────────────
 
 /// One measured cell: interleaved wall samples + the gate-feeding derivatives.
+#[derive(Clone)]
 struct CapturedCell {
     corpus: String,
     threads: usize,
@@ -545,6 +842,7 @@ struct CapturedCell {
 }
 
 /// One measured comparator arm of a cell.
+#[derive(Clone)]
 struct CapturedArm {
     id: String,
     /// wall samples (seconds); empty ⇒ the arm did not measure (ABSENT).
@@ -560,6 +858,7 @@ impl CapturedArm {
     }
 }
 
+#[derive(Clone)]
 struct CapturedKnob {
     name: String,
     env: String,
@@ -575,6 +874,7 @@ struct CapturedKnob {
     knob_sink: String,
 }
 
+#[derive(Clone)]
 struct CapturedSweep {
     region: String,
     region_self_ms: f64,
@@ -593,6 +893,7 @@ struct CapturedSweep {
     rejected: usize,
 }
 
+#[derive(Clone)]
 struct Captured {
     commit_sha: String,
     head_sha: String,
@@ -909,7 +1210,14 @@ fn oracles_for(spec: &RunSpec, fx: &Fixture) -> OracleCounters {
 
 // ─── live capture (runs the real workload; box-only) ─────────────────────────
 
-fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
+/// The GLOBAL (cell-independent) half of a live capture: the provenance
+/// preamble, the comparator A/A self-tests, the knob/oracle witnesses, and the
+/// per-corpus content oracles. Returns a [`Captured`] with `cells`/`sweeps`
+/// EMPTY — the caller fills them. Extracted so the INCREMENTAL run path
+/// ([`run_and_gate_incremental`]) can compute the globals ONCE and then
+/// measure + bank one cell at a time (a context-death after cell k leaves k
+/// cells durably banked), while [`capture_live`] keeps the batch behavior.
+fn capture_live_globals(spec: &RunSpec) -> Result<Captured, String> {
     if spec.gzippy_bin.is_empty() {
         return Err("live mode needs gzippy_bin".into());
     }
@@ -1007,9 +1315,11 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
     // sink classes (both arms on the same regular-file fs in the spine).
     let sink = spec.sink.clone();
 
+    // per-corpus content oracles for the WHOLE roster (cell-independent), so a
+    // single-cell incremental measurement can read its corpus sha without
+    // re-deriving the others.
     let mut corpus_sha = BTreeMap::new();
     let mut corpus_raw_bytes = BTreeMap::new();
-    let mut cells = Vec::new();
     for c in &spec.corpora {
         let (sha, bytes) = corpus_oracle(&c.path);
         if let Some(s) = sha {
@@ -1018,19 +1328,6 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
         if let Some(b) = bytes {
             corpus_raw_bytes.insert(c.id.clone(), b);
         }
-        for &t in &spec.threads {
-            cells.push(measure_cell_live(
-                spec,
-                c,
-                t,
-                corpus_sha.get(&c.id).cloned(),
-            )?);
-        }
-    }
-
-    let mut sweeps = Vec::new();
-    for p in &spec.perturbations {
-        sweeps.push(measure_sweep_live(spec, p)?);
     }
 
     Ok(Captured {
@@ -1053,9 +1350,35 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
         oracles,
         corpus_sha,
         corpus_raw_bytes,
-        cells,
-        sweeps,
+        cells: Vec::new(),
+        sweeps: Vec::new(),
     })
+}
+
+/// The BATCH live capture: globals + every cell + every sweep, measured up
+/// front (the historical behavior `run()` consumes). Equivalent to
+/// [`capture_live_globals`] followed by the cell and sweep loops, with cells
+/// emitted in `corpora × threads` order.
+fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
+    let mut g = capture_live_globals(spec)?;
+    let mut cells = Vec::new();
+    for c in &spec.corpora {
+        for &t in &spec.threads {
+            cells.push(measure_cell_live(
+                spec,
+                c,
+                t,
+                g.corpus_sha.get(&c.id).cloned(),
+            )?);
+        }
+    }
+    let mut sweeps = Vec::new();
+    for p in &spec.perturbations {
+        sweeps.push(measure_sweep_live(spec, p)?);
+    }
+    g.cells = cells;
+    g.sweeps = sweeps;
+    Ok(g)
 }
 
 fn derive_host(spec: &RunSpec) -> HostSpec {

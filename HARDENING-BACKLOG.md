@@ -42,6 +42,41 @@ Invariants every iteration must keep green:
    HYPOTHESIS queue, excluding the disproven family). Design comes from a parallel
    agent.
 
+7. **[DONE — branch `harden/incremental-store`]** Incremental store / streaming
+   output: make long `fulcrum run … --gate` measurements ROBUST + MONITORABLE.
+   **Problem (verified):** the gated CLI MEASURED every cell first (the slow
+   `capture_live` loop), THEN emitted gate results + banked the store in one batch
+   at the very end — so the log was empty mid-run (unmonitorable) and a driver that
+   died before the end lost ALL completed cells (this exhausted THREE baseline
+   agents). **Fix:** a new one-cell-at-a-time orchestrator
+   `runner::run_and_gate_incremental` (runner.rs) that, per cell, MEASURES →
+   emits that cell's own artifact dir (`cell_<corpus>_T<t>/`) → gates it through the
+   existing five in-process gates (`pipeline::run_from_artifacts`, which BANKS a
+   CERTIFIED cell to the JSONL store on disk IMMEDIATELY via the already-append-only
+   `Store::append`) → emits one per-cell progress line BEFORE the next cell is
+   measured. So a run that dies after cell k leaves k cells durably banked +
+   retrievable. Per-cell progress is a typed `CellProgress` + greppable
+   `FULCRUM_CELL <i>/<N> corpus=.. T.. CERTIFIED|VOID|SKIP cell_id=.. :: reason`
+   line (CLI flushes stdout per cell so `tail -f` is live); the final
+   `FULCRUM_PIPELINE` summary is kept. RESUME (opt-in `--resume`) skips a cell
+   already CERTIFIED in the store for its (commit, corpus, arch, threads, sink)
+   coordinate — idempotent re-run, the expensive live measurement is not repeated
+   (tool-set is intentionally NOT matched in the resume predicate; any CERTIFIED
+   cell at the coordinate counts as done). Composition, not new semantics: the SAME
+   N and the SAME five gates run over the SAME per-cell artifacts the batch path
+   emits — only WHEN/HOW results are persisted + reported changed. Refactors:
+   `capture_live` split into `capture_live_globals` (cell-independent preamble +
+   per-corpus oracles) + the cell/sweep loops (batch `run()` behavior unchanged);
+   capture structs gained `#[derive(Clone)]`; sweeps measured up front in the
+   incremental path so every per-cell dir reproduces the lever mint exactly. 4 new
+   self-tests (`tests/incremental_store.rs`, fixture mode + FixedOracle, no live
+   box, no `#[ignore]`): incremental write (store grows 1→2→3, not 0→0→3),
+   partial-survival after a simulated mid-run abort (k cells reloadable from a fresh
+   `Store`), per-cell progress record (verdict + `F-` cell_id), resume skips
+   already-CERTIFIED cells (no duplicates). 530 tests / 0 / 0; clippy 0-new; fmt
+   clean. Existing `run_dryrun_oracle` CLI tests still pass (stdout contract
+   preserved). NOTE: the full baseline should be RUN ON THIS COMMIT for robustness.
+
 6. **[STANDING — in progress]** Adversarial self-review for new bugs; parser/locale
    edge-cases (`cycles.rs` non-C-locale); coverage.
    - **[DONE — branch `harden/newcode-audit`]** Two real false-VOID defects in the

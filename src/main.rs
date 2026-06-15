@@ -2942,6 +2942,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut mode = runner::Mode::Fixture;
     let mut gate = false;
     let mut fixture_oracle = false;
+    let mut resume = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2963,6 +2964,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             "--gate" => {
                 gate = true;
+                i += 1;
+            }
+            "--resume" => {
+                resume = true;
                 i += 1;
             }
             "--fixture-oracle" => {
@@ -3013,20 +3018,27 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     let out_dir = std::path::PathBuf::from(out.unwrap_or("/dev/shm/fulcrum-art"));
-    let dir = match runner::run(&spec, &out_dir, mode) {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("run: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
     if !gate {
+        // No gating: emit the batch artifact tree as before.
+        let dir = match runner::run(&spec, &out_dir, mode) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("run: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
         return ExitCode::SUCCESS;
     }
-    // --gate: flow the emitted artifacts through the five in-process gates and
-    // bank every CERTIFIED cell (no subprocess, no Python).
+    // --gate: measure + gate + bank ONE CELL AT A TIME. Each CERTIFIED cell is
+    // banked to the store on disk IMMEDIATELY (before the next cell is measured),
+    // and a per-cell progress line is emitted as it finishes — so a `tail -f`
+    // watcher sees live progress and a run that dies after cell k leaves k cells
+    // durably banked. No subprocess, no Python.
     use fulcrum::finding::{FixedOracle, GitSrcOracle, SrcChangeOracle, Store};
+    use fulcrum::runner::{CellProgress, CellReporter};
+    use std::io::Write;
+    use std::ops::ControlFlow;
     let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let store_path = store
         .map(std::path::PathBuf::from)
@@ -3059,20 +3071,44 @@ fn cmd_run(args: &[String]) -> ExitCode {
         git_oracle = GitSrcOracle::new(&repo);
         &git_oracle
     };
-    match fulcrum::pipeline::run_from_artifacts(&dir, &mut store_obj, &store_path, oracle) {
-        Ok(results) => {
-            let mut certified = 0usize;
-            for (label, outcome) in &results {
-                println!("\n=== cell {label} ===");
-                println!("{}", fulcrum::pipeline::render_outcome(outcome));
-                if outcome.is_ok() {
-                    certified += 1;
-                }
-            }
+
+    /// The CLI reporter: prints the detailed `=== cell ===` block + the concise
+    /// greppable progress line, flushing stdout per cell so `tail -f` is live.
+    /// Never aborts (the CLI runs every planned cell).
+    struct CliReporter;
+    impl CellReporter for CliReporter {
+        fn on_cell(&mut self, p: &CellProgress) -> ControlFlow<()> {
+            println!("\n=== cell {} ===", p.label);
+            println!("{}", p.render);
+            println!("{}", p.line());
+            let _ = std::io::stdout().flush();
+            ControlFlow::Continue(())
+        }
+    }
+    let mut reporter = CliReporter;
+
+    match fulcrum::runner::run_and_gate_incremental(
+        &spec,
+        &out_dir,
+        mode,
+        resume,
+        &mut store_obj,
+        &store_path,
+        oracle,
+        &mut reporter,
+    ) {
+        Ok(summary) => {
+            println!("FULCRUM_RUN_ARTIFACTS={}", summary.run_dir.display());
             println!(
-                "\nFULCRUM_PIPELINE: {certified}/{} cell(s) CERTIFIED + banked into {}",
-                results.len(),
-                store_path.display()
+                "\nFULCRUM_PIPELINE: {certified}/{total} cell(s) CERTIFIED + banked into {store}{skip}",
+                certified = summary.certified,
+                total = summary.total,
+                store = store_path.display(),
+                skip = if summary.skipped > 0 {
+                    format!(" ({} resume-skipped)", summary.skipped)
+                } else {
+                    String::new()
+                },
             );
             ExitCode::SUCCESS
         }
