@@ -2764,83 +2764,10 @@ fn cmd_comparability(args: &[String]) -> ExitCode {
 }
 
 /// Parse a [`fulcrum::comparability::Capture`] from the JSON wire format.
-/// Kept in the CLI layer so the gate core stays serde-free (repo convention:
-/// `compare::Cell`/`ThreadCell` are not serde types).
+/// Delegates to the gate-core parser (moved there so the in-process pipeline
+/// can read runner-emitted captures without going through the CLI).
 fn parse_capture(json: &str) -> Option<fulcrum::comparability::Capture> {
-    use fulcrum::comparability::{ArmPresence, Capture, WorkCounter};
-    use fulcrum::compare::{BinaryKind, ThreadCell};
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-
-    let threads = match v.get("threads").and_then(|t| t.as_str()).unwrap_or("T1") {
-        s if s.eq_ignore_ascii_case("auto") => ThreadCell::Auto,
-        s => ThreadCell::Fixed(
-            s.trim_start_matches(['T', 't']).parse::<usize>().unwrap_or(1),
-        ),
-    };
-
-    let parse_kind = |s: &str| -> BinaryKind {
-        let l = s.to_ascii_lowercase();
-        if l == "native" {
-            BinaryKind::Native
-        } else if let Some(rest) = l.strip_prefix("interpreted:") {
-            BinaryKind::Interpreted(rest.to_string())
-        } else if l == "interpreted" {
-            BinaryKind::Interpreted("script".to_string())
-        } else {
-            BinaryKind::Unknown
-        }
-    };
-
-    let mut arms = Vec::new();
-    if let Some(arr) = v.get("arms").and_then(|a| a.as_array()) {
-        for a in arr {
-            arms.push(ArmPresence {
-                id: a.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                measured: a.get("measured").and_then(|x| x.as_bool()).unwrap_or(false),
-                binary_kind: a
-                    .get("binary_kind")
-                    .and_then(|x| x.as_str())
-                    .map(parse_kind)
-                    .unwrap_or(BinaryKind::Unknown),
-                aa_ratio: a.get("aa_ratio").and_then(|x| x.as_f64()),
-                aa_spread: a.get("aa_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                wall_ms: a.get("wall_ms").and_then(|x| x.as_f64()),
-                require_native_elf: a
-                    .get("require_native_elf")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false),
-            });
-        }
-    }
-
-    let mut counters = Vec::new();
-    if let Some(arr) = v.get("counters").and_then(|a| a.as_array()) {
-        for c in arr {
-            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let mut per_arm = std::collections::BTreeMap::new();
-            if let Some(obj) = c.get("per_arm").and_then(|x| x.as_object()) {
-                for (k, val) in obj {
-                    if let Some(f) = val.as_f64() {
-                        per_arm.insert(k.clone(), f);
-                    }
-                }
-            }
-            counters.push(WorkCounter { name, per_arm });
-        }
-    }
-
-    Some(Capture {
-        cell_id: v.get("cell_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        commit_sha: v.get("commit_sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        corpus: v.get("corpus").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        arch: v.get("arch").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        threads,
-        sink: v.get("sink").and_then(|x| x.as_str()).unwrap_or("regular-file").to_string(),
-        n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-        inter_run_spread: v.get("inter_run_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        arms,
-        counters,
-    })
+    fulcrum::comparability::parse_capture(json)
 }
 
 /// memlife: cross-tool, per-buffer ATTRIBUTED memory-lifecycle breakdown.
@@ -2940,12 +2867,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
     let mut spec_path: Option<&str> = None;
     let mut out: Option<&str> = None;
+    let mut store: Option<&str> = None;
     let mut mode = runner::Mode::Fixture;
+    let mut gate = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--out" => {
                 out = args.get(i + 1).map(|s| s.as_str());
+                i += 2;
+            }
+            "--store" => {
+                store = args.get(i + 1).map(|s| s.as_str());
                 i += 2;
             }
             "--dry-run" | "--fixture" => {
@@ -2954,6 +2887,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             "--live" => {
                 mode = runner::Mode::Live;
+                i += 1;
+            }
+            "--gate" => {
+                gate = true;
                 i += 1;
             }
             other if !other.starts_with("--") => {
@@ -2988,13 +2925,51 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     let out_dir = std::path::PathBuf::from(out.unwrap_or("/dev/shm/fulcrum-art"));
-    match runner::run(&spec, &out_dir, mode) {
-        Ok(dir) => {
-            println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
+    let dir = match runner::run(&spec, &out_dir, mode) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
+    if !gate {
+        return ExitCode::SUCCESS;
+    }
+    // --gate: flow the emitted artifacts through the five in-process gates and
+    // bank every CERTIFIED cell (no subprocess, no Python).
+    use fulcrum::finding::{GitSrcOracle, Store};
+    let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let store_path = store
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Store::default_path(&repo));
+    let mut store_obj = match Store::load(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("run --gate: load store {store_path:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let oracle = GitSrcOracle::new(&repo);
+    match fulcrum::pipeline::run_from_artifacts(&dir, &mut store_obj, &store_path, &oracle) {
+        Ok(results) => {
+            let mut certified = 0usize;
+            for (label, outcome) in &results {
+                println!("\n=== cell {label} ===");
+                println!("{}", fulcrum::pipeline::render_outcome(outcome));
+                if outcome.is_ok() {
+                    certified += 1;
+                }
+            }
+            println!(
+                "\nFULCRUM_PIPELINE: {certified}/{} cell(s) CERTIFIED + banked into {}",
+                results.len(),
+                store_path.display()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("run: {e}");
+            eprintln!("run --gate: {e}");
             ExitCode::FAILURE
         }
     }

@@ -52,6 +52,7 @@ pub mod memlife;
 pub mod microbench;
 pub mod model;
 pub mod perturb;
+pub mod pipeline;
 pub mod probe;
 pub mod provenance;
 pub mod quantity;

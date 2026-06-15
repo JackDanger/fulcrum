@@ -706,6 +706,84 @@ pub fn counters_from_traces(
     WorkCounter::new(counter_name, &[(a_id, a_value), (b_id, b_value)])
 }
 
+/// Parse a [`Capture`] from the JSON wire format the runner emits (and the
+/// `fulcrum comparability --capture` CLI consumes). The gate core stays
+/// serde-free (`compare::ThreadCell` / `BinaryKind` are not serde types), so the
+/// parse is a hand-mapped `serde_json::Value` walk.
+pub fn parse_capture(json: &str) -> Option<Capture> {
+    use crate::compare::{BinaryKind, ThreadCell};
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+
+    let threads = match v.get("threads").and_then(|t| t.as_str()).unwrap_or("T1") {
+        s if s.eq_ignore_ascii_case("auto") => ThreadCell::Auto,
+        s => ThreadCell::Fixed(s.trim_start_matches(['T', 't']).parse::<usize>().unwrap_or(1)),
+    };
+
+    let parse_kind = |s: &str| -> BinaryKind {
+        let l = s.to_ascii_lowercase();
+        if l == "native" {
+            BinaryKind::Native
+        } else if let Some(rest) = l.strip_prefix("interpreted:") {
+            BinaryKind::Interpreted(rest.to_string())
+        } else if l == "interpreted" {
+            BinaryKind::Interpreted("script".to_string())
+        } else {
+            BinaryKind::Unknown
+        }
+    };
+
+    let mut arms = Vec::new();
+    if let Some(arr) = v.get("arms").and_then(|a| a.as_array()) {
+        for a in arr {
+            arms.push(ArmPresence {
+                id: a.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                measured: a.get("measured").and_then(|x| x.as_bool()).unwrap_or(false),
+                binary_kind: a
+                    .get("binary_kind")
+                    .and_then(|x| x.as_str())
+                    .map(parse_kind)
+                    .unwrap_or(BinaryKind::Unknown),
+                aa_ratio: a.get("aa_ratio").and_then(|x| x.as_f64()),
+                aa_spread: a.get("aa_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                wall_ms: a.get("wall_ms").and_then(|x| x.as_f64()),
+                require_native_elf: a
+                    .get("require_native_elf")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+    }
+
+    let mut counters = Vec::new();
+    if let Some(arr) = v.get("counters").and_then(|a| a.as_array()) {
+        for c in arr {
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut per_arm = std::collections::BTreeMap::new();
+            if let Some(obj) = c.get("per_arm").and_then(|x| x.as_object()) {
+                for (k, val) in obj {
+                    if let Some(f) = val.as_f64() {
+                        per_arm.insert(k.clone(), f);
+                    }
+                }
+            }
+            counters.push(WorkCounter { name, per_arm });
+        }
+    }
+
+    Some(Capture {
+        cell_id: v.get("cell_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        commit_sha: v.get("commit_sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        corpus: v.get("corpus").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        arch: v.get("arch").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        threads,
+        sink: v.get("sink").and_then(|x| x.as_str()).unwrap_or("regular-file").to_string(),
+        n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        inter_run_spread: v.get("inter_run_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        arms,
+        counters,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
