@@ -29,10 +29,24 @@ Invariants every iteration must keep green:
    VOID/ONE-ARM, not admitted. rapidgzip keeps its dedicated global A/A (still feeds
    the manifest COMPARATOR-PRESENT check). 3 new self-tests (red-before/green-after).
 
-3. **[TODO]** Consolidate the branch stack into ONE verified `fulcrum` main and end
-   the branch debt. Order: `engines-merged → first-run-capable → tool-repaired →
-   live-path-baseline-aa → noisy-box-gate → harden/comparator-aa`. Verify the suite
-   at each step; land a single clean main.
+3. **[DONE — merge 176a593, main fast-forwarded]** Consolidate the branch stack into
+   ONE verified `fulcrum` main and end the branch debt. The hardening landed as a
+   LINEAR chain culminating in `77c82c0` (harden/incremental-store), which already
+   contained EVERY enumerated fix and the entire `harden/newcode-audit` tip
+   (verified: `git branch --merged 77c82c0` lists all feat/*, fix/*, harden/*).
+   `main` (8b0ecff) was a strict ancestor of `77c82c0`, so it fast-forwards. The
+   ONLY fix living OUTSIDE `77c82c0`'s ancestry was `fix/macos-portability`
+   (`8abeadb` — cross-platform BSD/macOS live capture: BSD `time -l` RSS parse,
+   `pinned_cmd` off-Linux degradation, `shasum -a 256` fallback, `/dev/shm`→temp-dir
+   fallback); it was MERGED additively (`176a593`), resolving the two `runner.rs`/
+   `main.rs` conflicts by combining the macOS degradation with HEAD's `pin_mask_pool`
+   wrong-core fix and `if !gate` incremental-store structure (no fix dropped).
+   `bump/0.1.1` (an old May-30 `Release v0.1.1` version bump off a pre-campaign
+   ancestor) is OUT OF SCOPE — not a hardening fix; left untouched. Verified on the
+   consolidated tip: `cargo test --release` 534 / 0-fail / 0-ignored · clippy 0-new
+   (12 pre-existing == 12) · `cargo fmt --check` clean · release build OK.
+   **`main` is now the single verified base** for the streaming-decoder design (in
+   flight) and the generator build (#5) — both branch off here.
 
 4. **[TODO]** Seam rewire: gzippy's `scripts/fulcrum` + `bench/decide.sh` call the
    Rust `fulcrum run` (not the Python pipeline); whole-pipeline cross-check; remove
