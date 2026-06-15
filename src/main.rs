@@ -55,6 +55,7 @@ USAGE:\n\
               --native <path> --isal <path> --rg <path>\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
+  fulcrum quantity [--demo|--algebra]   dimensioned-quantity evaluator (refuses share×wall→bytes etc.)\n\
   fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
   fulcrum run <spec.json> [--out DIR] [--dry-run|--live]   the live-capture RUNNER half:\n\
               run a gzippy-vs-rg decode workload and emit the gate-input artifacts\n\
@@ -2899,6 +2900,19 @@ fn cmd_memlife(args: &[String]) -> ExitCode {
     }
 }
 
+/// quantity: the DIMENSIONED-QUANTITY evaluator (QUANTITY-DIMENSION-OR-REFUSE).
+/// `--demo` replays the worked refutation of conclusion #11; default (or
+/// `--algebra`) renders the legal/refused algebra table.
+fn cmd_quantity(args: &[String]) -> ExitCode {
+    use fulcrum::quantity as q;
+    if args.iter().any(|a| a == "--demo") {
+        println!("{}", q::render_demo());
+    } else {
+        println!("{}", q::render_legal_algebra());
+    }
+    ExitCode::SUCCESS
+}
+
 /// mech-caps: report this host's cross-arch HW-counter availability.
 fn cmd_mech_caps(_args: &[String]) -> ExitCode {
     let caps = mech_arch::MechCaps::detect();
@@ -3054,6 +3068,7 @@ fn main() -> ExitCode {
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),
+        "quantity" => cmd_quantity(rest),
         "mech-caps" => cmd_mech_caps(rest),
         "validate" => cmd_validate(rest),
         "plan" => cmd_plan(rest),

@@ -54,6 +54,7 @@ pub mod model;
 pub mod perturb;
 pub mod probe;
 pub mod provenance;
+pub mod quantity;
 pub mod rank;
 pub mod region_hw;
 pub mod rg_verbose;
