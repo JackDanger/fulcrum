@@ -676,13 +676,41 @@ pub fn locate_one(
         .sum();
     let covered = on_compute + on_wait;
     let residual = wall_us - covered;
-    // CONSERVATION (asserted, not assumed): the three numbers MUST close on the
-    // wall, by construction. A failure here is an internal corruption — REFUSE.
-    if ((on_compute + on_wait + residual) - wall_us).abs() > 1.0 {
-        return Err(LocateError::Conservation(InvariantViolation::new(
-            CONSERVATION_INVARIANT,
-            "locate: ledger does not close (internal)".to_string(),
-        )));
+    // CONSERVATION-OR-NO-LOCATE (against an INDEPENDENT quantity): the old assert
+    // tested `|(on_compute+on_wait+residual) - wall_us|`, which is `|wall-wall|=0`
+    // for ALL inputs (residual := wall - covered) — a tautology that could never
+    // fire. Instead recompute, by interval-union over the path GEOMETRY, how much
+    // of the classified busy time actually lies INSIDE the declared wall window
+    // [trace_start, trace_start+wall_us]. `covered` is summed from per-entry CLASS
+    // durations; `covered_in_window` is an independent interval scan — they agree
+    // only when every on-path span fits inside the wall. Busy time OUTSIDE the
+    // window means the trace and the wall claim disagree (the in-window ledger
+    // cannot close) — REFUSE. The covered>wall case (negative residual) is owned
+    // by the flag below, so this guard runs only when residual is non-negative.
+    if wall_us > 0.0 && residual >= -1.0 {
+        let win_start = trace_start;
+        let win_end = trace_start + wall_us;
+        let covered_in_window: f64 = path
+            .iter()
+            .map(|p| (p.end.min(win_end) - p.start.max(win_start)).max(0.0))
+            .sum();
+        let out_of_window = covered - covered_in_window;
+        if out_of_window > 1.0 {
+            return Err(LocateError::Conservation(InvariantViolation::new(
+                CONSERVATION_INVARIANT,
+                format!(
+                    "locate: in-window ledger does not close -- {:.3}ms of on-path \
+                     busy time ({:.3}ms classified) falls OUTSIDE the wall window \
+                     [{:.3},{:.3}]ms (wall {:.3}ms). The trace and the wall claim \
+                     disagree. REFUSING.",
+                    out_of_window / 1000.0,
+                    covered / 1000.0,
+                    win_start / 1000.0,
+                    win_end / 1000.0,
+                    wall_us / 1000.0,
+                ),
+            )));
+        }
     }
     let residual_pct = if wall_us > 0.0 {
         residual / wall_us * 100.0

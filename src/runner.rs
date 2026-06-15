@@ -1709,16 +1709,76 @@ fn sha256_file(path: &str) -> Option<String> {
     s.split_whitespace().next().map(|x| x.to_string())
 }
 
+/// Count the `src/` files that ACTUALLY CONSUME env knob `env` at the working
+/// tree. The DERIVED-CONSUMER gate is only as sound as this count: a knob with
+/// zero consumers is VOIDed (its A/B measured the binary against itself). The
+/// old `grep -rlF <env> src/` was defeatable — a fixed-substring match with no
+/// word boundary that never checked the env was READ, so a bare mention, a
+/// comment, or a substring of a longer knob (`GZIPPY_SLOW` ⊂
+/// `GZIPPY_SLOW_BOOTSTRAP`) all certified. We now require evidence of an actual
+/// read (`env::var`/`var_os`) referencing the name on whole-identifier
+/// boundaries, with the line's `//` comment tail stripped.
 fn grep_consumers(repo: &Path, env: &str) -> i64 {
     let src = repo.join("src");
-    let out = Command::new("grep").args(["-rlF", env]).arg(&src).output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count() as i64,
-        Err(_) => 0,
+    let mut count = 0i64;
+    count_consuming_files(&src, env, &mut count);
+    count
+}
+
+fn count_consuming_files(dir: &Path, env: &str, count: &mut i64) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count_consuming_files(&path, env, count);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if text.lines().any(|l| env_read_in_line(l, env)) {
+                    *count += 1;
+                }
+            }
+        }
     }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True iff `line` contains an actual READ of env var `env` — an
+/// `env::var(...)` / `var_os(...)` call referencing the name on whole-identifier
+/// boundaries — after the line's `//` comment tail is stripped. A bare mention,
+/// a comment, or a substring of a longer knob does NOT count.
+fn env_read_in_line(line: &str, env: &str) -> bool {
+    // Strip a `//` line-comment tail (conservative: the first `//` ends the code
+    // portion — erring toward NOT-consumed is the safe direction for a gate).
+    let code = match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    // Require an env-read call token on the same line.
+    if !(code.contains("var(") || code.contains("var_os(") || code.contains("var_os (")) {
+        return false;
+    }
+    // The name must appear on whole-identifier boundaries (so `GZIPPY_SLOW`
+    // does not match inside `GZIPPY_SLOW_BOOTSTRAP`).
+    let bytes = code.as_bytes();
+    let nlen = env.len();
+    let mut i = 0;
+    while let Some(pos) = code[i..].find(env) {
+        let start = i + pos;
+        let end = start + nlen;
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = start + 1;
+    }
+    false
 }
 
 /// One timed, masked run → (seconds, output-sha256, peak-RSS-MiB). Sink is a
@@ -2202,6 +2262,89 @@ mod tests {
         assert!(run_dir.join("cell_silesia_T1/wall_rg.txt").exists());
         assert!(run_dir.join("cell_silesia_T1/wall_igzip.txt").exists());
         assert!(run_dir.join("cell_silesia_T1/wall_libdeflate.txt").exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── DEFECT 2 — DERIVED-CONSUMER must demand an ACTUAL env read ──────────
+    //
+    // The defeatable `grep -rlF` matched a bare/comment/substring mention and
+    // CERTIFIED a dead or typo'd knob (a kill-switch measuring the binary
+    // against itself). These adversaries reproduce the false-certify; each must
+    // resolve to ZERO consumers ⇒ VOID after the fix.
+
+    fn write_src(root: &Path, rel: &str, body: &str) {
+        let p = root.join("src").join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, body).unwrap();
+    }
+
+    fn consumer_verdict(root: &Path, env: &str) -> crate::provenance::CheckVerdict {
+        let n = grep_consumers(root, env);
+        let mut m = BTreeMap::new();
+        m.insert(env.to_string(), Some(n));
+        crate::provenance::check_derived_consumer(&m)
+            .into_iter()
+            .next()
+            .unwrap()
+            .verdict
+    }
+
+    #[test]
+    fn derived_consumer_comment_only_mention_is_void() {
+        let tmp = std::env::temp_dir().join(format!("fulcrum_dc_comment_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        // Mentioned ONLY in a comment — never read.
+        write_src(
+            &tmp,
+            "lib.rs",
+            "pub fn f() {\n    // GZIPPY_DEAD_KNOB is no longer honored\n    let _ = 1;\n}\n",
+        );
+        assert_eq!(
+            consumer_verdict(&tmp, "GZIPPY_DEAD_KNOB"),
+            crate::provenance::CheckVerdict::Void,
+            "a comment-only mention is NOT a consumer ⇒ VOID"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn derived_consumer_substring_of_other_knob_is_void() {
+        let tmp = std::env::temp_dir().join(format!("fulcrum_dc_substr_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        // Only GZIPPY_SLOW_BOOTSTRAP is read; GZIPPY_SLOW is a pure substring.
+        write_src(
+            &tmp,
+            "lib.rs",
+            "pub fn f() {\n    let v = std::env::var(\"GZIPPY_SLOW_BOOTSTRAP\").ok();\n    let _ = v;\n}\n",
+        );
+        assert_eq!(
+            consumer_verdict(&tmp, "GZIPPY_SLOW"),
+            crate::provenance::CheckVerdict::Void,
+            "a substring of a longer knob is NOT a consumer ⇒ VOID"
+        );
+        // And the real longer knob still certifies.
+        assert_eq!(
+            consumer_verdict(&tmp, "GZIPPY_SLOW_BOOTSTRAP"),
+            crate::provenance::CheckVerdict::Ok,
+            "the actual read knob certifies"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn derived_consumer_real_env_read_is_ok() {
+        let tmp = std::env::temp_dir().join(format!("fulcrum_dc_real_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        write_src(
+            &tmp,
+            "deep/mod.rs",
+            "pub fn g() -> bool {\n    std::env::var(\"GZIPPY_REAL\").is_ok()\n}\n",
+        );
+        assert_eq!(
+            consumer_verdict(&tmp, "GZIPPY_REAL"),
+            crate::provenance::CheckVerdict::Ok,
+            "an actual env::var read certifies"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -75,6 +75,10 @@ pub const TMA_NO_SLOTS: &str = "TMA-NO-SLOTS";
 pub const TMA_PARTIAL_LEVEL1: &str = "TMA-PARTIAL-LEVEL1";
 /// The four L1 categories do not sum to slots within tolerance — REFUSED.
 pub const TMA_CLOSURE: &str = "TMA-CLOSURE";
+/// A category absent from the capture was FILLED by subtraction to a NEGATIVE
+/// value — the 3 measured categories already exceed the slot count, so the
+/// capture is mismatched (wrong event group / multiplexing). REFUSED.
+pub const TMA_NEGATIVE_CATEGORY: &str = "TMA-NEGATIVE-CATEGORY";
 /// `stalls_mem_any` > `cycles` — physically impossible backend-split capture.
 pub const TMA_BACKEND_INCOHERENT: &str = "TMA-BACKEND-INCOHERENT";
 /// No parseable `<count> <event>` rows — the empty-output instrument class.
@@ -338,6 +342,12 @@ pub struct Tma {
     pub bad_spec_frac: f64,
     pub fe_bound_frac: f64,
     pub be_bound_frac: f64,
+    /// True when one L1 category was absent and FILLED by subtraction (the
+    /// 3-of-4 path). The closure test is then a tautology (`l1_sum == slots` by
+    /// construction), so the full TMA-CLOSURE guarantee is NOT granted — the
+    /// breakdown is unguarded against a mismatched capture beyond the negative
+    /// rejection. False ⇒ all four were independently measured and CLOSED.
+    pub degraded: bool,
     // raw slot counts (for cross-binary arithmetic).
     pub retiring: i64,
     pub bad_spec: i64,
@@ -430,14 +440,26 @@ pub fn build_tma(events: &Events, label: Option<&str>, tol_pct: f64) -> CyResult
     // Fill in a missing 4th category by subtraction so the closure test is
     // symmetric. Order matches Python's dict iteration: retiring, bad_spec,
     // fe_bound, be_bound (only the FIRST missing one is filled — when exactly 3
-    // are present there is at most one missing).
+    // are present there is at most one missing). A subtraction-filled breakdown
+    // is DEGRADED: the closure test below becomes a tautology, so the full
+    // TMA-CLOSURE guarantee is withheld and the only protection against a
+    // mismatched 3-category capture is the NEGATIVE-fill rejection.
+    let degraded = present < 4;
     let known_sum: i64 = [retiring, bad_spec, fe_bound, be_bound]
         .iter()
         .filter_map(|x| *x)
         .sum();
-    for slot in [&mut retiring, &mut bad_spec, &mut fe_bound, &mut be_bound] {
+    let mut filled: Option<(&str, i64)> = None;
+    for (slot, name) in [
+        (&mut retiring, "retiring"),
+        (&mut bad_spec, "bad_spec"),
+        (&mut fe_bound, "fe_bound"),
+        (&mut be_bound, "be_bound"),
+    ] {
         if slot.is_none() {
-            *slot = Some(slots - known_sum);
+            let v = slots - known_sum;
+            *slot = Some(v);
+            filled = Some((name, v));
             break;
         }
     }
@@ -446,6 +468,30 @@ pub fn build_tma(events: &Events, label: Option<&str>, tol_pct: f64) -> CyResult
     let bad_spec = bad_spec.expect("filled above");
     let fe_bound = fe_bound.expect("filled above");
     let be_bound = be_bound.expect("filled above");
+
+    // REFUSE a NEGATIVE subtraction fill: in the 3-of-4 path the closure test
+    // (l1_sum == slots) is a tautology and can never catch a capture whose 3
+    // measured categories already overshoot the slot count. The negative fill
+    // is the signature of exactly that mismatch — guard it explicitly.
+    if let Some((name, v)) = filled {
+        if v < 0 {
+            return Err(InvariantViolation::new(
+                TMA_NEGATIVE_CATEGORY,
+                format!(
+                    "TMA L1 category '{name}' was filled by subtraction to {} \
+                     (slots {} − Σ of the 3 measured categories {}) — a NEGATIVE \
+                     category is impossible; the 3 measured categories already \
+                     exceed the slot count, so the capture is mismatched (wrong \
+                     event group or a multiplexing error). The 3-of-4 closure \
+                     test cannot catch this (it is a tautology once a category is \
+                     inferred). REFUSING to render a breakdown.",
+                    group(v),
+                    group(slots),
+                    group(known_sum),
+                ),
+            ));
+        }
+    }
 
     // TMA-CLOSURE refusal: the four categories must sum to slots.
     let l1_sum = retiring + bad_spec + fe_bound + be_bound;
@@ -541,6 +587,7 @@ pub fn build_tma(events: &Events, label: Option<&str>, tol_pct: f64) -> CyResult
         bad_spec_frac,
         fe_bound_frac,
         be_bound_frac,
+        degraded,
         retiring,
         bad_spec,
         fe_bound,
