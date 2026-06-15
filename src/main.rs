@@ -24,8 +24,9 @@
 use fulcrum::config::Config;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, decompose,
-    finding, flow, mech, mech_arch, memlife, model, provenance, rank, region_hw, rg_verbose,
-    scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    finding, flow, invariants, mech, mech_arch, memlife, model, perturb, provenance, rank,
+    region_hw, rg_verbose, scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep,
+    xtool,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -55,6 +56,8 @@ USAGE:\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
   fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
+  fulcrum perturb <sweep-dir> [--allow-thaw]   causal perturbation harness (PERTURBATION-OR-NO-LEVER)\n\
+  fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
@@ -2829,6 +2832,42 @@ fn cmd_mech_caps(_args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// perturb: the causal perturbation harness (PERTURBATION-OR-NO-LEVER). Consumes
+/// a documented sweep-artifact directory written by a project's measurement
+/// policy and converts a HYPOTHESIS into a STRONG verdict (or refuses). ALL prose
+/// is routed through the gated cell methods, so a lever claim is impossible to
+/// emit for a non-(perturbation/LEVER) cell.
+fn cmd_perturb(args: &[String]) -> ExitCode {
+    let Some(dir) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!(
+            "fulcrum perturb <sweep-dir> [--allow-thaw]\n\
+             \n\
+             <sweep-dir> layout: meta.txt (region, region_self_ms, perturb_cmd, \
+             sha_ok, cell_id, freeze_state, quiet_state), baseline.txt, \
+             baseline_recheck.txt, spin/t{{10,20,30}}.txt, sleep/t{{10,20,30}}.txt, \
+             oracle_removed.txt (optional)."
+        );
+        return ExitCode::from(2);
+    };
+    let (sweep, meta) = match perturb::load_sweep(Path::new(dir)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("fulcrum perturb: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let frozen = perturb::frozen_ok(&meta) || args.iter().any(|a| a == "--allow-thaw");
+    let cell = perturb::analyze_sweep(&sweep);
+    print!("{}", perturb::render_perturb(&cell, frozen));
+    ExitCode::SUCCESS
+}
+
+/// invariants: render THE INVARIANT SET (the Rust-native registry).
+fn cmd_invariants(_args: &[String]) -> ExitCode {
+    println!("{}", invariants::render());
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
@@ -2866,6 +2905,8 @@ fn main() -> ExitCode {
         "plan" => cmd_plan(rest),
         "sixstage" => cmd_sixstage(rest),
         "finding" => cmd_finding(rest),
+        "perturb" => cmd_perturb(rest),
+        "invariants" => cmd_invariants(rest),
         "score" => {
             match score::args_from_cli(rest) {
                 Ok(a) => {
