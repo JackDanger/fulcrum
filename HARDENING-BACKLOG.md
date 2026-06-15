@@ -48,9 +48,49 @@ Invariants every iteration must keep green:
    **`main` is now the single verified base** for the streaming-decoder design (in
    flight) and the generator build (#5) — both branch off here.
 
-4. **[TODO]** Seam rewire: gzippy's `scripts/fulcrum` + `bench/decide.sh` call the
-   Rust `fulcrum run` (not the Python pipeline); whole-pipeline cross-check; remove
-   the Python `decide/`.
+4. **[DONE — branch `harden/remove-python-decide`]** Finish the Python→Rust
+   collapse: whole-pipeline cross-check, remove the superseded Python `decide/`,
+   rewire the gzippy seam to the Rust binary.
+   **STEP 1 — whole-pipeline cross-check (Rust vs the Python oracle).** Built shared
+   on-disk fixtures (the Python selftests' canonical inputs: traces, perf
+   stat/report captures, the `make_artifact` decide/provenance dir, the
+   KNOWN-LEVER perturb sweep, a ledger jsonl) and ran EACH engine through BOTH the
+   Rust binary and `python3 -m fulcrum.cli`, diffing verdict tokens + cell_ids:
+   `total` (flat/nested/delta), `locate` (serial/parallel), `insn` (single/delta),
+   `cycles` (single/delta), `quantity` (--demo/--algebra), `decide`≡`analyze`,
+   `provenance`, `perturb`, `ledger`, `invariants`. **Two REAL divergences caught
+   and fixed (both make Rust MORE faithful to the Python oracle):**
+   (a) `locate` used the older `trace::load_events` whose repair did NOT strip a
+   trailing comma sitting *before* an existing `]` (the canonical `},\n]` streamed
+   shape), so it REFUSED traces `total`/Python accept — unified its repair with
+   `parse_trace_text`/Python `_parse_trace_text`;
+   (b) `quantity` `QuantityRefusal` Display dropped the umbrella
+   `[QUANTITY-DIMENSION-OR-REFUSE]` token that Python's `InvariantViolation.__str__`
+   prepends, so `--demo` lost it per refusal line — Display now mirrors Python
+   `[umbrella] [refusal] msg`. Both got red-before/green-after regression tests.
+   Residual `invariants` difference is the static catalog PROSE only (Rust cites
+   Rust module paths + documents an EXTRA `INSN-CLOSURE-OR-NO-LEDGER` invariant —
+   a superset; no data-verdict token diverges) → ACCEPTABLE, not a blocker.
+   **STEP 2 — removed the Python `decide/`:** deleted `decide/fulcrum/` (core/*,
+   cli.py, adapters/, selftests/, __init__), `decide/pyproject.toml`,
+   `decide/README.md`, the pytest cache + selftest stamp. EVERY removed engine has
+   a verified Rust equivalent (trace/binloc/fingerprint/locate/ledger/cycles/decide/
+   stats/causal/provenance/quantity/perturb/report/insn/invariants; plus
+   comparability/finding/pipeline which are Rust-only — never had a Python CLI). KEPT
+   (no Rust equivalent, flagged): `decide/docs/` (SCHEMA.md on-disk loader contract,
+   MISSING.md not-yet-built ledger, CASE-STUDIES.md) → moved to repo-root `docs/`
+   with a Python→Rust banner on SCHEMA.md. **STEP 3 — rewired the gzippy seam:**
+   `scripts/fulcrum` (front door) + `scripts/bench/decide.sh` (ANALYZER) now call
+   the Rust binary (`$FULCRUM_BIN`; analyze→`decide`, selftest→`cargo test`, all
+   other subcommands pass through 1:1); dead shims `fulcrum_decide.py`/
+   `fulcrum_total.py` removed; doc-echo hints updated to `scripts/fulcrum total`.
+   Dry-run smoke confirms the rewired front door + `decide.sh --analyze-only`
+   render through the Rust binary. **FLAGGED:** `comparability`/`finding` have NO
+   Python CLI surface (the five-gate flow lives only in the in-process Rust
+   `fulcrum run --gate`) — not cross-checkable via CLI; covered by the Rust suite.
+   Verified: `cargo test --release` 536 / 0-fail / 0-ignored (534 baseline + 2 new
+   regression tests) · clippy 0-new (12 pre-existing == 12) · `cargo fmt --check`
+   clean · full binary surface intact.
 
 5. **[TODO]** Build the LEVER GENERATOR (`fulcrum generate <baseline>` → ranked
    HYPOTHESIS queue, excluding the disproven family). Design comes from a parallel

@@ -125,8 +125,12 @@ impl QuantityRefusal {
 
 impl fmt::Display for QuantityRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Same surface as Python: "[<refusal>] <message>".
-        write!(f, "[{}] {}", self.refusal, self.message)
+        // Faithful to Python `QuantityRefusal(InvariantViolation).__str__`, which
+        // wraps the message as "[<invariant>] [<refusal>] <message>" (the base
+        // InvariantViolation prepends the umbrella name). The umbrella prefix was
+        // missing here, so `quantity --demo` dropped the QUANTITY-DIMENSION-OR-REFUSE
+        // token Python emits per refusal line (cross-check divergence).
+        write!(f, "[{}] [{}] {}", INVARIANT, self.refusal, self.message)
     }
 }
 
