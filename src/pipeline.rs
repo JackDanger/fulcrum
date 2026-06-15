@@ -32,7 +32,8 @@ use std::path::Path;
 
 use crate::comparability::{self, Capture, GateClaim};
 use crate::finding::{
-    CitationRequest, CiteOutcome, CiteRefusal, Finding, Scope, SrcChangeOracle, Store, Threads,
+    CitationRequest, CiteOutcome, CiteRefusal, EvidenceTier, Finding, Scope, SrcChangeOracle,
+    Store, Threads, Verdict,
 };
 use crate::perturb::{self, PerturbCell, Sweep};
 use crate::provenance::{self, CheckVerdict, Differ, Provenance};
@@ -94,12 +95,44 @@ impl std::fmt::Display for PipelineRefusal {
     }
 }
 
+/// How a cell's finding is MINTED — the keystone of the baseline path.
+///
+/// * [`Mint::Perturbation`] — a causal sweep ran; gate 3 (PERTURBATION) gates
+///   the flow and the cell is minted from the [`PerturbCell`] (a LEVER).
+/// * [`Mint::Baseline`] — a baseline field+memory comparison; there is NO sweep,
+///   so gate 3 is SKIPPED and the cell is minted as a FrozenMatrix
+///   Tie/Loss/Win from the comparability outcome. This is the path a non-lever
+///   field+RSS measurement takes (it would otherwise die at gate 3).
+#[derive(Debug, Clone)]
+pub enum Mint {
+    /// Gate 3 runs; mint from the perturbation cell.
+    Perturbation,
+    /// Gate 3 skipped; mint a FrozenMatrix cell from the field comparison.
+    Baseline(BaselineMint),
+}
+
+/// The headline scalar + verdict a baseline cell banks (derived by the runner's
+/// `finding_*.json`, re-minted here so the shared machinery owns the cell_id).
+#[derive(Debug, Clone)]
+pub struct BaselineMint {
+    /// Tie/Loss/Win from the wall+memory comparison.
+    pub verdict: Verdict,
+    pub value: f64,
+    pub dimension: String,
+    /// subject peak RSS (MiB), folded into the cell so it gates MEMORY too.
+    pub rss_mb: Option<f64>,
+}
+
 /// A CERTIFIED, banked conclusion: the cell that survived every gate.
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
     pub cell: Finding,
-    pub perturb_cell: PerturbCell,
+    /// `Some` for a lever (perturbation) cell; `None` for a baseline cell.
+    pub perturb_cell: Option<PerturbCell>,
     pub comparability_verdict: String,
+    /// The cross-arch LAW stamp — single-arch baselines are NOT-YET-LAW
+    /// (hypothesis) until a second arch is merged (Fix 4).
+    pub law_stamp: String,
     pub bank_note: String,
 }
 
@@ -107,18 +140,25 @@ impl PipelineResult {
     pub fn render(&self) -> String {
         format!(
             "[PIPELINE CERTIFIED] banked {id}\n  region : {region}\n  \
-             verdict: {verdict} tier={tier} value={value}{dim}\n  \
-             scope  : {scope} sink={sink} n={n}\n  comparability: {comp}\n  {note}",
+             verdict: {verdict} tier={tier} value={value}{dim}{rss}\n  \
+             scope  : {scope} sink={sink} n={n}\n  comparability: {comp}\n  \
+             law    : {law}\n  {note}",
             id = self.cell.cell_id,
             region = self.cell.region,
             verdict = self.cell.verdict.label(),
             tier = self.cell.evidence_tier.label(),
             value = self.cell.value,
             dim = self.cell.dimension,
+            rss = self
+                .cell
+                .rss_mb
+                .map(|r| format!(" rss={r:.1}MiB"))
+                .unwrap_or_default(),
             scope = self.cell.scope.label(),
             sink = self.cell.sink,
             n = self.cell.n,
             comp = self.comparability_verdict,
+            law = self.law_stamp,
             note = self.bank_note,
         )
     }
@@ -153,8 +193,12 @@ pub struct PipelineInput<'a> {
     /// gate 4 input.
     pub capture: Capture,
     pub gate_claim: GateClaim,
-    /// gate 4 extra arms for a LAW claim (cross-arch replication captures).
+    /// gate 4 extra arms for a LAW claim (cross-arch replication captures). Also
+    /// the cross-arch evidence for a baseline cell's LAW stamp (Fix 4).
     pub law_captures: Vec<Capture>,
+    /// How the cell is minted — perturbation (gate 3 runs) vs baseline (gate 3
+    /// skipped, FrozenMatrix Tie/Loss/Win).
+    pub mint: Mint,
 }
 
 impl<'a> PipelineInput<'a> {
@@ -290,6 +334,51 @@ fn gate_finding(
     oracle: &dyn SrcChangeOracle,
 ) -> Result<(Finding, String), PipelineRefusal> {
     let cell = perturb_cell.to_finding(&inp.commit_sha, inp.scope(), &inp.sink, &inp.created_utc);
+    bank_and_cite(inp, cell, store, store_path, oracle)
+}
+
+/// GATE 5 (baseline). Mint a FrozenMatrix Tie/Loss/Win cell from the baseline
+/// field+memory comparison (gate 3 was SKIPPED — there is no causal sweep), then
+/// bank + prove it citable. The headline scalar/verdict/rss were derived by the
+/// runner; the cell_id is (re-)derived by the shared `Finding` machinery.
+fn gate_finding_baseline(
+    inp: &PipelineInput,
+    bm: &BaselineMint,
+    store: &mut Store,
+    store_path: &Path,
+    oracle: &dyn SrcChangeOracle,
+) -> Result<(Finding, String), PipelineRefusal> {
+    let mut cell = Finding::new(
+        &inp.region,
+        &inp.claim,
+        &inp.commit_sha,
+        inp.scope(),
+        &inp.sink,
+        inp.capture.n,
+        inp.capture.inter_run_spread,
+        EvidenceTier::FrozenMatrix,
+        bm.verdict.clone(),
+        bm.value,
+        &bm.dimension,
+        &inp.method,
+        &inp.created_utc,
+    );
+    if let Some(rss) = bm.rss_mb {
+        cell = cell.with_rss(rss);
+    }
+    bank_and_cite(inp, cell, store, store_path, oracle)
+}
+
+/// Shared BANK + CITE tail used by both mint paths: the store refuses a
+/// non-citable cell, then we prove it quotable as a STRONG, in-scope, CURRENT
+/// finding (a STALE / out-of-scope / under-tier citation is the refusal).
+fn bank_and_cite(
+    inp: &PipelineInput,
+    cell: Finding,
+    store: &mut Store,
+    store_path: &Path,
+    oracle: &dyn SrcChangeOracle,
+) -> Result<(Finding, String), PipelineRefusal> {
     // BANK: append refuses a non-citable cell (the store can never hold an
     // unquotable row).
     match store.append(store_path, cell.clone()) {
@@ -373,19 +462,63 @@ pub fn run_pipeline(
     if let Some(r) = gate_quantity(inp) {
         return Err(r);
     }
-    // GATE 3
-    let perturb_cell = gate_perturbation(inp)?;
-    // GATE 4
-    let comparability_verdict = gate_comparability(inp)?;
-    // GATE 5
-    let (cell, bank_note) = gate_finding(inp, &perturb_cell, store, store_path, oracle)?;
+    match &inp.mint {
+        Mint::Perturbation => {
+            // GATE 3 (lever flow only)
+            let perturb_cell = gate_perturbation(inp)?;
+            // GATE 4
+            let comparability_verdict = gate_comparability(inp)?;
+            // GATE 5
+            let (cell, bank_note) = gate_finding(inp, &perturb_cell, store, store_path, oracle)?;
+            Ok(PipelineResult {
+                cell,
+                perturb_cell: Some(perturb_cell),
+                comparability_verdict,
+                law_stamp: law_stamp(inp),
+                bank_note,
+            })
+        }
+        Mint::Baseline(bm) => {
+            // GATE 3 is SKIPPED — a baseline field+memory cell carries no causal
+            // sweep; its strength comes from the FrozenMatrix comparison, gated
+            // by COMPARABILITY (gate 4) and banked by FINDING-STORE (gate 5).
+            // GATE 4
+            let comparability_verdict = gate_comparability(inp)?;
+            // GATE 5
+            let (cell, bank_note) = gate_finding_baseline(inp, bm, store, store_path, oracle)?;
+            Ok(PipelineResult {
+                cell,
+                perturb_cell: None,
+                comparability_verdict,
+                law_stamp: law_stamp(inp),
+                bank_note,
+            })
+        }
+    }
+}
 
-    Ok(PipelineResult {
-        cell,
-        perturb_cell,
-        comparability_verdict,
-        bank_note,
-    })
+/// FIX 4 — the cross-arch LAW stamp. A single-(arch) capture is NOT-YET-LAW
+/// (a HYPOTHESIS-level generalization) no matter how clean; only ≥2 distinct
+/// arches earn REPLICATED. The primary capture plus any merged `law_captures`
+/// are the evidence. This stamps the *generalization*, distinct from the cell's
+/// own (FrozenMatrix-STRONG) verdict.
+fn law_stamp(inp: &PipelineInput) -> String {
+    let mut caps: Vec<&Capture> = vec![&inp.capture];
+    caps.extend(inp.law_captures.iter());
+    let (arches, tier) = comparability::predicate_cross_arch(&caps);
+    match tier {
+        comparability::EvidenceTier::Replicated | comparability::EvidenceTier::Confirmed => {
+            format!(
+                "LAW (replicated on {} arches: {})",
+                arches.len(),
+                arches.join(", ")
+            )
+        }
+        comparability::EvidenceTier::Hypothesis => format!(
+            "NOT-YET-LAW (single-arch [{}] — a 2nd-arch capture must be merged to replicate)",
+            arches.join(", ")
+        ),
+    }
 }
 
 // ─── the artifact bridge (runner emits → pipeline reads, no subprocess) ───────
@@ -450,7 +583,23 @@ pub fn run_from_artifacts(
             .and_then(|s| comparability::parse_capture(&s))
             .ok_or_else(|| format!("missing/invalid capture for cell {stem}"))?;
 
-        let gate_claim = claim_from_capture(&capture);
+        // BASELINE vs LEVER: a run with NO perturbation sweep is a baseline
+        // field+memory measurement — gate 3 is skipped and the cell is minted
+        // as a FrozenMatrix Tie/Loss/Win against the full field (a 'settled'
+        // claim). A run WITH a sweep is a lever (subject-specific) flow.
+        let (gate_claim, mint) = if sweep.is_none() {
+            (
+                settled_claim_from_capture(&capture),
+                Mint::Baseline(BaselineMint {
+                    verdict: coord.verdict.clone(),
+                    value: coord.value,
+                    dimension: coord.dimension.clone(),
+                    rss_mb: coord.rss_mb,
+                }),
+            )
+        } else {
+            (claim_from_capture(&capture), Mint::Perturbation)
+        };
 
         let inp = PipelineInput {
             region: sweep
@@ -472,6 +621,7 @@ pub fn run_from_artifacts(
             capture,
             gate_claim,
             law_captures: vec![],
+            mint,
         };
         let outcome = run_pipeline(&inp, store, store_path, oracle);
         out.push((stem, outcome));
@@ -506,6 +656,21 @@ fn claim_from_capture(cap: &Capture) -> GateClaim {
         contrast,
         counter: None,
         equal_spread: 0.05,
+    }
+}
+
+/// Build a baseline `settled/tie` claim: the subject is the first arm (the
+/// gzippy subject) and the field-tool roster is DERIVED from every OTHER arm
+/// declared in the capture (measured or absent). A declared-but-absent field
+/// tool VOIDs the claim (the field-roster gate), so the roster is exactly "the
+/// field this run committed to measure". `tie_bar` is the standard 0.99.
+fn settled_claim_from_capture(cap: &Capture) -> GateClaim {
+    let subject = cap.arms.first().map(|a| a.id.clone()).unwrap_or_default();
+    let field_tools: Vec<String> = cap.arms.iter().skip(1).map(|a| a.id.clone()).collect();
+    GateClaim::Settled {
+        subject,
+        field_tools,
+        tie_bar: 0.99,
     }
 }
 

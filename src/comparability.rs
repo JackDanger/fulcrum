@@ -90,6 +90,11 @@ pub struct ArmPresence {
     pub aa_spread: f64,
     /// Best wall in ms, when measured (for the settled-tie ratio check).
     pub wall_ms: Option<f64>,
+    /// Peak resident-set size in MiB, when measured (`/usr/bin/time -v`). Drives
+    /// the MEMORY half of the settled gate — a "settled" claim must clear the
+    /// field on memory too, not only wall (the ship goal is memory AND
+    /// performance). `None` ⇒ memory not measured for this arm.
+    pub rss_mb: Option<f64>,
     /// Does this arm REQUIRE a native ELF to count (e.g. the rg comparator must
     /// be the native ELF, not the pip wheel that adds +43ms startup)?
     pub require_native_elf: bool,
@@ -105,6 +110,7 @@ impl ArmPresence {
             aa_ratio: Some(1.0),
             aa_spread: 0.0,
             wall_ms: Some(wall_ms),
+            rss_mb: None,
             require_native_elf: false,
         }
     }
@@ -118,6 +124,7 @@ impl ArmPresence {
             aa_ratio: None,
             aa_spread: 0.0,
             wall_ms: None,
+            rss_mb: None,
             require_native_elf: false,
         }
     }
@@ -125,6 +132,12 @@ impl ArmPresence {
     /// Builder: require this arm to be a native ELF to count as a comparator.
     pub fn requiring_native_elf(mut self) -> Self {
         self.require_native_elf = true;
+        self
+    }
+
+    /// Builder: attach a captured peak RSS (MiB) for the memory half of the gate.
+    pub fn with_rss(mut self, rss_mb: f64) -> Self {
+        self.rss_mb = Some(rss_mb);
         self
     }
 
@@ -414,7 +427,9 @@ pub fn predicate_settled(
 ) -> Option<GateVerdict> {
     let mut missing = Vec::new();
     let mut losing = Vec::new();
-    let subj_wall = cap.arm(subject).and_then(|a| a.wall_ms);
+    let subj_arm = cap.arm(subject);
+    let subj_wall = subj_arm.and_then(|a| a.wall_ms);
+    let subj_rss = subj_arm.and_then(|a| a.rss_mb);
     for tool in field_tools {
         if tool == subject {
             continue;
@@ -425,7 +440,17 @@ pub fn predicate_settled(
                 if let (Some(sw), Some(ow)) = (subj_wall, arm.wall_ms) {
                     let ratio = ow / sw.max(1e-9);
                     if ratio < tie_bar {
-                        losing.push(format!("{tool} ({ratio:.2}× < {tie_bar:.2})"));
+                        losing.push(format!("{tool} wall ({ratio:.2}× < {tie_bar:.2})"));
+                    }
+                }
+                // MEMORY half: when BOTH arms measured RSS, the subject must use
+                // at-or-less memory at the same bar (ratio = other_rss / subj_rss
+                // ≥ bar; subject heavier ⇒ ratio < bar ⇒ losing). Skipped when
+                // either arm has no RSS (memory simply not gated for that pair).
+                if let (Some(sr), Some(or)) = (subj_rss, arm.rss_mb) {
+                    let ratio = or / sr.max(1e-9);
+                    if ratio < tie_bar {
+                        losing.push(format!("{tool} rss ({ratio:.2}× < {tie_bar:.2})"));
                     }
                 }
             }
@@ -766,6 +791,7 @@ pub fn parse_capture(json: &str) -> Option<Capture> {
                 aa_ratio: a.get("aa_ratio").and_then(|x| x.as_f64()),
                 aa_spread: a.get("aa_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 wall_ms: a.get("wall_ms").and_then(|x| x.as_f64()),
+                rss_mb: a.get("rss_mb").and_then(|x| x.as_f64()),
                 require_native_elf: a
                     .get("require_native_elf")
                     .and_then(|x| x.as_bool())

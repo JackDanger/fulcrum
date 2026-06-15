@@ -495,7 +495,7 @@ fn cmd_causal(args: &[String]) -> ExitCode {
     let static_fraction: f64 = flag(args, "--static-fraction")
         .and_then(|s| s.parse().ok())
         .unwrap_or(31.0);
-    let verbose = flag(args, "--verbose-log").map(load_verbose_log).flatten();
+    let verbose = flag(args, "--verbose-log").and_then(load_verbose_log);
     print_causal(&report, timeline_n, static_fraction);
     if let Some(ref v) = verbose {
         println!();

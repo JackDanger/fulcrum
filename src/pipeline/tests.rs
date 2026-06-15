@@ -156,6 +156,7 @@ fn base_input<'a>(quantity_check: Option<QuantityCheck<'a>>) -> PipelineInput<'a
         capture: two_arm_capture(),
         gate_claim: subject_claim(),
         law_captures: vec![],
+        mint: Mint::Perturbation,
     }
 }
 
@@ -374,6 +375,217 @@ fn run_artifacts_flow_through_the_pipeline_and_bank() {
     assert!(std::fs::read_to_string(&store_path)
         .unwrap()
         .contains(&res.cell.cell_id));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX 1/2/4 — the BASELINE (non-lever) field+memory path through the gates.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Emit a baseline run (no perturbations) and flow it through the gates. The
+/// `arms` are (id, wall_ms, rss_mb); a None wall_ms ⇒ a DECLARED-but-ABSENT
+/// field tool (drives SETTLED-VOIDED).
+fn flow_baseline(
+    arms: &[(&str, Option<f64>, f64)],
+    gz_wall_ms: f64,
+    gz_rss_mb: f64,
+) -> (std::path::PathBuf, Store, Vec<crate::pipeline::CellOutcome>) {
+    use crate::runner::{self, Mode, RunSpec};
+    let comparators = arms
+        .iter()
+        .map(|(id, _, _)| format!("{{\"id\":\"{id}\",\"bin\":\"/box/{id}\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let arm_fix = arms
+        .iter()
+        .filter_map(|(id, w, r)| w.map(|w| format!("\"{id}\":{{\"wall_ms\":{w},\"rss_mb\":{r}}}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let json = format!(
+        r#"{{
+          "runid":"base","arch":"amd","feature":"gzippy-native",
+          "gzippy_bin":"/box/gzippy",
+          "comparators":[{comparators}],
+          "corpora":[{{"id":"squishy","path":"<BENCH_ROOT>/squishy.gz"}}],
+          "threads":[1],"n":9,
+          "fixture":{{"commit_sha":"deadbeefcafe","head_sha":"deadbeefcafe","src_changed":"0",
+            "cells":{{"squishy:1":{{"gz_wall_ms":{gz_wall_ms},"gz_rss_mb":{gz_rss_mb},
+              "arms":{{{arm_fix}}}}}}}}}
+        }}"#
+    );
+    let spec: RunSpec = serde_json::from_str(&json).expect("baseline spec");
+    let (mut store, store_path) = fresh_store();
+    let out = std::env::temp_dir().join(format!(
+        "fulcrum_base_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let run_dir = runner::run(&spec, &out, Mode::Fixture).expect("runner emit");
+    let results = run_from_artifacts(
+        &run_dir,
+        &mut store,
+        &store_path,
+        &FixedOracle(SrcChange::Fresh),
+    )
+    .expect("artifact bridge");
+    (store_path, store, results)
+}
+
+// ── 1. BASELINE-FLOW: a no-perturbation FrozenMatrix cell BANKS CERTIFIED ─────
+#[test]
+fn baseline_no_sweep_banks_a_certified_frozenmatrix_finding() {
+    // gzippy is fastest AND lightest vs the full measured field ⇒ Settled admits.
+    let (store_path, store, results) = flow_baseline(
+        &[
+            ("igzip", Some(101.0), 320.0),
+            ("libdeflate", Some(102.0), 340.0),
+        ],
+        100.0,
+        300.0,
+    );
+    assert_eq!(results.len(), 1);
+    let (label, outcome) = &results[0];
+    let res = outcome
+        .as_ref()
+        .unwrap_or_else(|r| panic!("baseline cell {label} refused: {}", r.render()));
+    // gate 3 was SKIPPED — no perturb cell, FrozenMatrix tier, Win/Tie verdict.
+    assert!(res.perturb_cell.is_none(), "baseline has no perturb cell");
+    assert_eq!(
+        res.cell.evidence_tier,
+        crate::finding::EvidenceTier::FrozenMatrix
+    );
+    assert!(matches!(
+        res.cell.verdict,
+        crate::finding::Verdict::Win | crate::finding::Verdict::Tie
+    ));
+    // it carries the subject RSS (memory AND performance) and banked on disk.
+    assert_eq!(res.cell.rss_mb, Some(300.0));
+    assert!(res.comparability_verdict.contains("ADMITTED"));
+    assert!(res.cell.cell_id.starts_with("F-"));
+    assert!(store.get(&res.cell.cell_id).is_some());
+    assert!(std::fs::read_to_string(&store_path)
+        .unwrap()
+        .contains(&res.cell.cell_id));
+}
+
+// ── 2. FIELD-ROSTER: a missing field tool VOIDS the settled claim ─────────────
+#[test]
+fn baseline_missing_field_tool_voids_at_comparability() {
+    // igzip is DECLARED but not measured (no fixture wall) ⇒ SETTLED-VOIDED.
+    let (_p, _s, results) = flow_baseline(
+        &[("igzip", None, 0.0), ("libdeflate", Some(102.0), 340.0)],
+        100.0,
+        300.0,
+    );
+    let (_label, outcome) = &results[0];
+    let r = outcome
+        .as_ref()
+        .expect_err("must refuse with a missing tool");
+    assert_eq!(r.gate, G_COMPARABILITY);
+    assert_eq!(r.sub_check, "SETTLED-VOIDED");
+    assert!(r.reason.contains("igzip"));
+}
+
+// ── 2b. FIELD-ROSTER: subject heavier on MEMORY also voids (memory gated) ─────
+#[test]
+fn baseline_losing_on_memory_voids_settled() {
+    // subject is fastest but uses MORE memory than igzip ⇒ not settled.
+    let (_p, _s, results) = flow_baseline(
+        &[("igzip", Some(101.0), 200.0)],
+        100.0,
+        500.0, // subject 500MiB vs igzip 200MiB
+    );
+    let (_label, outcome) = &results[0];
+    let r = outcome.as_ref().expect_err("memory loss must void");
+    assert_eq!(r.gate, G_COMPARABILITY);
+    assert_eq!(r.sub_check, "SETTLED-VOIDED");
+    assert!(
+        r.reason.contains("rss"),
+        "the void cites memory: {}",
+        r.reason
+    );
+}
+
+// ── 4. SINGLE-ARCH ⇒ NOT-YET-LAW; two merged arches ⇒ LAW ─────────────────────
+#[test]
+fn single_arch_baseline_is_not_yet_law_two_arches_replicate() {
+    use crate::comparability::{ArmPresence, Capture};
+    use crate::compare::ThreadCell;
+    fn settled_capture(arch: &str) -> Capture {
+        Capture {
+            cell_id: format!("{arch}/t1/squishy"),
+            commit_sha: "abc1234".into(),
+            corpus: "squishy".into(),
+            arch: arch.into(),
+            threads: ThreadCell::Fixed(1),
+            sink: "regular-file".into(),
+            n: 9,
+            inter_run_spread: 0.01,
+            arms: vec![
+                ArmPresence::native("gzippy-native", 100.0).with_rss(300.0),
+                ArmPresence::native("igzip", 101.0).with_rss(320.0),
+            ],
+            counters: vec![],
+        }
+    }
+    let baseline_input = |law_caps: Vec<Capture>| PipelineInput {
+        region: "gzippy-native/wall".into(),
+        claim: "baseline field+memory".into(),
+        commit_sha: "abc1234".into(),
+        corpus: "squishy".into(),
+        arch: "amd".into(),
+        threads: Threads::Fixed(1),
+        sink: "regular-file".into(),
+        method: "fulcrum run".into(),
+        created_utc: "2026-06-14".into(),
+        provenance: clean_provenance(),
+        differ: None,
+        quantity_check: None,
+        sweep: Sweep::default(),
+        capture: settled_capture("amd"),
+        gate_claim: GateClaim::Settled {
+            subject: "gzippy-native".into(),
+            field_tools: vec!["igzip".into()],
+            tie_bar: 0.99,
+        },
+        law_captures: law_caps,
+        mint: Mint::Baseline(BaselineMint {
+            verdict: crate::finding::Verdict::Win,
+            value: 1.01,
+            dimension: "ratio".into(),
+            rss_mb: Some(300.0),
+        }),
+    };
+    // single arch (no merged captures) ⇒ NOT-YET-LAW.
+    let (mut s1, p1) = fresh_store();
+    let r1 = run_pipeline(
+        &baseline_input(vec![]),
+        &mut s1,
+        &p1,
+        &FixedOracle(SrcChange::Fresh),
+    )
+    .expect("single-arch baseline certifies");
+    assert!(
+        r1.law_stamp.contains("NOT-YET-LAW"),
+        "stamp: {}",
+        r1.law_stamp
+    );
+    // a 2nd-arch capture merged ⇒ LAW (replicated).
+    let (mut s2, p2) = fresh_store();
+    let r2 = run_pipeline(
+        &baseline_input(vec![settled_capture("intel-i7")]),
+        &mut s2,
+        &p2,
+        &FixedOracle(SrcChange::Fresh),
+    )
+    .expect("two-arch baseline certifies");
+    assert!(
+        r2.law_stamp.contains("LAW (replicated"),
+        "stamp: {}",
+        r2.law_stamp
+    );
 }
 
 // ── the gate order is fixed and the tokens are stable ─────────────────────────

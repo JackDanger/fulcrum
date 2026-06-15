@@ -100,6 +100,25 @@ fn default_pred() -> String {
     "none".to_string()
 }
 
+/// One field-tool comparator arm: an id (the arm/role name, e.g. `"igzip"`,
+/// `"libdeflate"`, `"rapidgzip"`), the binary, and its decode args. A baseline
+/// run measures the SUBJECT (`gzippy_bin`) against EVERY comparator in the same
+/// interleave, so a `settled/tie` claim can be gated against the full field.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComparatorSpec {
+    pub id: String,
+    pub bin: String,
+    /// decode args; `{path}` (literal) is replaced with the corpus path, and
+    /// `{t}` with the thread count. Empty ⇒ the gzip-family default
+    /// `-d -c -p <t> <path>`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Require this comparator to be a native ELF to count (e.g. rapidgzip must
+    /// be the native ELF, not the +43ms pip wheel).
+    #[serde(default)]
+    pub require_native_elf: bool,
+}
+
 /// An oracle whose firing the provenance gate must witness (ON ≠ OFF, == expected).
 #[derive(Debug, Clone, Deserialize)]
 pub struct OracleSpec {
@@ -159,12 +178,18 @@ pub struct RunSpec {
     /// tool-under-test binary.
     #[serde(default)]
     pub gzippy_bin: String,
-    /// comparator binary (rapidgzip native ELF).
+    /// comparator binary (rapidgzip native ELF). BACK-COMPAT shim: when
+    /// `comparators` is empty and this is set, it is normalized into a single
+    /// `rapidgzip` comparator arm.
     #[serde(default)]
     pub comparator_bin: String,
     /// comparator path probed for COMPARATOR-PRESENT (defaults to comparator_bin).
     #[serde(default)]
     pub comparator_path: String,
+    /// The FULL field of comparator arms (igzip, libdeflate, zlib-ng, rapidgzip,
+    /// pigz, …). A baseline `settled` claim is gated against every one of these.
+    #[serde(default)]
+    pub comparators: Vec<ComparatorSpec>,
     #[serde(default)]
     pub corpora: Vec<CorpusSpec>,
     #[serde(default)]
@@ -230,10 +255,18 @@ fn default_no_turbo() -> String {
 /// deterministic N-sample set whose min == mean and max == mean·(1+spread).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FixtureCell {
+    #[serde(default)]
     pub gz_wall_ms: f64,
+    #[serde(default)]
     pub rg_wall_ms: f64,
     #[serde(default = "default_spread_pct")]
     pub spread_pct: f64,
+    /// peak RSS (MiB) of the subject (gzippy) arm — the MEMORY half.
+    #[serde(default)]
+    pub gz_rss_mb: f64,
+    /// peak RSS (MiB) of the back-compat rapidgzip arm.
+    #[serde(default)]
+    pub rg_rss_mb: f64,
     /// volume self-test: decoded vs output bytes (≈ 1.000 at T1).
     #[serde(default)]
     pub decoded_bytes: f64,
@@ -244,9 +277,26 @@ pub struct FixtureCell {
     pub marker_count_gz: f64,
     #[serde(default)]
     pub marker_count_rg: f64,
+    /// per-field-tool canned arm (id → wall/rss). The full-field source for a
+    /// `settled` baseline; a declared comparator with NO entry here (and no
+    /// rg_wall_ms back-compat) emits an ABSENT arm (→ SETTLED-VOIDED).
+    #[serde(default)]
+    pub arms: BTreeMap<String, FixtureArm>,
     /// counter sidecar lines (verbose.txt) proving production routing.
     #[serde(default)]
     pub verbose: String,
+}
+
+/// One canned field-tool arm for a fixture cell.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FixtureArm {
+    pub wall_ms: f64,
+    #[serde(default)]
+    pub rss_mb: f64,
+    #[serde(default = "default_spread_pct")]
+    pub spread_pct: f64,
+    #[serde(default)]
+    pub require_native_elf: bool,
 }
 
 fn default_spread_pct() -> f64 {
@@ -325,6 +375,13 @@ pub struct Fixture {
     pub src_changed: String,
     #[serde(default)]
     pub bin_sha: String,
+    /// The binary's DERIVED flavor self-witness ("native" | "isal"), as it would
+    /// be read from the ELF symbol table live. Empty ⇒ assume it matches the
+    /// declared `feature` (no mismatch). A value that CONTRADICTS the declared
+    /// feature trips DERIVED-MISMATCH at capture (a mislabel once caused a false
+    /// bombshell — isal_chunks on a native binary).
+    #[serde(default)]
+    pub derived_flavor: String,
     #[serde(default)]
     pub rg_version: String,
     /// env-name → count of consuming src/ files (DERIVED-CONSUMER).
@@ -372,9 +429,60 @@ pub fn run(spec: &RunSpec, out: &Path, mode: Mode) -> Result<PathBuf, String> {
         Mode::Fixture => capture_fixture(spec),
         Mode::Live => capture_live(spec)?,
     };
+    // FIX 5 — DERIVED-MISMATCH: the binary's flavor self-witness must agree with
+    // the declared feature BEFORE any artifact is emitted. A native binary
+    // labeled isal (or vice-versa) is refused at capture (a mislabel once
+    // produced a false "ISA-L dormant" bombshell).
+    flavor_check(spec, &cap)?;
     let run_dir = out.join(&spec.runid);
     emit(spec, &cap, &run_dir)?;
     Ok(run_dir)
+}
+
+/// The declared flavor from the cargo feature: anything mentioning `isal` is the
+/// ISA-L build, else `native`.
+fn declared_flavor(feature: &str) -> &'static str {
+    if feature.to_ascii_lowercase().contains("isal") {
+        "isal"
+    } else {
+        "native"
+    }
+}
+
+/// FIX 5 — refuse on a declared-vs-derived flavor contradiction. A derived
+/// flavor of "unknown" (witness unavailable) degrades gracefully (no refusal).
+fn flavor_check(spec: &RunSpec, cap: &Captured) -> Result<(), String> {
+    let declared = declared_flavor(&spec.feature);
+    let derived = cap.derived_flavor.as_str();
+    if derived.is_empty() || derived == "unknown" {
+        return Ok(());
+    }
+    if derived != declared {
+        return Err(format!(
+            "DERIVED-MISMATCH: feature declares '{}' (flavor={declared}) but the binary's \
+             self-witness derives flavor '{derived}' — a mislabeled binary is REFUSED at \
+             capture (resolve: rebuild/relabel so the declared feature matches the ELF \
+             symbol witness, or point gzippy_bin at the correct flavor)",
+            spec.feature
+        ));
+    }
+    Ok(())
+}
+
+/// The normalized comparator roster: the explicit `comparators`, plus the
+/// back-compat single `comparator_bin` (as a `rapidgzip` native-ELF arm) when
+/// no explicit roster was given. Deduped by id (explicit wins).
+fn comparators(spec: &RunSpec) -> Vec<ComparatorSpec> {
+    let mut out = spec.comparators.clone();
+    if out.is_empty() && !spec.comparator_bin.is_empty() {
+        out.push(ComparatorSpec {
+            id: "rapidgzip".to_string(),
+            bin: spec.comparator_bin.clone(),
+            args: Vec::new(),
+            require_native_elf: true,
+        });
+    }
+    out
 }
 
 // ─── the intermediate capture (mode-independent emission input) ───────────────
@@ -385,8 +493,12 @@ struct CapturedCell {
     threads: usize,
     mask: String,
     maskd: String,
+    /// subject (gzippy) wall samples (seconds).
     gz: Vec<f64>,
-    rg: Vec<f64>,
+    /// subject peak RSS (MiB).
+    gz_rss_mb: f64,
+    /// the FULL field of comparator arms, interleaved with the subject.
+    arms: Vec<CapturedArm>,
     sha_ok: bool,
     verbose: String,
     decoded_bytes: f64,
@@ -394,6 +506,22 @@ struct CapturedCell {
     marker_count_gz: f64,
     marker_count_rg: f64,
     knobs: Vec<CapturedKnob>,
+}
+
+/// One measured comparator arm of a cell.
+struct CapturedArm {
+    id: String,
+    /// wall samples (seconds); empty ⇒ the arm did not measure (ABSENT).
+    wall: Vec<f64>,
+    /// peak RSS (MiB), 0 ⇒ not captured.
+    rss_mb: f64,
+    require_native_elf: bool,
+}
+
+impl CapturedArm {
+    fn measured(&self) -> bool {
+        !self.wall.is_empty()
+    }
 }
 
 struct CapturedKnob {
@@ -429,6 +557,8 @@ struct Captured {
     head_sha: String,
     src_changed: String,
     bin_sha: String,
+    /// the binary's DERIVED flavor self-witness ("native" | "isal" | "unknown").
+    derived_flavor: String,
     rg_version: String,
     host: HostSpec,
     sink_gz: String,
@@ -467,6 +597,7 @@ fn synth_samples(min_s: f64, spread_s: f64, n: usize) -> Vec<f64> {
 
 fn capture_fixture(spec: &RunSpec) -> Captured {
     let fx = &spec.fixture;
+    let roster = comparators(spec);
     let mut cells = Vec::new();
     for c in &spec.corpora {
         for &t in &spec.threads {
@@ -474,14 +605,43 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
             let fc = fx.cells.get(&key).cloned().unwrap_or_default();
             let spread = fc.spread_pct / 100.0;
             let gz_min = fc.gz_wall_ms / 1000.0;
-            let rg_min = fc.rg_wall_ms / 1000.0;
             let gz = synth_samples(gz_min, gz_min * spread, spec.n);
-            // no comparator wall ⇒ no rg arm (drives the one-arm refusal path).
-            let rg = if rg_min > 0.0 {
-                synth_samples(rg_min, rg_min * spread, spec.n)
-            } else {
-                Vec::new()
-            };
+            // one arm per DECLARED comparator: measured when a fixture wall is
+            // known, ABSENT otherwise (an absent declared tool VOIDs a settled
+            // claim — the field-roster gate).
+            let mut arms = Vec::new();
+            for comp in &roster {
+                if let Some(fa) = fc.arms.get(&comp.id) {
+                    let wmin = fa.wall_ms / 1000.0;
+                    let asp = fa.spread_pct / 100.0;
+                    arms.push(CapturedArm {
+                        id: comp.id.clone(),
+                        wall: if wmin > 0.0 {
+                            synth_samples(wmin, wmin * asp, spec.n)
+                        } else {
+                            Vec::new()
+                        },
+                        rss_mb: fa.rss_mb,
+                        require_native_elf: comp.require_native_elf || fa.require_native_elf,
+                    });
+                } else if comp.id == "rapidgzip" && fc.rg_wall_ms > 0.0 {
+                    // back-compat: the single rg_wall_ms drives the rapidgzip arm.
+                    let rg_min = fc.rg_wall_ms / 1000.0;
+                    arms.push(CapturedArm {
+                        id: comp.id.clone(),
+                        wall: synth_samples(rg_min, rg_min * spread, spec.n),
+                        rss_mb: fc.rg_rss_mb,
+                        require_native_elf: comp.require_native_elf,
+                    });
+                } else {
+                    arms.push(CapturedArm {
+                        id: comp.id.clone(),
+                        wall: Vec::new(),
+                        rss_mb: 0.0,
+                        require_native_elf: comp.require_native_elf,
+                    });
+                }
+            }
             let mut knobs = Vec::new();
             for k in &spec.knobs {
                 let fk = fx
@@ -526,7 +686,8 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
                 mask: pin_mask(t),
                 maskd: pin_mask(t),
                 gz,
-                rg,
+                gz_rss_mb: fc.gz_rss_mb,
+                arms,
                 sha_ok: true,
                 verbose: fc.verbose.clone(),
                 decoded_bytes: fc.decoded_bytes,
@@ -561,6 +722,8 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
         head_sha: nonempty(&fx.head_sha, &fx.commit_sha),
         src_changed: nonempty(&fx.src_changed, ""),
         bin_sha: nonempty(&fx.bin_sha, "unknown"),
+        // empty witness ⇒ assume it matches the declared feature (no mismatch).
+        derived_flavor: nonempty(&fx.derived_flavor, declared_flavor(&spec.feature)),
         rg_version: nonempty(&fx.rg_version, "unknown"),
         host: spec.host.clone(),
         sink_gz,
@@ -672,6 +835,15 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
         Err(_) => String::new(),
     };
     let bin_sha = sha256_file(&spec.gzippy_bin).unwrap_or_else(|| "unknown".into());
+    // FIX 5 — derive the binary's flavor from its ELF symbol witness (the same
+    // isal_inflate-symbol witness DecoderProvenance uses). 0 ⇒ native, >0 ⇒
+    // isal, unreadable ⇒ "unknown" (degrades gracefully, no refusal).
+    let derived_flavor =
+        match crate::provenance::count_isal_inflate_symbols(Path::new(&spec.gzippy_bin)) {
+            (Some(0), _) => "native".to_string(),
+            (Some(_), _) => "isal".to_string(),
+            (None, _) => "unknown".to_string(),
+        };
     let rg_version = if spec.comparator_bin.is_empty() {
         "unknown".into()
     } else {
@@ -749,6 +921,7 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
         head_sha,
         src_changed,
         bin_sha,
+        derived_flavor,
         rg_version,
         host: derive_host(spec),
         sink_gz: sink.clone(),
@@ -787,40 +960,50 @@ fn measure_cell_live(
     ref_sha: Option<String>,
 ) -> Result<CapturedCell, String> {
     let mask = pin_mask(t);
+    let roster = comparators(spec);
     let mut gz = Vec::new();
-    let mut rg = Vec::new();
+    let mut gz_rss = 0.0_f64;
+    let mut arm_walls: Vec<Vec<f64>> = vec![Vec::new(); roster.len()];
+    let mut arm_rss: Vec<f64> = vec![0.0; roster.len()];
     let mut sha_ok = true;
+    let gz_argv = decode_argv(t, &c.path);
     for i in 0..=spec.n {
-        let (gsec, gsha) = timed_masked(
-            &mask,
-            &spec.gzippy_bin,
-            &["-d", "-c", "-p", &t.to_string(), &c.path],
-        );
-        let (rsec, rsha) = if spec.comparator_bin.is_empty() {
-            (0.0, String::new())
-        } else {
-            timed_masked(
-                &mask,
-                &spec.comparator_bin,
-                &["-d", "-c", "-f", "-P", &t.to_string(), &c.path],
-            )
-        };
+        let (gsec, gsha, grss) = timed_argv(&mask, &spec.gzippy_bin, &gz_argv);
+        // every comparator arm, interleaved in the SAME iteration as the subject.
+        let comp_runs: Vec<(f64, String, f64)> = roster
+            .iter()
+            .map(|comp| timed_argv(&mask, &comp.bin, &comparator_argv(comp, t, &c.path)))
+            .collect();
         if i == 0 {
             continue; // drop warm-up
         }
         gz.push(gsec);
-        if !spec.comparator_bin.is_empty() {
-            rg.push(rsec);
-        }
+        gz_rss = gz_rss.max(grss);
         if let Some(rs) = &ref_sha {
             if &gsha != rs {
                 sha_ok = false;
             }
-            if !rsha.is_empty() && &rsha != rs {
-                sha_ok = false;
+        }
+        for (idx, (rsec, rsha, rrss)) in comp_runs.into_iter().enumerate() {
+            arm_walls[idx].push(rsec);
+            arm_rss[idx] = arm_rss[idx].max(rrss);
+            if let Some(rs) = &ref_sha {
+                if !rsha.is_empty() && &rsha != rs {
+                    sha_ok = false;
+                }
             }
         }
     }
+    let arms: Vec<CapturedArm> = roster
+        .iter()
+        .enumerate()
+        .map(|(idx, comp)| CapturedArm {
+            id: comp.id.clone(),
+            wall: std::mem::take(&mut arm_walls[idx]),
+            rss_mb: arm_rss[idx],
+            require_native_elf: comp.require_native_elf,
+        })
+        .collect();
     // counter sidecar (production-routing guard) + volume counters.
     let verbose = run_verbose(spec, &c.path, t);
     let (decoded, output) = parse_volume(&verbose);
@@ -830,7 +1013,8 @@ fn measure_cell_live(
         mask: mask.clone(),
         maskd: mask_readback(&mask),
         gz,
-        rg,
+        gz_rss_mb: gz_rss,
+        arms,
         sha_ok,
         verbose,
         decoded_bytes: decoded,
@@ -839,6 +1023,36 @@ fn measure_cell_live(
         marker_count_rg: 0.0,
         knobs: measure_knobs_live(spec, c, t, &mask, ref_sha.clone()),
     })
+}
+
+/// The gzip-family decode argv for the subject: `-d -c -p <t> <path>`.
+fn decode_argv(t: usize, path: &str) -> Vec<String> {
+    vec![
+        "-d".into(),
+        "-c".into(),
+        "-p".into(),
+        t.to_string(),
+        path.to_string(),
+    ]
+}
+
+/// A comparator arm's argv: its declared `args` with `{path}`/`{t}` substituted,
+/// or the gzip-family default when none are given.
+fn comparator_argv(comp: &ComparatorSpec, t: usize, path: &str) -> Vec<String> {
+    if comp.args.is_empty() {
+        decode_argv(t, path)
+    } else {
+        comp.args
+            .iter()
+            .map(|a| a.replace("{path}", path).replace("{t}", &t.to_string()))
+            .collect()
+    }
+}
+
+/// `timed_masked` over an owned argv (the comparator roster builds `Vec<String>`).
+fn timed_argv(mask: &str, bin: &str, argv: &[String]) -> (f64, String, f64) {
+    let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    timed_masked(mask, bin, &refs)
 }
 
 fn measure_knobs_live(
@@ -853,14 +1067,16 @@ fn measure_knobs_live(
         let (var, val) = split_env(&k.env);
         let mut base = Vec::new();
         let mut knob = Vec::new();
+        let mut rss_base = 0.0_f64;
+        let mut rss_knob = 0.0_f64;
         let mut sha_ok = true;
         for i in 0..=spec.knob_n {
-            let (bsec, bsha) = timed_masked(
+            let (bsec, bsha, brss) = timed_masked(
                 mask,
                 &spec.gzippy_bin,
                 &["-d", "-c", "-p", &t.to_string(), &c.path],
             );
-            let (ksec, ksha) = timed_masked_env(
+            let (ksec, ksha, krss) = timed_masked_env(
                 mask,
                 &var,
                 &val,
@@ -872,6 +1088,8 @@ fn measure_knobs_live(
             }
             base.push(bsec);
             knob.push(ksec);
+            rss_base = rss_base.max(brss);
+            rss_knob = rss_knob.max(krss);
             if let Some(rs) = &ref_sha {
                 if &bsha != rs || &ksha != rs {
                     sha_ok = false;
@@ -887,8 +1105,8 @@ fn measure_knobs_live(
             sha_ok,
             effect_base: String::new(),
             effect_knob: String::new(),
-            rss_base_mb: 0.0,
-            rss_knob_mb: 0.0,
+            rss_base_mb: rss_base,
+            rss_knob_mb: rss_knob,
             base_sink: spec.sink.clone(),
             knob_sink: spec.sink.clone(),
         });
@@ -912,7 +1130,7 @@ fn measure_sweep_live(spec: &RunSpec, p: &PerturbSpec) -> Result<CapturedSweep, 
     let measure = |env: &[(&str, String)]| -> Vec<f64> {
         let mut xs = Vec::new();
         for i in 0..=spec.n {
-            let (sec, _sha) = timed_masked_envs(
+            let (sec, _sha, _rss) = timed_masked_envs(
                 &mask,
                 env,
                 &spec.gzippy_bin,
@@ -986,6 +1204,10 @@ fn emit_manifest(spec: &RunSpec, cap: &Captured, run_dir: &Path) -> Result<(), S
     kv("bin", &spec.gzippy_bin);
     kv("bin_sha", &cap.bin_sha);
     kv("feature", &spec.feature);
+    // FIX 5 — flavor self-witness traceability (declared vs derived agree, else
+    // run() already refused at capture with DERIVED-MISMATCH).
+    kv("declared_flavor", declared_flavor(&spec.feature));
+    kv("derived_flavor", &cap.derived_flavor);
     kv("protocol", &spec.protocol);
     kv("sink_gz", &cap.sink_gz);
     kv("sink_rg", &cap.sink_rg);
@@ -1103,8 +1325,16 @@ fn emit_cell(
     let cdir = run_dir.join(format!("cell_{}_T{}", cell.corpus, cell.threads));
     fs::create_dir_all(&cdir).map_err(|e| e.to_string())?;
     write_samples(&cdir.join("wall_gz.txt"), &cell.gz)?;
-    if !cell.rg.is_empty() {
-        write_samples(&cdir.join("wall_rg.txt"), &cell.rg)?;
+    for arm in &cell.arms {
+        if arm.measured() {
+            // historical alias: the rapidgzip arm keeps wall_rg.txt.
+            let fname = if arm.id == "rapidgzip" {
+                "wall_rg.txt".to_string()
+            } else {
+                format!("wall_{}.txt", slug(&arm.id))
+            };
+            write_samples(&cdir.join(fname), &arm.wall)?;
+        }
     }
     if !cell.verbose.is_empty() {
         fs::write(cdir.join("verbose.txt"), &cell.verbose).map_err(|e| e.to_string())?;
@@ -1211,31 +1441,82 @@ fn emit_sweep(sw: &CapturedSweep, perturb_root: &Path) -> Result<(), String> {
 
 // ─── gate-wire serializers ───────────────────────────────────────────────────
 
+/// The subject arm id, e.g. `gzippy-native`.
+fn subject_id(spec: &RunSpec) -> String {
+    if spec.feature.starts_with("gzippy-") {
+        spec.feature.clone()
+    } else {
+        format!("gzippy-{}", spec.feature)
+    }
+}
+
+/// Emit one ArmPresence JSON object. An RSS of 0 ⇒ no rss_mb key (not measured).
+fn arm_json(
+    id: &str,
+    measured: bool,
+    wall_ms: Option<f64>,
+    rss_mb: f64,
+    aa_ratio: f64,
+    aa_spread: f64,
+    require_native_elf: bool,
+) -> String {
+    let mut s = format!(
+        "{{\"id\":\"{id}\",\"measured\":{measured},\"binary_kind\":\"native\",\
+         \"aa_ratio\":{},\"aa_spread\":{}",
+        fmt6(aa_ratio),
+        fmt6(aa_spread),
+    );
+    if let Some(w) = wall_ms {
+        s.push_str(&format!(",\"wall_ms\":{}", fmt6(w)));
+    }
+    if rss_mb > 0.0 {
+        s.push_str(&format!(",\"rss_mb\":{}", fmt6(rss_mb)));
+    }
+    s.push_str(&format!(",\"require_native_elf\":{require_native_elf}}}"));
+    s
+}
+
 fn comparability_capture_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCell) -> String {
     let gz_min = min_of(&cell.gz);
-    let rg_min = min_of(&cell.rg);
     let spread = spread_of(&cell.gz);
-    let mut arms = format!(
-        "{{\"id\":\"gzippy-{}\",\"measured\":true,\"binary_kind\":\"native\",\
-         \"aa_ratio\":1.0,\"aa_spread\":{},\"wall_ms\":{},\"require_native_elf\":false}}",
-        spec.feature.replace("gzippy-", ""),
-        fmt6(spread),
-        fmt6(gz_min * 1000.0),
+    let sid = subject_id(spec);
+    // subject arm (gzippy).
+    let mut arms = arm_json(
+        &sid,
+        true,
+        Some(gz_min * 1000.0),
+        cell.gz_rss_mb,
+        1.0,
+        spread,
+        false,
     );
-    if !cell.rg.is_empty() {
-        arms.push_str(&format!(
-            ",{{\"id\":\"rapidgzip\",\"measured\":true,\"binary_kind\":\"native\",\
-             \"aa_ratio\":{},\"aa_spread\":{},\"wall_ms\":{},\"require_native_elf\":true}}",
-            fmt6(cap.comparator_aa_ratio.unwrap_or(1.0)),
-            fmt6(spread_of(&cell.rg)),
-            fmt6(rg_min * 1000.0),
+    // one arm per DECLARED comparator (measured or ABSENT — the field roster).
+    for a in &cell.arms {
+        let aa_ratio = if a.id == "rapidgzip" {
+            cap.comparator_aa_ratio.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        arms.push(',');
+        arms.push_str(&arm_json(
+            &a.id,
+            a.measured(),
+            if a.measured() {
+                Some(min_of(&a.wall) * 1000.0)
+            } else {
+                None
+            },
+            a.rss_mb,
+            aa_ratio,
+            spread_of(&a.wall),
+            a.require_native_elf,
         ));
     }
     let counters = if cell.marker_count_gz > 0.0 || cell.marker_count_rg > 0.0 {
         format!(
             ",\"counters\":[{{\"name\":\"marker_count\",\"per_arm\":{{\
-             \"gzippy-{}\":{},\"rapidgzip\":{}}}}}]",
-            spec.feature.replace("gzippy-", ""),
+             \"{}\":{},\"rapidgzip\":{}}}}}]",
+            sid,
             fmt6(cell.marker_count_gz),
             fmt6(cell.marker_count_rg),
         )
@@ -1282,32 +1563,42 @@ fn quantity_json(cell: &CapturedCell) -> String {
     )
 }
 
+/// The baseline tie-bar: subject is at-or-faster when (best competitor / subject)
+/// ≥ this (mirrors the field-roster gate's 0.99).
+const TIE_BAR: f64 = 0.99;
+
 fn finding_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCell) -> String {
     let gz_min = min_of(&cell.gz);
-    let rg_min = min_of(&cell.rg);
-    let value = if rg_min > 0.0 {
-        rg_min / gz_min
-    } else {
-        gz_min
-    };
-    let dimension = if rg_min > 0.0 { "ratio" } else { "seconds" };
-    let verdict = if rg_min > 0.0 {
-        if rg_min / gz_min >= 0.99 {
+    let spread_frac = spread_of(&cell.gz) / gz_min.max(1e-9);
+    // best (fastest) MEASURED competitor across the whole field.
+    let best_comp = cell
+        .arms
+        .iter()
+        .filter(|a| a.measured())
+        .map(|a| min_of(&a.wall))
+        .fold(f64::INFINITY, f64::min);
+    let (value, dimension, verdict) = if best_comp.is_finite() {
+        let ratio = best_comp / gz_min.max(1e-9); // >1 ⇒ subject faster
+        let v = if ratio >= 1.0 + spread_frac {
+            Verdict::Win
+        } else if ratio >= TIE_BAR {
             Verdict::Tie
         } else {
             Verdict::Loss
-        }
+        };
+        (ratio, "ratio", v)
     } else {
-        Verdict::Located
+        // no comparator measured ⇒ a bare subject-wall LOCATED cell.
+        (gz_min, "seconds", Verdict::Located)
     };
     let f = Finding::new(
         &format!("{}/wall", spec.feature),
-        "runner-captured wall vs comparator",
+        "runner-captured wall vs field",
         &cap.commit_sha,
         Scope::new(&cell.corpus, &spec.arch, Threads::Fixed(cell.threads)),
         &spec.sink,
         spec.n,
-        spread_of(&cell.gz) / gz_min.max(1e-9),
+        spread_frac,
         crate::finding::EvidenceTier::FrozenMatrix,
         verdict,
         value,
@@ -1315,6 +1606,12 @@ fn finding_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCell) -> String {
         "fulcrum run (interleaved best-of-N, sha-verified)",
         "fixture",
     );
+    // FIX 3 — fold the subject's peak RSS into the cell so it gates MEMORY too.
+    let f = if cell.gz_rss_mb > 0.0 {
+        f.with_rss(cell.gz_rss_mb)
+    } else {
+        f
+    };
     serde_json::to_string(&f).unwrap_or_else(|_| "{}".into())
 }
 
@@ -1424,44 +1721,84 @@ fn grep_consumers(repo: &Path, env: &str) -> i64 {
     }
 }
 
-/// One timed, masked run → (seconds, output-sha256). Sink is a temp regular
-/// file (the SINK-LAW: never a pipe). Live only.
-fn timed_masked(mask: &str, bin: &str, args: &[&str]) -> (f64, String) {
+/// One timed, masked run → (seconds, output-sha256, peak-RSS-MiB). Sink is a
+/// temp regular file (the SINK-LAW: never a pipe). Live only.
+fn timed_masked(mask: &str, bin: &str, args: &[&str]) -> (f64, String, f64) {
     timed_masked_envs(mask, &[], bin, args)
 }
 
-fn timed_masked_env(mask: &str, var: &str, val: &str, bin: &str, args: &[&str]) -> (f64, String) {
+fn timed_masked_env(
+    mask: &str,
+    var: &str,
+    val: &str,
+    bin: &str,
+    args: &[&str],
+) -> (f64, String, f64) {
     timed_masked_envs(mask, &[(var, val.to_string())], bin, args)
 }
 
+/// FIX 3 — the timed invocation is wrapped in `/usr/bin/time -v` so the peak
+/// resident-set size is captured alongside the wall (memory AND performance).
+/// `/usr/bin/time -v` writes the rusage report (incl. "Maximum resident set
+/// size (kbytes)") to its OWN stderr, which we capture and parse; the child's
+/// stdout still streams to the regular-file sink for the sha check.
 fn timed_masked_envs(
     mask: &str,
     envs: &[(&str, String)],
     bin: &str,
     args: &[&str],
-) -> (f64, String) {
+) -> (f64, String, f64) {
     use std::time::Instant;
     let sink = std::env::temp_dir().join(format!("fulcrum_run_sink_{}", std::process::id()));
     let sink_f = match fs::File::create(&sink) {
         Ok(f) => f,
-        Err(_) => return (0.0, String::new()),
+        Err(_) => return (0.0, String::new(), 0.0),
     };
-    let mut cmd = Command::new("taskset");
-    cmd.arg("-c").arg(mask).arg(bin).args(args);
+    // /usr/bin/time -v taskset -c <mask> <bin> <args...>
+    let mut cmd = Command::new("/usr/bin/time");
+    cmd.arg("-v")
+        .arg("taskset")
+        .arg("-c")
+        .arg(mask)
+        .arg(bin)
+        .args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
     cmd.stdout(sink_f);
+    cmd.stderr(std::process::Stdio::piped());
     let t0 = Instant::now();
-    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    let out = cmd.output();
     let secs = t0.elapsed().as_secs_f64();
+    let (ok, rss_mb) = match &out {
+        Ok(o) => (
+            o.status.success(),
+            parse_max_rss_mb(&String::from_utf8_lossy(&o.stderr)).unwrap_or(0.0),
+        ),
+        Err(_) => (false, 0.0),
+    };
     let sha = if ok {
         sha256_file(sink.to_str().unwrap_or("")).unwrap_or_default()
     } else {
         String::new()
     };
     let _ = fs::remove_file(&sink);
-    (secs, sha)
+    (secs, sha, rss_mb)
+}
+
+/// Parse the peak RSS in MiB from a `/usr/bin/time -v` (GNU time) report. The
+/// line reads `Maximum resident set size (kbytes): N`; kbytes are KiB on Linux
+/// GNU time. Returns `None` when the line is absent (BSD `time` / unavailable).
+fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            if let Ok(kib) = rest.trim().parse::<f64>() {
+                return Some(kib / 1024.0);
+            }
+        }
+    }
+    None
 }
 
 fn run_verbose(spec: &RunSpec, corpus: &str, t: usize) -> String {
@@ -1540,7 +1877,7 @@ fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option
     let mask = pin_mask(t);
     let mut xs = Vec::new();
     for _ in 0..3 {
-        let (sec, _) = timed_masked(
+        let (sec, _, _) = timed_masked(
             &mask,
             &spec.comparator_bin,
             &["-d", "-c", "-f", "-P", &t.to_string(), corpus],
@@ -1646,8 +1983,16 @@ SPEC (JSON):\n\
   repo           gzippy repo root (live: git-diff src-currency + grep consumers)\n\
   arch           e.g. \"amd-zen2\" | \"intel-i7-13700\" (the cross-arch axis)\n\
   feature        \"gzippy-native\" | \"gzippy-isal\"\n\
-  gzippy_bin     tool-under-test binary\n\
-  comparator_bin rapidgzip NATIVE ELF\n\
+  gzippy_bin     tool-under-test binary (subject; flavor self-witnessed from\n\
+                 the ELF — a declared-vs-derived mismatch REFUSES at capture)\n\
+  comparators    [{id, bin, args, require_native_elf}]  the FULL field arm roster\n\
+                 (igzip, libdeflate, zlibng, rapidgzip, pigz, ...). args take\n\
+                 {path}/{t}. A baseline `settled` claim is gated on wall AND rss\n\
+                 vs every one of these. NO perturbations/knobs => BASELINE path\n\
+                 (gate 3 SKIPPED; FrozenMatrix Tie/Loss/Win; single-arch is\n\
+                 stamped NOT-YET-LAW until a 2nd-arch run is merged).\n\
+  comparator_bin BACK-COMPAT: a single rapidgzip NATIVE ELF (normalized into a\n\
+                 `rapidgzip` comparator arm when `comparators` is empty)\n\
   comparator_path probed for COMPARATOR-PRESENT (default = comparator_bin)\n\
   corpora        [{id, path}, ...]  (id = lowercase-alnum cell key)\n\
   threads        [1, 4, 8, ...]\n\
@@ -1659,10 +2004,12 @@ SPEC (JSON):\n\
   host           {cpu_model, kernel, id}  (live derives kernel)\n\
   fixture        canned numbers for --dry-run (box-free, deterministic):\n\
                  commit_sha/head_sha/src_changed, bin_sha, rg_version,\n\
+                 derived_flavor (\"native\"|\"isal\" self-witness; mismatch REFUSES),\n\
                  knob_consumers{ENV:count}, oracle_counters{name:{on,off}},\n\
                  comparator_present/aa_ratio/aa_spread_pct, corpus_sha,\n\
-                 corpus_raw_bytes, cells{\"corpus:T\":{gz_wall_ms,rg_wall_ms,\n\
-                 spread_pct,decoded_bytes,output_bytes,marker_count_*,verbose}},\n\
+                 corpus_raw_bytes, cells{\"corpus:T\":{gz_wall_ms,gz_rss_mb,rg_wall_ms,\n\
+                 spread_pct,decoded_bytes,output_bytes,marker_count_*,verbose,\n\
+                 arms{id:{wall_ms,rss_mb,spread_pct,require_native_elf}}}},\n\
                  knobs{\"corpus:T:name\"|\"name\":{base_ms,knob_ms,sha_ok,...}},\n\
                  perturb{region:{baseline_ms,spin_crit,sleep_crit,\n\
                  oracle_removed_ms,spread_ms,recheck_ms,sha_ok}}, ab_sinks{role:class}\n"
@@ -1753,6 +2100,108 @@ mod tests {
         assert!(fj.contains("\"cell_id\":\"F-"));
         let qj = fs::read_to_string(run_dir.join("gates/quantity_silesia_T1.json")).unwrap();
         assert!(qj.contains("\"ratio\":1.000000"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── FIX 3 self-test: parse a known /usr/bin/time -v block → rss_mb ─────────
+    #[test]
+    fn parses_max_rss_from_gnu_time_block() {
+        let block = "\
+\tCommand being timed: \"gzippy -d -c x.gz\"\n\
+\tUser time (seconds): 0.31\n\
+\tMaximum resident set size (kbytes): 422400\n\
+\tExit status: 0\n";
+        // 422400 KiB / 1024 = 412.5 MiB.
+        let mb = parse_max_rss_mb(block).expect("rss line present");
+        assert!((mb - 412.5).abs() < 1e-6, "got {mb}");
+        // a BSD/absent report yields None (graceful).
+        assert!(parse_max_rss_mb("real 0m0.3s\nuser 0m0.1s").is_none());
+    }
+
+    // ── FIX 3 self-test: the rss dimension FLOWS into the emitted finding ──────
+    #[test]
+    fn fixture_rss_flows_to_finding() {
+        let json = r#"{
+          "runid":"rss","arch":"amd","feature":"gzippy-native",
+          "gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"igzip","bin":"/box/igzip"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/s.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeefcafe","head_sha":"deadbeefcafe","src_changed":"0",
+            "cells":{"silesia:1":{"gz_wall_ms":100.0,"gz_rss_mb":412.5,
+              "arms":{"igzip":{"wall_ms":105.0,"rss_mb":300.0}}}}}
+        }"#;
+        let spec: RunSpec = serde_json::from_str(json).unwrap();
+        let tmp = std::env::temp_dir().join(format!("fulcrum_rss_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let run_dir = run(&spec, &tmp, Mode::Fixture).expect("run");
+        let fj = fs::read_to_string(run_dir.join("gates/finding_silesia_T1.json")).unwrap();
+        assert!(
+            fj.contains("\"rss_mb\":412.5"),
+            "finding carries subject rss: {fj}"
+        );
+        let capj = fs::read_to_string(run_dir.join("gates/capture_silesia_T1.json")).unwrap();
+        assert!(
+            capj.contains("\"rss_mb\":412.5"),
+            "subject arm rss in capture"
+        );
+        assert!(capj.contains("\"rss_mb\":300"), "igzip arm rss in capture");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── FIX 5 self-test: a native binary labeled isal → DERIVED-MISMATCH ───────
+    #[test]
+    fn flavor_mismatch_refuses_at_capture() {
+        let json = r#"{
+          "runid":"flav","arch":"amd","feature":"gzippy-isal",
+          "gzippy_bin":"/box/gzippy",
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/s.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeefcafe","derived_flavor":"native",
+            "cells":{"silesia:1":{"gz_wall_ms":100.0}}}
+        }"#;
+        let spec: RunSpec = serde_json::from_str(json).unwrap();
+        let tmp = std::env::temp_dir().join(format!("fulcrum_flav_{}", std::process::id()));
+        let err = run(&spec, &tmp, Mode::Fixture).unwrap_err();
+        assert!(err.contains("DERIVED-MISMATCH"), "got: {err}");
+        // control: a correctly-labeled native binary is NOT refused.
+        let ok_json = json.replace("gzippy-isal", "gzippy-native");
+        let ok_spec: RunSpec = serde_json::from_str(&ok_json).unwrap();
+        assert!(run(&ok_spec, &tmp, Mode::Fixture).is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── FIX 2 self-test: the full field is captured as one arm per comparator ──
+    #[test]
+    fn multi_comparator_field_is_captured() {
+        let json = r#"{
+          "runid":"field","arch":"amd","feature":"gzippy-native",
+          "gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"igzip","bin":"/box/igzip"},
+                         {"id":"libdeflate","bin":"/box/libdeflate"},
+                         {"id":"rapidgzip","bin":"/box/rg","require_native_elf":true}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/s.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeefcafe","head_sha":"deadbeefcafe","src_changed":"0",
+            "cells":{"silesia:1":{"gz_wall_ms":100.0,
+              "arms":{"igzip":{"wall_ms":101.0},"libdeflate":{"wall_ms":102.0},
+                      "rapidgzip":{"wall_ms":103.0}}}}}
+        }"#;
+        let spec: RunSpec = serde_json::from_str(json).unwrap();
+        let tmp = std::env::temp_dir().join(format!("fulcrum_field_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let run_dir = run(&spec, &tmp, Mode::Fixture).expect("run");
+        let capj = fs::read_to_string(run_dir.join("gates/capture_silesia_T1.json")).unwrap();
+        for id in ["gzippy-native", "igzip", "libdeflate", "rapidgzip"] {
+            assert!(
+                capj.contains(&format!("\"id\":\"{id}\"")),
+                "arm {id} present: {capj}"
+            );
+        }
+        // rapidgzip keeps wall_rg.txt; the others get wall_<id>.txt.
+        assert!(run_dir.join("cell_silesia_T1/wall_rg.txt").exists());
+        assert!(run_dir.join("cell_silesia_T1/wall_igzip.txt").exists());
+        assert!(run_dir.join("cell_silesia_T1/wall_libdeflate.txt").exists());
         let _ = fs::remove_dir_all(&tmp);
     }
 }

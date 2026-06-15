@@ -1,0 +1,33 @@
+{
+  "_comment": "FULCRUM FIRST-RUN BASELINE SPEC (field+memory, non-lever). Run on a frozen box with `fulcrum run examples/first-run-baseline.spec.json --live --gate --store <repo>/.fulcrum/findings.jsonl`. No perturbations/knobs => the BASELINE path: gate 3 (PERTURBATION) is SKIPPED, each cell is minted as a FrozenMatrix Tie/Loss/Win and gated by COMPARABILITY (a `settled` claim over the full field) on BOTH wall AND rss. Single-arch => every banked cell is stamped NOT-YET-LAW until a 2nd-arch run is merged. Box paths below are placeholders — set them to the staged binaries before --live.",
+  "runid": "first-run-baseline-amd",
+  "repo": "<BENCH_ROOT>/gzippy",
+  "arch": "amd-zen2",
+  "feature": "gzippy-native",
+  "gzippy_bin": "<BENCH_ROOT>/gzippy/target/release/gzippy",
+  "comparators": [
+    { "id": "igzip",      "bin": "/usr/bin/igzip",      "args": ["-d", "-c", "{path}"] },
+    { "id": "libdeflate", "bin": "/usr/bin/libdeflate-gunzip", "args": ["-d", "-c", "{path}"] },
+    { "id": "zlibng",     "bin": "/usr/bin/minigzip-ng", "args": ["-d", "-c", "{path}"] },
+    { "id": "rapidgzip",  "bin": "/usr/local/bin/rapidgzip", "args": ["-d", "-c", "-f", "-P", "{t}", "{path}"], "require_native_elf": true },
+    { "id": "pigz",       "bin": "/usr/bin/pigz",        "args": ["-d", "-c", "-p", "{t}", "{path}"] }
+  ],
+  "corpora": [
+    { "id": "squishycombined", "path": "<BENCH_ROOT>/corpora/squishy_combined.gz" },
+    { "id": "squishyreal",     "path": "<BENCH_ROOT>/corpora/squishy_realdata.gz" },
+    { "id": "silesia",         "path": "<BENCH_ROOT>/corpora/silesia.gz" },
+    { "id": "monorepo",        "path": "<BENCH_ROOT>/corpora/monorepo.gz" },
+    { "id": "nasa",            "path": "<BENCH_ROOT>/corpora/nasa.gz" }
+  ],
+  "threads": [1, 4, 8, 16],
+  "n": 9,
+  "sink": "/dev/null",
+  "knobs": [],
+  "oracles": [],
+  "perturbations": [],
+  "freeze_state": "frozen",
+  "quiet_state": "quiet",
+  "governor": "performance",
+  "no_turbo": "1",
+  "host": { "cpu_model": "AMD EPYC 7282", "id": "<BENCH_HOST>" }
+}

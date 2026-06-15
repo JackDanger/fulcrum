@@ -346,6 +346,14 @@ pub struct Finding {
     /// The measured quantity and its unit.
     pub value: f64,
     pub dimension: String,
+    /// Peak resident-set size of the SUBJECT arm, in MiB, when the runner
+    /// captured it (`/usr/bin/time -v` "Maximum resident set size"). `None` ⇒
+    /// memory was not measured for this cell. When `Some`, it is folded into the
+    /// fingerprint (the rss_mb dimension) so a cell that gates MEMORY is a
+    /// distinct CELL from a wall-only one (the ship goal is memory AND
+    /// performance).
+    #[serde(default)]
+    pub rss_mb: Option<f64>,
     /// How it was measured (perturbation script / oracle name / `fulcrum score`).
     pub method: String,
     /// ISO date the measurement was taken.
@@ -384,11 +392,21 @@ impl Finding {
             verdict,
             value,
             dimension: dimension.to_string(),
+            rss_mb: None,
             method: method.to_string(),
             created_utc: created_utc.to_string(),
         };
         f.cell_id = f.derive_id();
         f
+    }
+
+    /// Attach a captured peak RSS (MiB) to this finding and RE-DERIVE its id (the
+    /// rss_mb dimension is part of the cell identity). A memory-gated cell is a
+    /// distinct CELL from a wall-only one. Chainable after [`Finding::new`].
+    pub fn with_rss(mut self, rss_mb: f64) -> Finding {
+        self.rss_mb = Some(rss_mb);
+        self.cell_id = self.derive_id();
+        self
     }
 
     /// The fingerprint: the canonical, order-stable string the `cell_id` hashes.
@@ -397,7 +415,7 @@ impl Finding {
     /// cannot fork the id. `claim` is deliberately EXCLUDED — re-wording the
     /// prose must NOT mint a new cell (the prose is connective tissue).
     pub fn fingerprint(&self) -> String {
-        format!(
+        let base = format!(
             "v1|region={}|commit={}|arch={}|corpus={}|threads={}|sink={}|n={}|tier={}|verdict={}|value={}|dim={}|method={}",
             self.region,
             self.commit_sha,
@@ -411,7 +429,14 @@ impl Finding {
             canon_value(self.value),
             self.dimension,
             self.method,
-        )
+        );
+        // The rss_mb dimension is appended ONLY when measured, so a wall-only
+        // cell keeps its historical id while a memory-gated cell forks to a
+        // distinct CELL (memory AND performance).
+        match self.rss_mb {
+            Some(r) => format!("{base}|rss_mb={}", canon_value(r)),
+            None => base,
+        }
     }
 
     /// Derive the `cell_id` from the fingerprint. `F-` prefix + 12 hex chars of
@@ -916,6 +941,19 @@ mod tests {
         assert!(a.cell_id.starts_with("F-"));
         assert_eq!(a.cell_id.len(), 14);
         a.is_citable().unwrap();
+    }
+
+    #[test]
+    fn rss_dimension_forks_the_cell_and_is_citable() {
+        // The rss_mb dimension is part of the cell identity: a memory-gated cell
+        // is a DISTINCT, still-citable CELL from its wall-only twin.
+        let wall = sample(EvidenceTier::FrozenMatrix, "abc1234", amd_t4());
+        let mem = wall.clone().with_rss(412.5);
+        assert_ne!(wall.cell_id, mem.cell_id, "rss must fork the id");
+        assert_eq!(mem.rss_mb, Some(412.5));
+        mem.is_citable().unwrap();
+        // and the fork is deterministic.
+        assert_eq!(mem.derive_id(), wall.clone().with_rss(412.5).cell_id);
     }
 
     #[test]

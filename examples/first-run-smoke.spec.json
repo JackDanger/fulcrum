@@ -1,0 +1,40 @@
+{
+  "_comment": "SMALLEST certifiable BASELINE cell, box-free. `fulcrum run examples/first-run-smoke.spec.json --dry-run --gate --store /tmp/smoke-findings.jsonl` synthesizes wall+rss for ONE cell (squishy real-data-only, T1, gzippy-native vs igzip+libdeflate) and flows it provenance->quantity->comparability(Settled)->finding, banking a CERTIFIED FrozenMatrix cell. gzippy is fastest AND lightest, so the settled claim ADMITS; single-arch => NOT-YET-LAW.",
+  "runid": "first-run-smoke",
+  "arch": "amd-zen2",
+  "feature": "gzippy-native",
+  "gzippy_bin": "<BENCH_ROOT>/gzippy/target/release/gzippy",
+  "comparators": [
+    { "id": "igzip",      "bin": "/usr/bin/igzip" },
+    { "id": "libdeflate", "bin": "/usr/bin/libdeflate-gunzip" }
+  ],
+  "corpora": [
+    { "id": "squishyreal", "path": "<BENCH_ROOT>/corpora/squishy_realdata.gz" }
+  ],
+  "threads": [1],
+  "n": 9,
+  "sink": "/dev/null",
+  "host": { "cpu_model": "AMD EPYC 7282", "id": "<BENCH_HOST>" },
+  "fixture": {
+    "commit_sha": "deadbeefcafe1234",
+    "head_sha": "deadbeefcafe1234",
+    "src_changed": "0",
+    "bin_sha": "feedface",
+    "derived_flavor": "native",
+    "corpus_sha": { "squishyreal": "abc123" },
+    "corpus_raw_bytes": { "squishyreal": 180000000.0 },
+    "cells": {
+      "squishyreal:1": {
+        "gz_wall_ms": 95.0,
+        "gz_rss_mb": 110.0,
+        "spread_pct": 0.5,
+        "decoded_bytes": 180000000.0,
+        "output_bytes": 180000000.0,
+        "arms": {
+          "igzip":      { "wall_ms": 101.0, "rss_mb": 130.0 },
+          "libdeflate": { "wall_ms": 99.0,  "rss_mb": 125.0 }
+        }
+      }
+    }
+  }
+}
