@@ -206,8 +206,12 @@ pub const INVARIANTS: &[Invariant] = &[
         scar: "The two live wall hypotheses (mem-BW vs core-IPC bound) predict \
            different TMA buckets; reading raw perf stat without a closure guard can \
            manufacture the preferred hypothesis (the 690M double-count analogue).",
-        enforcement: "(SPECCED in Rust) — carried from Python cycles.build_tma until \
-                  ported; the closure-refusal contract is preserved by this registry.",
+        enforcement: "cycles::build_tma raises the TMA-CLOSURE refusal (and \
+                  TMA-NO-SLOTS / TMA-PARTIAL-LEVEL1 / TMA-BACKEND-INCOHERENT) \
+                  before any breakdown is returned; cycles::tma_from_text / \
+                  tma_from_file are the entry points; cycles::tests proves each \
+                  refusal FIRES by name and a non-summing ledger is REFUSED \
+                  (never rendered).",
     },
     Invariant {
         name: "INSN-CLOSURE-OR-NO-LEDGER",

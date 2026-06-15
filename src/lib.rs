@@ -42,6 +42,7 @@ pub mod consumer;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
+pub mod cycles;
 pub mod decompose;
 pub mod estimate;
 pub mod finding;
