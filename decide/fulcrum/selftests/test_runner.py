@@ -31,7 +31,7 @@ import tempfile
 from ..core import perturb
 from ..core import provenance as prov
 from ..core.decide import load_run_documented, parse_manifest
-from ..core.pipeline import find_fulcrum_bin
+from ..core.binloc import find_fulcrum_bin
 from . import Checker
 
 # A minimal corpus + thread set; one knob, one oracle, one perturb region.

@@ -15,16 +15,19 @@ from . import stamp as _stamp
 
 
 def run_all(write_stamp=True):
-    from . import (test_adapter, test_cell_roundtrip, test_cycles, test_decide,
+    # NOTE: test_cell_roundtrip + test_pipeline were removed with the
+    # subprocess-seam pipeline (core/pipeline.py, core/cell.py); that flow is now
+    # the all-Rust in-process src/pipeline.rs (+ src/pipeline/tests.rs).
+    from . import (test_adapter, test_cycles, test_decide,
                    test_insn, test_insn_calib, test_invariants, test_locate,
-                   test_perturb, test_pipeline, test_provenance, test_quantity,
+                   test_perturb, test_provenance, test_quantity,
                    test_runner, test_total)
     total_fail = 0
     counts = {}
     for mod in (test_total, test_decide, test_invariants, test_adapter,
                 test_locate, test_insn, test_insn_calib, test_cycles,
                 test_perturb, test_provenance, test_quantity,
-                test_cell_roundtrip, test_pipeline, test_runner):
+                test_runner):
         rc, n_checks, n_fail = mod.run()
         counts[mod.__name__.rsplit(".", 1)[-1]] = {"checks": n_checks,
                                                    "failures": n_fail}
