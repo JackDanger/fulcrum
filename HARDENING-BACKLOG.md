@@ -44,6 +44,40 @@ Invariants every iteration must keep green:
 
 6. **[STANDING — in progress]** Adversarial self-review for new bugs; parser/locale
    edge-cases (`cycles.rs` non-C-locale); coverage.
+   - **[DONE — branch `harden/newcode-audit`]** Two real false-VOID defects in the
+     just-landed BOX-VALID gate, plus a leak-guard regression for surface #3.
+     1. **OCCUPANCY false-VOID of a legitimately-serial cell (HIGH VALUE).**
+        `occupancy_of = (utime+stime)/(wall·k)` assumes the process saturates ALL
+        k cores. A partly-serial cell (e.g. a T4 decode with a serial bootstrap)
+        reads occupancy < 0.90 on a PERFECTLY QUIET box, so `clean_samples` (which
+        used the absolute `OCCUPANCY_MIN = 0.90` floor) rejected EVERY sample →
+        `reject_frac → 1.0` → a false `CONTAMINATION` VOID that HID a real
+        measurement. Fix: `perturb::effective_occupancy_min(occ)` relativizes the
+        floor to the cell's OWN reference (median) occupancy — if the cell
+        saturates (ref ≥ 0.90) keep the strict absolute floor (no weakening of the
+        saturating path), else the floor becomes `ref × OCCUPANCY_REL_FRAC` (0.90),
+        so preemption is a per-sample DIP below the cell's norm. Sustained uniform
+        box contention (which occupancy can't distinguish from serial-by-design)
+        stays caught INDEPENDENTLY by UNQUIET (procs_running) + DRIFT. `clean_samples`
+        now uses the effective floor; `occupancy_filter` stays a pure absolute-param
+        function (its direct tests unchanged). 3 red-before/green-after tests in
+        `src/perturb/tests.rs` (serial cell not false-voided; serial cell still
+        rejects a real dip; saturating cell keeps the strict bar).
+     2. **Empty-MID-block phantom DRIFT false-VOID (the legacy no-MID path).**
+        A short/legacy cell that never captured a MID control block emits
+        `ctrl_mid=0.000000` (`med([])`). `parse_box_valid_line` pushed that 0.0 into
+        `ctrl_medians` → `[FIRST, 0.0, LAST]`, so `bracket_drift` saw a ~FIRST-sized
+        swing and VOIDed an otherwise-clean cell with phantom DRIFT. Fix: the parser
+        DROPS non-positive control medians (a real timed decode wall is always > 0),
+        yielding the correct `[FIRST, LAST]` 2-point bracket. 1 red-before/green-after
+        test in `src/provenance.rs` (`empty_mid_block_does_not_false_void_drift`).
+     3. **Surface #3 (fixture-oracle leak) HELD — coverage added.** `--fixture-oracle`
+        is set ONLY by the explicit CLI flag, refused with `--live`, and `FixedOracle`
+        is constructed at exactly one gated site; no spec/config field feeds it
+        (`RunSpec` has no oracle/mode field, and lacks `deny_unknown_fields` so an
+        injected field is silently ignored). New test
+        `spec_field_cannot_enable_fixture_oracle` in `tests/run_dryrun_oracle.rs`
+        locks "no spec-field leak". 523 tests / 0 / 0; clippy 0-new; fmt clean.
    - **[DONE — branch `harden/dryrun-oracle`]** The dry-run fixture-oracle gap. The
      gated CLI (`fulcrum run … --gate`, `src/main.rs`) hardcoded a live
      `GitSrcOracle`, so a `--dry-run` over a SYNTHETIC/fixture commit could never
@@ -67,3 +101,12 @@ Invariants every iteration must keep green:
   dominates. Consider unifying rapidgzip's per-arm `aa_spread` onto
   `comparator_aa_spread_pct / 100` so the arm-level gate matches the manifest-level
   gate for rg too (kept back-compat here to avoid touching the rg path).
+  - **SHARPENED (harden/newcode-audit):** the seconds-as-fraction is NOT fully
+    harmless for a LARGE-WALL corpus. `comparability_capture_json` emits the
+    rapidgzip arm's `aa_spread = spread_of(&a.wall)` in SECONDS; `aa_ok` then uses
+    `max(aa_spread, AA_TOLERANCE)` as a FRACTION. For a multi-second rg cell even a
+    tight 2% spread is `~0.06s`, widening the A/A tolerance to 6% and ADMITTING rg
+    with up to 6% A/A drift (over-admit; never a false-VOID since seconds ≥ 0). The
+    fix is the unification above; flagged here as a concrete over-admission, not
+    just a latent unit nit. Should become its own backlog item if the rg path is
+    reworked. (Field tools already emit the FRACTION correctly via `sp / 100.0`.)

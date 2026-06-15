@@ -190,3 +190,51 @@ fn fixture_oracle_with_live_is_refused() {
         "the refusal must name the contradictory combo; stderr:\n{se}"
     );
 }
+
+/// GUARD: the fixture oracle cannot be enabled through the SPEC FILE — only the
+/// explicit `--fixture-oracle` CLI flag selects it. A spec carrying injected
+/// `"fixture_oracle":true` / `"live":true` fields (which `RunSpec` does not
+/// model) is parsed without enabling the fixture oracle, so a `--gate` run with
+/// NO CLI flag STILL selects the LIVE `GitSrcOracle` and refuses the synthetic
+/// commit. This locks "no config-file/spec-field leak path" for surface #3.
+#[test]
+fn spec_field_cannot_enable_fixture_oracle() {
+    let bin = env!("CARGO_BIN_EXE_fulcrum");
+    let dir = scratch("specfield");
+    // Same smoke spec, but with injected oracle/mode fields RunSpec does not model.
+    let poisoned = SMOKE_SPEC.replacen(
+        "\"runid\":\"e2e\",",
+        "\"runid\":\"e2e\",\"fixture_oracle\":true,\"live\":true,\"mode\":\"live\",\"oracle\":\"fixed\",",
+        1,
+    );
+    let spec = dir.join("spec.json");
+    std::fs::write(&spec, &poisoned).unwrap();
+    let store = dir.join("store.jsonl");
+    let out = dir.join("art");
+
+    let res = Command::new(bin)
+        .args([
+            "run",
+            spec.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--store",
+            store.to_str().unwrap(),
+            "--dry-run",
+            "--gate",
+            // NOTE: no --fixture-oracle CLI flag; the spec fields must NOT leak it.
+        ])
+        .output()
+        .expect("run fulcrum");
+
+    let so = String::from_utf8_lossy(&res.stdout);
+    let se = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        se.contains("LIVE GitSrcOracle"),
+        "spec fields must NOT select the fixture oracle; the LIVE oracle must be used; stderr:\n{se}"
+    );
+    assert!(
+        so.contains("0/1 cell(s) CERTIFIED"),
+        "a spec-field-poisoned synthetic commit must NOT certify; stdout:\n{so}"
+    );
+}

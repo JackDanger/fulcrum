@@ -67,10 +67,25 @@ pub const BIMODAL_K: f64 = 3.0;
 // the BOX-VALID sub-check in `provenance.rs` (the bracket drift + run-queue +
 // reject-fraction tests).
 
-/// Minimum per-sample occupancy ((utime+stime)/(wall·k)) for a sample to count.
-/// Below this the child was preempted off-core for a meaningful slice of its
-/// wall — the wall measured the box's contention, not the workload.
+/// Minimum per-sample occupancy ((utime+stime)/(wall·k)) for a sample to count
+/// when the cell SATURATES its cores. Below this a saturating cell's child was
+/// preempted off-core for a meaningful slice of its wall — the wall measured the
+/// box's contention, not the workload.
+///
+/// CAUTION: a cell whose workload is partly serial BY DESIGN (e.g. a T4 decode
+/// with a serial bootstrap) reads occupancy < 1 with NO preemption, so this
+/// absolute floor cannot be applied to it without false-rejecting every clean
+/// sample. [`effective_occupancy_min`] relativizes the floor to the cell's OWN
+/// intrinsic occupancy precisely so a legitimately-serial cell is not VOIDed as
+/// "contaminated"; preemption is then a per-sample DIP below the cell's norm,
+/// while sustained box contention is caught independently by the run-queue
+/// (UNQUIET) and control-bracket (DRIFT) checks.
 pub const OCCUPANCY_MIN: f64 = 0.90;
+/// Relative occupancy tolerance for a SUB-SATURATING (partly-serial) cell: a
+/// sample is preempted only if its occupancy falls below this fraction of the
+/// cell's own reference (median) occupancy. Mirrors the 10% slack of the
+/// absolute floor, applied to the cell's intrinsic parallelism instead of k.
+pub const OCCUPANCY_REL_FRAC: f64 = 0.90;
 /// Reject fraction that VOIDs a cell outright: more than half the raw samples
 /// preempted/fenced ⇒ the window was contaminated, no clean median trustable.
 pub const REJECT_VOID_FRAC: f64 = 0.50;
@@ -371,11 +386,45 @@ pub struct CleanResult {
     pub bimodal_after_fence: bool,
 }
 
+/// The per-cell EFFECTIVE occupancy floor — the fix for false-VOIDing a
+/// legitimately-serial cell. The absolute [`OCCUPANCY_MIN`] (occupancy relative
+/// to a fully-saturated k cores) is correct ONLY for a cell that saturates its
+/// cores; a partly-serial cell (a T4 decode with a serial bootstrap) reads
+/// occupancy < 1 with NO preemption and would have EVERY clean sample rejected.
+///
+/// So the floor is relativized to the cell's OWN intrinsic occupancy:
+/// * if the cell's reference (median) occupancy ≥ [`OCCUPANCY_MIN`] (it
+///   saturates), keep the strict absolute floor — full strictness, no weakening
+///   of the saturating path;
+/// * otherwise the cell is serial-by-design, so the floor becomes
+///   `reference × OCCUPANCY_REL_FRAC` — preemption is a per-sample DIP below the
+///   cell's own norm, not a fixed distance below k.
+///
+/// Sustained, uniform box contention (which depresses ALL samples equally and
+/// occupancy cannot distinguish from serial-by-design) is caught INDEPENDENTLY
+/// by the run-queue (UNQUIET) and control-bracket (DRIFT) checks. An empty `occ`
+/// (no CPU time captured — BSD time / fixture) ⇒ the absolute floor (the filter
+/// then no-ops on the unmatched tail anyway).
+pub fn effective_occupancy_min(occ: &[f64]) -> f64 {
+    if occ.is_empty() {
+        return OCCUPANCY_MIN;
+    }
+    let s = sorted(occ);
+    let reference = quantile_sorted(&s, 0.5); // robust to < 50% preempted samples
+    if reference >= OCCUPANCY_MIN {
+        OCCUPANCY_MIN
+    } else {
+        (reference * OCCUPANCY_REL_FRAC).max(0.0)
+    }
+}
+
 /// Clean a raw sample set: occupancy-filter (using `occ`, aligned 1:1) THEN
 /// Tukey IQR-fence, reporting the combined reject count and the post-fence
-/// bimodality tripwire. This is the exact order the BOX-VALID capture uses.
+/// bimodality tripwire. This is the exact order the BOX-VALID capture uses. The
+/// occupancy floor is the per-cell [`effective_occupancy_min`] (relativized for
+/// a serial-by-design cell), NOT the raw absolute [`OCCUPANCY_MIN`].
 pub fn clean_samples(xs: &[f64], occ: &[f64]) -> CleanResult {
-    let (after_occ, occ_rej) = occupancy_filter(xs, occ, OCCUPANCY_MIN);
+    let (after_occ, occ_rej) = occupancy_filter(xs, occ, effective_occupancy_min(occ));
     let (kept, fence_rej) = iqr_fence(&after_occ);
     let bimodal_after_fence = bimodal(&kept, BIMODAL_K);
     CleanResult {

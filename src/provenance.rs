@@ -1404,7 +1404,16 @@ pub fn parse_box_valid_line(v: &str) -> Option<CellBoxStats> {
             "maskd" => c.mask_readback = val.to_string(),
             "ctrl_first" | "ctrl_mid" | "ctrl_last" => {
                 if let Ok(x) = val.parse::<f64>() {
-                    c.ctrl_medians.push(x);
+                    // A control-block median of 0.0 means the block was NOT
+                    // captured (an empty MID on a short/legacy cell — `med([])`
+                    // emits 0.0): a real timed decode wall is always > 0. Skipping
+                    // it yields the correct [FIRST, LAST] 2-point bracket instead
+                    // of [FIRST, 0.0, LAST], which would otherwise make
+                    // `bracket_drift` see a ~FIRST-sized swing and FALSE-VOID the
+                    // cell with phantom DRIFT (the legacy no-MID-block path).
+                    if x > 0.0 {
+                        c.ctrl_medians.push(x);
+                    }
                 }
             }
             "ctrl_spread" => c.ctrl_spread = val.parse().unwrap_or(0.0),
@@ -1962,6 +1971,34 @@ mod box_valid_tests {
         assert_eq!(v, CheckVerdict::Void, "a drifting control bracket VOIDs");
         assert!(reason.contains("DRIFT"), "names DRIFT: {reason}");
         assert!(reason.contains("end-to-end"), "cites the end-to-end ramp");
+    }
+
+    // ── 2b. LEGACY no-MID-block path does NOT false-VOID with phantom DRIFT ──
+    // A short/legacy cell that never captured a MID control block emits
+    // `ctrl_mid=0.000000` (med of an empty block). The parser must DROP that
+    // non-positive sentinel so the bracket is the correct [FIRST, LAST]
+    // 2-point, NOT [FIRST, 0.0, LAST] which would make `bracket_drift` see a
+    // ~FIRST-sized swing and FALSE-VOID an otherwise-clean cell.
+    #[test]
+    fn empty_mid_block_does_not_false_void_drift() {
+        // The exact manifest line a no-MID cell emits: ctrl_mid=0.000000.
+        let line = "cell=silesia:4;k=4;n_raw=15;rejected=0;clean=15;escalated=0;\
+                    occ_med=0.99;procs_med=4.0;mask=2,4,8,10;maskd=0-15;\
+                    ctrl_first=1.000000;ctrl_mid=0.000000;ctrl_last=1.000000;\
+                    ctrl_spread=0.001000;ts_span=15.0";
+        let c = parse_box_valid_line(line).expect("parses");
+        // The 0.0 MID sentinel is dropped → a clean 2-point bracket.
+        assert_eq!(
+            c.ctrl_medians,
+            vec![1.000000, 1.000000],
+            "an uncaptured (0.0) MID block must be dropped, leaving [FIRST, LAST]"
+        );
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(
+            v,
+            CheckVerdict::Ok,
+            "a clean cell with no MID block must NOT false-VOID; reason: {reason}"
+        );
     }
 
     // ── 3. WRONG-MASK (the 8th bug: readback ⊉ requested) ──────────────────

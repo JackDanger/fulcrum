@@ -672,6 +672,55 @@ fn occupancy_filter_short_occ_keeps_unmatched_tail() {
 }
 
 #[test]
+fn serial_cell_is_not_false_voided_as_contaminated() {
+    // A legitimately partly-serial T4 cell: every sample reads occupancy ~0.60
+    // (serial bootstrap + parallel tail) on a PERFECTLY QUIET box, with NO
+    // preemption. Under the old absolute 0.90 floor EVERY sample is rejected
+    // (reject_frac → 1.0 ⇒ a false CONTAMINATION VOID that hides a real
+    // measurement). The relativized floor must keep them all.
+    let xs = samples_n(0.500, 0.004, 11);
+    let occ = vec![
+        0.58, 0.60, 0.61, 0.59, 0.62, 0.60, 0.61, 0.58, 0.60, 0.59, 0.62,
+    ];
+    let cr = clean_samples(&xs, &occ);
+    assert_eq!(
+        cr.rejected, 0,
+        "a clean serial-by-design cell must NOT be rejected (was a false-VOID)"
+    );
+    assert_eq!(cr.kept.len(), 11);
+}
+
+#[test]
+fn serial_cell_still_rejects_a_real_preemption_dip() {
+    // Same serial cell (occ ~0.60), but one sample was genuinely preempted: its
+    // occupancy DIPS to 0.30, well below the cell's own norm. The relativized
+    // floor (0.60 × 0.90 = 0.54) must still catch it.
+    let xs = vec![0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.99];
+    let occ = vec![0.60, 0.61, 0.59, 0.60, 0.62, 0.58, 0.61, 0.60, 0.59, 0.30];
+    let (kept, rejected) = occupancy_filter(&xs, &occ, effective_occupancy_min(&occ));
+    assert_eq!(
+        rejected, 1,
+        "the 0.30 dip below the cell's norm is preemption"
+    );
+    assert!(!kept.contains(&0.99), "the preempted sample is dropped");
+}
+
+#[test]
+fn effective_floor_keeps_strict_bar_for_saturating_cell() {
+    // A saturating cell (median occupancy ≥ 0.90) keeps the strict absolute
+    // floor — the fix must NOT weaken the saturating path.
+    let saturating = vec![0.99, 0.98, 1.0, 0.97, 0.99];
+    assert!((effective_occupancy_min(&saturating) - OCCUPANCY_MIN).abs() < 1e-12);
+    // A serial cell relativizes to reference × OCCUPANCY_REL_FRAC.
+    let serial = vec![0.60, 0.61, 0.59, 0.60, 0.62];
+    let eff = effective_occupancy_min(&serial);
+    assert!((eff - 0.60 * OCCUPANCY_REL_FRAC).abs() < 1e-9, "eff={eff}");
+    assert!(eff < OCCUPANCY_MIN);
+    // Empty occupancy ⇒ the absolute floor (graceful; filter no-ops anyway).
+    assert!((effective_occupancy_min(&[]) - OCCUPANCY_MIN).abs() < 1e-12);
+}
+
+#[test]
 fn iqr_fence_drops_a_lone_high_outlier() {
     let mut xs = samples_n(1.000, 0.004, 9);
     xs.push(5.0); // a gross outlier
