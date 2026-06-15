@@ -55,6 +55,9 @@ USAGE:\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
   fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
+  fulcrum run <spec.json> [--out DIR] [--dry-run|--live]   the live-capture RUNNER half:\n\
+              run a gzippy-vs-rg decode workload and emit the gate-input artifacts\n\
+              (--spec-help for the spec fields; --live-help for the frozen-box invocation)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
   fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
@@ -2900,6 +2903,86 @@ fn cmd_mech_caps(_args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// run: the live-capture RUNNER half — run a gzippy-vs-rg decode workload and
+/// emit the gate-input artifacts (manifest provenance keys, perturb sweeps,
+/// comparability captures, the unified finding cell) into an artifact dir the
+/// gated pipeline consumes.
+///
+///   fulcrum run <spec.json> [--out DIR] [--dry-run | --live]
+///   fulcrum run --spec-help          # the run-spec field reference
+///   fulcrum run --live-help          # the documented frozen-box invocation
+fn cmd_run(args: &[String]) -> ExitCode {
+    use fulcrum::runner;
+    if args.iter().any(|a| a == "--spec-help") {
+        print!("{}", runner::spec_help_doc());
+        return ExitCode::SUCCESS;
+    }
+    if args.iter().any(|a| a == "--live-help") {
+        print!("{}", runner::live_invocation_doc());
+        return ExitCode::SUCCESS;
+    }
+    let mut spec_path: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    let mut mode = runner::Mode::Fixture;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                out = args.get(i + 1).map(|s| s.as_str());
+                i += 2;
+            }
+            "--dry-run" | "--fixture" => {
+                mode = runner::Mode::Fixture;
+                i += 1;
+            }
+            "--live" => {
+                mode = runner::Mode::Live;
+                i += 1;
+            }
+            other if !other.starts_with("--") => {
+                spec_path = Some(other);
+                i += 1;
+            }
+            other => {
+                eprintln!("run: unknown flag '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(spec_path) = spec_path else {
+        eprintln!(
+            "run: needs a <spec.json> (see `fulcrum run --spec-help`)\n\n{}",
+            runner::spec_help_doc()
+        );
+        return ExitCode::from(2);
+    };
+    let spec_txt = match std::fs::read_to_string(spec_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("run: cannot read spec {spec_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec: runner::RunSpec = match serde_json::from_str(&spec_txt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("run: invalid spec JSON {spec_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let out_dir = std::path::PathBuf::from(out.unwrap_or("/dev/shm/fulcrum-art"));
+    match runner::run(&spec, &out_dir, mode) {
+        Ok(dir) => {
+            println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("run: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
@@ -2937,6 +3020,7 @@ fn main() -> ExitCode {
         "plan" => cmd_plan(rest),
         "sixstage" => cmd_sixstage(rest),
         "finding" => cmd_finding(rest),
+        "run" => cmd_run(rest),
         "score" => {
             match score::args_from_cli(rest) {
                 Ok(a) => {
