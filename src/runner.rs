@@ -2981,9 +2981,13 @@ fn shell_quote(s: &str) -> String {
 /// `Cpus_allowed_list` from `/proc/self/status`; the kernel value reflects any
 /// cgroup/affinity NARROWING (the `0-3 → 0,2-3` bug) the request could not
 /// override. The BOX-VALID gate VOIDs the cell when this readback does NOT
-/// superset-contain the requested mask. Falls back to echoing the request when
-/// the readback is unavailable (non-Linux / no /proc) so the gate degrades to
-/// INCOMPLETE rather than a false VOID.
+/// superset-contain the requested mask. When the readback is UNAVAILABLE
+/// (subprocess failed / non-Linux / no /proc / empty value) it returns the
+/// `"unknown"` SENTINEL — it does NOT echo the request. Echoing the request
+/// was a self-validation hole: requested == readback makes WRONG-MASK compare
+/// the request against itself and SILENTLY PASS a pin that was never verified.
+/// The sentinel (which `parse_cpu_mask` resolves to None) instead degrades the
+/// cell to a real INCOMPLETE at `check_box_valid` (non-citable, not a phantom OK).
 fn mask_readback(mask: &str) -> String {
     let out = Command::new("taskset")
         .arg("-c")
@@ -2992,21 +2996,31 @@ fn mask_readback(mask: &str) -> String {
         .arg("-c")
         .arg("cat /proc/self/status")
         .output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            for line in txt.lines() {
-                if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
-                    let v = rest.trim().to_string();
-                    if !v.is_empty() {
-                        return v;
-                    }
+    let status_txt = match out {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
+    };
+    mask_readback_parse(status_txt.as_deref())
+}
+
+/// Pure parse of a `/proc/self/status` dump → the `Cpus_allowed_list` value, or
+/// the `"unknown"` sentinel when the readback is unavailable/empty. Split out so
+/// the failure-fallback is deterministically testable cross-platform (the live
+/// `taskset` subprocess is Linux-only). The sentinel deliberately does NOT echo
+/// the requested mask — see `mask_readback`.
+fn mask_readback_parse(status_txt: Option<&str>) -> String {
+    if let Some(txt) = status_txt {
+        for line in txt.lines() {
+            if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+                let v = rest.trim().to_string();
+                if !v.is_empty() {
+                    return v;
                 }
             }
         }
     }
-    // readback unavailable ⇒ echo the request (gate sees requested == readback).
-    mask.to_string()
+    // readback unavailable ⇒ "unknown" sentinel ⇒ gate degrades to INCOMPLETE.
+    "unknown".to_string()
 }
 
 /// Map each logical CPU in `mask` to its PHYSICAL-core key, read from sysfs
@@ -3127,6 +3141,34 @@ SPEC (JSON):\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // mask_readback fallback: an unavailable readback returns the `unknown`
+    // sentinel (which the BOX-VALID gate degrades to INCOMPLETE), NOT an echo of
+    // the request (which would let WRONG-MASK silently pass an unverified pin).
+    #[test]
+    fn mask_readback_parse_sentinel_on_failure() {
+        // a real /proc/self/status dump → the Cpus_allowed_list value.
+        let dump = "Name:\tcat\nState:\tR\nCpus_allowed:\tff\nCpus_allowed_list:\t0-3\n";
+        assert_eq!(mask_readback_parse(Some(dump)), "0-3");
+
+        // subprocess failed entirely (None) → sentinel, NOT an echo of the request.
+        assert_eq!(mask_readback_parse(None), "unknown");
+
+        // status present but the line is absent → sentinel.
+        assert_eq!(
+            mask_readback_parse(Some("Name:\tcat\nState:\tR\n")),
+            "unknown"
+        );
+
+        // line present but the value is empty → sentinel (no false-empty mask).
+        assert_eq!(
+            mask_readback_parse(Some("Cpus_allowed_list:\t\n")),
+            "unknown"
+        );
+
+        // the sentinel resolves to None for the gate (does not crash a consumer).
+        assert!(crate::provenance::parse_cpu_mask(&mask_readback_parse(None)).is_none());
+    }
 
     fn good_spec() -> RunSpec {
         let json = r#"{

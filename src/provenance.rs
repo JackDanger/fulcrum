@@ -1007,6 +1007,30 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
             continue;
         }
 
+        // -- MASK-UNVERIFIED: there IS a requested mask but the Cpus_allowed_list
+        //    readback is UNAVAILABLE (the `maskd=unknown` sentinel, or any value
+        //    that does not parse). The pin could NOT be verified, so WRONG-MASK
+        //    narrowing cannot be ruled out. A cell whose pin we couldn't read back
+        //    is NON-CITABLE (INCOMPLETE) — NOT silently admitted by echoing the
+        //    request against itself (the old `mask_readback` fallback did exactly
+        //    that, defeating WRONG-MASK on any transient readback failure).
+        if parse_cpu_mask(&c.mask_requested).is_some() && parse_cpu_mask(&c.mask_readback).is_none()
+        {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Incomplete,
+                scope,
+                format!(
+                    "MASK-UNVERIFIED: cell {} requested cpus {{{}}} but the Cpus_allowed_list \
+                     readback was unavailable (maskd={:?}) — the pin could not be verified, so \
+                     WRONG-MASK narrowing cannot be ruled out; the cell is non-citable until a \
+                     successful readback (`taskset -c <mask> cat /proc/self/status` on the box)",
+                    c.cell, c.mask_requested, c.mask_readback,
+                ),
+            ));
+            continue;
+        }
+
         // -- WRONG-MASK (the 8th bug): requested ⊆ readback, else the pin ran on
         //    the wrong cores (cgroup narrowing 0-3 → 0,2-3). ----------------------
         if let (Some(req), Some(rb)) = (
@@ -2124,6 +2148,63 @@ mod box_valid_tests {
         assert_eq!(v, CheckVerdict::Void, "a narrowed core mask VOIDs");
         assert!(reason.contains("WRONG-MASK"), "names WRONG-MASK: {reason}");
         assert!(reason.contains("[1]"), "names the missing cpu(s): {reason}");
+    }
+
+    // ── 3a. MASK-UNVERIFIED (readback unavailable ⇒ INCOMPLETE, not silent OK) ─
+    // The `mask_readback` fallback used to ECHO the request on a readback failure,
+    // making requested == readback so WRONG-MASK compared the request against
+    // itself and SILENTLY PASSED an unverified pin. The fix emits the `unknown`
+    // sentinel; the gate now degrades such a cell to INCOMPLETE (non-citable).
+    #[test]
+    fn mask_unverified_is_incomplete_not_silent_ok() {
+        // GREEN control: a genuine successful readback (⊇ request) still certifies.
+        let ok = clean_cell();
+        assert_eq!(
+            verdict_of(&ok).0,
+            CheckVerdict::Ok,
+            "a verified pin (readback ⊇ request) must still pass"
+        );
+
+        // RED-before / GREEN-after: the `unknown` sentinel (readback unavailable).
+        // Old echo behavior: maskd == mask ⇒ WRONG-MASK passes ⇒ verdict OK (RED).
+        // Fixed: the gate degrades the unverifiable pin to INCOMPLETE (GREEN).
+        let mut c = clean_cell();
+        c.mask_readback = "unknown".into();
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(
+            v,
+            CheckVerdict::Incomplete,
+            "an unverifiable pin is non-citable (INCOMPLETE), never a silent OK: {reason}"
+        );
+        assert!(
+            reason.contains("MASK-UNVERIFIED"),
+            "names MASK-UNVERIFIED: {reason}"
+        );
+
+        // OVER-CORRECTION guard: the OLD echo (maskd == request) must NOT be how a
+        // failure is represented — but if some artifact DID echo a parseable mask,
+        // it must NOT trip MASK-UNVERIFIED (rb parses ⇒ this check stays silent;
+        // it's WRONG-MASK's job, which passes for an exact echo). Locks the gate to
+        // the sentinel, not to "readback equals request".
+        let mut echoed = clean_cell();
+        echoed.mask_requested = "2,4,8,10".into();
+        echoed.mask_readback = "2,4,8,10".into(); // legacy echo: parseable, ⊇ request
+        let (ev, _) = verdict_of(&echoed);
+        assert_eq!(
+            ev,
+            CheckVerdict::Ok,
+            "a parseable readback that supersets the request still certifies"
+        );
+
+        // a garbage/unparseable readback (not the sentinel) ALSO degrades, never
+        // silently passes by skipping WRONG-MASK.
+        let mut garbage = clean_cell();
+        garbage.mask_readback = "n/a".into();
+        assert_eq!(
+            verdict_of(&garbage).0,
+            CheckVerdict::Incomplete,
+            "an unparseable readback is non-citable, not a silent OK"
+        );
     }
 
     // ── 3b. OVERSUBSCRIBED (k threads pinned to < k distinct cores) ────────

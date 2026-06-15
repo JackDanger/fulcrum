@@ -242,24 +242,48 @@ Invariants every iteration must keep green:
   pool does NOT (verified above), so <BENCH_HOST>-banked cells are unaffected; re-check
   <BENCH_HOST>'s pool the same way before trusting its high-T cells.
 
-- **[TODO — relay #12 candidate]** `mask_readback` (runner.rs:2964) FALLBACK comment
-  is inaccurate AND a latent WRONG-MASK bypass. When `taskset … cat /proc/self/status`
-  fails/empty it returns `mask.to_string()` (echoes the REQUEST). The doc-comment
-  claims this "degrades to INCOMPLETE rather than a false VOID" — but it does NOT
-  degrade to INCOMPLETE: requested == readback ⇒ WRONG-MASK PASSES (silently
-  admitted, not INCOMPLETE). Harmless on the Linux bench boxes (taskset+/proc work),
-  but if the readback subprocess ever fails transiently on the box the WRONG-MASK
-  gate is defeated with no INCOMPLETE marker. Consider emitting a distinct
-  `maskd=unknown` sentinel on readback failure so the gate degrades to a real
-  INCOMPLETE (or VOIDs) instead of echoing the request. Low live-risk; correctness
-  of the self-validation story.
+- **[DONE — relay #12, branch `relay12-mask-readback`]** `mask_readback`
+  (runner.rs) FALLBACK was a latent WRONG-MASK bypass: on a readback subprocess
+  failure/empty it returned `mask.to_string()` (ECHOED THE REQUEST), so
+  requested == readback ⇒ WRONG-MASK compared the request against itself and
+  SILENTLY PASSED an unverified pin (verdict OK with reason "ran on the requested
+  cores (mask … ⊆ <echo>)") instead of degrading to INCOMPLETE. **Fix (two parts,
+  no gate weakened):** (1) `mask_readback` now returns the `"unknown"` SENTINEL on
+  failure — extracted the parse into a pure, cross-platform-testable
+  `mask_readback_parse(Option<&str>)`; the subprocess-only `taskset` path is the
+  sole Linux-specific wrapper. (2) `check_box_valid` gained a MASK-UNVERIFIED arm
+  (right after the n_raw==0 INCOMPLETE block, before WRONG-MASK): when a requested
+  mask parses but the readback does NOT (the sentinel, or any unparseable/garbage
+  value), the cell degrades to INCOMPLETE (non-citable) — it no longer falls
+  through to a phantom OK. `parse_cpu_mask` already treats `"unknown"` as None, so
+  the sentinel round-trips through `parse_box_valid_line` without crashing any
+  consumer. **Tests:** `provenance::box_valid_tests::mask_unverified_is_incomplete_not_silent_ok`
+  (RED-before — proven: with the gate arm stubbed `if false`, an `unknown` readback
+  returns OK; GREEN-after INCOMPLETE) with a GREEN successful-readback control + an
+  OVER-CORRECTION guard (a parseable echo that supersets the request still
+  certifies — the gate keys on the sentinel/unparseable, NOT on "readback ==
+  request") + a garbage-readback INCOMPLETE case; and
+  `runner::tests::mask_readback_parse_sentinel_on_failure` (valid dump → list;
+  None/missing-line/empty-value → `unknown`; sentinel → parse None). 547 tests /
+  0-fail / 0-ignored · clippy 0-new · fmt clean.
 
-- **[WATCH — relay #11]** Two acknowledged BOX-VALID design reliances worth a
-  deterministic stress: (1) `effective_occupancy_min` relativizes the floor by the
-  cell's MEDIAN occupancy, so a >50%-preempted cell (median itself depressed) lets
-  uniform contention pass the occupancy+CONTAMINATION arms — caught only by
-  UNQUIET/DRIFT; verify UNQUIET (`procs_running > k+1`) actually fires for the
-  realistic "1–2 competing procs" case at low k. (2) [RESOLVED — relay #11, see
+- **[TODO — relay #13 candidate, HIGH VoI]** UNQUIET single-competitor blind-spot
+  at low k. `effective_occupancy_min` relativizes the floor by the cell's MEDIAN
+  occupancy, so a >50%-preempted cell (median itself depressed) lets UNIFORM
+  contention pass the occupancy + CONTAMINATION arms — the cell then leans ENTIRELY
+  on UNQUIET/DRIFT. UNQUIET fires only when `procs_running_med > k + PROCS_RUNNING_SLACK`
+  (slack k+1). Deterministically stress whether a realistic "1–2 steady competing
+  procs" actually pushes `procs_running_med` over k+1 at LOW k (k=1: one competitor
+  → run-queue ~2 ≤ 2, MISS; k=2: ~3 ≤ 3, MISS). If a single sustained competitor at
+  k=1 stays under the bar AND occupancy is relativized away, the contention is
+  admitted with NO arm firing — that is a real silent-pass hole. Build the
+  red-before/green-after around a CellBoxStats with depressed median occupancy +
+  procs_running_med just under k+1, and decide whether the floor should key on an
+  ABSOLUTE occupancy bar (not only the relativized one) or UNQUIET slack should
+  shrink at low k. (Relay #12 confirmed the WRONG-MASK/readback arm; this is the
+  next self-validation arm to falsify.)
+
+- **[WATCH — relay #11, item 2 RESOLVED]** (2) [RESOLVED — relay #11, see
   the OVERSUBSCRIBED-SMT DONE entry above] SMT-sibling oversubscription is now
   caught: the runner captures `cpu_phys` (sibling map from
   `/sys/devices/system/cpu/*/topology/thread_siblings_list`) and `check_box_valid`
