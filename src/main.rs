@@ -2988,7 +2988,20 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let out_dir = std::path::PathBuf::from(out.unwrap_or("/dev/shm/fulcrum-art"));
+    let out_dir = match out {
+        Some(o) => std::path::PathBuf::from(o),
+        // Default to Linux tmpfs `/dev/shm` when it exists (fast, RAM-backed);
+        // otherwise (macOS has no /dev/shm) fall back to the OS temp dir so the
+        // runner doesn't fail to create its artifact tree on a non-Linux host.
+        None => {
+            let shm = std::path::Path::new("/dev/shm");
+            if shm.is_dir() {
+                shm.join("fulcrum-art")
+            } else {
+                std::env::temp_dir().join("fulcrum-art")
+            }
+        }
+    };
     let dir = match runner::run(&spec, &out_dir, mode) {
         Ok(dir) => dir,
         Err(e) => {

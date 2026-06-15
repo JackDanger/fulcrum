@@ -1689,6 +1689,38 @@ fn parse_cell(s: &str) -> Option<(String, usize)> {
     Some((c.to_string(), t.parse().ok()?))
 }
 
+// ─── platform abstraction for the live-capture toolchain ─────────────────────
+//
+// The live runner was written for the Linux bench boxes (<BENCH_HOST> / <BENCH_HOST>):
+// `taskset -c <mask>` core-pinning + GNU `/usr/bin/time -v` rusage + coreutils
+// `sha256sum`. macOS (the 2nd measurement arch) has NONE of those in the same
+// shape: no taskset, BSD `/usr/bin/time -l` (different flag; RSS in BYTES on a
+// lowercase line, not "(kbytes)"), and `shasum -a 256` instead of `sha256sum`.
+// These helpers let the live path produce a SANE — if UNPINNED — capture on
+// macOS rather than silently returning all-zero rows. Core-pinning and the
+// frozen-box freeze are documented-unsupported on macOS (see live_invocation_doc).
+
+/// True on Linux, where the live-capture toolchain (`taskset` core-pinning, GNU
+/// `/usr/bin/time -v`) is present. macOS branches to the unpinned BSD path.
+fn linux_live() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// A `Command` running `bin` core-pinned to `mask` where pinning exists (Linux
+/// `taskset -c`); on macOS (no taskset) it runs `bin` UNPINNED. The caller adds
+/// args/env. UNPINNED is a documented degradation, NOT silent — a macOS capture
+/// is a tool-validation capture, not a frozen-box ship number.
+fn pinned_cmd(mask: &str, bin: &str) -> Command {
+    if linux_live() {
+        let mut c = Command::new("taskset");
+        c.arg("-c").arg(mask).arg(bin);
+        c
+    } else {
+        let _ = mask; // pinning unavailable on macOS — run unpinned
+        Command::new(bin)
+    }
+}
+
 // ─── live subprocess primitives (box-only) ───────────────────────────────────
 
 fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
@@ -1710,10 +1742,38 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn sha256_file(path: &str) -> Option<String> {
-    // shell out to sha256sum (box has it); avoids pulling a crypto dep.
-    let out = Command::new("sha256sum").arg(path).output().ok()?;
+    // Prefer `sha256sum` (Linux coreutils; box has it); fall back to
+    // `shasum -a 256` (macOS base system) so the sha-verify works without
+    // coreutils installed. Both print `<hex>  <path>`; take the first field.
+    if let Ok(out) = Command::new("sha256sum").arg(path).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(hex) = s.split_whitespace().next() {
+                return Some(hex.to_string());
+            }
+        }
+    }
+    let out = Command::new("shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let s = String::from_utf8_lossy(&out.stdout);
     s.split_whitespace().next().map(|x| x.to_string())
+}
+
+/// The stdin-reading sha256 command for shell pipelines (`gzip -dc | <this>`).
+/// `sha256sum` on Linux, `shasum -a 256` on macOS; both emit `<hex>  -`.
+fn sha256_pipe_cmd() -> &'static str {
+    if linux_live() {
+        "sha256sum"
+    } else {
+        "shasum -a 256"
+    }
 }
 
 /// Count the `src/` files that ACTUALLY CONSUME env knob `env` at the working
@@ -1821,14 +1881,22 @@ fn timed_masked_envs(
         Ok(f) => f,
         Err(_) => return (0.0, String::new(), 0.0),
     };
-    // /usr/bin/time -v taskset -c <mask> <bin> <args...>
+    // Linux : /usr/bin/time -v taskset -c <mask> <bin> <args...>  (GNU rusage, pinned)
+    // macOS : /usr/bin/time -l <bin> <args...>                    (BSD rusage, UNPINNED)
+    // Both write the rusage report to their OWN stderr (captured below); the
+    // child's stdout streams to the regular-file sink for the sha check.
     let mut cmd = Command::new("/usr/bin/time");
-    cmd.arg("-v")
-        .arg("taskset")
-        .arg("-c")
-        .arg(mask)
-        .arg(bin)
-        .args(args);
+    if linux_live() {
+        cmd.arg("-v")
+            .arg("taskset")
+            .arg("-c")
+            .arg(mask)
+            .arg(bin)
+            .args(args);
+    } else {
+        let _ = mask; // pinning unavailable on macOS — run unpinned
+        cmd.arg("-l").arg(bin).args(args);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -1853,15 +1921,24 @@ fn timed_masked_envs(
     (secs, sha, rss_mb)
 }
 
-/// Parse the peak RSS in MiB from a `/usr/bin/time -v` (GNU time) report. The
-/// line reads `Maximum resident set size (kbytes): N`; kbytes are KiB on Linux
-/// GNU time. Returns `None` when the line is absent (BSD `time` / unavailable).
+/// Parse the peak RSS in MiB from a `/usr/bin/time` rusage report, handling BOTH
+/// the GNU and BSD line formats:
+///   GNU `time -v` (Linux): `Maximum resident set size (kbytes): N`  — N in KiB.
+///   BSD `time -l` (macOS): `<N>  maximum resident set size`         — N in BYTES.
+/// Returns `None` when neither line is present (rusage unavailable).
 fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
         let line = line.trim();
+        // GNU time -v — value is KiB.
         if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
             if let Ok(kib) = rest.trim().parse::<f64>() {
                 return Some(kib / 1024.0);
+            }
+        }
+        // BSD time -l — value is BYTES, on a lowercase trailing-label line.
+        if let Some(n) = line.strip_suffix("maximum resident set size") {
+            if let Ok(bytes) = n.trim().parse::<f64>() {
+                return Some(bytes / (1024.0 * 1024.0));
             }
         }
     }
@@ -1869,10 +1946,7 @@ fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
 }
 
 fn run_verbose(spec: &RunSpec, corpus: &str, t: usize) -> String {
-    let out = Command::new("taskset")
-        .arg("-c")
-        .arg(pin_mask(t))
-        .arg(&spec.gzippy_bin)
+    let out = pinned_cmd(&pin_mask(t), &spec.gzippy_bin)
         .args(["-d", "-c", "-p", &t.to_string(), corpus])
         .env("GZIPPY_VERBOSE", "1")
         .output();
@@ -1912,11 +1986,8 @@ fn oracle_counter(
     if counter.is_empty() {
         return None;
     }
-    let mut cmd = Command::new("taskset");
-    cmd.arg("-c")
-        .arg(pin_mask(t))
-        .arg(&spec.gzippy_bin)
-        .args(["-d", "-c", "-p", &t.to_string(), corpus])
+    let mut cmd = pinned_cmd(&pin_mask(t), &spec.gzippy_bin);
+    cmd.args(["-d", "-c", "-p", &t.to_string(), corpus])
         .env("GZIPPY_VERBOSE", "1");
     if !on_env.is_empty() {
         let (k, v) = split_env(on_env);
@@ -1966,12 +2037,14 @@ fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option
 }
 
 fn corpus_oracle(path: &str) -> (Option<String>, Option<f64>) {
-    // gzip -dc <path> | sha256sum  + byte count. Box-only.
+    // gzip -dc <path> | <sha256> | cut + byte count. `gzip` is cross-platform;
+    // the sha tool differs by OS (sha256sum on Linux, shasum -a 256 on macOS).
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "gzip -dc {q} | sha256sum | cut -d' ' -f1; gzip -dc {q} | wc -c",
-            q = shell_quote(path)
+            "gzip -dc {q} | {sha} | cut -d' ' -f1; gzip -dc {q} | wc -c",
+            q = shell_quote(path),
+            sha = sha256_pipe_cmd()
         ))
         .output();
     match out {
@@ -2181,8 +2254,75 @@ mod tests {
         // 422400 KiB / 1024 = 412.5 MiB.
         let mb = parse_max_rss_mb(block).expect("rss line present");
         assert!((mb - 412.5).abs() < 1e-6, "got {mb}");
-        // a BSD/absent report yields None (graceful).
+        // a non-rusage/absent report yields None (graceful).
         assert!(parse_max_rss_mb("real 0m0.3s\nuser 0m0.1s").is_none());
+    }
+
+    // ── macOS portability: parse a real BSD `/usr/bin/time -l` block → rss_mb ──
+    // BSD reports "maximum resident set size" in BYTES (not KiB) on a lowercase
+    // trailing-label line. This is the exact format macOS `/usr/bin/time -l`
+    // emits (captured live on arm64 macOS during the cross-platform audit).
+    #[test]
+    fn parses_max_rss_from_bsd_time_block() {
+        let block = "\
+        0.10 real         0.00 user         0.00 sys\n\
+             432013312  maximum resident set size\n\
+                   216  page reclaims\n\
+                901312  peak memory footprint\n";
+        // 432013312 bytes / 1048576 = 412.0 MiB.
+        let mb = parse_max_rss_mb(block).expect("bsd rss line present");
+        assert!((mb - 412.0).abs() < 1e-6, "got {mb}");
+        // The BSD parse must NOT misread "peak memory footprint" as the RSS.
+        let only_peak = "                901312  peak memory footprint\n";
+        assert!(parse_max_rss_mb(only_peak).is_none());
+    }
+
+    // ── macOS portability: the stdin sha tool matches the host OS ─────────────
+    #[test]
+    fn sha_pipe_cmd_is_host_appropriate() {
+        let cmd = sha256_pipe_cmd();
+        if cfg!(target_os = "linux") {
+            assert_eq!(cmd, "sha256sum");
+        } else {
+            assert_eq!(cmd, "shasum -a 256");
+        }
+    }
+
+    // ── macOS portability: pinning degrades to UNPINNED off Linux, no error ───
+    // On Linux the live command is `taskset -c <mask> <bin>`; on macOS (no
+    // taskset) it must be the bare `<bin>` so a live run runs UNPINNED instead
+    // of failing to exec a missing `taskset`.
+    #[test]
+    fn pinned_cmd_degrades_unpinned_off_linux() {
+        let c = pinned_cmd("0-3", "/usr/bin/true");
+        let prog = c.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        if cfg!(target_os = "linux") {
+            assert_eq!(prog, "taskset");
+            assert_eq!(args, vec!["-c", "0-3", "/usr/bin/true"]);
+        } else {
+            assert_eq!(prog, "/usr/bin/true");
+            assert!(args.is_empty(), "macOS runs unpinned: {args:?}");
+        }
+    }
+
+    // ── macOS portability: sha256_file actually hashes a real file here ───────
+    // Exercises the live sha primitive on the host's available tool
+    // (sha256sum OR shasum) — proves the sha-verify works cross-platform.
+    #[test]
+    fn sha256_file_hashes_a_real_file() {
+        let p = std::env::temp_dir().join(format!("fulcrum_sha_{}", std::process::id()));
+        fs::write(&p, b"abc\n").unwrap();
+        let got = sha256_file(p.to_str().unwrap()).expect("sha computed");
+        // sha256("abc\n") = edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb
+        assert_eq!(
+            got, "edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb",
+            "host sha256 tool produced wrong digest"
+        );
+        let _ = fs::remove_file(&p);
     }
 
     // ── FIX 3 self-test: the rss dimension FLOWS into the emitted finding ──────
