@@ -1618,9 +1618,10 @@ LXC `ssh -J <JUMP_HOST> root@<GUEST_IP>`):\n\
   # 4. write a run spec (see `fulcrum run --spec-help`) with the box paths:\n\
   #       gzippy_bin, comparator_bin, comparator_path, corpora, threads,\n\
   #       knobs, oracles, perturbations, arch, repo.\n\
-  # 5. run LIVE (all sinks regular-file, interleaved best-of-N>=9, sha-verified):\n\
+  # 5. run LIVE + flow EVERY cell through the five in-process gates and bank\n\
+  #    each CERTIFIED finding — ONE binary, no subprocess, no Python:\n\
   #\n\
-  #   fulcrum run spec.json --live --out /dev/shm/fulcrum-art\n\
+  #   fulcrum run spec.json --live --gate --store <repo>/.fulcrum/findings.jsonl\n\
   #\n\
   #    The runner: interleaves gzippy vs rapidgzip per cell (warm-up dropped,\n\
   #    every run sha-checked against `gzip -dc | sha256sum`); runs each knob\n\
@@ -1629,10 +1630,11 @@ LXC `ssh -J <JUMP_HOST> root@<GUEST_IP>`):\n\
   #    optional removal oracle); DERIVES commit_sha/head_sha/src_changed\n\
   #    (git), knob_consumer_<ENV> (grep -rlF src/), oracle on/off counters\n\
   #    (GZIPPY_VERBOSE sidecar), comparator presence + A/A, sink classes.\n\
-  # 6. pipe the artifact dir through the gates:\n\
-  #       fulcrum provenance  <art>/<runid>            (gate 1)\n\
-  #       python -m fulcrum.core.pipeline  <art>/<runid>   (all five)\n\
-  #       fulcrum comparability --capture <art>/<runid>/gates/capture_*.json ...\n\
+  #    Then --gate reads the emitted artifacts back through PROVENANCE ->\n\
+  #    DIMENSIONED-QUANTITY -> PERTURBATION -> COMPARABILITY -> FINDING-STORE\n\
+  #    (src/pipeline.rs::run_from_artifacts) and banks every CERTIFIED cell.\n\
+  #    Omit --gate to only emit artifacts (then: `fulcrum provenance <art>`\n\
+  #    for gate 1 alone, or `fulcrum comparability --capture ...` ad hoc).\n\
   #\n\
   # FREEZE/RESTORE and the per-corpus sha pins live in scripts/bench/guest.env\n\
   # (gzippy repo). N>=9, boost-off, /dev/null is NOT used — regular-file sinks.\n"
