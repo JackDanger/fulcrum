@@ -31,6 +31,7 @@
 
 pub mod alloc;
 pub mod audit;
+pub mod binloc;
 pub mod bundle;
 pub mod causal;
 pub mod comparability;
@@ -44,6 +45,7 @@ pub mod critpath;
 pub mod decompose;
 pub mod estimate;
 pub mod finding;
+pub mod fingerprint;
 pub mod flow;
 pub mod invariants;
 pub mod mech;
@@ -64,6 +66,7 @@ pub mod scaling;
 pub mod schedule;
 pub mod score;
 pub mod spans;
+pub mod stats;
 pub mod sweep;
 pub mod trace;
 pub mod validate;

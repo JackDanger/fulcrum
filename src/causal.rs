@@ -469,3 +469,173 @@ mod tests {
         assert!((percentile(&s, 100.0) - 5.0).abs() < 1e-9);
     }
 }
+
+// ===========================================================================
+// Knob A/B verdicts — the causal core (CAUSAL-OR-HYPOTHESIS).
+//
+// A faithful Rust port of `decide/fulcrum/core/causal.py` (module-name parity:
+// this file IS `causal`). Attribution (busy time, latency share, critical-path
+// blame) repeatedly manufactures levers that never convert at the wall. The
+// only causal currency here is a same-binary kill-switch A/B whose effect is
+// counter-verified by the SPREAD-RESOLUTION margin.
+//
+// Convention: min-based ratio + max-spread margin (the same-binary kill-switch
+// instrument that separates layout wobble from behavior).
+// ===========================================================================
+
+use crate::stats::{bimodal, resolution, sample_stats, Resolution, SampleStats, BIMODAL_K};
+
+/// The causal A/B status. Tokens match `causal.py` exactly via
+/// [`KnobStatus::token`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnobStatus {
+    /// The altered arm (kill-switch thrown) is faster ⇒ the shipped default
+    /// COSTS wall in this cell (`delta < 0`). Actionable.
+    VerifiedCosts,
+    /// The altered arm is slower ⇒ the feature PAYS (`delta > 0`).
+    VerifiedPays,
+    /// `|delta|` within the spread margin — no causal effect resolved.
+    Null,
+    /// One or both arms had no samples.
+    NoData,
+}
+
+impl KnobStatus {
+    /// The literal token the Python oracle emits.
+    pub fn token(self) -> &'static str {
+        match self {
+            KnobStatus::VerifiedCosts => "CAUSAL-VERIFIED-COSTS",
+            KnobStatus::VerifiedPays => "CAUSAL-VERIFIED-PAYS",
+            KnobStatus::Null => "CAUSAL-NULL",
+            KnobStatus::NoData => "NO-DATA",
+        }
+    }
+}
+
+/// The full knob A/B verdict. Mirrors the dict `causal.knob_verdict` returns.
+#[derive(Debug, Clone)]
+pub struct KnobVerdict {
+    pub status: KnobStatus,
+    /// `(knob_min - base_min) * 1000` (ms). `< 0` ⇒ altered arm faster.
+    pub delta_ms: f64,
+    /// The spread margin in ms (`max(spread_pct)/100 * base_min * 1000`).
+    pub margin_ms: f64,
+    pub base: Option<SampleStats>,
+    pub knob: Option<SampleStats>,
+    /// Either arm flagged bimodal.
+    pub bimodal: bool,
+    pub resolution: Option<Resolution>,
+    pub n_needed: Option<usize>,
+}
+
+/// Knob A/B verdict over two wall-sample lists (seconds).
+///
+/// `knob` is the FEATURE-ALTERED arm (kill-switch thrown / opt-in enabled).
+/// `delta = knob_min - base_min`: `delta < 0` ⇒ altered arm faster ⇒ the
+/// shipped default COSTS wall in this cell (actionable). A `|delta|` within the
+/// max-spread margin is [`KnobStatus::Null`].
+///
+/// Faithful port of `causal.knob_verdict` — same min-based delta, same
+/// `max(spread_pct)/100 * base_min` margin, same branch order.
+pub fn knob_verdict(base: &[f64], knob: &[f64]) -> KnobVerdict {
+    let sb = sample_stats(base);
+    let sk = sample_stats(knob);
+    let (sb, sk) = match (sb, sk) {
+        (Some(b), Some(k)) => (b, k),
+        _ => {
+            return KnobVerdict {
+                status: KnobStatus::NoData,
+                delta_ms: 0.0,
+                margin_ms: 0.0,
+                base: sb,
+                knob: sk,
+                bimodal: false,
+                resolution: None,
+                n_needed: None,
+            };
+        }
+    };
+    let delta = sk.min - sb.min;
+    let margin = sb.spread_pct.max(sk.spread_pct) / 100.0 * sb.min;
+    let (res, n_need) = resolution(delta, margin, margin, sb.n);
+    let status = if delta.abs() > margin {
+        if delta < 0.0 {
+            KnobStatus::VerifiedCosts
+        } else {
+            KnobStatus::VerifiedPays
+        }
+    } else {
+        KnobStatus::Null
+    };
+    KnobVerdict {
+        status,
+        delta_ms: delta * 1000.0,
+        margin_ms: margin * 1000.0,
+        base: Some(sb),
+        knob: Some(sk),
+        bimodal: bimodal(base, BIMODAL_K) || bimodal(knob, BIMODAL_K),
+        resolution: Some(res),
+        n_needed: n_need,
+    }
+}
+
+#[cfg(test)]
+mod knob_tests {
+    use super::*;
+
+    // The knob harness contract from test_decide.py §1.
+    #[test]
+    fn known_null_knob_is_causal_null() {
+        let base = [1.000, 1.002, 1.001, 1.003, 1.002, 1.001, 1.004];
+        let v = knob_verdict(&base, &base);
+        assert_eq!(v.status, KnobStatus::Null, "{:?}", v.status);
+    }
+
+    #[test]
+    fn minus_50ms_shift_is_costs() {
+        let base = [1.000, 1.002, 1.001, 1.003, 1.002, 1.001, 1.004];
+        let knob: Vec<f64> = base.iter().map(|x| x - 0.050).collect();
+        let v = knob_verdict(&base, &knob);
+        assert_eq!(v.status, KnobStatus::VerifiedCosts);
+        assert!(v.delta_ms < 0.0, "delta {} should be negative", v.delta_ms);
+    }
+
+    #[test]
+    fn plus_50ms_shift_is_pays() {
+        let base = [1.000, 1.002, 1.001, 1.003, 1.002, 1.001, 1.004];
+        let knob: Vec<f64> = base.iter().map(|x| x + 0.050).collect();
+        let v = knob_verdict(&base, &knob);
+        assert_eq!(v.status, KnobStatus::VerifiedPays);
+    }
+
+    #[test]
+    fn sub_spread_shift_is_null() {
+        // +10ms on an 8% spread is below the margin => CAUSAL-NULL.
+        let wide = [1.00, 1.05, 1.02, 1.08, 1.01, 1.06, 1.03];
+        let knob: Vec<f64> = wide.iter().map(|x| x + 0.01).collect();
+        let v = knob_verdict(&wide, &knob);
+        assert_eq!(
+            v.status,
+            KnobStatus::Null,
+            "delta_ms={} margin_ms={}",
+            v.delta_ms,
+            v.margin_ms
+        );
+    }
+
+    #[test]
+    fn empty_arm_is_no_data() {
+        let v = knob_verdict(&[], &[1.0, 2.0]);
+        assert_eq!(v.status, KnobStatus::NoData);
+        let v2 = knob_verdict(&[1.0, 2.0], &[]);
+        assert_eq!(v2.status, KnobStatus::NoData);
+    }
+
+    #[test]
+    fn status_tokens_match_python() {
+        assert_eq!(KnobStatus::VerifiedCosts.token(), "CAUSAL-VERIFIED-COSTS");
+        assert_eq!(KnobStatus::VerifiedPays.token(), "CAUSAL-VERIFIED-PAYS");
+        assert_eq!(KnobStatus::Null.token(), "CAUSAL-NULL");
+        assert_eq!(KnobStatus::NoData.token(), "NO-DATA");
+    }
+}

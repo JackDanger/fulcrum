@@ -784,15 +784,9 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
 
 // ── Loader (documented sweep-artifact layout) ───────────────────────────────
 
-fn read_samples(path: &Path) -> Vec<f64> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
+// `read_samples` lives in the canonical `crate::stats` module (unified, not
+// forked — same whitespace-float loader `core/stats.py` defines).
+use crate::stats::read_samples;
 
 /// Load a documented perturb-sweep directory into a [`Sweep`] plus its raw meta
 /// map. Layout (decide/docs/SCHEMA.md):
