@@ -839,6 +839,10 @@ struct CapturedCell {
     ctrl_first: Vec<f64>,
     ctrl_mid: Vec<f64>,
     ctrl_last: Vec<f64>,
+    /// logical-cpu → physical-core key (min of `thread_siblings_list`) for each
+    /// requested CPU, read from sysfs at capture time. EMPTY ⇒ topology not
+    /// captured (fixture / non-Linux) ⇒ the OVERSUBSCRIBED-SMT gate no-ops.
+    cpu_phys: std::collections::BTreeMap<usize, usize>,
 }
 
 /// One measured comparator arm of a cell.
@@ -1065,6 +1069,10 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
                 ctrl_first: gz.clone(),
                 ctrl_mid: gz.clone(),
                 ctrl_last: gz,
+                // Fixture cells carry no real topology → empty map → the
+                // OVERSUBSCRIBED-SMT gate degrades to a no-op (clean by
+                // construction).
+                cpu_phys: std::collections::BTreeMap::new(),
             });
         }
     }
@@ -1551,6 +1559,7 @@ fn measure_cell_live(
         ctrl_first,
         ctrl_mid,
         ctrl_last,
+        cpu_phys: topology_phys_map(&mask),
     })
 }
 
@@ -2001,9 +2010,22 @@ fn box_valid_record(cell: &CapturedCell) -> String {
         (Some(a), Some(b)) => (b - a).max(0.0),
         _ => 0.0,
     };
+    // logical:phys pairs (e.g. "2:2,4:4"); empty ⇒ the field is omitted (the
+    // parser/gate then treat topology as not-captured → SMT check no-ops).
+    let cpuphys = cell
+        .cpu_phys
+        .iter()
+        .map(|(lc, pc)| format!("{lc}:{pc}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cpuphys_field = if cpuphys.is_empty() {
+        String::new()
+    } else {
+        format!(";cpuphys={cpuphys}")
+    };
     format!(
         "cell={}:{};k={};n_raw={};rejected={};clean={};escalated={};occ_med={};procs_med={};\
-         mask={};maskd={};ctrl_first={};ctrl_mid={};ctrl_last={};ctrl_spread={};ts_span={}",
+         mask={};maskd={};ctrl_first={};ctrl_mid={};ctrl_last={};ctrl_spread={};ts_span={}{}",
         cell.corpus,
         cell.threads,
         cell.threads,
@@ -2020,6 +2042,7 @@ fn box_valid_record(cell: &CapturedCell) -> String {
         fmt6(ctrl_last),
         fmt6(ctrl_spread),
         fmt6(ts_span),
+        cpuphys_field,
     )
 }
 
@@ -2986,6 +3009,34 @@ fn mask_readback(mask: &str) -> String {
     mask.to_string()
 }
 
+/// Map each logical CPU in `mask` to its PHYSICAL-core key, read from sysfs
+/// (`/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`). The key is
+/// the MIN of that cpu's sibling set — a stable per-physical-core id that two
+/// hyperthread SIBLINGS share. The gate counts distinct values over the
+/// requested mask to get the number of distinct physical cores the pin spans
+/// (OVERSUBSCRIBED-SMT). A cpu whose sibling list is unreadable/unparseable is
+/// OMITTED, so the map degrades to "not captured" rather than lying — the gate
+/// then skips the SMT check for that cell (never a false VOID). Non-Linux /
+/// missing sysfs ⇒ an empty map (same graceful no-op).
+fn topology_phys_map(mask: &str) -> std::collections::BTreeMap<usize, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(cpus) = crate::provenance::parse_cpu_mask(mask) else {
+        return out;
+    };
+    for cpu in cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        let Ok(txt) = std::fs::read_to_string(&path) else {
+            continue; // unreadable → omit (degrades to not-captured for this cpu)
+        };
+        if let Some(sibs) = crate::provenance::parse_cpu_mask(txt.trim()) {
+            if let Some(&phys) = sibs.iter().next() {
+                out.insert(cpu, phys); // min of the sibling set = physical-core key
+            }
+        }
+    }
+    out
+}
+
 // ─── documented LIVE invocation (specced; not run here) ──────────────────────
 
 /// The exact LIVE invocation for the frozen bench boxes (<BENCH_HOST> / <BENCH_HOST>).
@@ -3162,6 +3213,7 @@ mod tests {
             mask_readback: "2".into(), // cpu 4 narrowed away
             ctrl_medians: vec![1.0, 1.0, 1.0],
             ctrl_spread: 0.001,
+            cpu_phys: std::collections::BTreeMap::new(),
         };
         let v = check_box_valid(std::slice::from_ref(&narrowed));
         assert_eq!(v[0].verdict, CheckVerdict::Void);

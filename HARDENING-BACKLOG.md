@@ -211,7 +211,38 @@ Invariants every iteration must keep green:
   T-cells need re-running on a ≥k-core pool). Cells where the pool ⊇ k cores at every
   T are unaffected.
 
-- **[TODO — relay #11 candidate]** `mask_readback` (runner.rs:2964) FALLBACK comment
+- **[DONE — relay #11, branch `harden/smt-oversubscribe`]** BOX-VALID gate hole:
+  OVERSUBSCRIBED-SMT. Sibling of the relay-#10 `|mask| < k` hole — a cell where
+  `|mask| == k` (so the relay-#10 check is silent) but the k pinned logical CPUs are
+  HYPERTHREAD SIBLINGS of each other, mapping to `< k` distinct PHYSICAL cores. Such
+  a cell oversubscribes physical cores (k threads contend for SMT siblings of the same
+  core, steady self-contention) yet passed every gate: WRONG-MASK silent (request ⊆
+  readback), `|mask| < k` silent (`|mask| == k`), occupancy/CONTAMINATION relativize
+  the steady contention away, UNQUIET/DRIFT pass. **Topology FACT captured FIRST
+  (read-only sysfs on <BENCH_HOST> LXC-199, no freeze, did not disturb the live matrix
+  leader):** `core_pool=[2,4,8,10,12,14,0]` → `thread_siblings_list` =
+  2-3,4-5,8-9,10-11,12-13,14-15,0-1 → physical-core keys {2,4,8,10,12,14,0}, all 7
+  DISTINCT P-cores (siblings 3,5,9,11,13,15,1 are NOT in the pool). So the live T7
+  cells are physically clean — NO already-banked cell is retroactively suspect from
+  THIS box's pool. Fix: new `cpu_phys` capture in runner.rs (`topology_phys_map`,
+  per-requested-cpu min-of-`thread_siblings_list`, emitted as `cpuphys=lc:pc,…` in the
+  box_valid line, parsed back in `parse_box_valid_line`) + a new OVERSUBSCRIBED-SMT
+  VOID in `check_box_valid` right after the `|mask| < k` OVERSUBSCRIBED block: VOIDs
+  when the requested mask's k logical CPUs map to `< k` distinct physical-core keys.
+  NOT a weakening: k distinct PHYSICAL cores (siblings excluded) still pass; topology
+  not-captured / partial (any requested cpu unmapped) degrades to a NO-OP, never a
+  false VOID. Regression test `oversubscribed_smt_voids_red_before_green_after`
+  (proven RED with the guard stubbed to `if false`, GREEN live; GREEN controls:
+  distinct-physical pair + the live <BENCH_HOST> T7 7-distinct-P-core shape + the
+  partial-topology graceful no-op) + cpuphys round-trip assertion in
+  `box_valid_line_round_trips`. 545 tests / 0-fail / 0-ignored · clippy 0-new (9 == 9)
+  · fmt clean. **GATE BEHAVIOR CHANGED (strengthened):** any already-banked cell whose
+  k pinned logical CPUs included SMT siblings was admitted as CERTIFIED and is now
+  SUSPECT — but only IF the run's core pool contained sibling pairs. The live <BENCH_HOST>
+  pool does NOT (verified above), so <BENCH_HOST>-banked cells are unaffected; re-check
+  <BENCH_HOST>'s pool the same way before trusting its high-T cells.
+
+- **[TODO — relay #12 candidate]** `mask_readback` (runner.rs:2964) FALLBACK comment
   is inaccurate AND a latent WRONG-MASK bypass. When `taskset … cat /proc/self/status`
   fails/empty it returns `mask.to_string()` (echoes the REQUEST). The doc-comment
   claims this "degrades to INCOMPLETE rather than a false VOID" — but it does NOT
@@ -228,12 +259,11 @@ Invariants every iteration must keep green:
   cell's MEDIAN occupancy, so a >50%-preempted cell (median itself depressed) lets
   uniform contention pass the occupancy+CONTAMINATION arms — caught only by
   UNQUIET/DRIFT; verify UNQUIET (`procs_running > k+1`) actually fires for the
-  realistic "1–2 competing procs" case at low k. (2) SMT-sibling oversubscription
-  (T8 pinned to 4 physical P-cores' 8 logical SMT threads) is NOT detectable from
-  `|mask|` alone — `|mask| == k` but the cores are siblings. Needs topology
-  (sibling map from `/sys/devices/system/cpu/*/topology/thread_siblings_list`)
-  captured by the runner before the gate could catch it. Designed-deferred (needs
-  new capture); flag if the rg-T4+ hunt cares about SMT pinning.
+  realistic "1–2 competing procs" case at low k. (2) [RESOLVED — relay #11, see
+  the OVERSUBSCRIBED-SMT DONE entry above] SMT-sibling oversubscription is now
+  caught: the runner captures `cpu_phys` (sibling map from
+  `/sys/devices/system/cpu/*/topology/thread_siblings_list`) and `check_box_valid`
+  VOIDs when the k requested logical CPUs span `< k` distinct physical cores.
 
 - **[DONE — branch `harden/post-removal-audit`]** Adversarial post-removal audit:
   re-validated the standalone Rust `fulcrum` as self-sufficient now that the Python

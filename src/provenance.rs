@@ -429,6 +429,16 @@ pub struct CellBoxStats {
     pub ctrl_medians: Vec<f64>,
     /// the control IQR dispersion floor (seconds) drift is judged against.
     pub ctrl_spread: f64,
+    /// logical-cpu → physical-core key (the min of that cpu's
+    /// `thread_siblings_list`), captured from sysfs for each requested logical
+    /// CPU. Two logical CPUs that are HYPERTHREAD SIBLINGS share a physical-core
+    /// key, so the count of DISTINCT values over the requested mask is the
+    /// number of distinct PHYSICAL cores the pin actually spans — the witness
+    /// the OVERSUBSCRIBED-SMT check needs. EMPTY ⇒ topology not captured
+    /// (fixture / non-Linux / unreadable sysfs) ⇒ the SMT check degrades to a
+    /// no-op (never a false VOID). Partial (some requested cpu missing) is also
+    /// treated as not-captured for the SMT check.
+    pub cpu_phys: std::collections::BTreeMap<usize, usize>,
 }
 
 impl Default for CellBoxStats {
@@ -446,6 +456,7 @@ impl Default for CellBoxStats {
             mask_readback: String::new(),
             ctrl_medians: Vec::new(),
             ctrl_spread: 0.0,
+            cpu_phys: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -961,6 +972,11 @@ pub fn check_comparator_present(
 ///   to the pool size, so `k` threads contend for `< k` cores). WRONG-MASK cannot
 ///   catch this — the clamped request IS a subset of the readback; the contention
 ///   is steady so occupancy relativizes it away and `procs_running` stays ≤ k+1.
+/// * OVERSUBSCRIBED-SMT — the requested mask has k DISTINCT logical CPUs (so the
+///   `|mask| < k` check above is silent) but some are HYPERTHREAD SIBLINGS of
+///   each other, so they span `< k` distinct PHYSICAL cores. Caught only by the
+///   per-cpu physical-core mapping (`cpu_phys`); degrades to a no-op when the
+///   topology was not captured.
 /// * CONTAMINATION — > [`REJECT_VOID_FRAC`] of raw samples preempted/fenced, or
 ///   fewer than [`MIN_N`] clean samples remain.
 /// * UNDERPOWERED-AFTER-REJECT — escalated to [`N_RAW_ESCALATED`] and STILL <
@@ -1044,6 +1060,50 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
                         ),
                     ));
                     continue;
+                }
+            }
+        }
+
+        // -- OVERSUBSCRIBED-SMT: the requested mask has k DISTINCT logical CPUs
+        //    (so |mask| == k and the |mask| < k check above is silent) BUT some
+        //    of them are HYPERTHREAD SIBLINGS of each other, so they map to
+        //    FEWER than k distinct PHYSICAL cores. k threads then contend for
+        //    SMT siblings of the same core — the wall is inflated by the same
+        //    steady self-contention the plain OVERSUBSCRIBED check catches, and
+        //    occupancy/UNQUIET miss it the same way. Caught only by the per-cpu
+        //    physical-core mapping (`cpu_phys`). Degrades to a no-op when the
+        //    topology was not captured or is incomplete for the requested mask
+        //    (never a false VOID). `cpu_phys` capture: src/runner.rs.
+        if c.k > 0 && !c.cpu_phys.is_empty() {
+            if let Some(req) = parse_cpu_mask(&c.mask_requested) {
+                // Map EVERY requested cpu to its physical-core key; bail (skip
+                // the check) if any requested cpu has no capture — partial
+                // topology is untrusted, not a contradiction.
+                let phys: Option<std::collections::BTreeSet<usize>> =
+                    req.iter().map(|cpu| c.cpu_phys.get(cpu).copied()).collect();
+                if let Some(phys_set) = phys {
+                    if phys_set.len() < c.k {
+                        out.push(GateCheck::new(
+                            BOX_VALID,
+                            CheckVerdict::Void,
+                            scope,
+                            format!(
+                                "OVERSUBSCRIBED-SMT: {} thread(s) pinned to {} distinct logical \
+                                 CPU(s) {{{}}} that map to only {} distinct PHYSICAL core(s) \
+                                 ({{{}}}) — some pinned CPUs are hyperthread siblings of the same \
+                                 core, so k threads contend for SMT siblings and the wall is \
+                                 inflated by self-contention (steady, so occupancy/UNQUIET miss \
+                                 it). Re-run with a core pool of ≥ k cores with NO SMT siblings \
+                                 (one thread per physical core)",
+                                c.k,
+                                req.len(),
+                                fmt_set(&req),
+                                phys_set.len(),
+                                fmt_set(&phys_set),
+                            ),
+                        ));
+                        continue;
+                    }
                 }
             }
         }
@@ -1436,6 +1496,20 @@ pub fn parse_box_valid_line(v: &str) -> Option<CellBoxStats> {
             "procs_med" => c.procs_running_med = val.parse().unwrap_or(0.0),
             "mask" => c.mask_requested = val.to_string(),
             "maskd" => c.mask_readback = val.to_string(),
+            // logical:phys pairs, comma-joined (e.g. "2:2,3:2,4:4"). Malformed
+            // pairs are skipped (incomplete topology degrades the SMT check to a
+            // no-op rather than corrupting the map).
+            "cpuphys" => {
+                for pair in val.split(',') {
+                    if let Some((lc, pc)) = pair.split_once(':') {
+                        if let (Ok(lc), Ok(pc)) =
+                            (lc.trim().parse::<usize>(), pc.trim().parse::<usize>())
+                        {
+                            c.cpu_phys.insert(lc, pc);
+                        }
+                    }
+                }
+            }
             "ctrl_first" | "ctrl_mid" | "ctrl_last" => {
                 if let Ok(x) = val.parse::<f64>() {
                     // A control-block median of 0.0 means the block was NOT
@@ -1955,6 +2029,9 @@ mod box_valid_tests {
             mask_readback: "0-15".into(),
             ctrl_medians: vec![1.000, 1.000, 1.000],
             ctrl_spread: 0.001,
+            // no topology captured by default → OVERSUBSCRIBED-SMT no-ops; the
+            // SMT test plants cpu_phys explicitly to exercise the check.
+            cpu_phys: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2089,6 +2166,90 @@ mod box_valid_tests {
         );
     }
 
+    // ── 3c. OVERSUBSCRIBED-SMT (|mask| == k, but the k logical CPUs map to ──
+    //    < k distinct PHYSICAL cores: hyperthread siblings of the same core).
+    //    The plain OVERSUBSCRIBED check is SILENT here (|mask| == k); WRONG-MASK
+    //    and occupancy/UNQUIET miss it the same way they miss the clamp case.
+    //    Caught ONLY by the per-cpu physical-core mapping (`cpu_phys`).
+    //
+    //    RED-before/GREEN-after: stub the SMT block's guard to `if false` (or
+    //    delete the block) and the sibling-pair assertion below flips to OK —
+    //    that is the regression this test locks.
+    #[test]
+    fn oversubscribed_smt_voids_red_before_green_after() {
+        use std::collections::BTreeMap;
+
+        // GREEN control 1: the clean cell carries no topology capture →
+        // the SMT check degrades to a no-op (never a false VOID).
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+
+        // RED-before: T2 cell pinned to cpus {2,3} which are SMT siblings of
+        // the SAME physical core (both map to phys key 2). |mask| == k == 2 so
+        // plain OVERSUBSCRIBED is silent; readback supersets the request so
+        // WRONG-MASK is silent; the run is clean/quiet/drift-free. Must VOID.
+        let mut c = clean_cell();
+        c.k = 2;
+        c.mask_requested = "2,3".into();
+        c.mask_readback = "0-15".into(); // pool ⊇ request → WRONG-MASK passes
+        c.procs_running_med = 2.0; // ≤ k+1 = 3 → UNQUIET passes
+        c.cpu_phys = BTreeMap::from([(2, 2), (3, 2)]); // 2 & 3 share phys core 2
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(
+            v,
+            CheckVerdict::Void,
+            "k logical CPUs on < k physical cores VOIDs"
+        );
+        assert!(
+            reason.contains("OVERSUBSCRIBED-SMT"),
+            "names OVERSUBSCRIBED-SMT: {reason}"
+        );
+        assert!(
+            reason.contains("2 thread")
+                && reason.contains("2 distinct logical")
+                && reason.contains("1 distinct PHYSICAL core"),
+            "names the logical-vs-physical mismatch: {reason}"
+        );
+
+        // GREEN-after 1 (no over-correction): same k=2 mask but the two CPUs
+        // are DISTINCT physical cores (phys keys 2 and 4) → certifies.
+        let mut ok = c.clone();
+        ok.mask_requested = "2,4".into();
+        ok.cpu_phys = BTreeMap::from([(2, 2), (4, 4)]);
+        assert_eq!(
+            verdict_of(&ok).0,
+            CheckVerdict::Ok,
+            "k distinct physical cores is not SMT-oversubscribed"
+        );
+
+        // GREEN-after 2 (the LIVE <BENCH_HOST> shape): core_pool=[2,4,8,10,12,14,0]
+        // at T7 — 7 distinct logical CPUs, each on its OWN physical core (sysfs
+        // thread_siblings_list 2-3,4-5,8-9,10-11,12-13,14-15,0-1 → phys mins
+        // 2,4,8,10,12,14,0 all distinct). Must certify — this is the fact that
+        // the live high-T run is physically clean.
+        let mut live = clean_cell();
+        live.k = 7;
+        live.mask_requested = "2,4,8,10,12,14,0".into();
+        live.mask_readback = "0-15".into();
+        live.procs_running_med = 7.0;
+        live.cpu_phys =
+            BTreeMap::from([(2, 2), (4, 4), (8, 8), (10, 10), (12, 12), (14, 14), (0, 0)]);
+        assert_eq!(
+            verdict_of(&live).0,
+            CheckVerdict::Ok,
+            "7 distinct physical P-cores certifies (the live <BENCH_HOST> T7 shape)"
+        );
+
+        // GRACEFUL: partial topology (a requested cpu missing from the map) →
+        // the SMT check is skipped (untrusted), not a false VOID.
+        let mut partial = c.clone();
+        partial.cpu_phys = BTreeMap::from([(2, 2)]); // cpu 3 unmapped
+        assert_eq!(
+            verdict_of(&partial).0,
+            CheckVerdict::Ok,
+            "incomplete topology degrades the SMT check to a no-op"
+        );
+    }
+
     // ── 4. UNQUIET (busy run-queue: procs_running > k+1) ───────────────────
     #[test]
     fn unquiet_voids_red_before_green_after() {
@@ -2180,7 +2341,7 @@ mod box_valid_tests {
     fn box_valid_line_round_trips() {
         let v = "cell=silesia:4;k=4;n_raw=15;rejected=2;clean=13;escalated=0;occ_med=0.97;\
                  procs_med=4.0;mask=2,4,8,10;maskd=0-15;ctrl_first=1.0;ctrl_mid=1.001;\
-                 ctrl_last=1.0;ctrl_spread=0.002;ts_span=15.0";
+                 ctrl_last=1.0;ctrl_spread=0.002;ts_span=15.0;cpuphys=2:2,4:4,8:8,10:10";
         let c = parse_box_valid_line(v).unwrap();
         assert_eq!(c.cell, "silesia:4");
         assert_eq!(c.k, 4);
@@ -2191,6 +2352,12 @@ mod box_valid_tests {
         assert_eq!(c.mask_requested, "2,4,8,10");
         assert_eq!(c.mask_readback, "0-15");
         assert_eq!(c.ctrl_medians, vec![1.0, 1.001, 1.0]);
+        // cpuphys parses into the logical→physical map (4 distinct physical
+        // cores for k=4 → OVERSUBSCRIBED-SMT stays silent).
+        assert_eq!(
+            c.cpu_phys,
+            std::collections::BTreeMap::from([(2, 2), (4, 4), (8, 8), (10, 10)])
+        );
         assert_eq!(verdict_of(&c).0, CheckVerdict::Ok, "a clean line certifies");
     }
 }
