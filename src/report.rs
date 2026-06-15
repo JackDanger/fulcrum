@@ -149,9 +149,15 @@ fn render_one_tma(o: &mut String, tma: &Tma) {
         commas(tma.be_bound)
     );
     let total_frac = tma.retiring_frac + tma.bad_spec_frac + tma.fe_bound_frac + tma.be_bound_frac;
+    let closure_note = if tma.degraded {
+        "DEGRADED — 4th category filled by subtraction; closure NOT independently verified"
+    } else {
+        "CONSERVED — closure guard passed"
+    };
     ln!(
-        "  sum             :  {:6.2}%  (CONSERVED — closure guard passed)",
-        total_frac * 100.0
+        "  sum             :  {:6.2}%  ({})",
+        total_frac * 100.0,
+        closure_note
     );
     if tma.backend_split_available {
         ln!("-- BACKEND SPLIT ({}) --", tma.backend_split_note);

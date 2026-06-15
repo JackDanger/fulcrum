@@ -234,6 +234,52 @@ fn three_category_infers_missing_fourth_by_subtraction() {
     assert!((tma.be_bound_frac - 0.25).abs() < 1e-9);
 }
 
+// ── DEFECT 4 — the 3-of-4 subtraction fill must NOT certify a NEGATIVE
+//    category, and must mark the breakdown DEGRADED (closure not independently
+//    verified). Adversary: the 3 measured categories already exceed slots, so
+//    the inferred 4th is negative — the old code returned Ok with
+//    be_bound_frac = -0.200 (the closure test is a tautology when one category
+//    is filled by subtraction, so it could never catch this).
+
+#[test]
+fn three_category_negative_fill_refuses_by_name() {
+    // slots=1000; retiring+bad_spec+fe_bound = 1200 > slots; be_bound absent.
+    // Inferred be_bound = 1000-1200 = -200  ⇒  be_bound_frac = -0.200.
+    let stat = "  1,000      topdown.slots\n\
+                  500      topdown-retiring\n\
+                  400      topdown-bad-spec\n\
+                  300      topdown-fe-bound\n";
+    assert!(
+        raises_named(
+            tma_from_text(stat, None, DEFAULT_TOL_PCT),
+            "TMA-NEGATIVE-CATEGORY"
+        ),
+        "a NEGATIVE subtraction-filled category must REFUSE (mismatched capture)"
+    );
+}
+
+#[test]
+fn three_category_fill_is_marked_degraded() {
+    // A valid (positive) 3-of-4 fill still closes, but the closure guarantee is
+    // NOT granted on the subtraction tautology — the breakdown is DEGRADED.
+    let stat = "  10,000      topdown.slots\n\
+                  4,000      topdown-retiring\n\
+                  1,500      topdown-bad-spec\n\
+                  2,000      topdown-fe-bound\n";
+    let tma = from_text(stat, None);
+    assert!(tma.degraded, "subtraction-filled breakdown is DEGRADED");
+}
+
+#[test]
+fn four_category_closed_is_not_degraded() {
+    // All four independently measured + closing ⇒ full guarantee, NOT degraded.
+    let tma = from_text(&Stat::default().text(), Some("known"));
+    assert!(
+        !tma.degraded,
+        "a 4-of-4 closed ledger keeps the full closure guarantee"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // 5. TMA-BACKEND-INCOHERENT refusal MUST FIRE: stalls_mem_any > cycles.
 // ──────────────────────────────────────────────────────────────────────────

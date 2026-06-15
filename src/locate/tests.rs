@@ -387,6 +387,60 @@ fn conserved_serial_does_not_refuse_and_closes() {
     assert!(assert_path_closed(&r.path).is_ok());
 }
 
+// ── DEFECT 5 — CONSERVATION-OR-NO-LOCATE must test an INDEPENDENT quantity ──
+//
+// The old assert was `|(on_compute+on_wait+residual) - wall_us| > 1.0`, which
+// is `|wall - wall| = 0` for ALL inputs (residual := wall - covered) — it could
+// never fire. The fix recomputes, by interval-union over the path geometry, how
+// much classified busy time actually falls INSIDE the declared wall window; busy
+// time OUTSIDE the window means the trace and the wall claim disagree and the
+// in-window ledger cannot close — REFUSE. This is distinct from the (kept)
+// negative-residual flag, which owns the covered>wall case.
+#[test]
+fn conservation_refuses_busy_time_outside_wall_window() {
+    // Two compute spans on one thread: [0,40]ms and [60,100]ms (covered=80ms).
+    // Declared wall = 90ms ⇒ residual = +10ms (POSITIVE — the negative-residual
+    // flag does NOT fire). But span `b` runs to 100ms, 10ms past the window, so
+    // 10ms of busy time lies OUTSIDE [0,90]ms ⇒ the in-window ledger fails to
+    // close ⇒ REFUSE. The old tautological assert returned Ok here.
+    let p = write(
+        "outside_window",
+        &[
+            span_events("a", 1, 0.0, 40_000.0),
+            span_events("b", 1, 60_000.0, 100_000.0),
+        ],
+    );
+    let err = locate(&[&p], Some(90.0), DEFAULT_THRESHOLD_PCT, None, None)
+        .expect_err("busy time outside the wall window must REFUSE");
+    match err {
+        LocateError::Conservation(v) => {
+            assert_eq!(v.invariant, CONSERVATION_INVARIANT);
+            assert!(
+                v.message.contains("OUTSIDE the wall window"),
+                "names the independent in-window ledger failure: {}",
+                v.message
+            );
+        }
+        other => panic!("expected Conservation refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn conservation_in_window_does_not_refuse() {
+    // Positive control: the SAME spans with a declared wall (110ms) that fully
+    // contains them close the in-window ledger — NOT refused.
+    let p = write(
+        "inside_window",
+        &[
+            span_events("a", 1, 0.0, 40_000.0),
+            span_events("b", 1, 60_000.0, 100_000.0),
+        ],
+    );
+    let res = locate(&[&p], Some(110.0), DEFAULT_THRESHOLD_PCT, None, None)
+        .expect("a fully-contained ledger must NOT refuse");
+    assert!(res.per_trace[0].residual_ms > 0.0);
+}
+
 // ===========================================================================
 // 7. Adapter wait list vs the substring default
 // ===========================================================================
