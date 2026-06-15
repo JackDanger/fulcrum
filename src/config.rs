@@ -17,7 +17,9 @@
 //! Supply it with `--config profile.json`. With no `--config`, the built-in
 //! [`Config::demo`] is used, which matches the bundled toy pipeline example.
 
+use crate::trace::Taxonomy;
 use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// A source-line range identifying one region in a file. Coz reports the
@@ -695,5 +697,814 @@ impl Default for Config {
     /// The generic profile (no pipeline-specific needles).
     fn default() -> Self {
         Config::generic()
+    }
+}
+
+// ===========================================================================
+// Project adapter surface (faithful port of `decide/fulcrum/adapters/base.py`
+// + `adapters/gzippy.py`).
+//
+// The core trace-analysis engine ([`crate::trace::analyze`]) is project-
+// agnostic; a [`ProjectAdapter`] supplies the project's span taxonomy plus the
+// counter/routing/oracle guards that keep a contaminated run from being read as
+// truth. The gzippy span VOCABULARY (consumer profile, flow stages, regions)
+// already lives in [`Config::gzippy`]; this adapter surface is the COMPLEMENT
+// (taxonomy + guards), unified into this one config module rather than forked
+// into a second config. [`GzippyAdapter::config`] ties the two together.
+// ===========================================================================
+
+/// One same-binary kill-switch. Faithful port of `adapters/base.py::Knob`.
+///
+/// `env` is the FEATURE-ALTERED arm; `pred` names the effect predicate proving
+/// the switch engaged; `desc` is human-readable. `reverted` marks a knob
+/// guarding a previously-shipped-then-reverted feature (the decision brief says
+/// "reconcile with the prior revert" instead of "fix/condition" — structured,
+/// not string-matched from the desc).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Knob {
+    pub env: String,
+    pub pred: String,
+    pub desc: String,
+    pub reverted: bool,
+}
+
+impl Knob {
+    fn new(env: &str, pred: &str, desc: &str) -> Self {
+        Knob {
+            env: env.to_string(),
+            pred: pred.to_string(),
+            desc: desc.to_string(),
+            reverted: false,
+        }
+    }
+    fn reverted(env: &str, pred: &str, desc: &str) -> Self {
+        Knob {
+            reverted: true,
+            ..Knob::new(env, pred, desc)
+        }
+    }
+}
+
+/// The plug surface between the fulcrum core and a project. Faithful port of
+/// `adapters/base.py::ProjectAdapter` (the methods the trace engine consumes).
+///
+/// Default methods reproduce the base-class behavior: an empty taxonomy, no
+/// routing/oracle guard, the documented-manifest comparator key. A project
+/// subclasses by implementing a struct (see [`GzippyAdapter`]).
+pub trait ProjectAdapter {
+    /// Project identity.
+    fn name(&self) -> &str {
+        "project"
+    }
+    /// PASS bar for the comparator ratio (project policy).
+    fn tie_bar(&self) -> f64 {
+        0.99
+    }
+    /// Span-name classification (wait/compute/output/...). The trace engine
+    /// borrows this; an implementor must own a [`Taxonomy`].
+    fn taxonomy(&self) -> &Taxonomy;
+    /// Counter-sidecar text -> `{counter: value}`.
+    fn parse_counters(&self, _text: &str) -> BTreeMap<String, i64> {
+        BTreeMap::new()
+    }
+    /// `(is_production, reason)`. `Some(false)` => the run is oracle-contaminated
+    /// and its numbers are REFUSED; `None` => inconclusive (cannot certify
+    /// production routing).
+    fn routing_guard(
+        &self,
+        _counters: &BTreeMap<String, i64>,
+        _feature: Option<&str>,
+    ) -> (Option<bool>, String) {
+        (None, "adapter provides no routing guard".to_string())
+    }
+    /// Removal-oracle contamination warnings (a handicapped contender must not
+    /// be read as a ceiling).
+    fn oracle_guard(
+        &self,
+        _counters: &BTreeMap<String, i64>,
+        _trace_self: &HashMap<String, (f64, f64, usize)>,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+    /// Normalized comparator tool version for the fingerprint's `comparator`
+    /// field. The default reads the documented manifest key; "unknown" never
+    /// compares.
+    fn comparator_version(&self, manifest: &BTreeMap<String, String>) -> String {
+        manifest
+            .get("comparator_version")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+    /// The project's same-binary kill-switch registry (name -> [`Knob`]).
+    fn knobs(&self) -> BTreeMap<String, Knob> {
+        BTreeMap::new()
+    }
+    /// Suggested perturbation command per trace class (compute/output/wait/idle).
+    fn perturbations(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+}
+
+/// The bare base adapter: empty taxonomy, no guards (the honest "I don't know
+/// your pipeline yet" default). Mirrors instantiating `ProjectAdapter()` in
+/// Python.
+#[derive(Debug, Default)]
+pub struct BaseAdapter {
+    taxonomy: Taxonomy,
+}
+
+impl BaseAdapter {
+    pub fn new() -> Self {
+        BaseAdapter::default()
+    }
+}
+
+impl ProjectAdapter for BaseAdapter {
+    fn taxonomy(&self) -> &Taxonomy {
+        &self.taxonomy
+    }
+}
+
+/// The gzippy span classification taxonomy. Faithful port of
+/// `adapters/gzippy.py::GZIPPY_TAXONOMY`.
+///
+/// A WAIT (blocked on another thread's decode future) must NEVER be counted as
+/// serial COMPUTE work — that inversion bit the campaign. UNKNOWN names are
+/// surfaced, never silently bucketed.
+pub fn gzippy_taxonomy() -> Taxonomy {
+    let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    Taxonomy {
+        // A WAIT span = this thread is BLOCKED on another thread / future / lock.
+        wait_prefixes: v(&[
+            "wait.",
+            "lock.wait",
+            "pool.pick.wait",
+            "consumer.wait_replaced_markers",
+            "consumer.dispatch_recv",
+            "ttp.rx_recv_block",
+            "ttp.get_if_available",
+        ]),
+        // OUTPUT = bytes/checksum leaving the pipeline (the serial tail).
+        output_prefixes: v(&[
+            "consumer.writev",
+            "consumer.write_buffered",
+            "consumer.combine_crc",
+            "consumer.publish_windows",
+            "consumer.window_publish_clean",
+            "consumer.window_publish_marker",
+        ]),
+        // COMPUTE = actual decode / marker-resolve / window-apply work.
+        compute_prefixes: v(&[
+            "worker.",
+            "post_process.apply_window",
+            "post_process.task",
+            "pool.run_task",
+            "consumer.eager_postproc",
+            "consumer.process_prefetches",
+            "consumer.queue_prefetched_postproc",
+            "consumer.arc_take_or_clone",
+            "consumer.dispatch_post_process",
+            "consumer.get_last_window",
+            "consumer.try_take_prefetched",
+            "consumer.block_finder_get",
+            "ttp.take_prefetch",
+            "coord.prefetch",
+        ]),
+        // Scheduler bookkeeping: neither engine compute nor a blocking wait.
+        sched_overhead_prefixes: v(&["pool.submit", "pool.pick.lock", "pool.pick"]),
+        // Outer loop frames nest everything; excluded from the busy/wait split.
+        outer_frame_names: v(&["consumer.iter", "consumer.drain", "consumer.dispatch_recv"]),
+        // lock.held is OVERHEAD, NOT busy.
+        overhead_prefixes: v(&["lock.held"]),
+        // Emitted ONLY on the consumer thread.
+        consumer_exclusive_frames: v(&["consumer.iter", "consumer.drain"]),
+    }
+}
+
+/// The gzippy (reference) project adapter. Faithful port of
+/// `adapters/gzippy.py::GzippyAdapter` — the trace taxonomy, counter-sidecar
+/// patterns, re-derived routing/seeding guard, oracle-contamination guard,
+/// comparator-version normalizer, and knob/perturbation registries.
+#[derive(Debug)]
+pub struct GzippyAdapter {
+    taxonomy: Taxonomy,
+}
+
+impl Default for GzippyAdapter {
+    fn default() -> Self {
+        GzippyAdapter::new()
+    }
+}
+
+impl GzippyAdapter {
+    pub fn new() -> Self {
+        GzippyAdapter {
+            taxonomy: gzippy_taxonomy(),
+        }
+    }
+
+    /// The gzippy span VOCABULARY config (consumer profile + flow stages +
+    /// regions). Ties this adapter's taxonomy/guards to the one canonical
+    /// [`Config`] — there is no second config.
+    pub fn config(&self) -> Config {
+        Config::gzippy()
+    }
+}
+
+impl ProjectAdapter for GzippyAdapter {
+    fn name(&self) -> &str {
+        "gzippy"
+    }
+
+    // The binding TIE bar: >=0.99x at EVERY thread count.
+    fn tie_bar(&self) -> f64 {
+        0.99
+    }
+
+    fn taxonomy(&self) -> &Taxonomy {
+        &self.taxonomy
+    }
+
+    fn parse_counters(&self, text: &str) -> BTreeMap<String, i64> {
+        let mut out = BTreeMap::new();
+        // (key, needle, exclude-when-preceded-by-"oracle_"). The two ISA-L
+        // patterns carry the negative-lookbehind that keeps `isal_chunks` and
+        // `isal_oracle_chunks` disjoint (Python uses `(?<!oracle_)`; the Rust
+        // `regex` crate has no lookbehind, so this is a faithful manual port).
+        let specs: &[(&str, &str, bool)] = &[
+            ("window_seeded", "window_seeded=", false),
+            ("flip_to_clean", "flip_to_clean=", false),
+            ("finished_no_flip", "finished_no_flip=", false),
+            ("seeded_block", "seeded_block=", false),
+            ("seeded_wrapper", "seeded_wrapper=", false),
+            ("exact_block", "exact_block=", false),
+            ("exact_wrapper", "exact_wrapper=", false),
+            ("isal_chunks", "isal_chunks=", true),
+            ("isal_fallbacks", "isal_fallbacks=", true),
+            ("isal_oracle_chunks", "isal_oracle_chunks=", false),
+            ("isal_oracle_fallbacks", "isal_oracle_fallbacks=", false),
+            ("bad_seed_resync", "bad_seed_resync=", false),
+            ("seed_replay_hits", "SEED_WINDOWS replay: hits=", false),
+            ("bypass_replay_hits", "BYPASS_DECODE replay: hits=", false),
+        ];
+        for (key, needle, excl) in specs {
+            if let Some(n) = find_counter(text, needle, *excl) {
+                out.insert(key.to_string(), n);
+            }
+        }
+        out
+    }
+
+    fn routing_guard(
+        &self,
+        counters: &BTreeMap<String, i64>,
+        feature: Option<&str>,
+    ) -> (Option<bool>, String) {
+        if counters.is_empty() {
+            return (
+                None,
+                "NO COUNTER SIDECAR -- cannot verify production routing. \
+                 Capture with GZIPPY_VERBOSE=1 2> verbose_<label>.txt and pass \
+                 --counters. REFUSING to certify this as a production-routing \
+                 measurement."
+                    .to_string(),
+            );
+        }
+        let get = |k: &str| counters.get(k).copied().unwrap_or(0);
+        let feat = feature.unwrap_or("").replace("gzippy-", "");
+        let replay = get("seed_replay_hits");
+        let bypass = get("bypass_replay_hits");
+        let oracle = get("isal_chunks").max(get("isal_oracle_chunks"));
+        let seeded = get("window_seeded");
+        let flips = get("flip_to_clean");
+        let no_flip = get("finished_no_flip");
+        let seeded_block = get("seeded_block");
+        let exact_block = get("exact_block");
+        if replay > 0 {
+            return (
+                Some(false),
+                format!(
+                    "ORACLE-SEEDED RUN (SEED_WINDOWS replay hits={replay}). The \
+                     seed store forced clean-engine decodes at boundaries \
+                     production would marker-bootstrap. This measures the \
+                     clean-engine ceiling, NOT production."
+                ),
+            );
+        }
+        if bypass > 0 {
+            return (
+                Some(false),
+                format!(
+                    "BYPASS_DECODE REPLAY ACTIVE (hits={bypass}). Pre-computed \
+                     decode results replayed — real engine cost masked. This is \
+                     a measurement contaminant, NOT production."
+                ),
+            );
+        }
+        if oracle > 0 && feat != "isal" {
+            if feat == "native" {
+                return (
+                    Some(false),
+                    format!(
+                        "ISA-L ENGINE ORACLE RAN (isal_chunks={oracle} on a \
+                         gzippy-native build -- only GZIPPY_ISAL_ENGINE_ORACLE \
+                         reaches that engine there). A CEILING oracle, not \
+                         production."
+                    ),
+                );
+            }
+            return (
+                Some(false),
+                format!(
+                    "isal_chunks={oracle} with build feature UNDECLARED -- \
+                     production on gzippy-isal, an engine oracle on native. Pass \
+                     --feature to disambiguate; refusing conservatively."
+                ),
+            );
+        }
+        if no_flip == 0 && flips == 0 && seeded == 0 && seeded_block == 0 && exact_block == 0 {
+            return (
+                None,
+                "No decode-path counter fired (finished_no_flip, flip_to_clean, \
+                 window_seeded, seeded_block, exact_block all 0) -- cannot \
+                 confirm the production pipeline ran. (The 'oracle silently \
+                 re-ran/skipped the bootstrap' failure class.) Inconclusive."
+                    .to_string(),
+            );
+        }
+        let seeded_note = if seeded > 0 {
+            format!(
+                "window_seeded={seeded} is PRODUCTION-SEEDED routing \
+                 (WindowMap-published predecessor windows, M3+), "
+            )
+        } else {
+            "window_seeded=0, ".to_string()
+        };
+        let isal_note = if oracle > 0 {
+            format!("isal_chunks={oracle} (PRODUCTION clean-tail on gzippy-isal), ")
+        } else {
+            String::new()
+        };
+        (
+            Some(true),
+            format!(
+                "PRODUCTION routing confirmed: no SEED_WINDOWS replay, no engine \
+                 oracle ({seeded_note}{isal_note}finished_no_flip={no_flip}, \
+                 flip_to_clean={flips}, seeded_block={seeded_block}, \
+                 exact_block={exact_block})."
+            ),
+        )
+    }
+
+    fn oracle_guard(
+        &self,
+        counters: &BTreeMap<String, i64>,
+        trace_self: &HashMap<String, (f64, f64, usize)>,
+    ) -> Vec<String> {
+        let mut warns = Vec::new();
+        if !counters.is_empty() {
+            let get = |k: &str| counters.get(k).copied().unwrap_or(0);
+            let fb = get("isal_fallbacks").max(get("isal_oracle_fallbacks"));
+            let oc = get("isal_chunks").max(get("isal_oracle_chunks"));
+            if oc > 0 && fb > 0 {
+                warns.push(format!(
+                    "ORACLE IMPURE: {fb}/{} chunks fell back to the real engine \
+                     -- the oracle did NOT replace 100% of decode; its wall is a \
+                     BLEND, not a clean ceiling.",
+                    oc + fb
+                ));
+            }
+        }
+        // Deterministic order over the span names (Python iterates dict order).
+        let mut names: Vec<&String> = trace_self.keys().collect();
+        names.sort();
+        for n in names {
+            if n.contains("to_vec") || n.contains("oracle_copy") || n.contains("oracle_alloc") {
+                warns.push(format!(
+                    "ORACLE COPY SPAN '{n}' present -- this is overhead the \
+                     production path does not pay; subtract it before reading a \
+                     ceiling (a handicapped contender != a ceiling)."
+                ));
+            }
+        }
+        warns
+    }
+
+    fn comparator_version(&self, manifest: &BTreeMap<String, String>) -> String {
+        // Normalize the rapidgzip --version banner recorded by the guest
+        // (`rg_version=`). Handles the full banner and the short
+        // "rapidgzip 0.16.0" form. Unknown stays unknown (never compares).
+        let raw = manifest.get("rg_version").map(|s| s.trim()).unwrap_or("");
+        if raw.is_empty() {
+            return "unknown".to_string();
+        }
+        match parse_trailing_version(raw) {
+            Some(ver) => format!("rapidgzip {ver}"),
+            None => raw.to_string(),
+        }
+    }
+
+    fn knobs(&self) -> BTreeMap<String, Knob> {
+        let mut k = BTreeMap::new();
+        k.insert(
+            "dist_amort".to_string(),
+            Knob::new(
+                "GZIPPY_DIST_AMORT=0",
+                "prof_dist",
+                "P3.4 DistTable amortization",
+            ),
+        );
+        k.insert(
+            "stored_flip".to_string(),
+            Knob::new("GZIPPY_NO_STORED_FLIP=1", "none", "M2b stored early-flip"),
+        );
+        k.insert(
+            "seeded_block".to_string(),
+            Knob::new(
+                "GZIPPY_SEEDED_BLOCK=0",
+                "verbose_seeded",
+                "M3 seeded chunks on Block",
+            ),
+        );
+        k.insert(
+            "exact_block".to_string(),
+            Knob::new(
+                "GZIPPY_EXACT_BLOCK=0",
+                "verbose_exact",
+                "M4 until-exact on Block",
+            ),
+        );
+        k.insert(
+            "hit_drive".to_string(),
+            Knob::new(
+                "GZIPPY_NO_HIT_DRIVE=1",
+                "none",
+                "confirmed-offset hit-drive prefetch",
+            ),
+        );
+        k.insert(
+            "slab_alloc".to_string(),
+            Knob::reverted(
+                "GZIPPY_SLAB_ALLOC=1",
+                "rpmalloc_stats",
+                "slab allocator force-on (the reverted lever, reconciled: \
+                 auto-ON at T<=GZIPPY_SLAB_MAX_T — expect CAUSAL-NULL at \
+                 default-ON cells)",
+            ),
+        );
+        k.insert(
+            "slab_off".to_string(),
+            Knob::new(
+                "GZIPPY_SLAB_ALLOC=0",
+                "rpmalloc_stats_off",
+                "slab force-OFF (gate proof: at T1 default-ON the knob arm must \
+                 lose the slab win and zero the slab counters)",
+            ),
+        );
+        k.insert(
+            "slab_bigbudget".to_string(),
+            Knob::new(
+                "GZIPPY_SLAB_BUDGET_MIB=600",
+                "none",
+                "budget-shape probe (evidence trail): admit-everything \
+                 retention (~the original f2 force-on class) vs the default T x \
+                 largest budget — separates budget-shape headroom from \
+                 state-dependence of the -99.9ms finding",
+            ),
+        );
+        k.insert(
+            "eager_postproc".to_string(),
+            Knob::new(
+                "GZIPPY_EAGER_POSTPROC=1",
+                "none",
+                "eager consumer post-processing (opt-in)",
+            ),
+        );
+        k.insert(
+            "isal_incremental_growth".to_string(),
+            Knob::new(
+                "GZIPPY_ISAL_INCREMENTAL_GROWTH=1",
+                "none",
+                "ISA-L always-small initial buffer (vs ratio-informed reserve): \
+                 faithfully ports rapidgzip ALLOCATION_CHUNK_SIZE=128KiB append \
+                 loop; knob arm = always-small; base arm = production \
+                 ratio-reserve",
+            ),
+        );
+        k
+    }
+
+    fn perturbations(&self) -> BTreeMap<String, String> {
+        let mut p = BTreeMap::new();
+        p.insert(
+            "compute".to_string(),
+            "GZIPPY_SLOW_MODE=50 [GZIPPY_SLOW_KIND=sleep control] via \
+             scripts/bench/oracle.sh --kind perturb (clean-loop slow-inject, \
+             slow_knob.rs)"
+                .to_string(),
+        );
+        p.insert(
+            "output".to_string(),
+            "GZIPPY_SKIP_WRITEV_SYSCALL=1 A/B (output-stage removal probe)".to_string(),
+        );
+        p.insert(
+            "wait".to_string(),
+            "worker-side lever — perturb the ENGINE (slow_knob) and watch this \
+             wait shrink/grow; the wait itself is not the cause"
+                .to_string(),
+        );
+        p.insert(
+            "idle".to_string(),
+            "scheduling-state probe: N=21 re-measure (bimodal check) before \
+             anything"
+                .to_string(),
+        );
+        p
+    }
+}
+
+/// Find `needle` (a `key=` pattern) and parse the unsigned integer that must
+/// immediately follow it. If `exclude_oracle` is set, occurrences immediately
+/// preceded by `oracle_` are skipped (the faithful manual equivalent of the
+/// Python `(?<!oracle_)` lookbehind). Returns the FIRST valid match, mirroring
+/// `re.search`.
+fn find_counter(text: &str, needle: &str, exclude_oracle: bool) -> Option<i64> {
+    let tb = text.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || tb.len() < nb.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i + nb.len() <= tb.len() {
+        if &tb[i..i + nb.len()] == nb {
+            let oracle_before = exclude_oracle && i >= 7 && &tb[i - 7..i] == b"oracle_";
+            if !oracle_before {
+                let dstart = i + nb.len();
+                let mut j = dstart;
+                while j < tb.len() && tb[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > dstart {
+                    return std::str::from_utf8(&tb[dstart..j]).ok()?.parse().ok();
+                }
+            }
+            i += nb.len();
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Extract a trailing `\d+\.\d+(\.\d+)*` version from a `--version` banner
+/// (faithful to the Python regex `(\d+\.\d+(?:\.\d+)*)\s*$`). Returns the
+/// version string, or `None` if the tail is not a dotted version.
+fn parse_trailing_version(raw: &str) -> Option<String> {
+    let raw = raw.trim_end();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = chars.len();
+    while i > 0 && (chars[i - 1].is_ascii_digit() || chars[i - 1] == '.') {
+        i -= 1;
+    }
+    let cand: String = chars[i..].iter().collect();
+    // Validate `\d+\.\d+(\.\d+)*`: at least two dot-separated parts, every part
+    // non-empty and all-digits (so a trailing/leading '.' is rejected).
+    let parts: Vec<&str> = cand.split('.').collect();
+    if parts.len() >= 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    //! Value-parity port of the adapter checks in
+    //! `decide/fulcrum/selftests/test_total.py` (routing guard #6, parse #6f,
+    //! oracle guard #7) plus comparator-version normalization. Same inputs →
+    //! same `(is_production, reason-substring)` / counter values as
+    //! `adapters/gzippy.py`.
+    use super::*;
+    use std::collections::HashMap;
+
+    fn counters(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    // --- 6: routing guard (RE-DERIVED): refuse only on ACTUAL contamination.
+    #[test]
+    fn routing_guard_value_parity() {
+        let ad = GzippyAdapter::new();
+
+        let (p, r) = ad.routing_guard(
+            &counters(&[
+                ("window_seeded", 17),
+                ("finished_no_flip", 4),
+                ("flip_to_clean", 12),
+                ("seeded_block", 16),
+            ]),
+            Some("gzippy-native"),
+        );
+        assert_eq!(p, Some(true));
+        assert!(
+            r.contains("PRODUCTION-SEEDED"),
+            "accepts production-seeded run"
+        );
+
+        let (p, r) = ad.routing_guard(
+            &counters(&[
+                ("window_seeded", 17),
+                ("finished_no_flip", 0),
+                ("seed_replay_hits", 17),
+            ]),
+            None,
+        );
+        assert_eq!(p, Some(false));
+        assert!(r.contains("ORACLE-SEEDED"), "refuses SEED_WINDOWS replay");
+
+        let (p, r) = ad.routing_guard(
+            &counters(&[("finished_no_flip", 4), ("bypass_replay_hits", 12)]),
+            None,
+        );
+        assert_eq!(p, Some(false));
+        assert!(r.contains("BYPASS_DECODE"), "refuses BYPASS_DECODE replay");
+
+        let (p, _) = ad.routing_guard(
+            &counters(&[
+                ("window_seeded", 0),
+                ("finished_no_flip", 16),
+                ("flip_to_clean", 1),
+            ]),
+            None,
+        );
+        assert_eq!(
+            p,
+            Some(true),
+            "accepts unseeded window-absent production run"
+        );
+
+        let (p, r) = ad.routing_guard(
+            &counters(&[("isal_chunks", 16), ("finished_no_flip", 4)]),
+            Some("gzippy-native"),
+        );
+        assert_eq!(p, Some(false));
+        assert!(
+            r.contains("ORACLE"),
+            "refuses isal_chunks>0 on NATIVE (engine oracle)"
+        );
+
+        let (p, r) = ad.routing_guard(
+            &counters(&[
+                ("isal_chunks", 16),
+                ("finished_no_flip", 4),
+                ("window_seeded", 12),
+            ]),
+            Some("gzippy-isal"),
+        );
+        assert_eq!(p, Some(true));
+        assert!(
+            r.contains("PRODUCTION clean-tail"),
+            "accepts isal_chunks>0 on ISAL build"
+        );
+
+        let (p, _) = ad.routing_guard(
+            &counters(&[("isal_chunks", 16), ("finished_no_flip", 4)]),
+            None,
+        );
+        assert_eq!(
+            p,
+            Some(false),
+            "refuses isal_chunks>0 with feature UNDECLARED"
+        );
+
+        let (p, _) = ad.routing_guard(&counters(&[("isal_oracle_chunks", 16)]), Some("native"));
+        assert_eq!(
+            p,
+            Some(false),
+            "refuses legacy isal_oracle_chunks on native"
+        );
+
+        let (p, _) = ad.routing_guard(&counters(&[]), None);
+        assert_eq!(p, None, "inconclusive with no counter sidecar");
+
+        let (p, _) = ad.routing_guard(
+            &counters(&[
+                ("window_seeded", 0),
+                ("finished_no_flip", 0),
+                ("flip_to_clean", 0),
+            ]),
+            None,
+        );
+        assert_eq!(p, None, "inconclusive when no decode-path counter fired");
+    }
+
+    // --- 6f: parse_counters reads the REAL binary labels (isal_chunks=, ...)
+    //         and does NOT manufacture the legacy isal_oracle_chunks key.
+    #[test]
+    fn parse_counters_real_sidecar() {
+        let ad = GzippyAdapter::new();
+        let parsed = ad.parse_counters(
+            "  Unified decoder: flip_to_clean=12 finished_no_flip=4 finish_decode=16 \
+             inflate_wrapper=0 window_seeded=2 seeded_block=16 seeded_wrapper=0 \
+             exact_block=3 exact_wrapper=0 bad_seed_resync=0 resumable_resync_calls=0 \
+             handoff_window_grows=8\n  ISA-L clean-tail engine (production on \
+             gzippy-isal): isal_chunks=14 isal_fallbacks=0 bfinal_exact_accepted=2 \
+             until_exact_fb=0 inexact_fb=0\n",
+        );
+        assert_eq!(parsed.get("isal_chunks"), Some(&14));
+        assert_eq!(parsed.get("window_seeded"), Some(&2));
+        assert_eq!(parsed.get("seeded_block"), Some(&16));
+        assert_eq!(parsed.get("isal_fallbacks"), Some(&0));
+        assert!(
+            !parsed.contains_key("isal_oracle_chunks"),
+            "no phantom legacy key"
+        );
+    }
+
+    // --- 6f-extra: the negative-lookbehind excludes an `oracle_`-prefixed token.
+    #[test]
+    fn parse_counters_lookbehind_excludes_oracle_prefix() {
+        let ad = GzippyAdapter::new();
+        // "oracle_isal_chunks=99" must NOT satisfy the plain isal_chunks key,
+        // but isal_oracle_chunks= IS its own key.
+        let parsed = ad.parse_counters("oracle_isal_chunks=99 isal_oracle_chunks=7\n");
+        assert!(
+            !parsed.contains_key("isal_chunks"),
+            "oracle_-prefixed occurrence skipped"
+        );
+        assert_eq!(parsed.get("isal_oracle_chunks"), Some(&7));
+    }
+
+    // --- 7: oracle contamination guard flags a fallback-blended ceiling.
+    #[test]
+    fn oracle_guard_flags_impure_blend() {
+        let ad = GzippyAdapter::new();
+        let empty: HashMap<String, (f64, f64, usize)> = HashMap::new();
+        let warns = ad.oracle_guard(
+            &counters(&[("isal_oracle_chunks", 14), ("isal_oracle_fallbacks", 2)]),
+            &empty,
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("IMPURE")),
+            "flags fallback-blended ceiling"
+        );
+
+        // An oracle-copy span name surfaces a separate warning.
+        let mut ts: HashMap<String, (f64, f64, usize)> = HashMap::new();
+        ts.insert("worker.oracle_copy_buf".to_string(), (10.0, 10.0, 1));
+        let warns2 = ad.oracle_guard(&counters(&[]), &ts);
+        assert!(warns2.iter().any(|w| w.contains("ORACLE COPY SPAN")));
+    }
+
+    // --- comparator_version normalizes the rg_version banner; unknown stays.
+    #[test]
+    fn comparator_version_parity() {
+        let ad = GzippyAdapter::new();
+        let mk = |v: &str| -> BTreeMap<String, String> {
+            let mut m = BTreeMap::new();
+            m.insert("rg_version".to_string(), v.to_string());
+            m
+        };
+        assert_eq!(
+            ad.comparator_version(&mk("rapidgzip 0.16.0")),
+            "rapidgzip 0.16.0"
+        );
+        assert_eq!(
+            ad.comparator_version(&mk(
+                "rapidgzip, CLI to the ... library rapidgzip version 0.16.0"
+            )),
+            "rapidgzip 0.16.0"
+        );
+        assert_eq!(ad.comparator_version(&BTreeMap::new()), "unknown");
+        // Unrecognized shape stays verbatim (still a known value, never compares
+        // as unknown).
+        assert_eq!(ad.comparator_version(&mk("nightly-build")), "nightly-build");
+    }
+
+    // --- base adapter defaults match adapters/base.py.
+    #[test]
+    fn base_adapter_defaults() {
+        let ad = BaseAdapter::new();
+        assert_eq!(ad.name(), "project");
+        assert_eq!(ad.routing_guard(&BTreeMap::new(), None).0, None);
+        assert!(ad.parse_counters("anything=5").is_empty());
+        assert!(ad.taxonomy().classify("anything") == crate::trace::SpanClass::Unknown);
+    }
+
+    // --- knob registry is structured (reverted flag is data, not desc text).
+    #[test]
+    fn gzippy_knobs_structured_reverted() {
+        let ad = GzippyAdapter::new();
+        let knobs = ad.knobs();
+        assert!(
+            knobs["slab_alloc"].reverted,
+            "slab_alloc is the reverted lever"
+        );
+        assert!(!knobs["dist_amort"].reverted, "dist_amort is not reverted");
+        assert_eq!(knobs["dist_amort"].env, "GZIPPY_DIST_AMORT=0");
     }
 }

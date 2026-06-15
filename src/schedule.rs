@@ -310,6 +310,7 @@ mod tests {
             ts_end: end,
             dur: end - start,
             args,
+            depth: 0,
         }
     }
 
