@@ -311,6 +311,16 @@ pub struct FixtureArm {
     pub spread_pct: f64,
     #[serde(default)]
     pub require_native_elf: bool,
+    /// Canned per-tool A/A self-test ratio (between-half drift) for this arm. A
+    /// dry-run plants an UNSTABLE comparator here to prove COMPARATOR-PRESENT
+    /// VOIDs it instead of admitting it by fiat. `None` ⇒ a stable canned A/A
+    /// (`1.0`) is synthesized for a measured arm.
+    #[serde(default)]
+    pub aa_ratio: Option<f64>,
+    /// Canned per-tool A/A within-half noise budget (PERCENT). `None` ⇒
+    /// `default_spread_pct`.
+    #[serde(default)]
+    pub aa_spread_pct: Option<f64>,
 }
 
 fn default_spread_pct() -> f64 {
@@ -599,6 +609,13 @@ struct Captured {
     comparator_path: String,
     comparator_aa_ratio: Option<f64>,
     comparator_aa_spread_pct: Option<f64>,
+    /// REAL per-comparator A/A self-test: arm-id → (aa_ratio, aa_spread_pct). Each
+    /// non-rapidgzip field tool (igzip/libdeflate/zlib-ng/pigz) is measured
+    /// binary-vs-itself through its OWN `comparator_argv` invocation — NOT the
+    /// synthetic `1.0` that used to admit every field tool by fiat, and NOT
+    /// rapidgzip's hardcoded `-P`. rapidgzip keeps its dedicated global A/A
+    /// (`comparator_aa_ratio` above), which also feeds the manifest gate.
+    comparator_aa: BTreeMap<String, (f64, f64)>,
     knob_consumers: BTreeMap<String, i64>,
     oracles: OracleCounters,
     corpus_sha: BTreeMap<String, String>,
@@ -757,6 +774,30 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
         sweeps.push(synth_sweep(spec, p, &fp));
     }
 
+    // REAL per-comparator A/A from the canned field arms (mirrors live: corpus[0],
+    // threads[0]). A measured field arm with no planted A/A gets a stable canned
+    // `1.0` self-test; a dry-run plants an UNSTABLE `aa_ratio`/`aa_spread_pct` to
+    // prove COMPARATOR-PRESENT VOIDs it. rapidgzip is excluded (its dedicated
+    // global A/A drives the rapidgzip arm + manifest gate).
+    let mut comparator_aa: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    if let (Some(c0), Some(&t0)) = (spec.corpora.first(), spec.threads.first()) {
+        let key = format!("{}:{}", c0.id, t0);
+        if let Some(fc) = fx.cells.get(&key) {
+            for comp in &roster {
+                if comp.id == "rapidgzip" {
+                    continue;
+                }
+                if let Some(fa) = fc.arms.get(&comp.id) {
+                    if fa.wall_ms > 0.0 {
+                        let ratio = fa.aa_ratio.unwrap_or(1.0);
+                        let spread = fa.aa_spread_pct.unwrap_or_else(default_spread_pct);
+                        comparator_aa.insert(comp.id.clone(), (ratio, spread));
+                    }
+                }
+            }
+        }
+    }
+
     // ab_sink for the wall A/B (gz vs rg).
     let sink_gz = fx
         .ab_sinks
@@ -785,6 +826,7 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
         comparator_path: nonempty(&spec.comparator_path, &spec.comparator_bin),
         comparator_aa_ratio: fx.comparator_aa_ratio,
         comparator_aa_spread_pct: fx.comparator_aa_spread_pct,
+        comparator_aa,
         knob_consumers: knob_consumers_for(spec, &fx.knob_consumers),
         oracles: oracles_for(spec, fx),
         corpus_sha: fx.corpus_sha.clone(),
@@ -942,6 +984,26 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
             (None, None)
         };
 
+    // REAL per-comparator A/A for every FIELD tool (igzip/libdeflate/zlib-ng/pigz):
+    // each is measured binary-vs-itself through its OWN `comparator_argv` — so a
+    // noisy/broken field tool VOIDs COMPARATOR-PRESENT instead of being admitted by
+    // the old synthetic 1.0. rapidgzip is skipped here: it keeps the dedicated
+    // hardcoded-`-P` global A/A above (which also feeds the manifest gate).
+    let mut comparator_aa: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    if !spec.corpora.is_empty() {
+        let c = &spec.corpora[0];
+        let t = spec.threads.first().copied().unwrap_or(1);
+        for comp in &comparators(spec) {
+            if comp.id == "rapidgzip" || !Path::new(&comp.bin).exists() {
+                continue;
+            }
+            let (r, sp) = comparator_aa_argv(spec, comp, &c.path, t);
+            if let (Some(r), Some(sp)) = (r, sp) {
+                comparator_aa.insert(comp.id.clone(), (r, sp));
+            }
+        }
+    }
+
     // sink classes (both arms on the same regular-file fs in the spine).
     let sink = spec.sink.clone();
 
@@ -986,6 +1048,7 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
         comparator_path: cmp_path,
         comparator_aa_ratio,
         comparator_aa_spread_pct,
+        comparator_aa,
         knob_consumers,
         oracles,
         corpus_sha,
@@ -1776,21 +1839,28 @@ fn subject_id(spec: &RunSpec) -> String {
 }
 
 /// Emit one ArmPresence JSON object. An RSS of 0 ⇒ no rss_mb key (not measured).
+/// A `None` `aa_ratio` (no self-test captured for a measured arm) OMITS the
+/// `aa_ratio` key entirely — the comparability gate then reads `aa_ratio: None`
+/// and refuses to trust the arm, rather than admitting it by a fiat `1.0`.
+/// `aa_spread` is the within-half A/A noise budget as a FRACTION (max/min−1), the
+/// unit the comparability gate compares `|aa_ratio−1|` against.
 fn arm_json(
     id: &str,
     measured: bool,
     wall_ms: Option<f64>,
     rss_mb: f64,
-    aa_ratio: f64,
+    aa_ratio: Option<f64>,
     aa_spread: f64,
     require_native_elf: bool,
 ) -> String {
     let mut s = format!(
         "{{\"id\":\"{id}\",\"measured\":{measured},\"binary_kind\":\"native\",\
-         \"aa_ratio\":{},\"aa_spread\":{}",
-        fmt6(aa_ratio),
+         \"aa_spread\":{}",
         fmt6(aa_spread),
     );
+    if let Some(r) = aa_ratio {
+        s.push_str(&format!(",\"aa_ratio\":{}", fmt6(r)));
+    }
     if let Some(w) = wall_ms {
         s.push_str(&format!(",\"wall_ms\":{}", fmt6(w)));
     }
@@ -1805,22 +1875,38 @@ fn comparability_capture_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCel
     let gz_min = min_of(&cell.gz);
     let spread = spread_of(&cell.gz);
     let sid = subject_id(spec);
-    // subject arm (gzippy).
+    // subject arm (gzippy) — not a comparator self-test; fixed-1.0 A/A.
     let mut arms = arm_json(
         &sid,
         true,
         Some(gz_min * 1000.0),
         cell.gz_rss_mb,
-        1.0,
+        Some(1.0),
         spread,
         false,
     );
     // one arm per DECLARED comparator (measured or ABSENT — the field roster).
+    // Each MEASURED comparator carries its OWN MEASURED A/A: rapidgzip from its
+    // dedicated global self-test (unchanged), every FIELD tool from `comparator_aa`
+    // — its own `comparator_argv` self-test, NOT the synthetic `1.0` that used to
+    // admit every field tool by fiat. A measured field tool with NO captured A/A
+    // emits `None` → the gate refuses it. ABSENT arms carry no A/A (refused on
+    // `!measured` first).
     for a in &cell.arms {
-        let aa_ratio = if a.id == "rapidgzip" {
-            cap.comparator_aa_ratio.unwrap_or(1.0)
+        let (aa_ratio, aa_spread): (Option<f64>, f64) = if a.id == "rapidgzip" {
+            // unchanged back-compat: the dedicated global rg A/A, wall-spread floor.
+            (
+                Some(cap.comparator_aa_ratio.unwrap_or(1.0)),
+                spread_of(&a.wall),
+            )
+        } else if !a.measured() {
+            (None, 0.0)
         } else {
-            1.0
+            match cap.comparator_aa.get(&a.id) {
+                // measured A/A spread is a PERCENT → convert to the gate's fraction.
+                Some(&(r, sp)) => (Some(r), sp / 100.0),
+                None => (None, 0.0),
+            }
         };
         arms.push(',');
         arms.push_str(&arm_json(
@@ -1833,7 +1919,7 @@ fn comparability_capture_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCel
             },
             a.rss_mb,
             aa_ratio,
-            spread_of(&a.wall),
+            aa_spread,
             a.require_native_elf,
         ));
     }
@@ -2353,6 +2439,36 @@ fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option
             &spec.comparator_bin,
             &["-d", "-c", "-f", "-P", &t.to_string(), corpus],
         );
+        if i == 0 {
+            continue; // drop warm-up
+        }
+        if s.secs > 0.0 {
+            xs.push(s.secs);
+        }
+    }
+    aa_stats(&xs)
+}
+
+/// REAL A/A self-test for an ARBITRARY comparator, run through the comparator's
+/// OWN measurement invocation (`comparator_argv` with `{path}`/`{t}` substituted)
+/// — the SAME argv that produces its competitive wall, so the self-test exercises
+/// the real artifact rather than rapidgzip's hardcoded `-P` flag. Returns the
+/// distinct-statistics A/A (between-half drift ratio, within-half spread percent)
+/// via the shared `aa_stats`.
+fn comparator_aa_argv(
+    spec: &RunSpec,
+    comp: &ComparatorSpec,
+    corpus: &str,
+    t: usize,
+) -> (Option<f64>, Option<f64>) {
+    let mask = pin_mask_pool(t, &spec.core_pool);
+    let argv = comparator_argv(comp, t, corpus);
+    // Interleaved best-of-N, warm-up dropped — the same discipline as the cell and
+    // the rapidgzip A/A, so the self-test rests on a real distribution.
+    let n = spec.n.max(4);
+    let mut xs = Vec::new();
+    for i in 0..=n {
+        let s = timed_argv(&mask, &comp.bin, &argv);
         if i == 0 {
             continue; // drop warm-up
         }
@@ -2934,6 +3050,133 @@ mod tests {
         assert_eq!(
             aa_through_gate(&[0.5, 0.51, 0.52]),
             crate::provenance::CheckVerdict::Incomplete
+        );
+    }
+
+    // ── BACKLOG #2: REAL per-comparator A/A (no admittance by fiat) ───────────
+    //
+    // Before this fix, `comparability_capture_json` assigned every NON-rapidgzip
+    // field tool a SYNTHETIC `aa_ratio = 1.0`, so `aa_ok()`/COMPARATOR-PRESENT
+    // admitted a noisy/broken field tool WITHOUT a self-test. These tests drive a
+    // capture (with a planted per-tool A/A) all the way THROUGH the runner's
+    // capture-JSON emit and the comparability parser, proving the gate now reads
+    // each field tool's MEASURED A/A. RED-BEFORE: with the synthetic-1.0 emit, the
+    // unstable tool reads aa_ratio 1.000000 and is admitted, failing every
+    // assertion below; GREEN-AFTER: it reads its real ratio and is refused.
+
+    /// Build a fixture capture for a one-cell spec and return the parsed
+    /// comparability `Capture` for that cell (the exact object the gate reasons
+    /// over).
+    fn field_aa_capture(spec_json: &str) -> crate::comparability::Capture {
+        let spec: RunSpec = serde_json::from_str(spec_json).expect("parse spec");
+        let cap = capture_fixture(&spec);
+        let cell = cap.cells.first().expect("one cell");
+        let json = comparability_capture_json(&spec, &cap, cell);
+        crate::comparability::parse_capture(&json).expect("parse capture json")
+    }
+
+    #[test]
+    fn unstable_field_comparator_is_not_admitted_by_fiat() {
+        // igzip's binary-vs-itself A/A drifts 8% (between-half) with only 0.5%
+        // within-half noise ⇒ a genuinely unstable instrument.
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"igzip","bin":"/box/igzip"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "cells":{"silesia:1":{"gz_wall_ms":300.0,
+              "arms":{"igzip":{"wall_ms":280.0,"aa_ratio":1.08,"aa_spread_pct":0.5}}}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let arm = cap.arm("igzip").expect("igzip arm present");
+        // it carries its REAL measured A/A — NOT the old synthetic 1.0.
+        assert_eq!(arm.aa_ratio, Some(1.08), "real measured A/A, not fiat 1.0");
+        assert!(arm.measured, "the field tool WAS measured this run");
+        // |1.08−1| = 0.08 > max(0.005, AA_TOLERANCE=0.03) ⇒ refused.
+        assert!(!arm.aa_ok(), "unstable A/A must FAIL the self-test");
+        assert!(
+            !arm.usable_as_comparator(),
+            "an unstable field tool must NOT be admitted by fiat"
+        );
+        assert!(arm.comparator_defect().unwrap().contains("A/A self-test"));
+        // And at the GATE: an unstable contrast cannot settle a two-arm claim.
+        use crate::comparability::{evaluate, GateClaim};
+        let claim = GateClaim::SubjectSpecific {
+            subject: "gzippy-native".into(),
+            contrast: "igzip".into(),
+            counter: None,
+            equal_spread: 0.05,
+        };
+        assert!(
+            !evaluate(&cap, &claim).verdict.admitted(),
+            "an unstable comparator must not be admitted (VOID/ONE-ARM)"
+        );
+    }
+
+    #[test]
+    fn stable_field_comparator_admitted_with_real_measured_ratio() {
+        // igzip self-tests at a stable 1.003 (within its noise) ⇒ admitted, and the
+        // emitted ratio is the MEASURED value, not a hardcoded 1.0.
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"igzip","bin":"/box/igzip"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "cells":{"silesia:1":{"gz_wall_ms":300.0,
+              "arms":{"igzip":{"wall_ms":280.0,"aa_ratio":1.003,"aa_spread_pct":0.5}}}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let arm = cap.arm("igzip").expect("igzip arm present");
+        assert_eq!(
+            arm.aa_ratio,
+            Some(1.003),
+            "the emitted A/A is the measured value, NOT the hardcoded 1.0"
+        );
+        assert!(arm.aa_ok(), "a stable A/A passes the self-test");
+        assert!(arm.usable_as_comparator());
+        use crate::comparability::{evaluate, GateClaim};
+        let claim = GateClaim::SubjectSpecific {
+            subject: "gzippy-native".into(),
+            contrast: "igzip".into(),
+            counter: None,
+            equal_spread: 0.05,
+        };
+        assert!(
+            evaluate(&cap, &claim).verdict.admitted(),
+            "a stable, self-tested field comparator is admitted"
+        );
+    }
+
+    #[test]
+    fn multi_comparator_capture_each_arm_carries_own_measured_aa() {
+        // The full field: igzip stable, zlib-ng unstable. EACH arm must carry its
+        // OWN measured A/A — not one shared/synthetic value.
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"igzip","bin":"/box/igzip"},
+                         {"id":"zlib-ng","bin":"/box/zlibng"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "cells":{"silesia:1":{"gz_wall_ms":300.0,"arms":{
+              "igzip":{"wall_ms":280.0,"aa_ratio":1.002,"aa_spread_pct":0.5},
+              "zlib-ng":{"wall_ms":320.0,"aa_ratio":1.07,"aa_spread_pct":0.5}}}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let igzip = cap.arm("igzip").expect("igzip arm");
+        let zng = cap.arm("zlib-ng").expect("zlib-ng arm");
+        assert_eq!(igzip.aa_ratio, Some(1.002));
+        assert_eq!(zng.aa_ratio, Some(1.07));
+        assert_ne!(
+            igzip.aa_ratio, zng.aa_ratio,
+            "each arm carries its OWN measured A/A, not a shared value"
+        );
+        assert!(igzip.usable_as_comparator(), "stable arm admitted");
+        assert!(
+            !zng.usable_as_comparator(),
+            "the unstable arm is refused independently"
         );
     }
 }
