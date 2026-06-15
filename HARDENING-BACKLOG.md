@@ -330,19 +330,47 @@ Invariants every iteration must keep green:
   DID retroactively reclassify banked T1 cells off the already-stored
   `occupancy_med`.)
 
-- **[TODO — relay #15 candidate, LOW/MEDIUM VoI]** PREEMPTED-K≥2 witness (ii):
-  cross-check `occupancy_med` against a THEORETICAL serial-fraction ceiling when
-  the cell's serial fraction is independently known (e.g. from a bootstrap-removed
-  oracle or a declared serial-section share), to catch a SUSTAINED (steady, NOT
-  round-robining) k≥2 competitor whose per-sample occupancy is UNIMODAL-but-too-low
-  — the one shape relay #14's bimodality backstop cannot see (a steady competitor
-  depresses occupancy as smoothly as a serial fraction does). Open question to
-  pre-register: is the serial fraction ever independently known at gate time? If
-  not, this likely lands as a NON-blocking WARN ("occ_med below serial-ceiling, but
-  unimodal — possible sustained k≥2 competitor"), NOT a hard VOID (a hard floor
-  here is the same relay-#13 trap). Also consider: short k≥2 cells (clean < 5)
-  silently no-op the bimodality backstop — a non-blocking WARN that the cell was
-  too short for the shape check would surface that blind spot to the supervisor.
+- **[DONE — relay #15, branch `harden/preempted-k2-sustained-warn`]** PREEMPTED-K≥2
+  witness (ii): the SUSTAINED (steady, non-round-robining) k≥2 competitor blind
+  spot + the shape-check-skipped blind spot, both as NON-BLOCKING WARNs (a hard
+  floor is the relay-#13 trap; relay #14's bimodality VOID cannot SEE a sustained
+  competitor — it depresses occupancy as SMOOTHLY/unimodally as a serial-by-design
+  bootstrap does, so it is indistinguishable by shape). **Pre-registered open
+  question RESOLVED: the serial fraction is NOT independently captured on
+  `CellBoxStats` at gate time** (no field carries a bootstrap-removed-oracle / declared
+  serial-section share), so the theoretical serial-fraction-ceiling cross-check
+  CANNOT be computed soundly — discarded as the discriminator (per the backlog's own
+  "if not, lands as a NON-blocking WARN" fallback). **Implemented:** a `warnings:
+  Vec<String>` field on `GateCheck` (NON-BLOCKING — never consulted by `severity()`/
+  `stamp()`/`run_gate()` aggregation, so it changes NO verdict) attached to the
+  cell's certifying OK check by `with_warnings`. In `check_box_valid`, after the
+  PREEMPTED-K≥2 VOID branch, a k≥2 cell with DEPRESSED occupancy (`occ_med <
+  OCCUPANCY_MIN`, gated `occ_med > 0.0` so uncaptured no-ops) emits:
+  (a) `POSSIBLE-SUSTAINED-K≥2` when ≥5 samples were captured and the distribution
+  is UNIMODAL (bimodal already `false` — the VOID branch `continue`d); (b)
+  `K≥2-SHAPE-CHECK-SKIPPED` when 1..5 samples were captured (the bimodality check
+  needs ≥5 → it was skipped, so even a competitor would have slipped through).
+  EMPTY samples (a pre-this-field banked artifact) stay a SILENT no-op — relay
+  #14's degradation contract preserved, **so NO banked cell gains a new annotation
+  and NO VOID/PASS verdict changes** (a WARN rides on an OK verdict). **Tests
+  (RED-before proven by `if false`-stubbing the WARN guard → the unimodal cell's
+  `warnings` came back empty `[]` while it still certified; GREEN-after warns):**
+  `provenance::box_valid_tests::sustained_k2_unimodal_warns_but_certifies_red_before_green_after`
+  — controls: quiet occ≈0.99 → NO warn + OK; legacy empty-samples depressed → NO
+  warn + OK (no-banked-annotation proof); depressed-UNIMODAL ≥5-sample → 1 WARN
+  (POSSIBLE-SUSTAINED-K≥2) + still OK; depressed 3-sample → 1 WARN
+  (K≥2-SHAPE-CHECK-SKIPPED) + still OK; depressed-BIMODAL → still VOID with NO warn
+  (the VOID branch wins, not downgraded). 551 / 0-fail / 0-ignored · clippy 0-new
+  (12 == 12 on main) · fmt clean.
+
+- **[TODO — relay #16 candidate, LOW VoI]** The relay-#15 WARNs live on
+  `GateCheck.warnings` but nothing SURFACES them yet to a supervisor: `GateStamp`
+  aggregates only `verdict.label()` per check (the warnings are dropped at stamp
+  time), and the runner's CERTIFIED/VOID line (`runner.rs:510`) prints only
+  `verdict`+`reason`. Wire the BOX-VALID warnings through to the analysis output
+  (stamp annotation and/or the runner's per-cell line) so a CERTIFIED-with-WARN
+  cell is visibly flagged, not silently certified. Keep it advisory (no verdict
+  change). Add a test that a stamped report carries the warning text.
 
 - **[WATCH — relay #11, item 2 RESOLVED]** (2) [RESOLVED — relay #11, see
   the OVERSUBSCRIBED-SMT DONE entry above] SMT-sibling oversubscription is now

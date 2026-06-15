@@ -567,6 +567,12 @@ pub struct GateCheck {
     /// "run" | "knob:{env}" | "ab:{id}" | "oracle:{name}"
     pub scope: String,
     pub reason: String,
+    /// NON-BLOCKING advisory flags attached to this check. A WARN surfaces a
+    /// RISK a supervisor should verify (e.g. a possible SUSTAINED k≥2 competitor
+    /// the bimodality VOID cannot see by shape) WITHOUT changing the verdict /
+    /// severity — a legitimately-serial cell still CERTIFIES. Empty for every
+    /// check that has nothing to flag, so it never alters stamp aggregation.
+    pub warnings: Vec<String>,
 }
 
 impl GateCheck {
@@ -576,7 +582,15 @@ impl GateCheck {
             verdict,
             scope,
             reason,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Attach NON-BLOCKING advisory flags. Does not touch the verdict, so the
+    /// cell's severity (and the stamp aggregation) is unchanged.
+    fn with_warnings(mut self, warnings: Vec<String>) -> GateCheck {
+        self.warnings = warnings;
+        self
     }
 }
 
@@ -1289,6 +1303,64 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
             continue;
         }
 
+        // -- WARN (NON-BLOCKING): the SUSTAINED-k≥2 blind spot + the shape-check
+        //    skip. PREEMPTED-K≥2 above VOIDs only a BIMODAL depressed cell (a
+        //    competitor that ROUND-ROBINS on/off our pinned cores). A SUSTAINED,
+        //    steady k≥2 competitor depresses occupancy just as SMOOTHLY (unimodal)
+        //    as a serial-by-design bootstrap does, so it is INDISTINGUISHABLE by
+        //    shape from a legitimately-serial parallel cell — a hard floor here is
+        //    the relay-#13 trap (it would false-VOID every serial parallel cell).
+        //    A theoretical serial-fraction occupancy CEILING would be the only
+        //    sound discriminator, but the cell's serial fraction is NOT
+        //    independently captured on `CellBoxStats` at gate time, so that
+        //    cross-check cannot be computed soundly. We therefore do NOT void; we
+        //    attach a NON-BLOCKING WARN so a supervisor verifies the window was
+        //    quiet while the cell still CERTIFIES. Both shapes are gated on
+        //    occupancy being DEPRESSED (occ_med < OCCUPANCY_MIN), so a quiet
+        //    occ≈1.0 cell never warns, and on occ_med > 0.0, so an uncaptured cell
+        //    (occ_med == 0.0) no-ops:
+        //      (a) UNIMODAL depressed with ≥5 captured samples (bimodal already
+        //          false — the VOID branch above `continue`d): possible sustained
+        //          k≥2 preemption.
+        //      (b) 1..5 captured samples: the bimodality shape-check was SKIPPED
+        //          (`bimodal` needs ≥5), so even a round-robining competitor would
+        //          have slipped through silently — surface that blind spot.
+        //    EMPTY samples (occ_med>0 but no per-sample capture: a pre-this-field
+        //    banked artifact / BSD time) stay a SILENT no-op — exactly relay #14's
+        //    degradation contract, so NO banked cell gains a new annotation.
+        let mut cell_warnings: Vec<String> = Vec::new();
+        if c.k >= 2 && c.occupancy_med > 0.0 && c.occupancy_med < crate::perturb::OCCUPANCY_MIN {
+            let n = c.occupancy_samples.len();
+            if n >= 5 {
+                cell_warnings.push(format!(
+                    "POSSIBLE-SUSTAINED-K≥2: k={} cell median occupancy {:.2} < {} but the \
+                     per-sample distribution is UNIMODAL across {} clean samples — VERIFY the \
+                     window was quiet. A SUSTAINED (steady, non-round-robining) k≥2 competitor \
+                     depresses occupancy as smoothly as a serial-by-design bootstrap does, so it \
+                     is indistinguishable by shape; the cell still CERTIFIES (a hard floor would \
+                     false-VOID a legitimately-serial parallel cell — the relay-#13 trap). \
+                     Re-confirm on a verified-quiet window if this cell anchors a banked finding",
+                    c.k,
+                    c.occupancy_med,
+                    crate::perturb::OCCUPANCY_MIN,
+                    n,
+                ));
+            } else if n >= 1 {
+                cell_warnings.push(format!(
+                    "K≥2-SHAPE-CHECK-SKIPPED: k={} cell median occupancy {:.2} < {} but only {} \
+                     per-sample occupancy value(s) were captured (<5 needed for the bimodality \
+                     shape-check) — the PREEMPTED-K≥2 competitor backstop was SKIPPED, so even a \
+                     bimodal off-core competitor would not have been caught. VERIFY the window was \
+                     quiet; the cell still CERTIFIES. Re-run capturing ≥5 per-sample occupancy \
+                     values to exercise the shape-check",
+                    c.k,
+                    c.occupancy_med,
+                    crate::perturb::OCCUPANCY_MIN,
+                    n,
+                ));
+            }
+        }
+
         // -- DRIFT: control bracket swing > K×floor OR end-to-end > PCT. ---------
         if let Some(d) = bracket_drift(&c.ctrl_medians) {
             let swing_bar = DRIFT_VOID_K * c.ctrl_spread;
@@ -1338,23 +1410,27 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
             continue;
         }
 
-        out.push(GateCheck::new(
-            BOX_VALID,
-            CheckVerdict::Ok,
-            scope,
-            format!(
-                "cell {}: ran on the requested cores (mask {} ⊆ {}), {} clean / {} raw samples, \
-                 median occupancy {:.2}, run-queue {:.1} ≤ k+{}, control bracket steady",
-                c.cell,
-                c.mask_requested,
-                c.mask_readback,
-                c.clean,
-                c.n_raw,
-                c.occupancy_med,
-                c.procs_running_med,
-                PROCS_RUNNING_SLACK,
-            ),
-        ));
+        out.push(
+            GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Ok,
+                scope,
+                format!(
+                    "cell {}: ran on the requested cores (mask {} ⊆ {}), {} clean / {} raw \
+                     samples, median occupancy {:.2}, run-queue {:.1} ≤ k+{}, control bracket \
+                     steady",
+                    c.cell,
+                    c.mask_requested,
+                    c.mask_readback,
+                    c.clean,
+                    c.n_raw,
+                    c.occupancy_med,
+                    c.procs_running_med,
+                    PROCS_RUNNING_SLACK,
+                ),
+            )
+            .with_warnings(cell_warnings),
+        );
     }
     out
 }
@@ -2702,6 +2778,122 @@ mod box_valid_tests {
         assert!(
             reason.contains("PREEMPTED-K≥2"),
             "names the check: {reason}"
+        );
+    }
+
+    // ── relay #15: NON-BLOCKING WARN for the SUSTAINED-k≥2 blind spot ───────
+    //    PREEMPTED-K≥2 (relay #14) only catches a competitor that ROUND-ROBINS
+    //    (bimodal occupancy). A SUSTAINED steady k≥2 competitor depresses
+    //    occupancy SMOOTHLY (unimodal), indistinguishable by shape from a
+    //    serial-by-design cell, so a hard VOID is forbidden (the relay-#13 trap).
+    //    This emits a NON-BLOCKING WARN instead: the cell still CERTIFIES (OK),
+    //    but carries a flag for the supervisor. Also WARNs when the shape-check
+    //    was SKIPPED for too few captured samples (<5).
+    fn box_check_of(c: &CellBoxStats) -> GateCheck {
+        let checks = check_box_valid(std::slice::from_ref(c));
+        assert_eq!(checks.len(), 1, "exactly one BOX-VALID check per cell");
+        checks.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn sustained_k2_unimodal_warns_but_certifies_red_before_green_after() {
+        // GREEN control (no-false-warn): a fully-quiet k=4 cell (occ≈0.99,
+        // unimodal, NOT depressed) emits NO warn and CERTIFIES.
+        let quiet = box_check_of(&unimodal_k4_cell(0.99));
+        assert_eq!(quiet.verdict, CheckVerdict::Ok, "quiet cell certifies");
+        assert!(
+            quiet.warnings.is_empty(),
+            "a quiet k≥2 cell must NOT warn: {:?}",
+            quiet.warnings
+        );
+
+        // GREEN control (no-false-warn): the EXISTING uncaptured degradation
+        // shape (occ_med depressed but NO per-sample capture — a pre-this-field
+        // banked artifact) stays a SILENT no-op: certifies, NO warn. This is the
+        // proof no banked cell gains a new annotation.
+        let mut legacy = clean_cell(); // k=4
+        legacy.occupancy_med = 0.5;
+        legacy.occupancy_samples = Vec::new();
+        let legacy = box_check_of(&legacy);
+        assert_eq!(
+            legacy.verdict,
+            CheckVerdict::Ok,
+            "legacy artifact certifies"
+        );
+        assert!(
+            legacy.warnings.is_empty(),
+            "an uncaptured (empty-samples) banked cell must NOT gain a warning: {:?}",
+            legacy.warnings
+        );
+
+        // RED-before / GREEN-after (a): a depressed-but-UNIMODAL k=4 cell
+        // (occ≈0.5, ≥5 tightly-clustered samples) is a possible SUSTAINED k≥2
+        // competitor the bimodality VOID cannot see. It must CERTIFY (a hard
+        // floor is the relay-#13 trap) AND carry the POSSIBLE-SUSTAINED-K≥2 WARN.
+        let unimodal = unimodal_k4_cell(0.5);
+        // sanity: the planted distribution is NOT bimodal (so PREEMPTED-K≥2 did
+        // not fire) and has ≥5 samples (so the shape-check ran).
+        assert!(
+            !crate::perturb::bimodal(&unimodal.occupancy_samples, crate::perturb::BIMODAL_K),
+            "the unimodal fixture must not be bimodal"
+        );
+        assert!(unimodal.occupancy_samples.len() >= 5);
+        let gc = box_check_of(&unimodal);
+        assert_eq!(
+            gc.verdict,
+            CheckVerdict::Ok,
+            "a depressed-unimodal k≥2 cell must STILL certify (non-blocking WARN, not VOID)"
+        );
+        assert_eq!(gc.warnings.len(), 1, "exactly one WARN: {:?}", gc.warnings);
+        assert!(
+            gc.warnings[0].contains("POSSIBLE-SUSTAINED-K≥2"),
+            "names the sustained-k≥2 blind spot: {}",
+            gc.warnings[0]
+        );
+        assert!(
+            gc.warnings[0].contains("VERIFY"),
+            "tells the supervisor to verify: {}",
+            gc.warnings[0]
+        );
+
+        // RED-before / GREEN-after (b): a depressed k=4 cell with FEWER than 5
+        // captured per-sample occupancy values silently no-ops the bimodality
+        // backstop. It must CERTIFY AND carry the K≥2-SHAPE-CHECK-SKIPPED WARN.
+        let mut short = clean_cell(); // k=4
+        short.occupancy_med = 0.5;
+        short.occupancy_samples = vec![0.50, 0.49, 0.51]; // 3 < 5
+        let gc = box_check_of(&short);
+        assert_eq!(
+            gc.verdict,
+            CheckVerdict::Ok,
+            "a depressed short-sample k≥2 cell must STILL certify"
+        );
+        assert_eq!(gc.warnings.len(), 1, "exactly one WARN: {:?}", gc.warnings);
+        assert!(
+            gc.warnings[0].contains("K≥2-SHAPE-CHECK-SKIPPED"),
+            "names the skipped shape-check: {}",
+            gc.warnings[0]
+        );
+
+        // CONTROL: a depressed-BIMODAL k=4 cell still hard-VOIDs (PREEMPTED-K≥2)
+        // and is NOT downgraded to a mere WARN — the VOID branch wins.
+        let mut comp = clean_cell(); // k=4
+        let mut samples = vec![0.30, 0.31, 0.29, 0.30, 0.32, 0.31, 0.30, 0.30];
+        samples.extend_from_slice(&[1.00, 0.99, 1.00, 0.98, 1.00, 0.99]);
+        comp.n_raw = 14;
+        comp.clean = 14;
+        comp.occupancy_med = 0.305;
+        comp.occupancy_samples = samples;
+        let gc = box_check_of(&comp);
+        assert_eq!(
+            gc.verdict,
+            CheckVerdict::Void,
+            "a bimodal competitor still VOIDs (not downgraded to a WARN)"
+        );
+        assert!(
+            gc.warnings.is_empty(),
+            "a VOIDed cell carries no WARN (the verdict already drops it): {:?}",
+            gc.warnings
         );
     }
 
