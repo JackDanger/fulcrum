@@ -578,19 +578,26 @@ struct Captured {
 
 // ─── deterministic sample synthesis ──────────────────────────────────────────
 
-/// Build an N-sample set (seconds) whose MIN == `min_s` and MAX == `min_s +
-/// spread_s`. Mirrors the gate self-tests' convention so the analyzer's
-/// min-based deltas + spread land exactly where intended.
+/// Build an N-sample set (seconds) EVENLY SPACED from MIN == `min_s` to MAX ==
+/// `min_s + spread_s`. Mirrors the gate self-tests' `samples_n` convention so the
+/// analyzer's central deltas (median-to-median) + robust spread (IQR) land
+/// exactly where intended.
+///
+/// NB: the prior shape spiked all interior samples at the midpoint, which gave a
+/// DEGENERATE IQR of 0 — fine for the old max−min spread, but the keystone gate
+/// now uses a robust IQR floor, so a real distribution is required. Even spacing
+/// keeps MIN, MAX and the median identical to before; only the (now meaningful)
+/// quartiles change.
 fn synth_samples(min_s: f64, spread_s: f64, n: usize) -> Vec<f64> {
-    let mut v = Vec::with_capacity(n.max(1));
-    v.push(min_s);
-    if n >= 2 {
-        v.push(min_s + spread_s);
+    if n == 0 {
+        return Vec::new();
     }
-    for _ in 2..n {
-        v.push(min_s + spread_s / 2.0);
+    if n == 1 {
+        return vec![min_s];
     }
-    v
+    (0..n)
+        .map(|i| min_s + spread_s * i as f64 / (n as f64 - 1.0))
+        .collect()
 }
 
 // ─── fixture capture ─────────────────────────────────────────────────────────
