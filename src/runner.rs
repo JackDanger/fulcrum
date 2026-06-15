@@ -1942,26 +1942,65 @@ fn oracle_counter(
 
 fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option<f64>) {
     let mask = pin_mask(t);
+    // Interleaved best-of-N, warm-up dropped (the same discipline as a cell), so
+    // the A/A self-test rests on a real distribution rather than 3 cold pokes.
+    let n = spec.n.max(4);
     let mut xs = Vec::new();
-    for _ in 0..3 {
+    for i in 0..=n {
         let (sec, _, _) = timed_masked(
             &mask,
             &spec.comparator_bin,
             &["-d", "-c", "-f", "-P", &t.to_string(), corpus],
         );
+        if i == 0 {
+            continue; // drop warm-up
+        }
         if sec > 0.0 {
             xs.push(sec);
         }
     }
-    if xs.len() < 2 {
+    aa_stats(&xs)
+}
+
+/// Derive the A/A self-test (ratio, spread_pct) from a binary-vs-itself sample
+/// set. The ratio is the BETWEEN-half drift signal (best of the late half ÷ best
+/// of the early half) and the spread is the WITHIN-half noise budget (the larger
+/// half's relative range). The two are DISTINCT statistics by construction, so
+/// the gate's `|ratio-1| > spread` comparison is meaningful:
+///
+/// * a stable instrument has no early-vs-late drift ⇒ `ratio ≈ 1.0`, far inside
+///   its within-half noise ⇒ OK;
+/// * a thermally-DRIFTING instrument (late runs systematically slower than early)
+///   pushes `ratio` past the within-half noise ⇒ VOID — exactly what an A/A must
+///   catch.
+///
+/// The OLD form set `ratio = max/min` and `spread = (max/min − 1)·100` — the SAME
+/// quantity twice. `|ratio−1|` then equalled `spread` exactly, so the gate's
+/// strict `>` was decided purely by independent 6-decimal rounding of the ratio
+/// vs the percent: a real rapidgzip A/A of 1.024438 / 2.443791% false-VOIDed by
+/// 1e-7. Distinct statistics remove that boundary entirely.
+fn aa_stats(xs: &[f64]) -> (Option<f64>, Option<f64>) {
+    if xs.len() < 4 {
         return (None, None);
     }
-    let mn = min_of(&xs);
-    let mx = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    // A/A ratio = first-half vs second-half best; here just max/min as the
-    // self-test ratio (a clean A/A reads ~1.0 within its own spread).
-    let ratio = mx / mn;
-    let spread_pct = (mx / mn - 1.0) * 100.0;
+    let half = xs.len() / 2;
+    let (early, late) = xs.split_at(half);
+    let early_best = min_of(early);
+    let late_best = min_of(late);
+    if early_best <= 0.0 {
+        return (None, None);
+    }
+    let ratio = late_best / early_best;
+    // within-half relative range = the noise budget the drift must clear.
+    let disp = |g: &[f64]| -> f64 {
+        let mn = min_of(g);
+        if mn <= 0.0 {
+            return 0.0;
+        }
+        let mx = g.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (mx / mn - 1.0) * 100.0
+    };
+    let spread_pct = disp(early).max(disp(late));
     (Some(ratio), Some(spread_pct))
 }
 
@@ -2353,5 +2392,61 @@ mod tests {
             "an actual env::var read certifies"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── LIVE-PATH BUG: a within-noise comparator A/A false-VOIDed at the gate ──
+    //
+    // The degenerate `ratio = max/min`, `spread = (max/min − 1)·100` made
+    // `|ratio−1|` EQUAL `spread`, so the gate's strict `>` was decided by the
+    // 6-decimal emit/parse rounding alone. The FIRST live <BENCH_HOST> run hit it:
+    // rapidgzip A/A 1.024438 / 2.443791% → VOID by 1e-7. `aa_stats` now derives
+    // ratio (between-half drift) and spread (within-half noise) as DISTINCT
+    // statistics. This replays the failing distribution THROUGH the manifest's
+    // 6-decimal round-trip and asserts the gate no longer voids.
+    fn aa_through_gate(xs: &[f64]) -> crate::provenance::CheckVerdict {
+        let (ratio, spread_pct) = aa_stats(xs);
+        // round-trip exactly as the manifest emits (fmt6) and the gate parses.
+        let ratio = ratio.map(|r| fmt6(r).parse::<f64>().unwrap());
+        let spread_pct = spread_pct.map(|s| fmt6(s).parse::<f64>().unwrap());
+        crate::provenance::check_comparator_present(Some(true), ratio, spread_pct, "/box/rg").verdict
+    }
+
+    #[test]
+    fn aa_within_noise_does_not_false_void() {
+        // a real rapidgzip self-run set: ~2.4% jitter, NO monotonic drift (the
+        // slow/fast samples are interleaved across both halves).
+        let xs = vec![
+            0.500, 0.512, 0.503, 0.511, 0.502, 0.510, 0.504, 0.509, 0.501, 0.508,
+        ];
+        assert_eq!(
+            aa_through_gate(&xs),
+            crate::provenance::CheckVerdict::Ok,
+            "within-noise A/A must certify (was a 1e-7 rounding false-void)"
+        );
+    }
+
+    #[test]
+    fn aa_monotonic_drift_voids() {
+        // a thermally-drifting instrument: every late run is ~12% slower than
+        // every early run, far beyond the tight within-half noise — a genuine
+        // A/A failure the self-test MUST catch (box not actually frozen).
+        let xs = vec![
+            0.500, 0.501, 0.502, 0.503, 0.504, 0.560, 0.561, 0.562, 0.563, 0.564,
+        ];
+        assert_eq!(
+            aa_through_gate(&xs),
+            crate::provenance::CheckVerdict::Void,
+            "monotonic early→late drift must VOID the A/A self-test"
+        );
+    }
+
+    #[test]
+    fn aa_too_few_samples_is_incomplete() {
+        // < 4 samples ⇒ (None, None) ⇒ COMPARATOR-PRESENT Incomplete (present but
+        // not self-tested), never a Void.
+        assert_eq!(
+            aa_through_gate(&[0.5, 0.51, 0.52]),
+            crate::provenance::CheckVerdict::Incomplete
+        );
     }
 }

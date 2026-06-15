@@ -659,18 +659,20 @@ fn claim_from_capture(cap: &Capture) -> GateClaim {
     }
 }
 
-/// Build a baseline `settled/tie` claim: the subject is the first arm (the
-/// gzippy subject) and the field-tool roster is DERIVED from every OTHER arm
-/// declared in the capture (measured or absent). A declared-but-absent field
-/// tool VOIDs the claim (the field-roster gate), so the roster is exactly "the
-/// field this run committed to measure". `tie_bar` is the standard 0.99.
+/// Build a baseline FIELD claim: the subject is the first arm (the gzippy
+/// subject) and the field-tool roster is DERIVED from every OTHER arm declared in
+/// the capture. A baseline is a MEASUREMENT, not a tie assertion — the claim is
+/// [`GateClaim::FieldBaseline`], which ADMITS iff the whole field is measured
+/// comparably here (a declared-but-absent field tool still REFUSES — the
+/// apples-to-apples roster gate) and lets the FINDING carry the win/tie/loss
+/// verdict, so an honest LOSS banks. (Use [`GateClaim::Settled`] only when
+/// actually ASSERTING a tie.)
 fn settled_claim_from_capture(cap: &Capture) -> GateClaim {
     let subject = cap.arms.first().map(|a| a.id.clone()).unwrap_or_default();
     let field_tools: Vec<String> = cap.arms.iter().skip(1).map(|a| a.id.clone()).collect();
-    GateClaim::Settled {
+    GateClaim::FieldBaseline {
         subject,
         field_tools,
-        tie_bar: 0.99,
     }
 }
 

@@ -470,10 +470,13 @@ fn baseline_no_sweep_banks_a_certified_frozenmatrix_finding() {
         .contains(&res.cell.cell_id));
 }
 
-// ── 2. FIELD-ROSTER: a missing field tool VOIDS the settled claim ─────────────
+// ── 2. FIELD-ROSTER: a missing field tool REFUSES the baseline comparison ──────
 #[test]
-fn baseline_missing_field_tool_voids_at_comparability() {
-    // igzip is DECLARED but not measured (no fixture wall) ⇒ SETTLED-VOIDED.
+fn baseline_missing_field_tool_refuses_at_comparability() {
+    // igzip is DECLARED but not measured (no fixture wall). A baseline is still
+    // apples-to-apples — you cannot compare against a tool you never ran — so the
+    // cell REFUSES at comparability (now ONE-ARM-INCONCLUSIVE, not the old
+    // SETTLED-VOIDED, because a baseline is a measurement not a tie assertion).
     let (_p, _s, results) = flow_baseline(
         &[("igzip", None, 0.0), ("libdeflate", Some(102.0), 340.0)],
         100.0,
@@ -484,28 +487,35 @@ fn baseline_missing_field_tool_voids_at_comparability() {
         .as_ref()
         .expect_err("must refuse with a missing tool");
     assert_eq!(r.gate, G_COMPARABILITY);
-    assert_eq!(r.sub_check, "SETTLED-VOIDED");
+    assert_eq!(r.sub_check, "ONE-ARM-INCONCLUSIVE");
     assert!(r.reason.contains("igzip"));
 }
 
-// ── 2b. FIELD-ROSTER: subject heavier on MEMORY also voids (memory gated) ─────
+// ── 2b. BASELINE: faster-on-wall but HEAVIER-on-memory still BANKS ────────────
 #[test]
-fn baseline_losing_on_memory_voids_settled() {
-    // subject is fastest but uses MORE memory than igzip ⇒ not settled.
-    let (_p, _s, results) = flow_baseline(
+fn baseline_faster_but_heavier_memory_still_banks() {
+    // A baseline is a MEASUREMENT, not a tie/settled assertion: the subject is
+    // fastest on wall but uses MORE memory than igzip. The OLD path routed every
+    // baseline through a `Settled` claim and VOIDed this on the memory gate, so
+    // the cell — and its RSS number — never banked. The new FieldBaseline path
+    // ADMITS (the field is fully measured) and BANKS the cell with the wall
+    // verdict AND the recorded peak RSS, so the honest memory figure survives.
+    let (store_path, store, results) = flow_baseline(
         &[("igzip", Some(101.0), 200.0)],
         100.0,
-        500.0, // subject 500MiB vs igzip 200MiB
+        500.0, // subject 500MiB vs igzip 200MiB — heavier, but measured + banked
     );
-    let (_label, outcome) = &results[0];
-    let r = outcome.as_ref().expect_err("memory loss must void");
-    assert_eq!(r.gate, G_COMPARABILITY);
-    assert_eq!(r.sub_check, "SETTLED-VOIDED");
-    assert!(
-        r.reason.contains("rss"),
-        "the void cites memory: {}",
-        r.reason
-    );
+    let (label, outcome) = &results[0];
+    let res = outcome
+        .as_ref()
+        .unwrap_or_else(|r| panic!("baseline cell {label} refused: {}", r.render()));
+    assert!(res.comparability_verdict.contains("ADMITTED"));
+    // wall verdict (subject fastest) + the heavier RSS is RECORDED, not gated.
+    assert_eq!(res.cell.rss_mb, Some(500.0));
+    assert!(store.get(&res.cell.cell_id).is_some());
+    assert!(std::fs::read_to_string(&store_path)
+        .unwrap()
+        .contains(&res.cell.cell_id));
 }
 
 // ── 4. SINGLE-ARCH ⇒ NOT-YET-LAW; two merged arches ⇒ LAW ─────────────────────

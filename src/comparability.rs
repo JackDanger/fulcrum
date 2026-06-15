@@ -274,6 +274,17 @@ pub enum GateClaim {
         /// e.g. 0.99 — `subject` must be at-or-faster (ratio other/subject ≥ bar).
         tie_bar: f64,
     },
+    /// A non-adjudicating BASELINE field comparison: `subject` measured against
+    /// the full `field_tools` roster, apples-to-apples. ADMITS iff every declared
+    /// field tool is measured here with a usable A/A — it does NOT assert a
+    /// tie/win/loss. The win/tie/loss verdict is carried by the FINDING, so an
+    /// honest LOSS still BANKS (unlike [`GateClaim::Settled`], which VOIDs a loss).
+    /// This is the claim a `fulcrum run` BASELINE (no perturbation) flows: a
+    /// baseline is a MEASUREMENT, not a tie assertion.
+    FieldBaseline {
+        subject: String,
+        field_tools: Vec<String>,
+    },
 }
 
 impl GateClaim {
@@ -290,6 +301,9 @@ impl GateClaim {
             },
             GateClaim::Law { statement } => format!("LAW: {statement}"),
             GateClaim::Settled { subject, .. } => format!("{subject} is settled/tie at this cell"),
+            GateClaim::FieldBaseline { subject, .. } => {
+                format!("{subject} baseline vs the field at this cell")
+            }
         }
     }
 }
@@ -467,6 +481,43 @@ pub fn predicate_settled(
     }
 }
 
+/// PREDICATE 4b — BASELINE field COMPARABILITY (no tie adjudication). A baseline
+/// field comparison is speakable iff the subject AND every declared field tool
+/// are measured here with a usable A/A — the apples-to-apples requirement. Unlike
+/// [`predicate_settled`] it does NOT test win/tie/loss: the verdict is carried by
+/// the finding, so an honest LOSS still banks. Returns `OneArmInconclusive` when
+/// a required arm is unmeasured/unusable, else `None` (the field is comparable).
+pub fn predicate_field_measured(
+    cap: &Capture,
+    subject: &str,
+    field_tools: &[String],
+) -> Option<GateVerdict> {
+    let mut missing = Vec::new();
+    match cap.arm(subject) {
+        Some(a) if a.wall_ms.is_some() => {}
+        _ => missing.push(subject.to_string()),
+    }
+    for tool in field_tools {
+        if tool == subject {
+            continue;
+        }
+        match cap.arm(tool) {
+            Some(arm) if arm.usable_as_comparator() && arm.wall_ms.is_some() => {}
+            _ => missing.push(tool.clone()),
+        }
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(GateVerdict::OneArmInconclusive {
+            missing,
+            why: "a baseline field comparison needs the subject and every declared field \
+                  tool measured comparably (same capture, usable A/A) at this cell"
+                .to_string(),
+        })
+    }
+}
+
 // ───────────────────────────── evaluators ───────────────────────────────────────
 
 /// Evaluate a single-capture claim ([`GateClaim::SubjectSpecific`] or
@@ -578,6 +629,36 @@ pub fn evaluate(cap: &Capture, claim: &GateClaim) -> GateOutcome {
                         "ADMITTED: every field tool measured here and {subject} ≥{:.2}× vs each. \
                          (Single capture ⇒ HYPOTHESIS until cross-arch replicated.)",
                         tie_bar
+                    ),
+                )
+            }
+        }
+        GateClaim::FieldBaseline {
+            subject,
+            field_tools,
+        } => {
+            if let Some(v) = predicate_field_measured(cap, subject, field_tools) {
+                let detail = match &v {
+                    GateVerdict::OneArmInconclusive { missing, .. } => missing.join(", "),
+                    _ => String::new(),
+                };
+                (
+                    v,
+                    EvidenceTier::Hypothesis,
+                    format!(
+                        "REFUSED: a '{subject}' baseline field comparison needs the subject and \
+                         every declared field tool measured comparably here — UNMEASURED: {detail}."
+                    ),
+                )
+            } else {
+                (
+                    GateVerdict::Admitted,
+                    EvidenceTier::Hypothesis,
+                    format!(
+                        "ADMITTED: {subject} measured comparably against the full field ({}) at \
+                         this cell; the win/tie/loss verdict is carried by the finding. (Single \
+                         capture ⇒ HYPOTHESIS until cross-arch replicated.)",
+                        field_tools.join(", ")
                     ),
                 )
             }
@@ -1148,6 +1229,63 @@ mod tests {
                 assert!(losing.iter().any(|l| l.contains("igzip")));
             }
             v => panic!("expected SETTLED-VOIDED, got {v:?}"),
+        }
+    }
+
+    // ── PREDICATE 4b: BASELINE field comparison (banks an honest loss) ───────────
+    //
+    // LIVE-PATH BUG (first <BENCH_HOST> run): the baseline path routed EVERY cell
+    // through a `Settled` (tie) claim, so a cell where gzippy genuinely LOSES the
+    // field (T1: 0.72× igzip) VOIDed at the comparability gate and never banked —
+    // defeating a baseline matrix, whose whole job is to record honest losses.
+    // `FieldBaseline` admits a fully-measured field and lets the FINDING carry the
+    // verdict.
+
+    #[test]
+    fn field_baseline_admits_an_honest_loss() {
+        // The exact shape of the first <BENCH_HOST> T1 cell: gzippy slower than the
+        // field, but every field tool measured comparably ⇒ ADMITTED (the loss is
+        // the finding's verdict, not a gate void).
+        let cap = cap_with(
+            vec![
+                aa_clean("gzippy-native", 623.0),
+                aa_clean("igzip", 447.0), // gzippy 0.72× — a real loss
+                aa_clean("libdeflate", 533.0),
+            ],
+            vec![],
+        );
+        let claim = GateClaim::FieldBaseline {
+            subject: "gzippy-native".into(),
+            field_tools: vec!["igzip".into(), "libdeflate".into()],
+        };
+        let o = evaluate(&cap, &claim);
+        assert!(
+            o.verdict.admitted(),
+            "a fully-measured baseline field comparison ADMITS even on a loss: {:?}",
+            o.verdict
+        );
+    }
+
+    #[test]
+    fn field_baseline_refuses_an_unmeasured_field_tool() {
+        // Apples-to-apples still requires the whole declared field measured here —
+        // a declared-but-absent tool REFUSES (you cannot baseline against nothing).
+        let cap = cap_with(
+            vec![
+                aa_clean("gzippy-native", 623.0),
+                aa_clean("igzip", 447.0),
+            ],
+            vec![],
+        );
+        let claim = GateClaim::FieldBaseline {
+            subject: "gzippy-native".into(),
+            field_tools: vec!["igzip".into(), "libdeflate".into()], // libdeflate absent
+        };
+        match evaluate(&cap, &claim).verdict {
+            GateVerdict::OneArmInconclusive { missing, .. } => {
+                assert!(missing.contains(&"libdeflate".to_string()));
+            }
+            v => panic!("expected ONE-ARM-INCONCLUSIVE, got {v:?}"),
         }
     }
 }
