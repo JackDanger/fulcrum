@@ -247,6 +247,11 @@ fn gate_provenance(inp: &PipelineInput) -> Option<PipelineRefusal> {
             "COMPARATOR-PRESENT" => {
                 "stage the native comparator ELF on the box and capture its A/A self-test"
             }
+            "BOX-VALID" => {
+                "re-run on a quiet, frozen window pinned to the requested cores \
+                 (procs_running ≤ k+1, boost/turbo off, governor=performance, \
+                 Cpus_allowed_list ⊇ the mask, ≥9 clean samples) — see the reason"
+            }
             _ => "re-capture the missing/failed provenance field",
         };
         return Some(PipelineRefusal::new(

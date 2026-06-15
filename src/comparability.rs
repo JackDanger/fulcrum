@@ -1271,10 +1271,7 @@ mod tests {
         // Apples-to-apples still requires the whole declared field measured here —
         // a declared-but-absent tool REFUSES (you cannot baseline against nothing).
         let cap = cap_with(
-            vec![
-                aa_clean("gzippy-native", 623.0),
-                aa_clean("igzip", 447.0),
-            ],
+            vec![aa_clean("gzippy-native", 623.0), aa_clean("igzip", 447.0)],
             vec![],
         );
         let claim = GateClaim::FieldBaseline {

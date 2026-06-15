@@ -58,6 +58,38 @@ pub const LINEARITY_K: f64 = 2.0;
 /// Largest-gap bimodality heuristic factor (the N=21 lesson).
 pub const BIMODAL_K: f64 = 3.0;
 
+// ── NOISY-BOX VALIDITY constants (the shared-LXC drift/preempt/wrong-core gate) ─
+//
+// These turn the measurement discipline for a shared LXC into deterministic VOID
+// thresholds. A number measured while the box drifted, was preempted, or ran on
+// the wrong cores CANNOT bank. They are consumed by the per-sample cleaning
+// primitives below ([`occupancy_filter`]/[`iqr_fence`]/[`clean_samples`]) and by
+// the BOX-VALID sub-check in `provenance.rs` (the bracket drift + run-queue +
+// reject-fraction tests).
+
+/// Minimum per-sample occupancy ((utime+stime)/(wall·k)) for a sample to count.
+/// Below this the child was preempted off-core for a meaningful slice of its
+/// wall — the wall measured the box's contention, not the workload.
+pub const OCCUPANCY_MIN: f64 = 0.90;
+/// Reject fraction that VOIDs a cell outright: more than half the raw samples
+/// preempted/fenced ⇒ the window was contaminated, no clean median trustable.
+pub const REJECT_VOID_FRAC: f64 = 0.50;
+/// Control-bracket drift VOID multiple: a swing > K × the control IQR floor is a
+/// genuine box-state shift mid-cell (not sample noise).
+pub const DRIFT_VOID_K: f64 = 2.0;
+/// Control-bracket end-to-end drift VOID percent: |last−first|/first beyond this
+/// is a thermal/turbo ramp across the cell regardless of the IQR floor.
+pub const DRIFT_VOID_PCT: f64 = 3.0;
+/// Raw samples taken per cell before cleaning (drop ⇒ clean set).
+pub const N_RAW: usize = 15;
+/// Escalated raw-sample count when the in-cell reject rate is high.
+pub const N_RAW_ESCALATED: usize = 21;
+/// Reject fraction at which N escalates from [`N_RAW`] to [`N_RAW_ESCALATED`].
+pub const ESCALATE_REJECT_FRAC: f64 = 0.33;
+/// Run-queue slack over the requested core count k: a median `procs_running`
+/// above k + this many is competing load (the box was not quiet).
+pub const PROCS_RUNNING_SLACK: i64 = 1;
+
 // ── Verdict + evidence tier ─────────────────────────────────────────────────
 
 /// The six deterministic verdicts. These are the perturbation-harness verdicts;
@@ -263,6 +295,134 @@ fn spread_s(sets: &[&[f64]]) -> f64 {
         }
     }
     sp
+}
+
+/// Public wrapper over the robust IQR dispersion floor (the widest IQR across
+/// the supplied sample sets). Exposed so the BOX-VALID gate and the runner derive
+/// the control-bracket noise floor through the SAME arithmetic the keystone fix
+/// uses, never a hand-rolled spread.
+pub fn iqr_spread(sets: &[&[f64]]) -> f64 {
+    spread_s(sets)
+}
+
+// ── NOISY-BOX sample cleaning (occupancy filter + Tukey IQR fence) ───────────
+//
+// The cleaning pipeline a contaminated shared-LXC sample set must pass BEFORE
+// the keystone IQR dispersion / median delta judge it. Occupancy-filter first
+// (drop preempted samples), then IQR-fence (drop dispersion outliers), then keep
+// the existing bimodality tripwire as a check that fencing did not merely HIDE
+// two modes. Composes with — does not replace — the keystone median/IQR stats.
+
+/// Linear-interpolation percentile over an ALREADY-SORTED slice (the numpy /
+/// `sample_stats` convention, factored out so the fence reuses one arithmetic).
+fn quantile_sorted(s: &[f64], p: f64) -> f64 {
+    let n = s.len();
+    let k = (n as f64 - 1.0) * p;
+    let lo = k.floor() as usize;
+    let hi = k.ceil() as usize;
+    if lo == hi {
+        s[lo]
+    } else {
+        s[lo] + (s[hi] - s[lo]) * (k - lo as f64)
+    }
+}
+
+/// Occupancy-filter: keep only samples whose aligned per-sample occupancy is
+/// ≥ `min`. `occ[i]` is the occupancy of `xs[i]`; a SHORTER `occ` leaves the
+/// unmatched tail untouched (no occupancy captured ⇒ assume clean — graceful
+/// degradation, never a phantom reject). Returns (kept, rejected_count).
+pub fn occupancy_filter(xs: &[f64], occ: &[f64], min: f64) -> (Vec<f64>, usize) {
+    let mut kept = Vec::with_capacity(xs.len());
+    let mut rejected = 0usize;
+    for (i, &x) in xs.iter().enumerate() {
+        match occ.get(i) {
+            Some(&o) if o < min => rejected += 1,
+            _ => kept.push(x),
+        }
+    }
+    (kept, rejected)
+}
+
+/// Tukey IQR fence: drop samples outside [Q1 − 1.5·IQR, Q3 + 1.5·IQR]. Fewer
+/// than 4 samples are returned unchanged (no defensible quartiles). Returns
+/// (kept, dropped_count).
+pub fn iqr_fence(xs: &[f64]) -> (Vec<f64>, usize) {
+    if xs.len() < 4 {
+        return (xs.to_vec(), 0);
+    }
+    let s = sorted(xs);
+    let q1 = quantile_sorted(&s, 0.25);
+    let q3 = quantile_sorted(&s, 0.75);
+    let iqr = q3 - q1;
+    let lo = q1 - 1.5 * iqr;
+    let hi = q3 + 1.5 * iqr;
+    let kept: Vec<f64> = xs.iter().copied().filter(|&x| x >= lo && x <= hi).collect();
+    let dropped = xs.len() - kept.len();
+    (kept, dropped)
+}
+
+/// The result of cleaning a raw sample set: the surviving samples, the TOTAL
+/// rejected count (occupancy + fence), and whether the FENCED set still looks
+/// bimodal (fencing hid two modes — a tripwire, not a clean unimodal cell).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleanResult {
+    pub kept: Vec<f64>,
+    pub rejected: usize,
+    pub bimodal_after_fence: bool,
+}
+
+/// Clean a raw sample set: occupancy-filter (using `occ`, aligned 1:1) THEN
+/// Tukey IQR-fence, reporting the combined reject count and the post-fence
+/// bimodality tripwire. This is the exact order the BOX-VALID capture uses.
+pub fn clean_samples(xs: &[f64], occ: &[f64]) -> CleanResult {
+    let (after_occ, occ_rej) = occupancy_filter(xs, occ, OCCUPANCY_MIN);
+    let (kept, fence_rej) = iqr_fence(&after_occ);
+    let bimodal_after_fence = bimodal(&kept, BIMODAL_K);
+    CleanResult {
+        kept,
+        rejected: occ_rej + fence_rej,
+        bimodal_after_fence,
+    }
+}
+
+// ── NOISY-BOX control-bracket drift (the FULL-CELL A/A, generalized) ─────────
+
+/// The drift of a control bracket: the worst median-to-median swing across the
+/// bracket points (seconds) and the end-to-end percent (|last−first|/first·100).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BracketDrift {
+    pub swing_s: f64,
+    pub end_to_end_pct: f64,
+}
+
+/// Generalize the single A/A drift check (baseline vs recheck) to a FULL-CELL
+/// control bracket: a reference control block emitted FIRST, MID and LAST of a
+/// cell. `medians` are the per-block control medians (seconds), in bracket order.
+/// `swing_s` is the worst pairwise median drift (robust, median-to-median like
+/// the keystone A/A); `end_to_end_pct` is the first→last ramp. The BOX-VALID
+/// DRIFT test VOIDs when `swing_s` > [`DRIFT_VOID_K`]·floor OR `end_to_end_pct` >
+/// [`DRIFT_VOID_PCT`]. `None` for fewer than two bracket points.
+pub fn bracket_drift(medians: &[f64]) -> Option<BracketDrift> {
+    if medians.len() < 2 {
+        return None;
+    }
+    let mut swing = 0.0_f64;
+    for i in 0..medians.len() {
+        for j in (i + 1)..medians.len() {
+            swing = swing.max((medians[i] - medians[j]).abs());
+        }
+    }
+    let first = medians[0];
+    let last = medians[medians.len() - 1];
+    let end_to_end_pct = if first > 0.0 {
+        (last - first).abs() / first * 100.0
+    } else {
+        0.0
+    };
+    Some(BracketDrift {
+        swing_s: swing,
+        end_to_end_pct,
+    })
 }
 
 // ── arm response (one injector arm) ─────────────────────────────────────────
@@ -608,6 +768,10 @@ pub struct Sweep {
     pub region_self_ms: f64,
     pub sha_ok: Option<String>,
     pub baseline: Vec<f64>,
+    /// Optional MID reference-control block — when present, the A/A drift check
+    /// is a FULL-CELL bracket (baseline=FIRST, baseline_mid=MID, recheck=LAST)
+    /// rather than the 2-point baseline-vs-recheck. Empty ⇒ legacy 2-point A/A.
+    pub baseline_mid: Vec<f64>,
     pub baseline_recheck: Vec<f64>,
     pub spin: BTreeMap<u32, Vec<f64>>,
     pub sleep: BTreeMap<u32, Vec<f64>>,
@@ -677,10 +841,18 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
         c.notes = vec!["no baseline samples".to_string()];
         return c;
     };
-    let base_spread = if sr.is_some() {
-        spread_s(&[&sweep.baseline, &sweep.baseline_recheck])
-    } else {
-        sb.iqr
+    let sm = sample_stats(&sweep.baseline_mid);
+    // The control bracket: FIRST (baseline), optional MID, LAST (recheck). With a
+    // MID block this is the FULL-CELL drift bracket; without it, the legacy
+    // 2-point A/A. The IQR floor spans every present control block.
+    let base_spread = match (sr.is_some(), sm.is_some()) {
+        (true, true) => spread_s(&[
+            &sweep.baseline,
+            &sweep.baseline_mid,
+            &sweep.baseline_recheck,
+        ]),
+        (true, false) => spread_s(&[&sweep.baseline, &sweep.baseline_recheck]),
+        _ => sb.iqr,
     };
     if let Some(sr) = sr {
         // ROBUST A/A swing = median-to-median (was min-to-min), CONSISTENT with
@@ -688,16 +860,29 @@ pub fn analyze_sweep(sweep: &Sweep) -> PerturbCell {
         // FAST outlier in either baseline block — the mirror image of the SLACK
         // bug: it could VOID a perfectly good cell. Median drift vs IQR floor
         // detects a genuine box-state shift without being moved by one sample.
-        let swing = (sb.med - sr.med).abs();
-        if swing > base_spread {
+        //
+        // FULL-CELL bracket: when a MID block is present, the worst pairwise
+        // median drift across FIRST/MID/LAST is used (and the FIRST→LAST ramp is
+        // additionally fenced by DRIFT_VOID_PCT), so a mid-cell excursion that a
+        // first-vs-last comparison would average away still VOIDs.
+        let mut medians = vec![sb.med];
+        if let Some(sm) = sm {
+            medians.push(sm.med);
+        }
+        medians.push(sr.med);
+        let drift = bracket_drift(&medians).expect("≥2 control points");
+        let swing = drift.swing_s;
+        if swing > base_spread || drift.end_to_end_pct > DRIFT_VOID_PCT {
             let mut c = cell(Verdict::Void, Tier::Hypothesis);
             c.spread_ms = Some(base_spread * 1000.0);
             c.delta_ms = Some(swing * 1000.0);
             c.notes = vec![format!(
-                "control baseline swung {:.1}ms > spread {:.1}ms between A/A runs \
-                 — box state differed; cell VOID (no verdict trustable)",
+                "control bracket swung {:.1}ms > spread {:.1}ms ({:.2}% end-to-end) across \
+                 {}-point A/A — box state differed; cell VOID (no verdict trustable)",
                 swing * 1000.0,
-                base_spread * 1000.0
+                base_spread * 1000.0,
+                drift.end_to_end_pct,
+                medians.len(),
             )];
             return c;
         }
@@ -894,6 +1079,7 @@ pub fn load_sweep(sweep_dir: &Path) -> Result<(Sweep, BTreeMap<String, String>),
             .unwrap_or(0.0),
         sha_ok: meta.get("sha_ok").cloned(),
         baseline: read_samples(&sweep_dir.join("baseline.txt")),
+        baseline_mid: read_samples(&sweep_dir.join("baseline_mid.txt")),
         baseline_recheck: read_samples(&sweep_dir.join("baseline_recheck.txt")),
         spin: BTreeMap::new(),
         sleep: BTreeMap::new(),

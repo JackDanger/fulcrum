@@ -41,6 +41,7 @@ fn lever_sweep() -> Sweep {
         region_self_ms: SELF_MS,
         sha_ok: Some("1".to_string()),
         baseline: samples(1.000),
+        baseline_mid: Vec::new(),
         baseline_recheck: samples(1.0001),
         spin: linear_arm(1.0),
         sleep: linear_arm(1.0),
@@ -89,6 +90,7 @@ fn clean_provenance() -> Provenance {
         comparator_present: Some(true),
         comparator_aa_ratio: Some(1.0),
         comparator_aa_spread_pct: Some(0.0),
+        box_cells: Vec::new(),
     }
 }
 

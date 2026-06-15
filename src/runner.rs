@@ -71,6 +71,12 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::finding::{Finding, Scope, Threads, Verdict};
+use crate::perturb::{N_RAW, N_RAW_ESCALATED};
+
+/// Reference-control block size (subject decodes per FIRST/MID/LAST bracket).
+const CTRL_BLOCK_N: usize = 3;
+/// Emit a MID reference-control block after this many in-cell samples.
+const CTRL_MID_EVERY: usize = 10;
 
 /// Per-oracle firing counters: name → (on, off, expected). Captured at run time
 /// (live: ON/OFF arm verbose counters; fixture: from the spec) and emitted as
@@ -214,6 +220,14 @@ pub struct RunSpec {
     pub governor: String,
     #[serde(default = "default_no_turbo")]
     pub no_turbo: String,
+    /// FIX 8 (the wrong-core bug) — the INDEPENDENT-P-core pool to pin into,
+    /// in priority order. `pin_mask_pool(t, pool)` takes the first `t` of this pool, so a
+    /// T-run lands on T distinct P-cores and never on cpu 0 (reserved for the
+    /// driver) or an SMT sibling. The frozen i7/<BENCH_HOST> box is
+    /// `[2,4,8,10,12,14,0]` (P-cores by physical id; cpu 0 last, driver-reserved).
+    /// EMPTY ⇒ the legacy sequential `0..t` mask (back-compat for old specs).
+    #[serde(default)]
+    pub core_pool: Vec<usize>,
     #[serde(default)]
     pub host: HostSpec,
     /// Deterministic canned numbers for fixture / `--dry-run` mode.
@@ -506,6 +520,18 @@ struct CapturedCell {
     marker_count_gz: f64,
     marker_count_rg: f64,
     knobs: Vec<CapturedKnob>,
+    /// NOISY-BOX validity capture (subject arm). `occupancy`/`procs_running`/`ts`
+    /// are per-CLEAN-sample; `rejected`/`n_raw`/`escalated` summarize the cleaning;
+    /// `ctrl_first/mid/last` are the bracketed reference-control blocks (seconds).
+    occupancy: Vec<f64>,
+    procs_running: Vec<f64>,
+    ts: Vec<f64>,
+    rejected: usize,
+    n_raw: usize,
+    escalated: bool,
+    ctrl_first: Vec<f64>,
+    ctrl_mid: Vec<f64>,
+    ctrl_last: Vec<f64>,
 }
 
 /// One measured comparator arm of a cell.
@@ -546,10 +572,15 @@ struct CapturedSweep {
     cell_id: String,
     sha_ok: String,
     baseline: Vec<f64>,
+    /// MID reference-control block — the FULL-CELL drift bracket's middle point
+    /// (baseline=FIRST, baseline_mid=MID, recheck=LAST). Empty ⇒ 2-point A/A.
+    baseline_mid: Vec<f64>,
     recheck: Vec<f64>,
     spin: BTreeMap<u32, Vec<f64>>,
     sleep: BTreeMap<u32, Vec<f64>>,
     oracle_removed: Option<Vec<f64>>,
+    /// occupancy/IQR rejects summed across the sweep's arms (drift bookkeeping).
+    rejected: usize,
 }
 
 struct Captured {
@@ -687,12 +718,17 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
                     knob_sink,
                 });
             }
+            // Fixture box-validity: a clean, frozen, quiet window by construction
+            // (occupancy 1.0, run-queue 0, mask ⊆ readback echo, no drift). The
+            // validity-sample count mirrors the wall sample count.
+            let nclean = gz.len();
+            let mask = pin_mask_pool(t, &spec.core_pool);
             cells.push(CapturedCell {
                 corpus: c.id.clone(),
                 threads: t,
-                mask: pin_mask(t),
-                maskd: pin_mask(t),
-                gz,
+                mask: mask.clone(),
+                maskd: mask,
+                gz: gz.clone(),
                 gz_rss_mb: fc.gz_rss_mb,
                 arms,
                 sha_ok: true,
@@ -702,6 +738,15 @@ fn capture_fixture(spec: &RunSpec) -> Captured {
                 marker_count_gz: fc.marker_count_gz,
                 marker_count_rg: fc.marker_count_rg,
                 knobs,
+                occupancy: vec![1.0; nclean],
+                procs_running: vec![0.0; nclean],
+                ts: Vec::new(),
+                rejected: 0,
+                n_raw: nclean,
+                escalated: false,
+                ctrl_first: gz.clone(),
+                ctrl_mid: gz.clone(),
+                ctrl_last: gz,
             });
         }
     }
@@ -790,10 +835,13 @@ fn synth_sweep(spec: &RunSpec, p: &PerturbSpec, fp: &FixturePerturb) -> Captured
         cell_id: nonempty(&p.cell, &format!("perturb_{}", slug(&p.region))),
         sha_ok: nonempty(&fp.sha_ok, "1"),
         baseline: synth_samples(base_s, spread_s, spec.n),
+        // fixture: a steady MID control block (no drift) at the baseline mean.
+        baseline_mid: synth_samples(base_s, spread_s, spec.n),
         recheck: synth_samples(recheck_s, spread_s, spec.n),
         spin,
         sleep,
         oracle_removed,
+        rejected: 0,
     }
 }
 
@@ -966,41 +1014,120 @@ fn measure_cell_live(
     t: usize,
     ref_sha: Option<String>,
 ) -> Result<CapturedCell, String> {
-    let mask = pin_mask(t);
+    let mask = pin_mask_pool(t, &spec.core_pool);
+    let maskd = mask_readback(&mask);
+    let k = t.max(1);
     let roster = comparators(spec);
-    let mut gz = Vec::new();
-    let mut gz_rss = 0.0_f64;
     let mut arm_walls: Vec<Vec<f64>> = vec![Vec::new(); roster.len()];
     let mut arm_rss: Vec<f64> = vec![0.0; roster.len()];
     let mut sha_ok = true;
     let gz_argv = decode_argv(t, &c.path);
-    for i in 0..=spec.n {
-        let (gsec, gsha, grss) = timed_argv(&mask, &spec.gzippy_bin, &gz_argv);
-        // every comparator arm, interleaved in the SAME iteration as the subject.
-        let comp_runs: Vec<(f64, String, f64)> = roster
+
+    // A fixed reference-control block: CTRL_BLOCK_N subject decodes (the
+    // "control reference workload"). Run FIRST/MID/LAST of the cell; their
+    // medians feed the BOX-VALID DRIFT bracket.
+    let control_block = || -> Vec<f64> {
+        (0..CTRL_BLOCK_N)
+            .map(|_| timed_argv(&mask, &spec.gzippy_bin, &gz_argv).secs)
+            .collect()
+    };
+    let ctrl_first = control_block();
+
+    // Raw subject samples + per-sample occupancy/run-queue/timestamp, with every
+    // comparator arm interleaved in the same iteration. A MID control block is
+    // emitted ~every CTRL_MID_EVERY samples.
+    let mut raw_walls: Vec<f64> = Vec::new();
+    let mut raw_occ: Vec<f64> = Vec::new();
+    let mut raw_procs: Vec<f64> = Vec::new();
+    let mut raw_ts: Vec<f64> = Vec::new();
+    let mut ctrl_mid: Vec<f64> = Vec::new();
+    let mut warm = true;
+
+    let take_sample = |raw_walls: &mut Vec<f64>,
+                       raw_occ: &mut Vec<f64>,
+                       raw_procs: &mut Vec<f64>,
+                       raw_ts: &mut Vec<f64>,
+                       arm_walls: &mut Vec<Vec<f64>>,
+                       arm_rss: &mut Vec<f64>,
+                       sha_ok: &mut bool,
+                       warm: &mut bool| {
+        let g = timed_argv(&mask, &spec.gzippy_bin, &gz_argv);
+        let comp_runs: Vec<TimedSample> = roster
             .iter()
             .map(|comp| timed_argv(&mask, &comp.bin, &comparator_argv(comp, t, &c.path)))
             .collect();
-        if i == 0 {
-            continue; // drop warm-up
+        if *warm {
+            *warm = false; // drop warm-up
+            return;
         }
-        gz.push(gsec);
-        gz_rss = gz_rss.max(grss);
+        raw_walls.push(g.secs);
+        raw_occ.push(occupancy_of(&g, k));
+        raw_procs.push(g.procs_running);
+        raw_ts.push(g.ts);
         if let Some(rs) = &ref_sha {
-            if &gsha != rs {
-                sha_ok = false;
+            if &g.sha != rs {
+                *sha_ok = false;
             }
         }
-        for (idx, (rsec, rsha, rrss)) in comp_runs.into_iter().enumerate() {
-            arm_walls[idx].push(rsec);
-            arm_rss[idx] = arm_rss[idx].max(rrss);
+        for (idx, r) in comp_runs.into_iter().enumerate() {
+            arm_walls[idx].push(r.secs);
+            arm_rss[idx] = arm_rss[idx].max(r.rss_mb);
             if let Some(rs) = &ref_sha {
-                if !rsha.is_empty() && &rsha != rs {
-                    sha_ok = false;
+                if !r.sha.is_empty() && &r.sha != rs {
+                    *sha_ok = false;
                 }
             }
         }
+    };
+
+    for _ in 0..=N_RAW {
+        take_sample(
+            &mut raw_walls,
+            &mut raw_occ,
+            &mut raw_procs,
+            &mut raw_ts,
+            &mut arm_walls,
+            &mut arm_rss,
+            &mut sha_ok,
+            &mut warm,
+        );
+        if raw_walls.len() == CTRL_MID_EVERY && ctrl_mid.is_empty() {
+            ctrl_mid = control_block();
+        }
     }
+
+    // Clean (occupancy filter + IQR fence). Escalate N when the reject rate is
+    // high, then re-clean.
+    let mut clean = crate::perturb::clean_samples(&raw_walls, &raw_occ);
+    let mut escalated = false;
+    if !raw_walls.is_empty()
+        && (clean.rejected as f64 / raw_walls.len() as f64) > crate::perturb::ESCALATE_REJECT_FRAC
+    {
+        escalated = true;
+        while raw_walls.len() < N_RAW_ESCALATED {
+            take_sample(
+                &mut raw_walls,
+                &mut raw_occ,
+                &mut raw_procs,
+                &mut raw_ts,
+                &mut arm_walls,
+                &mut arm_rss,
+                &mut sha_ok,
+                &mut warm,
+            );
+        }
+        clean = crate::perturb::clean_samples(&raw_walls, &raw_occ);
+    }
+    let n_raw = raw_walls.len();
+    let ctrl_last = control_block();
+
+    // The kept (clean) samples + their aligned occupancy/run-queue/ts snapshots.
+    let gz = clean.kept.clone();
+    // align occupancy/procs/ts to the clean walls (by value membership; the
+    // cleaning only drops, never reorders).
+    let (occupancy, procs_running, ts) =
+        align_clean(&raw_walls, &raw_occ, &raw_procs, &raw_ts, &gz);
+
     let arms: Vec<CapturedArm> = roster
         .iter()
         .enumerate()
@@ -1018,9 +1145,9 @@ fn measure_cell_live(
         corpus: c.id.clone(),
         threads: t,
         mask: mask.clone(),
-        maskd: mask_readback(&mask),
+        maskd,
         gz,
-        gz_rss_mb: gz_rss,
+        gz_rss_mb: subject_rss(spec, &mask, t, &c.path),
         arms,
         sha_ok,
         verbose,
@@ -1029,7 +1156,65 @@ fn measure_cell_live(
         marker_count_gz: 0.0,
         marker_count_rg: 0.0,
         knobs: measure_knobs_live(spec, c, t, &mask, ref_sha.clone()),
+        occupancy,
+        procs_running,
+        ts,
+        rejected: clean.rejected,
+        n_raw,
+        escalated,
+        ctrl_first,
+        ctrl_mid,
+        ctrl_last,
     })
+}
+
+/// CPU occupancy of one timed sample at core count `k`: cpu_secs / (wall·k). No
+/// CPU time captured (BSD time) ⇒ 1.0 (assume clean — never a false reject).
+fn occupancy_of(s: &TimedSample, k: usize) -> f64 {
+    if s.cpu_secs <= 0.0 {
+        return 1.0;
+    }
+    let denom = s.secs * k as f64;
+    if denom <= 0.0 {
+        1.0
+    } else {
+        s.cpu_secs / denom
+    }
+}
+
+/// Re-measure the subject's peak RSS once (a single `/usr/bin/time -v` run); the
+/// wall samples were cleaned, so we take RSS from a dedicated probe rather than a
+/// dropped sample.
+fn subject_rss(spec: &RunSpec, mask: &str, t: usize, path: &str) -> f64 {
+    timed_argv(mask, &spec.gzippy_bin, &decode_argv(t, path)).rss_mb
+}
+
+/// Align the per-sample occupancy/run-queue/ts snapshots to the CLEAN wall set.
+/// Cleaning only drops samples (never reorders), so we walk the raw set and keep
+/// the snapshots whose wall survived (first-match consumed, to handle equal walls).
+fn align_clean(
+    raw_walls: &[f64],
+    raw_occ: &[f64],
+    raw_procs: &[f64],
+    raw_ts: &[f64],
+    clean: &[f64],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut occ = Vec::new();
+    let mut procs = Vec::new();
+    let mut ts = Vec::new();
+    let mut used = vec![false; raw_walls.len()];
+    for &cw in clean {
+        for (i, &rw) in raw_walls.iter().enumerate() {
+            if !used[i] && rw == cw {
+                used[i] = true;
+                occ.push(*raw_occ.get(i).unwrap_or(&1.0));
+                procs.push(*raw_procs.get(i).unwrap_or(&0.0));
+                ts.push(*raw_ts.get(i).unwrap_or(&0.0));
+                break;
+            }
+        }
+    }
+    (occ, procs, ts)
 }
 
 /// The gzip-family decode argv for the subject: `-d -c -p <t> <path>`.
@@ -1057,7 +1242,7 @@ fn comparator_argv(comp: &ComparatorSpec, t: usize, path: &str) -> Vec<String> {
 }
 
 /// `timed_masked` over an owned argv (the comparator roster builds `Vec<String>`).
-fn timed_argv(mask: &str, bin: &str, argv: &[String]) -> (f64, String, f64) {
+fn timed_argv(mask: &str, bin: &str, argv: &[String]) -> TimedSample {
     let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     timed_masked(mask, bin, &refs)
 }
@@ -1078,12 +1263,12 @@ fn measure_knobs_live(
         let mut rss_knob = 0.0_f64;
         let mut sha_ok = true;
         for i in 0..=spec.knob_n {
-            let (bsec, bsha, brss) = timed_masked(
+            let b = timed_masked(
                 mask,
                 &spec.gzippy_bin,
                 &["-d", "-c", "-p", &t.to_string(), &c.path],
             );
-            let (ksec, ksha, krss) = timed_masked_env(
+            let kk = timed_masked_env(
                 mask,
                 &var,
                 &val,
@@ -1093,12 +1278,12 @@ fn measure_knobs_live(
             if i == 0 {
                 continue;
             }
-            base.push(bsec);
-            knob.push(ksec);
-            rss_base = rss_base.max(brss);
-            rss_knob = rss_knob.max(krss);
+            base.push(b.secs);
+            knob.push(kk.secs);
+            rss_base = rss_base.max(b.rss_mb);
+            rss_knob = rss_knob.max(kk.rss_mb);
             if let Some(rs) = &ref_sha {
-                if &bsha != rs || &ksha != rs {
+                if &b.sha != rs || &kk.sha != rs {
                     sha_ok = false;
                 }
             }
@@ -1133,36 +1318,56 @@ fn measure_sweep_live(spec: &RunSpec, p: &PerturbSpec) -> Result<CapturedSweep, 
                 .map(|c| (c.path.clone(), spec.threads.first().copied().unwrap_or(1)))
         })
         .ok_or("perturb sweep needs a cell or a corpus")?;
-    let mask = pin_mask(t);
-    let measure = |env: &[(&str, String)]| -> Vec<f64> {
-        let mut xs = Vec::new();
-        for i in 0..=spec.n {
-            let (sec, _sha, _rss) = timed_masked_envs(
-                &mask,
-                env,
-                &spec.gzippy_bin,
-                &["-d", "-c", "-p", &t.to_string(), &corpus],
-            );
+    let mask = pin_mask_pool(t, &spec.core_pool);
+    let t_str = t.to_string();
+    // One arm: N_RAW interleaved samples, warm-up dropped, occupancy-filtered +
+    // IQR-fenced BEFORE the keystone dispersion sees them, escalating to
+    // N_RAW_ESCALATED when the in-arm reject rate is high. Returns (clean, rejected).
+    let measure = |env: &[(&str, String)]| -> (Vec<f64>, usize) {
+        let argv = ["-d", "-c", "-p", t_str.as_str(), corpus.as_str()];
+        let mut walls: Vec<f64> = Vec::new();
+        let mut occ: Vec<f64> = Vec::new();
+        for i in 0..=N_RAW {
+            let s = timed_masked_envs(&mask, env, &spec.gzippy_bin, &argv);
             if i == 0 {
-                continue;
+                continue; // drop warm-up
             }
-            xs.push(sec);
+            walls.push(s.secs);
+            occ.push(occupancy_of(&s, t));
         }
-        xs
+        let mut cr = crate::perturb::clean_samples(&walls, &occ);
+        if !walls.is_empty()
+            && (cr.rejected as f64 / walls.len() as f64) > crate::perturb::ESCALATE_REJECT_FRAC
+        {
+            while walls.len() < N_RAW_ESCALATED {
+                let s = timed_masked_envs(&mask, env, &spec.gzippy_bin, &argv);
+                walls.push(s.secs);
+                occ.push(occupancy_of(&s, t));
+            }
+            cr = crate::perturb::clean_samples(&walls, &occ);
+        }
+        (cr.kept, cr.rejected)
     };
-    let baseline = measure(&[]);
-    let recheck = measure(&[]);
+    let mut rejected = 0usize;
+    let (baseline, r) = measure(&[]);
+    rejected += r;
+    // MID + LAST reference-control blocks (the FULL-CELL drift bracket).
+    let (baseline_mid, r) = measure(&[]);
+    rejected += r;
+    let (recheck, r) = measure(&[]);
+    rejected += r;
     let mut spin = BTreeMap::new();
     let mut sleep = BTreeMap::new();
     for pct in [10u32, 20, 30] {
-        spin.insert(pct, measure(&[(&p.slow_knob, pct.to_string())]));
-        sleep.insert(
-            pct,
-            measure(&[
-                (&p.slow_knob, pct.to_string()),
-                ("GZIPPY_SLOW_KIND", "sleep".to_string()),
-            ]),
-        );
+        let (s, r) = measure(&[(&p.slow_knob, pct.to_string())]);
+        rejected += r;
+        spin.insert(pct, s);
+        let (sl, r) = measure(&[
+            (&p.slow_knob, pct.to_string()),
+            ("GZIPPY_SLOW_KIND", "sleep".to_string()),
+        ]);
+        rejected += r;
+        sleep.insert(pct, sl);
     }
     Ok(CapturedSweep {
         region: p.region.clone(),
@@ -1171,10 +1376,12 @@ fn measure_sweep_live(spec: &RunSpec, p: &PerturbSpec) -> Result<CapturedSweep, 
         cell_id: nonempty(&p.cell, &format!("perturb_{}", slug(&p.region))),
         sha_ok: "1".to_string(),
         baseline,
+        baseline_mid,
         recheck,
         spin,
         sleep,
         oracle_removed: None,
+        rejected,
     })
 }
 
@@ -1225,8 +1432,12 @@ fn emit_manifest(spec: &RunSpec, cap: &Captured, run_dir: &Path) -> Result<(), S
     kv("host_cpu_model", &cap.host.cpu_model);
     kv("host_kernel", &cap.host.kernel);
     kv("host_id", &cap.host.id);
-    kv("freeze_state", &spec.freeze_state);
-    kv("quiet_state", &spec.quiet_state);
+    // FIX 5b — DERIVE, don't assert: write quiet_state from the MEASURED
+    // run-queue and freeze_state from a sysfs readback, so the manifest reflects
+    // the box's reality, not the spec author's hope. Both degrade to the declared
+    // spec value when the witness is unavailable (fixture / non-Linux).
+    kv("freeze_state", &derive_freeze_state(spec));
+    kv("quiet_state", &derive_quiet_state(spec, cap));
     kv("governor", &spec.governor);
     kv("no_turbo", &spec.no_turbo);
     kv("n", &spec.n.to_string());
@@ -1303,6 +1514,11 @@ fn emit_manifest(spec: &RunSpec, cap: &Captured, run_dir: &Path) -> Result<(), S
                 if cell.sha_ok { 1 } else { 0 }
             ),
         );
+        // NOISY-BOX validity record (consumed by from_manifest → BOX-VALID).
+        kv(
+            &format!("box_valid_{}_T{}", cell.corpus, cell.threads),
+            &box_valid_record(cell),
+        );
         for k in &cell.knobs {
             if k.sha_ok {
                 kv(
@@ -1320,6 +1536,105 @@ fn emit_manifest(spec: &RunSpec, cap: &Captured, run_dir: &Path) -> Result<(), S
     kv("finished", "fixture");
 
     fs::write(run_dir.join("manifest.txt"), m).map_err(|e| e.to_string())
+}
+
+/// FIX 5b — derive `quiet_state` from the MEASURED per-cell run-queue medians.
+/// Any cell whose median `procs_running` exceeds k + slack marks the run "noisy".
+/// No capture (fixture) ⇒ quiet. Falls back to the declared spec value only when
+/// there are no cells to measure.
+fn derive_quiet_state(spec: &RunSpec, cap: &Captured) -> String {
+    use crate::perturb::PROCS_RUNNING_SLACK;
+    if cap.cells.is_empty() {
+        return spec.quiet_state.clone();
+    }
+    for cell in &cap.cells {
+        let med = crate::perturb::sample_stats(&cell.procs_running)
+            .map(|s| s.med)
+            .unwrap_or(0.0);
+        if med > cell.threads as f64 + PROCS_RUNNING_SLACK as f64 {
+            return "noisy".to_string();
+        }
+    }
+    "quiet".to_string()
+}
+
+/// FIX 5b — derive `freeze_state` from a sysfs readback of the boost/turbo knob
+/// and the governor: frozen iff turbo/boost is OFF and the governor is
+/// `performance` (Intel `intel_pstate/no_turbo=1`, or AMD `cpufreq/boost=0`).
+/// Unreadable (fixture / non-Linux / unknown topology) ⇒ the declared spec value.
+fn derive_freeze_state(spec: &RunSpec) -> String {
+    let gov = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").ok();
+    let intel_no_turbo = fs::read_to_string("/sys/devices/system/cpu/intel_pstate/no_turbo").ok();
+    let amd_boost = fs::read_to_string("/sys/devices/system/cpu/cpufreq/boost").ok();
+    let turbo_off = match (intel_no_turbo, amd_boost) {
+        (Some(nt), _) => Some(nt.trim() == "1"),
+        (None, Some(b)) => Some(b.trim() == "0"),
+        (None, None) => None,
+    };
+    match (turbo_off, gov) {
+        (Some(off), Some(g)) => {
+            if off && g.trim() == "performance" {
+                "frozen".to_string()
+            } else {
+                "thawed".to_string()
+            }
+        }
+        // witness unavailable ⇒ trust the declared state (graceful).
+        _ => spec.freeze_state.clone(),
+    }
+}
+
+/// Serialize a cell's NOISY-BOX validity into the `;`-joined record
+/// `from_manifest`/`parse_box_valid_line` consume. Medians come from
+/// `perturb::sample_stats`; the control IQR floor from `perturb::iqr_spread` —
+/// the SAME robust arithmetic the keystone dispersion uses.
+fn box_valid_record(cell: &CapturedCell) -> String {
+    let med = |xs: &[f64]| {
+        crate::perturb::sample_stats(xs)
+            .map(|s| s.med)
+            .unwrap_or(0.0)
+    };
+    // no occupancy captured (fixture / BSD time) ⇒ assume a clean window.
+    let occ_med = if cell.occupancy.is_empty() {
+        1.0
+    } else {
+        med(&cell.occupancy)
+    };
+    let procs_med = med(&cell.procs_running);
+    let ctrl_first = med(&cell.ctrl_first);
+    let ctrl_mid = med(&cell.ctrl_mid);
+    let ctrl_last = med(&cell.ctrl_last);
+    let ctrl_spread = crate::perturb::iqr_spread(&[
+        cell.ctrl_first.as_slice(),
+        cell.ctrl_mid.as_slice(),
+        cell.ctrl_last.as_slice(),
+    ]);
+    let clean = cell.gz.len();
+    // wall-clock span of the cell (first→last sample timestamp) — drift context.
+    let ts_span = match (cell.ts.first(), cell.ts.last()) {
+        (Some(a), Some(b)) => (b - a).max(0.0),
+        _ => 0.0,
+    };
+    format!(
+        "cell={}:{};k={};n_raw={};rejected={};clean={};escalated={};occ_med={};procs_med={};\
+         mask={};maskd={};ctrl_first={};ctrl_mid={};ctrl_last={};ctrl_spread={};ts_span={}",
+        cell.corpus,
+        cell.threads,
+        cell.threads,
+        cell.n_raw,
+        cell.rejected,
+        clean,
+        if cell.escalated { 1 } else { 0 },
+        fmt6(occ_med),
+        fmt6(procs_med),
+        cell.mask,
+        cell.maskd,
+        fmt6(ctrl_first),
+        fmt6(ctrl_mid),
+        fmt6(ctrl_last),
+        fmt6(ctrl_spread),
+        fmt6(ts_span),
+    )
 }
 
 fn emit_cell(
@@ -1427,11 +1742,14 @@ fn emit_sweep(sw: &CapturedSweep, perturb_root: &Path) -> Result<(), String> {
     let dir = perturb_root.join(slug(&sw.region));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let meta = format!(
-        "region={}\nregion_self_ms={}\nperturb_cmd={}\ncell_id={}\nsha_ok={}\nfreeze_state=frozen\nquiet_state=quiet\n",
-        sw.region, fmt6(sw.region_self_ms), sw.perturb_cmd, sw.cell_id, sw.sha_ok,
+        "region={}\nregion_self_ms={}\nperturb_cmd={}\ncell_id={}\nsha_ok={}\nfreeze_state=frozen\nquiet_state=quiet\nrejected={}\n",
+        sw.region, fmt6(sw.region_self_ms), sw.perturb_cmd, sw.cell_id, sw.sha_ok, sw.rejected,
     );
     fs::write(dir.join("meta.txt"), meta).map_err(|e| e.to_string())?;
     write_samples(&dir.join("baseline.txt"), &sw.baseline)?;
+    if !sw.baseline_mid.is_empty() {
+        write_samples(&dir.join("baseline_mid.txt"), &sw.baseline_mid)?;
+    }
     write_samples(&dir.join("baseline_recheck.txt"), &sw.recheck)?;
     for (arm, levels) in [("spin", &sw.spin), ("sleep", &sw.sleep)] {
         let adir = dir.join(arm);
@@ -1676,12 +1994,27 @@ fn slug(s: &str) -> String {
 
 /// Canonical pin mask for a thread count (the spine's `pin_mask`: P-cores
 /// 0..t-1). Live taskset; fixture just records it.
-fn pin_mask(t: usize) -> String {
-    if t <= 1 {
-        "0".to_string()
-    } else {
-        format!("0-{}", t - 1)
+/// FIX 8 — the taskset mask for a `t`-thread cell, selected from the
+/// INDEPENDENT-P-core `pool` (first `t` cpus, comma-joined). The old
+/// `format!("0-{}", t-1)` was the confirmed wrong-core bug: it pinned to cpus
+/// `0..t-1` — cpu 0 is the driver's core and consecutive ids are SMT siblings,
+/// so a "T-core" run actually shared cores and ran on the wrong core COUNT. With
+/// the pool the run lands on `t` distinct P-cores. An EMPTY pool falls back to
+/// the legacy sequential mask (back-compat for specs without `core_pool`).
+fn pin_mask_pool(t: usize, pool: &[usize]) -> String {
+    if pool.is_empty() {
+        return if t <= 1 {
+            "0".to_string()
+        } else {
+            format!("0-{}", t - 1)
+        };
     }
+    let take = t.clamp(1, pool.len());
+    pool[..take]
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_cell(s: &str) -> Option<(String, usize)> {
@@ -1788,38 +2121,57 @@ fn env_read_in_line(line: &str, env: &str) -> bool {
     false
 }
 
-/// One timed, masked run → (seconds, output-sha256, peak-RSS-MiB). Sink is a
-/// temp regular file (the SINK-LAW: never a pipe). Live only.
-fn timed_masked(mask: &str, bin: &str, args: &[&str]) -> (f64, String, f64) {
+/// One timed, masked run: wall + sha + RSS, plus the NOISY-BOX validity inputs
+/// (child CPU seconds, the run-queue depth snapshot, and the sample timestamp).
+/// `occupancy` is derived by the caller (it needs the core count `k`).
+#[derive(Debug, Clone, Default)]
+struct TimedSample {
+    secs: f64,
+    sha: String,
+    rss_mb: f64,
+    /// child utime+stime (seconds) from `/usr/bin/time -v` — the occupancy
+    /// numerator (occupancy = cpu_secs / (secs · k)).
+    cpu_secs: f64,
+    /// `/proc/stat procs_running` snapshot at the sample (the UNQUIET witness).
+    procs_running: f64,
+    /// unix timestamp (seconds) of the sample (drift bookkeeping).
+    ts: f64,
+}
+
+/// One timed, masked run → [`TimedSample`]. Sink is a temp regular file (the
+/// SINK-LAW: never a pipe). Live only.
+fn timed_masked(mask: &str, bin: &str, args: &[&str]) -> TimedSample {
     timed_masked_envs(mask, &[], bin, args)
 }
 
-fn timed_masked_env(
-    mask: &str,
-    var: &str,
-    val: &str,
-    bin: &str,
-    args: &[&str],
-) -> (f64, String, f64) {
+fn timed_masked_env(mask: &str, var: &str, val: &str, bin: &str, args: &[&str]) -> TimedSample {
     timed_masked_envs(mask, &[(var, val.to_string())], bin, args)
 }
 
-/// FIX 3 — the timed invocation is wrapped in `/usr/bin/time -v` so the peak
-/// resident-set size is captured alongside the wall (memory AND performance).
-/// `/usr/bin/time -v` writes the rusage report (incl. "Maximum resident set
-/// size (kbytes)") to its OWN stderr, which we capture and parse; the child's
-/// stdout still streams to the regular-file sink for the sha check.
-fn timed_masked_envs(
-    mask: &str,
-    envs: &[(&str, String)],
-    bin: &str,
-    args: &[&str],
-) -> (f64, String, f64) {
+/// FIX 3 + the NOISY-BOX capture — the timed invocation is wrapped in
+/// `/usr/bin/time -v` so the peak resident-set size AND the child CPU time
+/// (User+System seconds) are captured alongside the wall. The run-queue depth
+/// (`/proc/stat procs_running`) and a unix timestamp are snapshotted per sample
+/// so the BOX-VALID gate can reject preempted samples (occupancy) and an unquiet
+/// window (run-queue). The child's stdout still streams to the regular-file sink
+/// for the sha check.
+fn timed_masked_envs(mask: &str, envs: &[(&str, String)], bin: &str, args: &[&str]) -> TimedSample {
     use std::time::Instant;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let procs_running = snapshot_procs_running();
     let sink = std::env::temp_dir().join(format!("fulcrum_run_sink_{}", std::process::id()));
     let sink_f = match fs::File::create(&sink) {
         Ok(f) => f,
-        Err(_) => return (0.0, String::new(), 0.0),
+        Err(_) => {
+            return TimedSample {
+                procs_running,
+                ts,
+                ..Default::default()
+            }
+        }
     };
     // /usr/bin/time -v taskset -c <mask> <bin> <args...>
     let mut cmd = Command::new("/usr/bin/time");
@@ -1837,12 +2189,16 @@ fn timed_masked_envs(
     let t0 = Instant::now();
     let out = cmd.output();
     let secs = t0.elapsed().as_secs_f64();
-    let (ok, rss_mb) = match &out {
-        Ok(o) => (
-            o.status.success(),
-            parse_max_rss_mb(&String::from_utf8_lossy(&o.stderr)).unwrap_or(0.0),
-        ),
-        Err(_) => (false, 0.0),
+    let (ok, rss_mb, cpu_secs) = match &out {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            (
+                o.status.success(),
+                parse_max_rss_mb(&stderr).unwrap_or(0.0),
+                parse_cpu_secs(&stderr).unwrap_or(0.0),
+            )
+        }
+        Err(_) => (false, 0.0, 0.0),
     };
     let sha = if ok {
         sha256_file(sink.to_str().unwrap_or("")).unwrap_or_default()
@@ -1850,7 +2206,52 @@ fn timed_masked_envs(
         String::new()
     };
     let _ = fs::remove_file(&sink);
-    (secs, sha, rss_mb)
+    TimedSample {
+        secs,
+        sha,
+        rss_mb,
+        cpu_secs,
+        procs_running,
+        ts,
+    }
+}
+
+/// Snapshot `/proc/stat`'s `procs_running` (the kernel's current run-queue
+/// depth). Unavailable (non-Linux) ⇒ 0.0 (the gate treats it as quiet, never a
+/// false UNQUIET).
+fn snapshot_procs_running() -> f64 {
+    match fs::read_to_string("/proc/stat") {
+        Ok(txt) => {
+            for line in txt.lines() {
+                if let Some(rest) = line.strip_prefix("procs_running ") {
+                    if let Ok(v) = rest.trim().parse::<f64>() {
+                        return v;
+                    }
+                }
+            }
+            0.0
+        }
+        Err(_) => 0.0,
+    }
+}
+
+/// Parse child CPU seconds (User + System) from a `/usr/bin/time -v` report.
+/// Returns `None` when neither line is present (BSD time / unavailable).
+fn parse_cpu_secs(stderr: &str) -> Option<f64> {
+    let mut user = None;
+    let mut sys = None;
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("User time (seconds):") {
+            user = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("System time (seconds):") {
+            sys = rest.trim().parse::<f64>().ok();
+        }
+    }
+    match (user, sys) {
+        (None, None) => None,
+        (u, s) => Some(u.unwrap_or(0.0) + s.unwrap_or(0.0)),
+    }
 }
 
 /// Parse the peak RSS in MiB from a `/usr/bin/time -v` (GNU time) report. The
@@ -1871,7 +2272,7 @@ fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
 fn run_verbose(spec: &RunSpec, corpus: &str, t: usize) -> String {
     let out = Command::new("taskset")
         .arg("-c")
-        .arg(pin_mask(t))
+        .arg(pin_mask_pool(t, &spec.core_pool))
         .arg(&spec.gzippy_bin)
         .args(["-d", "-c", "-p", &t.to_string(), corpus])
         .env("GZIPPY_VERBOSE", "1")
@@ -1914,7 +2315,7 @@ fn oracle_counter(
     }
     let mut cmd = Command::new("taskset");
     cmd.arg("-c")
-        .arg(pin_mask(t))
+        .arg(pin_mask_pool(t, &spec.core_pool))
         .arg(&spec.gzippy_bin)
         .args(["-d", "-c", "-p", &t.to_string(), corpus])
         .env("GZIPPY_VERBOSE", "1");
@@ -1941,13 +2342,13 @@ fn oracle_counter(
 }
 
 fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option<f64>) {
-    let mask = pin_mask(t);
+    let mask = pin_mask_pool(t, &spec.core_pool);
     // Interleaved best-of-N, warm-up dropped (the same discipline as a cell), so
     // the A/A self-test rests on a real distribution rather than 3 cold pokes.
     let n = spec.n.max(4);
     let mut xs = Vec::new();
     for i in 0..=n {
-        let (sec, _, _) = timed_masked(
+        let s = timed_masked(
             &mask,
             &spec.comparator_bin,
             &["-d", "-c", "-f", "-P", &t.to_string(), corpus],
@@ -1955,8 +2356,8 @@ fn comparator_aa(spec: &RunSpec, corpus: &str, t: usize) -> (Option<f64>, Option
         if i == 0 {
             continue; // drop warm-up
         }
-        if sec > 0.0 {
-            xs.push(sec);
+        if s.secs > 0.0 {
+            xs.push(s.secs);
         }
     }
     aa_stats(&xs)
@@ -2029,8 +2430,36 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// FIX 8 — read the ACTUAL allowed cpu list after pinning. Launch a process
+/// UNDER the same `taskset -c <mask>` and have it report its own
+/// `Cpus_allowed_list` from `/proc/self/status`; the kernel value reflects any
+/// cgroup/affinity NARROWING (the `0-3 → 0,2-3` bug) the request could not
+/// override. The BOX-VALID gate VOIDs the cell when this readback does NOT
+/// superset-contain the requested mask. Falls back to echoing the request when
+/// the readback is unavailable (non-Linux / no /proc) so the gate degrades to
+/// INCOMPLETE rather than a false VOID.
 fn mask_readback(mask: &str) -> String {
-    // live: taskset would report the kernel's view; fixture echoes the request.
+    let out = Command::new("taskset")
+        .arg("-c")
+        .arg(mask)
+        .arg("sh")
+        .arg("-c")
+        .arg("cat /proc/self/status")
+        .output();
+    if let Ok(o) = out {
+        if o.status.success() {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            for line in txt.lines() {
+                if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+                    let v = rest.trim().to_string();
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    // readback unavailable ⇒ echo the request (gate sees requested == readback).
     mask.to_string()
 }
 
@@ -2164,6 +2593,63 @@ mod tests {
         assert_eq!(xs.len(), 9);
         assert_eq!(min_of(&xs), 1.0);
         assert!((spread_of(&xs) - 0.01).abs() < 1e-12);
+    }
+
+    // ── FIX 8 self-test: pin_mask selects INDEPENDENT P-cores, never 0..t-1 ──
+    //
+    // The confirmed wrong-core bug pinned a T-run to cpus `0..t-1` — cpu 0 is the
+    // driver's core and adjacent ids are SMT siblings, so the run shared cores
+    // and ran on the WRONG core count. The pool fix lands a T-run on T distinct
+    // P-cores. The companion readback test (in provenance::box_valid_tests)
+    // proves a cgroup-NARROWED Cpus_allowed_list ⊉ the requested mask VOIDs.
+    #[test]
+    fn pin_mask_selects_from_independent_pcore_pool() {
+        let pool = vec![2usize, 4, 8, 10, 12, 14, 0];
+        // a 4-thread cell takes the first 4 P-cores — NOT "0-3".
+        assert_eq!(pin_mask_pool(4, &pool), "2,4,8,10");
+        assert_ne!(
+            pin_mask_pool(4, &pool),
+            "0-3",
+            "the wrong-core bug is fixed"
+        );
+        // a 1-thread cell never lands on cpu 0 (driver-reserved) when a pool exists.
+        assert_eq!(pin_mask_pool(1, &pool), "2");
+        // t beyond the pool clamps (never panics / never invents cores).
+        assert_eq!(pin_mask_pool(99, &pool), "2,4,8,10,12,14,0");
+        // EMPTY pool ⇒ legacy sequential mask (back-compat for old specs).
+        assert_eq!(pin_mask_pool(4, &[]), "0-3");
+        assert_eq!(pin_mask_pool(1, &[]), "0");
+    }
+
+    // ── FIX 8 self-test: a narrowed Cpus_allowed_list readback VOIDs (the gate) ─
+    #[test]
+    fn narrowed_mask_readback_voids_at_box_valid() {
+        use crate::provenance::{check_box_valid, CellBoxStats, CheckVerdict};
+        // requested 2-core pin, but the cgroup allowed only ONE of them back.
+        let narrowed = CellBoxStats {
+            cell: "silesia:2".into(),
+            k: 2,
+            n_raw: 15,
+            rejected: 0,
+            clean: 15,
+            escalated: false,
+            occupancy_med: 0.99,
+            procs_running_med: 2.0,
+            mask_requested: "2,4".into(),
+            mask_readback: "2".into(), // cpu 4 narrowed away
+            ctrl_medians: vec![1.0, 1.0, 1.0],
+            ctrl_spread: 0.001,
+        };
+        let v = check_box_valid(std::slice::from_ref(&narrowed));
+        assert_eq!(v[0].verdict, CheckVerdict::Void);
+        assert!(v[0].reason.contains("WRONG-MASK"), "{}", v[0].reason);
+        // CONTROL: a superset readback (the cgroup left all requested cores) is OK.
+        let mut ok = narrowed;
+        ok.mask_readback = "0-15".into();
+        assert_eq!(
+            check_box_valid(std::slice::from_ref(&ok))[0].verdict,
+            CheckVerdict::Ok
+        );
     }
 
     #[test]
@@ -2408,7 +2894,8 @@ mod tests {
         // round-trip exactly as the manifest emits (fmt6) and the gate parses.
         let ratio = ratio.map(|r| fmt6(r).parse::<f64>().unwrap());
         let spread_pct = spread_pct.map(|s| fmt6(s).parse::<f64>().unwrap());
-        crate::provenance::check_comparator_present(Some(true), ratio, spread_pct, "/box/rg").verdict
+        crate::provenance::check_comparator_present(Some(true), ratio, spread_pct, "/box/rg")
+            .verdict
     }
 
     #[test]

@@ -325,6 +325,11 @@ pub const DERIVED_SINK_SYMMETRIC: &str = "DERIVED-SINK-SYMMETRIC";
 pub const DERIVED_SHA_CURRENT: &str = "DERIVED-SHA-CURRENT";
 pub const COMPARATOR_PRESENT: &str = "COMPARATOR-PRESENT";
 
+/// The NOISY-BOX validity sub-check (a shared-LXC measured ON the wrong cores /
+/// during drift / under preemption CANNOT bank). Composes into PROVENANCE-OR-VOID
+/// by worst-severity at stamp aggregation, no extra pipeline wiring.
+pub const BOX_VALID: &str = "BOX-VALID";
+
 /// The umbrella invariant name (the scar-name carried by a refusal).
 pub const PROVENANCE_OR_VOID: &str = "PROVENANCE-OR-VOID";
 
@@ -393,6 +398,91 @@ impl ArmSink {
     }
 }
 
+/// The NOISY-BOX validity capture for ONE measured cell, derived by the runner
+/// from the per-sample occupancy/run-queue snapshots, the taskset mask readback,
+/// and the bracketed reference-control blocks. All times are SECONDS. A cell with
+/// `n_raw == 0` is treated as "not captured" (INCOMPLETE), so an old artifact
+/// degrades gracefully and never trips the gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellBoxStats {
+    /// "corpus:T" — the cell label (scope `cell:<corpus>:T<t>`).
+    pub cell: String,
+    /// requested core count (== thread count) — the run-queue/UNQUIET denominator.
+    pub k: usize,
+    /// raw samples taken (N_RAW, or N_RAW_ESCALATED after escalation).
+    pub n_raw: usize,
+    /// samples rejected by the occupancy filter + IQR fence.
+    pub rejected: usize,
+    /// clean samples surviving the filter/fence.
+    pub clean: usize,
+    /// whether N escalated to N_RAW_ESCALATED (the high-reject branch).
+    pub escalated: bool,
+    /// median per-sample occupancy of the clean set.
+    pub occupancy_med: f64,
+    /// median `/proc/stat procs_running` snapshot across the cell.
+    pub procs_running_med: f64,
+    /// the taskset mask requested (e.g. "2,4,8,10").
+    pub mask_requested: String,
+    /// the `Cpus_allowed_list` read back after pinning (the WRONG-MASK witness).
+    pub mask_readback: String,
+    /// reference-control medians (seconds), bracket order FIRST/MID/LAST.
+    pub ctrl_medians: Vec<f64>,
+    /// the control IQR dispersion floor (seconds) drift is judged against.
+    pub ctrl_spread: f64,
+}
+
+impl Default for CellBoxStats {
+    fn default() -> Self {
+        CellBoxStats {
+            cell: String::new(),
+            k: 0,
+            n_raw: 0,
+            rejected: 0,
+            clean: 0,
+            escalated: false,
+            occupancy_med: 0.0,
+            procs_running_med: 0.0,
+            mask_requested: String::new(),
+            mask_readback: String::new(),
+            ctrl_medians: Vec::new(),
+            ctrl_spread: 0.0,
+        }
+    }
+}
+
+/// Parse a CPU mask spec ("2,4,8-10") into the set of cpu ids. Empty / "unknown"
+/// ⇒ None (un-derivable, not a contradiction).
+pub fn parse_cpu_mask(s: &str) -> Option<std::collections::BTreeSet<usize>> {
+    let s = s.trim();
+    if s.is_empty() || s == "unknown" {
+        return None;
+    }
+    let mut set = std::collections::BTreeSet::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let a: usize = a.trim().parse().ok()?;
+            let b: usize = b.trim().parse().ok()?;
+            if a > b {
+                return None;
+            }
+            for c in a..=b {
+                set.insert(c);
+            }
+        } else {
+            set.insert(part.parse().ok()?);
+        }
+    }
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
 /// Everything the gate needs for one run, derived by the runner at capture
 /// time. Absent fields stay at their incomplete sentinels so a pre-provenance
 /// artifact degrades to INCOMPLETE, never a refusal.
@@ -422,6 +512,9 @@ pub struct Provenance {
     pub comparator_aa_ratio: Option<f64>,
     /// the comparator's own A/A spread.
     pub comparator_aa_spread_pct: Option<f64>,
+    /// NOISY-BOX validity per measured cell (occupancy/run-queue/mask/drift).
+    /// Empty ⇒ no BOX-VALID check emitted (graceful: an old artifact is silent).
+    pub box_cells: Vec<CellBoxStats>,
 }
 
 impl Default for Provenance {
@@ -438,6 +531,7 @@ impl Default for Provenance {
             comparator_present: None,
             comparator_aa_ratio: None,
             comparator_aa_spread_pct: None,
+            box_cells: Vec::new(),
         }
     }
 }
@@ -852,6 +946,198 @@ pub fn check_comparator_present(
     )
 }
 
+/// BOX-VALID: a measurement taken on a shared/noisy LXC must have run on the
+/// REQUESTED cores, on a QUIET run-queue, without mid-cell DRIFT, and with enough
+/// CLEAN (non-preempted, non-outlier) samples to trust the median. Each failing
+/// condition VOIDs the cell (dropped from ranking) and NAMES the resolving
+/// measurement. A cell with no capture (`n_raw == 0`) is INCOMPLETE, never void.
+///
+/// The five conditions (any ⇒ VOID), in priority order:
+/// * WRONG-MASK — the `Cpus_allowed_list` readback does NOT superset-contain the
+///   requested mask (a cgroup narrowed cores away; the pin ran on the wrong core
+///   count). This is the 8th real bug.
+/// * CONTAMINATION — > [`REJECT_VOID_FRAC`] of raw samples preempted/fenced, or
+///   fewer than [`MIN_N`] clean samples remain.
+/// * UNDERPOWERED-AFTER-REJECT — escalated to [`N_RAW_ESCALATED`] and STILL <
+///   [`MIN_N`] clean (the window never settled).
+/// * DRIFT — control bracket swing > [`DRIFT_VOID_K`]×floor OR end-to-end >
+///   [`DRIFT_VOID_PCT`]% (the box warmed/changed mid-cell).
+/// * UNQUIET — median `procs_running` > k + [`PROCS_RUNNING_SLACK`] (competing
+///   load; the window was not quiet).
+pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
+    use crate::perturb::{
+        bracket_drift, DRIFT_VOID_K, DRIFT_VOID_PCT, ESCALATE_REJECT_FRAC, MIN_N, N_RAW_ESCALATED,
+        PROCS_RUNNING_SLACK, REJECT_VOID_FRAC,
+    };
+    let mut out = Vec::new();
+    for c in cells {
+        let scope = format!("cell:{}", c.cell);
+        // Not captured ⇒ INCOMPLETE (graceful; never trips the gate).
+        if c.n_raw == 0 {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Incomplete,
+                scope,
+                format!(
+                    "cell {}: no NOISY-BOX validity capture (occupancy/mask/drift)",
+                    c.cell
+                ),
+            ));
+            continue;
+        }
+
+        // -- WRONG-MASK (the 8th bug): requested ⊆ readback, else the pin ran on
+        //    the wrong cores (cgroup narrowing 0-3 → 0,2-3). ----------------------
+        if let (Some(req), Some(rb)) = (
+            parse_cpu_mask(&c.mask_requested),
+            parse_cpu_mask(&c.mask_readback),
+        ) {
+            let missing: Vec<usize> = req.difference(&rb).copied().collect();
+            if !missing.is_empty() {
+                out.push(GateCheck::new(
+                    BOX_VALID,
+                    CheckVerdict::Void,
+                    scope,
+                    format!(
+                        "WRONG-MASK: taskset requested cpus {{{}}} but Cpus_allowed_list read \
+                         back {{{}}} — cpu(s) {:?} were narrowed away (cgroup/affinity), so the \
+                         pin ran on the WRONG core count; was [{}] vs [{}]. Re-run after widening \
+                         the container cores (pct/cgroup) so the readback ⊇ the requested mask",
+                        fmt_set(&req),
+                        fmt_set(&rb),
+                        missing,
+                        c.mask_requested,
+                        c.mask_readback,
+                    ),
+                ));
+                continue;
+            }
+        }
+
+        let reject_frac = c.rejected as f64 / c.n_raw as f64;
+
+        // -- UNDERPOWERED-AFTER-REJECT: escalated and STILL < MIN_N clean. -------
+        if (c.escalated || c.n_raw >= N_RAW_ESCALATED) && c.clean < MIN_N {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Void,
+                scope,
+                format!(
+                    "UNDERPOWERED-AFTER-REJECT: escalated to N={} but only {} clean sample(s) \
+                     survived (need ≥{}) — the window never settled. Re-run on a quiet, \
+                     thermally-steady frozen window long enough to land ≥{} clean samples",
+                    c.n_raw, c.clean, MIN_N, MIN_N
+                ),
+            ));
+            continue;
+        }
+
+        // -- CONTAMINATION: > REJECT_VOID_FRAC preempted/fenced, or < MIN_N clean.
+        if reject_frac > REJECT_VOID_FRAC || c.clean < MIN_N {
+            let escalate_hint = if reject_frac > ESCALATE_REJECT_FRAC && !c.escalated {
+                " (reject rate over the escalation threshold — re-run with N escalated)"
+            } else {
+                ""
+            };
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Void,
+                scope,
+                format!(
+                    "CONTAMINATION: {}/{} raw samples preempted/fenced (occupancy < {} or IQR \
+                     outlier), {} clean remain (need ≥{}){}. Re-run on a quiet window where \
+                     ≥{}% of samples keep occupancy ≥ {}",
+                    c.rejected,
+                    c.n_raw,
+                    crate::perturb::OCCUPANCY_MIN,
+                    c.clean,
+                    MIN_N,
+                    escalate_hint,
+                    ((1.0 - REJECT_VOID_FRAC) * 100.0) as i64,
+                    crate::perturb::OCCUPANCY_MIN,
+                ),
+            ));
+            continue;
+        }
+
+        // -- DRIFT: control bracket swing > K×floor OR end-to-end > PCT. ---------
+        if let Some(d) = bracket_drift(&c.ctrl_medians) {
+            let swing_bar = DRIFT_VOID_K * c.ctrl_spread;
+            let swing_void = d.swing_s > swing_bar;
+            let pct_void = d.end_to_end_pct > DRIFT_VOID_PCT;
+            if swing_void || pct_void {
+                out.push(GateCheck::new(
+                    BOX_VALID,
+                    CheckVerdict::Void,
+                    scope,
+                    format!(
+                        "DRIFT: control bracket swung {:.1}ms (bar {:.1}ms = {}×{:.1}ms floor), \
+                         {:.2}% end-to-end FIRST→LAST (bar {:.1}%) — the box warmed/changed \
+                         mid-cell. Re-run on a thermally-steady frozen window (boost-off, \
+                         governor=performance, bench-lock held)",
+                        d.swing_s * 1000.0,
+                        swing_bar * 1000.0,
+                        DRIFT_VOID_K,
+                        c.ctrl_spread * 1000.0,
+                        d.end_to_end_pct,
+                        DRIFT_VOID_PCT,
+                    ),
+                ));
+                continue;
+            }
+        }
+
+        // -- UNQUIET: median run-queue depth > k + slack. -----------------------
+        let quiet_bar = c.k as i64 + PROCS_RUNNING_SLACK;
+        if c.procs_running_med > quiet_bar as f64 {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Void,
+                scope,
+                format!(
+                    "UNQUIET: median procs_running {:.1} > k+{} ({}) — the box was not quiet \
+                     (competing load on the run-queue). Re-run on a quiet window \
+                     (procs_running ≤ k+{} = {}); was {:.1}",
+                    c.procs_running_med,
+                    PROCS_RUNNING_SLACK,
+                    quiet_bar,
+                    PROCS_RUNNING_SLACK,
+                    quiet_bar,
+                    c.procs_running_med,
+                ),
+            ));
+            continue;
+        }
+
+        out.push(GateCheck::new(
+            BOX_VALID,
+            CheckVerdict::Ok,
+            scope,
+            format!(
+                "cell {}: ran on the requested cores (mask {} ⊆ {}), {} clean / {} raw samples, \
+                 median occupancy {:.2}, run-queue {:.1} ≤ k+{}, control bracket steady",
+                c.cell,
+                c.mask_requested,
+                c.mask_readback,
+                c.clean,
+                c.n_raw,
+                c.occupancy_med,
+                c.procs_running_med,
+                PROCS_RUNNING_SLACK,
+            ),
+        ));
+    }
+    out
+}
+
+/// Render a cpu-id set compactly ("0,2,3") for a refusal message.
+fn fmt_set(s: &std::collections::BTreeSet<usize>) -> String {
+    s.iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 // ---------------------------------------------------------------------------
 // The gate — aggregate the five checks into per-scope verdicts + a CELL stamp.
 // ---------------------------------------------------------------------------
@@ -961,6 +1247,7 @@ pub fn run_gate(
         prov.comparator_aa_spread_pct,
         &prov.comparator_path,
     ));
+    checks.extend(check_box_valid(&prov.box_cells));
 
     let voided: std::collections::BTreeSet<String> = checks
         .iter()
@@ -1012,9 +1299,14 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
     let mut knob_consumers: BTreeMap<String, Option<i64>> = BTreeMap::new();
     let mut oracles: BTreeMap<String, OracleProbe> = BTreeMap::new();
     let mut ab_arms: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut box_cells: Vec<CellBoxStats> = Vec::new();
 
     for (k, v) in man {
-        if let Some(env) = k.strip_prefix("knob_consumer_") {
+        if k.starts_with("box_valid_") {
+            if let Some(c) = parse_box_valid_line(v) {
+                box_cells.push(c);
+            }
+        } else if let Some(env) = k.strip_prefix("knob_consumer_") {
             knob_consumers.insert(env.to_string(), int_or_none(v));
         } else if let Some(rest) = k.strip_prefix("oracle_") {
             for suf in ["_on", "_off", "_expected"] {
@@ -1080,7 +1372,46 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
         comparator_aa_spread_pct: man
             .get("comparator_aa_spread_pct")
             .and_then(|v| float_or_none(v)),
+        box_cells,
     }
+}
+
+/// Parse one `box_valid_<corpus>_T<t>` manifest value: a `;`-joined `k=v` record
+/// emitted by the runner. Missing fields fall back to the `CellBoxStats` default
+/// (an `n_raw=0` record degrades to INCOMPLETE). Returns None for an empty value.
+pub fn parse_box_valid_line(v: &str) -> Option<CellBoxStats> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let mut c = CellBoxStats::default();
+    for field in v.split(';') {
+        let Some((key, val)) = field.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        match key {
+            "cell" => c.cell = val.to_string(),
+            "k" => c.k = val.parse().unwrap_or(0),
+            "n_raw" => c.n_raw = val.parse().unwrap_or(0),
+            "rejected" => c.rejected = val.parse().unwrap_or(0),
+            "clean" => c.clean = val.parse().unwrap_or(0),
+            "escalated" => c.escalated = val == "1" || val.eq_ignore_ascii_case("true"),
+            "occ_med" => c.occupancy_med = val.parse().unwrap_or(0.0),
+            "procs_med" => c.procs_running_med = val.parse().unwrap_or(0.0),
+            "mask" => c.mask_requested = val.to_string(),
+            "maskd" => c.mask_readback = val.to_string(),
+            "ctrl_first" | "ctrl_mid" | "ctrl_last" => {
+                if let Ok(x) = val.parse::<f64>() {
+                    c.ctrl_medians.push(x);
+                }
+            }
+            "ctrl_spread" => c.ctrl_spread = val.parse().unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    Some(c)
 }
 
 /// Parse a `manifest.txt` (newline-delimited `key=value`) into a key→value map.
@@ -1551,5 +1882,204 @@ mod gate_tests {
         stamp.apply_to_finding(&mut f);
         assert_eq!(f.commit_sha, "abc123");
         assert_eq!(f.cell_id, f.derive_id()); // id re-derived and self-consistent
+    }
+}
+
+// ===========================================================================
+// BOX-VALID self-tests — the NOISY-BOX validity gate (binary-vs-itself). Each
+// fixture is RED-before (a contaminated capture VOIDs at the named condition)
+// and GREEN-after (the clean control certifies). The gate must be trustable
+// before it can be used, so every VOID path has a planted fixture + a passing
+// control on the SAME builder.
+// ===========================================================================
+#[cfg(test)]
+mod box_valid_tests {
+    use super::*;
+
+    /// A clean, frozen, quiet capture: ran on the requested cores (mask ⊆
+    /// readback), 15/15 samples kept, run-queue at k, no control drift.
+    fn clean_cell() -> CellBoxStats {
+        CellBoxStats {
+            cell: "silesia:4".into(),
+            k: 4,
+            n_raw: 15,
+            rejected: 0,
+            clean: 15,
+            escalated: false,
+            occupancy_med: 0.99,
+            procs_running_med: 4.0,
+            mask_requested: "2,4,8,10".into(),
+            mask_readback: "0-15".into(),
+            ctrl_medians: vec![1.000, 1.000, 1.000],
+            ctrl_spread: 0.001,
+        }
+    }
+
+    fn verdict_of(c: &CellBoxStats) -> (CheckVerdict, String) {
+        let checks = check_box_valid(std::slice::from_ref(c));
+        assert_eq!(checks.len(), 1, "exactly one BOX-VALID check per cell");
+        (checks[0].verdict, checks[0].reason.clone())
+    }
+
+    // ── CONTROL: the clean window certifies ────────────────────────────────
+    #[test]
+    fn clean_window_is_ok() {
+        let (v, _) = verdict_of(&clean_cell());
+        assert_eq!(
+            v,
+            CheckVerdict::Ok,
+            "a clean frozen/quiet capture certifies"
+        );
+    }
+
+    // ── 1. CONTAMINATION (planted occupancy 0.4 → >50% rejected) ───────────
+    #[test]
+    fn contamination_voids_red_before_green_after() {
+        // GREEN: control.
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+        // RED: occupancy 0.4 on most samples ⇒ 9/15 rejected (> REJECT_VOID_FRAC).
+        let mut c = clean_cell();
+        c.rejected = 9;
+        c.clean = 6;
+        c.occupancy_med = 0.4;
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void, "contaminated window VOIDs");
+        assert!(
+            reason.contains("CONTAMINATION"),
+            "names CONTAMINATION: {reason}"
+        );
+        assert!(reason.contains("Re-run"), "names the resolving measurement");
+    }
+
+    // ── 2. DRIFT (planted 5% control bracket drift) ────────────────────────
+    #[test]
+    fn drift_voids_red_before_green_after() {
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+        let mut c = clean_cell();
+        // FIRST 1.000 → MID 1.025 → LAST 1.050 = 5% end-to-end, swing 50ms ≫ floor.
+        c.ctrl_medians = vec![1.000, 1.025, 1.050];
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void, "a drifting control bracket VOIDs");
+        assert!(reason.contains("DRIFT"), "names DRIFT: {reason}");
+        assert!(reason.contains("end-to-end"), "cites the end-to-end ramp");
+    }
+
+    // ── 3. WRONG-MASK (the 8th bug: readback ⊉ requested) ──────────────────
+    #[test]
+    fn wrong_mask_voids_red_before_green_after() {
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+        // requested 0-3 = {0,1,2,3}; cgroup narrowed the allowed list to {0,2,3}.
+        let mut c = clean_cell();
+        c.mask_requested = "0-3".into();
+        c.mask_readback = "0,2-3".into();
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void, "a narrowed core mask VOIDs");
+        assert!(reason.contains("WRONG-MASK"), "names WRONG-MASK: {reason}");
+        assert!(reason.contains("[1]"), "names the missing cpu(s): {reason}");
+    }
+
+    // ── 4. UNQUIET (busy run-queue: procs_running > k+1) ───────────────────
+    #[test]
+    fn unquiet_voids_red_before_green_after() {
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+        let mut c = clean_cell();
+        c.procs_running_med = 4.2 + 2.0; // k=4, bar=k+1=5 → 6.2 > 5
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void, "an unquiet run-queue VOIDs");
+        assert!(reason.contains("UNQUIET"), "names UNQUIET: {reason}");
+        assert!(
+            reason.contains("quiet window"),
+            "names the resolving measurement"
+        );
+    }
+
+    // ── 5. UNDERPOWERED-AFTER-REJECT (escalated to 21, still < 9 clean) ────
+    #[test]
+    fn underpowered_after_reject_voids() {
+        let mut c = clean_cell();
+        c.escalated = true;
+        c.n_raw = 21;
+        c.clean = 7;
+        c.rejected = 14;
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void);
+        assert!(
+            reason.contains("UNDERPOWERED-AFTER-REJECT"),
+            "the escalated-but-still-thin branch is named first: {reason}"
+        );
+    }
+
+    // ── graceful degradation: no capture ⇒ INCOMPLETE, never a false VOID ──
+    #[test]
+    fn uncaptured_cell_is_incomplete() {
+        let c = CellBoxStats {
+            cell: "silesia:4".into(),
+            ..Default::default()
+        };
+        let (v, _) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Incomplete, "n_raw=0 degrades, never VOIDs");
+    }
+
+    // ── composition: a VOID box cell drives run_gate to VOID + voided scope ─
+    #[test]
+    fn box_void_composes_into_provenance_gate() {
+        let mut prov = Provenance {
+            commit_sha: "abc".into(),
+            head_sha: Some("abc".into()),
+            comparator_present: Some(true),
+            comparator_aa_ratio: Some(1.0),
+            comparator_aa_spread_pct: Some(1.0),
+            // clean box cell: gate is OK.
+            box_cells: vec![clean_cell()],
+            ..Default::default()
+        };
+        let rep = run_gate(&prov, None, true).unwrap();
+        assert_eq!(rep.run_verdict, CheckVerdict::Ok, "clean box ⇒ no void");
+        // contaminate: the worst-severity stamp now reads VOID and drops the cell.
+        let mut bad = clean_cell();
+        bad.procs_running_med = 99.0;
+        prov.box_cells = vec![bad];
+        let rep = run_gate(&prov, None, true).unwrap();
+        assert_eq!(rep.run_verdict, CheckVerdict::Void);
+        assert!(rep.voided_scopes.contains("cell:silesia:4"));
+        assert_eq!(rep.stamp("abc").provenance_verdict, "VOID");
+    }
+
+    // ── unit: mask parsing + line round-trip ───────────────────────────────
+    #[test]
+    fn cpu_mask_parses_ranges_and_lists() {
+        assert_eq!(
+            parse_cpu_mask("0-3").unwrap(),
+            [0, 1, 2, 3].into_iter().collect()
+        );
+        assert_eq!(
+            parse_cpu_mask("0,2-3").unwrap(),
+            [0, 2, 3].into_iter().collect()
+        );
+        assert_eq!(parse_cpu_mask("2,4,8,10").unwrap().len(), 4);
+        assert!(parse_cpu_mask("").is_none());
+        assert!(parse_cpu_mask("unknown").is_none());
+        // a requested 0-3 is NOT a subset of the narrowed 0,2-3.
+        let req = parse_cpu_mask("0-3").unwrap();
+        let rb = parse_cpu_mask("0,2-3").unwrap();
+        assert!(!req.is_subset(&rb));
+    }
+
+    #[test]
+    fn box_valid_line_round_trips() {
+        let v = "cell=silesia:4;k=4;n_raw=15;rejected=2;clean=13;escalated=0;occ_med=0.97;\
+                 procs_med=4.0;mask=2,4,8,10;maskd=0-15;ctrl_first=1.0;ctrl_mid=1.001;\
+                 ctrl_last=1.0;ctrl_spread=0.002;ts_span=15.0";
+        let c = parse_box_valid_line(v).unwrap();
+        assert_eq!(c.cell, "silesia:4");
+        assert_eq!(c.k, 4);
+        assert_eq!(c.n_raw, 15);
+        assert_eq!(c.rejected, 2);
+        assert_eq!(c.clean, 13);
+        assert!(!c.escalated);
+        assert_eq!(c.mask_requested, "2,4,8,10");
+        assert_eq!(c.mask_readback, "0-15");
+        assert_eq!(c.ctrl_medians, vec![1.0, 1.001, 1.0]);
+        assert_eq!(verdict_of(&c).0, CheckVerdict::Ok, "a clean line certifies");
     }
 }

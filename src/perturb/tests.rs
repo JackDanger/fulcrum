@@ -50,6 +50,7 @@ fn base_sweep() -> Sweep {
         region_self_ms: SELF_MS,
         sha_ok: Some("1".to_string()),
         baseline: samples(1.000),
+        baseline_mid: Vec::new(),
         baseline_recheck: samples(1.0001),
         spin: BTreeMap::new(),
         sleep: BTreeMap::new(),
@@ -643,4 +644,111 @@ fn median_delta_equals_min_delta_for_clean_evenly_spaced_sets() {
         (median_delta - min_delta).abs() < 1e-9,
         "median_delta={median_delta} min_delta={min_delta}"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NOISY-BOX cleaning primitives — occupancy filter, IQR fence, clean composition,
+// bracket drift, and the FULL-CELL A/A bracket extension to analyze_sweep.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn occupancy_filter_rejects_preempted_samples() {
+    let xs = vec![1.0, 1.1, 1.2, 1.3];
+    // 1.1 and 1.3 were preempted (occupancy below the floor).
+    let occ = vec![0.99, 0.40, 0.97, 0.20];
+    let (kept, rejected) = occupancy_filter(&xs, &occ, OCCUPANCY_MIN);
+    assert_eq!(kept, vec![1.0, 1.2]);
+    assert_eq!(rejected, 2);
+}
+
+#[test]
+fn occupancy_filter_short_occ_keeps_unmatched_tail() {
+    // missing occupancy ⇒ assume clean (graceful), never a phantom reject.
+    let xs = vec![1.0, 1.1, 1.2];
+    let occ = vec![0.40]; // only the first has occupancy
+    let (kept, rejected) = occupancy_filter(&xs, &occ, OCCUPANCY_MIN);
+    assert_eq!(kept, vec![1.1, 1.2]);
+    assert_eq!(rejected, 1);
+}
+
+#[test]
+fn iqr_fence_drops_a_lone_high_outlier() {
+    let mut xs = samples_n(1.000, 0.004, 9);
+    xs.push(5.0); // a gross outlier
+    let (kept, dropped) = iqr_fence(&xs);
+    assert_eq!(dropped, 1, "the 5.0 outlier is fenced out");
+    assert!(!kept.contains(&5.0));
+    // a clean, evenly-spaced set loses nothing.
+    let (kept2, dropped2) = iqr_fence(&samples_n(1.000, 0.004, 9));
+    assert_eq!(dropped2, 0);
+    assert_eq!(kept2.len(), 9);
+}
+
+#[test]
+fn iqr_fence_too_few_samples_unchanged() {
+    let xs = vec![1.0, 9.0, 1.0];
+    let (kept, dropped) = iqr_fence(&xs);
+    assert_eq!(dropped, 0, "<4 samples ⇒ no defensible quartiles");
+    assert_eq!(kept.len(), 3);
+}
+
+#[test]
+fn clean_samples_composes_occupancy_then_fence() {
+    let mut xs = samples_n(1.000, 0.004, 9);
+    let mut occ = vec![0.99; 9];
+    // append a preempted sample AND a dispersion outlier.
+    xs.push(1.5);
+    occ.push(0.30); // preempted → occupancy-rejected first
+    xs.push(9.0);
+    occ.push(0.99); // clean occupancy but a fence outlier
+    let cr = clean_samples(&xs, &occ);
+    assert_eq!(cr.rejected, 2, "one occupancy reject + one fence reject");
+    assert!(!cr.kept.contains(&1.5) && !cr.kept.contains(&9.0));
+    assert!(!cr.bimodal_after_fence, "the cleaned set is unimodal");
+}
+
+#[test]
+fn bracket_drift_swing_and_end_to_end() {
+    let d = bracket_drift(&[1.000, 1.025, 1.050]).unwrap();
+    assert!((d.swing_s - 0.050).abs() < 1e-9, "worst pairwise = 50ms");
+    assert!((d.end_to_end_pct - 5.0).abs() < 1e-6, "first→last = 5%");
+    // a mid-cell excursion that first==last would hide is still caught by swing.
+    let d2 = bracket_drift(&[1.000, 1.040, 1.000]).unwrap();
+    assert!((d2.swing_s - 0.040).abs() < 1e-9);
+    assert!(
+        d2.end_to_end_pct.abs() < 1e-9,
+        "first==last ⇒ 0% end-to-end"
+    );
+    assert!(bracket_drift(&[1.0]).is_none(), "<2 points ⇒ None");
+}
+
+#[test]
+fn full_cell_bracket_voids_a_mid_excursion_that_2point_misses() {
+    // FIRST == LAST (a 2-point A/A would read steady), but a MID excursion of
+    // 40ms ≫ the IQR floor VOIDs under the FULL-CELL bracket.
+    let mut sw = base_sweep();
+    sw.baseline = samples_n(1.000, 0.002, 9);
+    sw.baseline_mid = samples_n(1.040, 0.002, 9);
+    sw.baseline_recheck = samples_n(1.000, 0.002, 9);
+    sw.spin = linear_arm(1.0);
+    sw.sleep = linear_arm(1.0);
+    let pc = analyze_sweep(&sw);
+    assert_eq!(pc.verdict, Verdict::Void, "mid-cell drift VOIDs the cell");
+    assert!(pc.notes.iter().any(|n| n.contains("control bracket swung")));
+    // CONTROL: with a STEADY mid block the same cell is a clean LEVER again.
+    sw.baseline_mid = samples_n(1.000, 0.002, 9);
+    let pc2 = analyze_sweep(&sw);
+    assert_eq!(pc2.verdict, Verdict::Lever, "a steady bracket still levers");
+}
+
+#[test]
+fn noisy_box_constants_are_the_pre_registered_values() {
+    assert_eq!(OCCUPANCY_MIN, 0.90);
+    assert_eq!(REJECT_VOID_FRAC, 0.50);
+    assert_eq!(DRIFT_VOID_K, 2.0);
+    assert_eq!(DRIFT_VOID_PCT, 3.0);
+    assert_eq!(N_RAW, 15);
+    assert_eq!(N_RAW_ESCALATED, 21);
+    assert_eq!(ESCALATE_REJECT_FRAC, 0.33);
+    assert_eq!(PROCS_RUNNING_SLACK, 1);
 }
