@@ -1,8 +1,18 @@
 # Fulcrum run-artifact schema (the documented loader contract)
 
+> **Note (Python→Rust collapse, 2026-06-15):** the decision engine is now the
+> Rust `fulcrum` binary (`fulcrum decide <art-dir>`); the superseded Python
+> `decide/` package was removed after a clean whole-pipeline cross-check. The
+> **directory-layout / file-format contract below is current and
+> language-neutral** — the Rust loader reads exactly this. Residual references
+> to Python internals (`fulcrum.core.*`, `ProjectAdapter.load_run`, the inline
+> `python` run-dict snippet) are HISTORICAL and describe the removed
+> implementation; the Rust tool consumes the on-disk layout directly and has no
+> pluggable Python adapter.
+
 This is the contract between a project's **measurement policy** (the shell/CI
 side that runs the tool under freeze/mask/sink discipline) and the fulcrum
-**decision engine** (`fulcrum analyze <art-dir>` / `fulcrum.core.decide`).
+**decision engine** (`fulcrum decide <art-dir>`).
 
 Two ways to satisfy it:
 
@@ -85,7 +95,7 @@ the sink targets, `git diff`, a comparator A/A run):
 The gate stamps each CELL with `commit_sha`, `provenance_verdict`
 (CERTIFIED / STALE / VOID / REFUSED / PROVENANCE-INCOMPLETE), an
 `evidence_tier`, and the per-check verdicts. `fulcrum provenance <art-dir>`
-renders the verdict standalone; the gate also runs inside `fulcrum analyze`
+renders the verdict standalone; the gate also runs inside `fulcrum decide`
 (REFUSED aborts, VOID drops the affected cell/knob, STALE labels + blocks
 banking). See `core/provenance.py` + `selftests/test_provenance.py`.
 

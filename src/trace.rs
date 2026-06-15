@@ -94,27 +94,24 @@ impl Span {
 
 /// Load + repair + parse a Chrome-trace JSON file.
 pub fn load_events(path: &Path) -> std::io::Result<Vec<Event>> {
-    let mut s = std::fs::read_to_string(path)?;
-    let trimmed = s.trim_end();
-    s = trimmed.to_string();
-    if s.starts_with('[') && !s.ends_with(']') {
-        // strip trailing comma/newline, close the array
-        while s.ends_with(',') || s.ends_with('\n') {
-            s.pop();
-        }
-        s.push('\n');
-        s.push(']');
-    } else if s.ends_with(',') {
-        while s.ends_with(',') || s.ends_with('\n') {
-            s.pop();
-        }
-        if !s.ends_with(']') {
-            s.push(']');
-        }
+    let raw = std::fs::read_to_string(path)?;
+    let raw = raw.trim();
+    // Repair order MUST match `parse_trace_text` (and Python `_parse_trace_text`)
+    // exactly: prepend '[' if absent, strip a trailing ']' (if the emitter closed
+    // the array), drop any trailing comma/newline a streaming emitter left, then
+    // re-add the bracket. The older two-branch form here did NOT strip a comma
+    // sitting *before* an existing ']' (the canonical `},\n]` streamed shape), so
+    // `locate` refused traces `total`/Python accept (cross-check divergence).
+    let mut s = if raw.starts_with('[') {
+        raw.to_string()
+    } else {
+        format!("[{raw}")
+    };
+    if s.ends_with(']') {
+        s.pop();
     }
-    if !s.starts_with('[') {
-        s.insert(0, '[');
-    }
+    let trimmed = s.trim_end().trim_end_matches(',').trim_end();
+    let s = format!("{trimmed}\n]");
     let events: Vec<Event> = serde_json::from_str(&s).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1436,6 +1433,29 @@ mod tests {
         )
         .unwrap();
         let events = load_events_checked(&p).unwrap();
+        assert_eq!(events.len(), 2);
+        let spans = pair_spans(&events);
+        assert_eq!(spans.len(), 1);
+        assert!((spans[0].dur - 5.0).abs() < 1e-9);
+    }
+
+    // --- regression: `load_events` (the io::Result loader `locate` uses) must
+    //     repair a streamed array that the emitter ALSO closed, i.e. a trailing
+    //     comma sitting *before* a present `]` (`},\n]`) — the canonical shape
+    //     `write_trace`/the Python loader emit. The old two-branch repair only
+    //     handled an UN-closed array, so `locate` REFUSED traces `total`/Python
+    //     accept (cross-check divergence, fulcrum #4 STEP 1).
+    #[test]
+    fn t_load_events_repairs_trailing_comma_before_close() {
+        let d = tmpdir("repair_closed");
+        let p = d.join("trace_closed.json");
+        std::fs::write(
+            &p,
+            "[\n{\"name\":\"a\",\"ph\":\"B\",\"ts\":0,\"pid\":1,\"tid\":1},\n\
+             {\"name\":\"a\",\"ph\":\"E\",\"ts\":5,\"pid\":1,\"tid\":1},\n]\n",
+        )
+        .unwrap();
+        let events = load_events(&p).unwrap();
         assert_eq!(events.len(), 2);
         let spans = pair_spans(&events);
         assert_eq!(spans.len(), 1);

@@ -119,6 +119,23 @@ fn add_wall_bytes_refused() {
     assert!(raises_named(add(&wall, &byt), "DIMENSION-REFUSED"));
 }
 
+// regression: QuantityRefusal Display must carry the umbrella invariant token
+// "[QUANTITY-DIMENSION-OR-REFUSE] [<refusal>] <msg>" exactly like the Python
+// `QuantityRefusal(InvariantViolation).__str__`. The umbrella prefix was missing,
+// so `quantity --demo` dropped that token Python emits per refusal line (fulcrum
+// #4 STEP 1 cross-check divergence).
+#[test]
+fn refusal_display_carries_umbrella_invariant_token() {
+    let wall = m(0.329, "wall_seconds", "c_wall");
+    let byt = m(2.0e8, "bytes", "c_byt");
+    let e = add(&wall, &byt).unwrap_err();
+    let s = e.to_string();
+    assert!(
+        s.starts_with("[QUANTITY-DIMENSION-OR-REFUSE] [DIMENSION-REFUSED] "),
+        "Display must mirror Python's [umbrella] [refusal] msg, got: {s}"
+    );
+}
+
 #[test]
 fn ratio_bytes_wall_refused() {
     let wall = m(0.329, "wall_seconds", "c_wall");
