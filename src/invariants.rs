@@ -138,13 +138,18 @@ pub const INVARIANTS: &[Invariant] = &[
         name: "CONSERVATION-OR-NO-LOCATE",
         rule: "A locate result must CLOSE its wall ledger: wall == critical-path \
            classified time (compute + wait) + residual, with park spans \
-           non-covering; FLAGGED when (residual + wait-only-carried)/wall exceeds \
-           the threshold; a negative residual or overlapping path REFUSES.",
+           non-covering. FLAGGED (emitted, never silently trusted) when \
+           (residual + wait-only-carried)/wall exceeds the threshold OR the \
+           residual is negative; an OVERLAPPING / double-counted path (the \
+           ledger cannot close) REFUSES outright — never rendered.",
         scar: "Localization by producer-side attribution manufactured phantoms (the \
            377ms pair-drain, the combine_crc '62ms serial CRC' nested-span \
            double-count): un-closed ledgers let wall time hide in unattributed gaps.",
-        enforcement: "(SPECCED in Rust) — the locate ledger is the model/critpath \
-                  closure; carried from Python locate.locate_one until ported.",
+        enforcement: "locate::assert_path_closed (overlapping/non-positive path => \
+                  Err(InvariantViolation) REFUSED) + locate::locate_one ledger-close \
+                  guard; locate::tests (serial/overlapped/straggler/wait-dom KNOWN \
+                  paths, FLAGGED gap + negative-residual, threshold control, \
+                  park/greedy, and the overlap-REFUSES corruption test).",
     },
     Invariant {
         name: "PERTURBATION-OR-NO-LEVER",
