@@ -182,6 +182,59 @@ Invariants every iteration must keep green:
 
 ## Newly-discovered (append as found)
 
+- **[DONE — relay #10, branch `harden/relay10-gatehunt`]** BOX-VALID gate hole:
+  an OVERSUBSCRIBED cell (k threads pinned to FEWER than k distinct cores) read as
+  VALID. Adversarial sweep of every gate the live matrix depends on found ONE real
+  hole, exactly on the prompt's "T8-spills-cores" axis. `pin_mask_pool(t, pool)`
+  (runner.rs:2421) does `take = t.clamp(1, pool.len())` — when the thread count
+  exceeds the core pool (e.g. T8 on a 7-core physical pool, the realistic
+  <BENCH_HOST>/<BENCH_HOST> config that reserves cores / uses physical-only pools), it
+  SILENTLY clamps the mask to the pool size and emits `k=8` with a 7-core mask.
+  The cell then ran 8 threads on 7 cores (self-contention) yet PASSED every
+  BOX-VALID check: WRONG-MASK misses it (the clamped request IS ⊆ the readback,
+  `req.difference(&rb)` empty); `effective_occupancy_min` relativizes the steady
+  ~7/8 occupancy away (ref<0.90 ⇒ floor = ref×0.90 ⇒ no sample rejected); UNQUIET
+  passes (`procs_running` ≈ 8 ≤ k+1 = 9); DRIFT passes (contention is steady).
+  Fix: a new OVERSUBSCRIBED VOID in `check_box_valid` (provenance.rs), placed right
+  after WRONG-MASK — VOIDs when `parse_cpu_mask(mask_requested).len() < k`, derived
+  purely from already-captured data (k vs |mask|), no new capture needed. NOT a
+  weakening: requesting k threads with <k distinct cores is always oversubscription;
+  the no-pool default (`0-{t-1}`, always exactly t cores) and any pool ≥ k never
+  false-VOID. Red-before/green-after regression test
+  `oversubscribed_mask_voids_red_before_green_after` (proven RED with the check
+  stubbed to `if false`, GREEN with it live; plus a same-cell GREEN control at
+  k cores for k threads to lock out over-correction). 544 tests / 0-fail / 0-ignored
+  · clippy 0-new (9 == 9) · fmt clean. **GATE BEHAVIOR CHANGED (strengthened):** any
+  already-banked matrix cell whose thread count exceeded its core pool was admitted
+  as CERTIFIED and is now SUSPECT — the supervisor should re-check whether the live
+  run used a core pool smaller than its max T (if `pin_mask_pool` ever clamped, those
+  T-cells need re-running on a ≥k-core pool). Cells where the pool ⊇ k cores at every
+  T are unaffected.
+
+- **[TODO — relay #11 candidate]** `mask_readback` (runner.rs:2964) FALLBACK comment
+  is inaccurate AND a latent WRONG-MASK bypass. When `taskset … cat /proc/self/status`
+  fails/empty it returns `mask.to_string()` (echoes the REQUEST). The doc-comment
+  claims this "degrades to INCOMPLETE rather than a false VOID" — but it does NOT
+  degrade to INCOMPLETE: requested == readback ⇒ WRONG-MASK PASSES (silently
+  admitted, not INCOMPLETE). Harmless on the Linux bench boxes (taskset+/proc work),
+  but if the readback subprocess ever fails transiently on the box the WRONG-MASK
+  gate is defeated with no INCOMPLETE marker. Consider emitting a distinct
+  `maskd=unknown` sentinel on readback failure so the gate degrades to a real
+  INCOMPLETE (or VOIDs) instead of echoing the request. Low live-risk; correctness
+  of the self-validation story.
+
+- **[WATCH — relay #11]** Two acknowledged BOX-VALID design reliances worth a
+  deterministic stress: (1) `effective_occupancy_min` relativizes the floor by the
+  cell's MEDIAN occupancy, so a >50%-preempted cell (median itself depressed) lets
+  uniform contention pass the occupancy+CONTAMINATION arms — caught only by
+  UNQUIET/DRIFT; verify UNQUIET (`procs_running > k+1`) actually fires for the
+  realistic "1–2 competing procs" case at low k. (2) SMT-sibling oversubscription
+  (T8 pinned to 4 physical P-cores' 8 logical SMT threads) is NOT detectable from
+  `|mask|` alone — `|mask| == k` but the cores are siblings. Needs topology
+  (sibling map from `/sys/devices/system/cpu/*/topology/thread_siblings_list`)
+  captured by the runner before the gate could catch it. Designed-deferred (needs
+  new capture); flag if the rg-T4+ hunt cares about SMT pinning.
+
 - **[DONE — branch `harden/post-removal-audit`]** Adversarial post-removal audit:
   re-validated the standalone Rust `fulcrum` as self-sufficient now that the Python
   `decide/` cross-check oracle is GONE. Five attack surfaces, all worked:

@@ -952,10 +952,15 @@ pub fn check_comparator_present(
 /// condition VOIDs the cell (dropped from ranking) and NAMES the resolving
 /// measurement. A cell with no capture (`n_raw == 0`) is INCOMPLETE, never void.
 ///
-/// The five conditions (any ⇒ VOID), in priority order:
+/// The conditions (any ⇒ VOID), in priority order:
 /// * WRONG-MASK — the `Cpus_allowed_list` readback does NOT superset-contain the
 ///   requested mask (a cgroup narrowed cores away; the pin ran on the wrong core
 ///   count). This is the 8th real bug.
+/// * OVERSUBSCRIBED — the requested mask pins FEWER distinct cores than the
+///   thread count `k` (e.g. T8 on a 7-core pool; `pin_mask_pool` CLAMPS the mask
+///   to the pool size, so `k` threads contend for `< k` cores). WRONG-MASK cannot
+///   catch this — the clamped request IS a subset of the readback; the contention
+///   is steady so occupancy relativizes it away and `procs_running` stays ≤ k+1.
 /// * CONTAMINATION — > [`REJECT_VOID_FRAC`] of raw samples preempted/fenced, or
 ///   fewer than [`MIN_N`] clean samples remain.
 /// * UNDERPOWERED-AFTER-REJECT — escalated to [`N_RAW_ESCALATED`] and STILL <
@@ -1011,6 +1016,35 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
                     ),
                 ));
                 continue;
+            }
+        }
+
+        // -- OVERSUBSCRIBED: the requested mask pins FEWER distinct cores than the
+        //    thread count k. `pin_mask_pool` clamps the mask to the core-pool size,
+        //    so a T8 cell on a 7-core pool emits k=8 with a 7-core mask — k threads
+        //    contend for < k cores. WRONG-MASK above misses it (the clamped request
+        //    IS ⊆ the readback); occupancy relativizes the steady self-contention
+        //    away (effective_occupancy_min) and procs_running stays ≤ k+1, so this
+        //    is the ONLY check that catches it. Derived purely from k vs |mask|.
+        if c.k > 0 {
+            if let Some(req) = parse_cpu_mask(&c.mask_requested) {
+                if req.len() < c.k {
+                    out.push(GateCheck::new(
+                        BOX_VALID,
+                        CheckVerdict::Void,
+                        scope,
+                        format!(
+                            "OVERSUBSCRIBED: {} thread(s) pinned to only {} distinct core(s) \
+                             ({{{}}}) — k threads contend for fewer than k cores, so the wall is \
+                             inflated by self-contention (steady, so occupancy/UNQUIET miss it). \
+                             Re-run with a core pool of ≥ k cores (one thread per physical core)",
+                            c.k,
+                            req.len(),
+                            fmt_set(&req),
+                        ),
+                    ));
+                    continue;
+                }
             }
         }
 
@@ -2013,6 +2047,46 @@ mod box_valid_tests {
         assert_eq!(v, CheckVerdict::Void, "a narrowed core mask VOIDs");
         assert!(reason.contains("WRONG-MASK"), "names WRONG-MASK: {reason}");
         assert!(reason.contains("[1]"), "names the missing cpu(s): {reason}");
+    }
+
+    // ── 3b. OVERSUBSCRIBED (k threads pinned to < k distinct cores) ────────
+    // The pin_mask_pool clamp silently produces an oversubscribed mask when the
+    // thread count exceeds the core pool (T8 on a 7-core pool → k=8, 7-core mask).
+    // WRONG-MASK misses it because the clamped request IS ⊆ the readback; steady
+    // self-contention dodges occupancy/UNQUIET. This is the gate that catches it.
+    #[test]
+    fn oversubscribed_mask_voids_red_before_green_after() {
+        // GREEN-after control: k cores requested for k threads certifies.
+        assert_eq!(verdict_of(&clean_cell()).0, CheckVerdict::Ok);
+
+        // RED-before: T8 cell whose mask was clamped to a 7-core pool. The
+        // readback SUPERSETS the request (so WRONG-MASK is silent), every sample
+        // is clean, the run-queue is quiet, and there is no drift — yet 8 threads
+        // ran on 7 cores. Must VOID via OVERSUBSCRIBED.
+        let mut c = clean_cell();
+        c.k = 8;
+        c.mask_requested = "0-6".into(); // 7 distinct cores for k=8 threads
+        c.mask_readback = "0-23".into(); // pool ⊇ request → WRONG-MASK passes
+        c.procs_running_med = 8.0; // ≤ k+1 = 9 → UNQUIET passes
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(v, CheckVerdict::Void, "k threads on < k cores VOIDs");
+        assert!(
+            reason.contains("OVERSUBSCRIBED"),
+            "names OVERSUBSCRIBED: {reason}"
+        );
+        assert!(
+            reason.contains("8 thread") && reason.contains("7 distinct core"),
+            "names the k-vs-core-count mismatch: {reason}"
+        );
+
+        // GREEN-after: widen the pool to k cores → certifies (no over-correction).
+        let mut ok = c.clone();
+        ok.mask_requested = "0-7".into(); // 8 cores for 8 threads
+        assert_eq!(
+            verdict_of(&ok).0,
+            CheckVerdict::Ok,
+            "k cores for k threads is not oversubscribed"
+        );
     }
 
     // ── 4. UNQUIET (busy run-queue: procs_running > k+1) ───────────────────
