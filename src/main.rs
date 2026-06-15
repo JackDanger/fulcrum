@@ -213,7 +213,7 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
 
     // rapidgzip side (optional — without it we print gzippy-only six rows).
     let rg = flag(args, "--rg-verbose")
-        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| rg_verbose::parse(&s));
     let label = flag(args, "--label").unwrap_or("(run)").to_string();
 
@@ -242,20 +242,25 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
 
     // --- rapidgzip per-stage cpu (seconds) ---
     let rg_stages = rg.as_ref().filter(|v| v.parsed).map(|v| v.six_stages());
-    let rg_tot: f64 = rg_stages.map(|s| s.iter().map(|x| x.cpu_s).sum()).unwrap_or(0.0);
+    let rg_tot: f64 = rg_stages
+        .map(|s| s.iter().map(|x| x.cpu_s).sum())
+        .unwrap_or(0.0);
 
     println!("\nFULCRUM sixstage — cross-tool wall decomposition  [{label}]");
     println!("gzippy trace: {gz_trace}");
     if rg.as_ref().map(|v| v.parsed).unwrap_or(false) {
-        println!("rapidgzip --verbose: parsed (pool-efficiency {:.1}%, replaced-markers {:.1}%)",
-            rg.as_ref().unwrap().pool_efficiency_pct, rg.as_ref().unwrap().replaced_marker_pct);
+        println!(
+            "rapidgzip --verbose: parsed (pool-efficiency {:.1}%, replaced-markers {:.1}%)",
+            rg.as_ref().unwrap().pool_efficiency_pct,
+            rg.as_ref().unwrap().replaced_marker_pct
+        );
     } else {
         println!("rapidgzip --verbose: NOT supplied / not parsed (gzippy-only view)");
     }
     println!();
     println!(
-        "  {:<18} {:>10} {:>10} {:>10} {:>10} {:>8}  {}",
-        "stage", "gz busy%", "gz wall%", "rg busy%", "gz/rg", "deviant", "rg confidence"
+        "  {:<18} {:>10} {:>10} {:>10} {:>10} {:>8}  rg confidence",
+        "stage", "gz busy%", "gz wall%", "rg busy%", "gz/rg", "deviant"
     );
     println!("  {}", "-".repeat(90));
 
@@ -263,10 +268,17 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
         let gzb = pct(gz_busy[i], gz_busy_tot);
         let gzw = pct(gz_wc[i], wall);
         let (rgb, conf) = match rg_stages {
-            Some(s) => (pct(s[i].cpu_s, rg_tot), if s[i].direct { "DIRECT" } else { "hypoth" }),
+            Some(s) => (
+                pct(s[i].cpu_s, rg_tot),
+                if s[i].direct { "DIRECT" } else { "hypoth" },
+            ),
             None => (f64::NAN, "—"),
         };
-        let ratio = if rgb > 0.0 && rgb.is_finite() { gzb / rgb } else { f64::NAN };
+        let ratio = if rgb > 0.0 && rgb.is_finite() {
+            gzb / rgb
+        } else {
+            f64::NAN
+        };
         // Deviant: gzippy busy-share materially exceeds rapidgzip's (>1.3x AND
         // an absolute gap >5 percentage points), OR the gz wall-critical share
         // is the dominant stage. We mark on busy-share excess (the comparable).
@@ -280,8 +292,16 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
             name,
             gzb,
             gzw,
-            if rgb.is_finite() { format!("{rgb:.1}") } else { "—".to_string() },
-            if ratio.is_finite() { format!("{ratio:.2}x") } else { "—".to_string() },
+            if rgb.is_finite() {
+                format!("{rgb:.1}")
+            } else {
+                "—".to_string()
+            },
+            if ratio.is_finite() {
+                format!("{ratio:.2}x")
+            } else {
+                "—".to_string()
+            },
             deviant,
             conf,
         );
@@ -290,11 +310,7 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
 
     // --- G0 reconciliation ---
     let wc_residual = wall - gz_wc_tot;
-    let waits_and_umbrella = report
-        .unclassified
-        .iter()
-        .map(|(_, d)| d)
-        .sum::<f64>();
+    let waits_and_umbrella = report.unclassified.iter().map(|(_, d)| d).sum::<f64>();
     let rpct = pct(wc_residual, wall);
     println!(
         "\n  G0 RECONCILE (gzippy wall-critical):  wall {:.2}ms  =  Σ6-stage wall-crit {:.2}ms  +  ·residual {:.2}ms ({:.1}%)",
@@ -336,8 +352,15 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
         }
         let mut w: Vec<(&str, f64)> = waits.into_iter().collect();
         w.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top: Vec<String> = w.iter().take(4).map(|(n, d)| format!("{n}={:.0}ms", d / 1000.0)).collect();
-        println!("  ·residual dominated by consumer waits: {}", top.join(", "));
+        let top: Vec<String> = w
+            .iter()
+            .take(4)
+            .map(|(n, d)| format!("{n}={:.0}ms", d / 1000.0))
+            .collect();
+        println!(
+            "  ·residual dominated by consumer waits: {}",
+            top.join(", ")
+        );
     }
     println!(
         "  gzippy busy total {:.2}ms across {} threads; unclassified span time {:.2}ms",
@@ -356,7 +379,10 @@ fn cmd_sixstage(args: &[String]) -> ExitCode {
             .take(5)
             .map(|(n, d)| format!("{n}={:.0}us", d))
             .collect();
-        println!("  UNCLASSIFIED spans (should be empty for a complete trace): {}", top.join(", "));
+        println!(
+            "  UNCLASSIFIED spans (should be empty for a complete trace): {}",
+            top.join(", ")
+        );
     }
     if let Some(v) = rg.as_ref().filter(|v| v.parsed) {
         println!(
@@ -1002,7 +1028,11 @@ fn cmd_scaling(args: &[String]) -> ExitCode {
             eprintln!("fulcrum scaling: bad --at '{spec}' (want T:trace.json)");
             return ExitCode::FAILURE;
         };
-        let Ok(t) = tstr.trim_start_matches('T').trim_start_matches('t').parse::<u64>() else {
+        let Ok(t) = tstr
+            .trim_start_matches('T')
+            .trim_start_matches('t')
+            .parse::<u64>()
+        else {
             eprintln!("fulcrum scaling: bad thread count in '{spec}'");
             return ExitCode::FAILURE;
         };
@@ -1023,7 +1053,11 @@ fn cmd_scaling(args: &[String]) -> ExitCode {
             eprintln!("fulcrum scaling: bad --rg-wall '{spec}' (want T:ms)");
             return ExitCode::FAILURE;
         };
-        let Ok(t) = tstr.trim_start_matches('T').trim_start_matches('t').parse::<u64>() else {
+        let Ok(t) = tstr
+            .trim_start_matches('T')
+            .trim_start_matches('t')
+            .parse::<u64>()
+        else {
             eprintln!("fulcrum scaling: bad thread count in '{spec}'");
             return ExitCode::FAILURE;
         };
@@ -1123,7 +1157,11 @@ fn print_scaling(r: &scaling::ScalingReport) {
             .filter(|(_, _, f)| *f >= 0.08)
             .map(|(n, _, f)| format!("{:.0}% {}", 100.0 * f, n))
             .collect();
-        println!("     VERDICT: T{} scaling loss = {}", d.t, verdict.join(" + "));
+        println!(
+            "     VERDICT: T{} scaling loss = {}",
+            d.t,
+            verdict.join(" + ")
+        );
     }
 
     if !r.valid {
@@ -1212,7 +1250,6 @@ fn cmd_alloc(args: &[String]) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
-
 
 /// Pull residual counters out of the trace. gzippy emits them as instant
 /// events named `rusage.region` carrying `tid`-implied + counter args; we read
@@ -2361,7 +2398,10 @@ checked (default: current dir)."
     let mut store = match Store::load(&store_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fulcrum finding: cannot load store {}: {e}", store_path.display());
+            eprintln!(
+                "fulcrum finding: cannot load store {}: {e}",
+                store_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -2386,7 +2426,8 @@ checked (default: current dir)."
                 Threads::parse(req("--threads").unwrap_or("*")),
             );
             let parse_f = |n: &str, d: f64| req(n).and_then(|s| s.parse::<f64>().ok()).unwrap_or(d);
-            let parse_u = |n: &str, d: usize| req(n).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+            let parse_u =
+                |n: &str, d: usize| req(n).and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
             let f = Finding::new(
                 region,
                 claim,
@@ -2496,7 +2537,11 @@ checked (default: current dir)."
             if store.findings.is_empty() {
                 println!("(store empty: {})", store_path.display());
             } else {
-                println!("{} finding(s) in {}:", store.findings.len(), store_path.display());
+                println!(
+                    "{} finding(s) in {}:",
+                    store.findings.len(),
+                    store_path.display()
+                );
                 for f in &store.findings {
                     let fresh = oracle.src_changed_since(&f.commit_sha);
                     println!("  [{}] {}", fresh.label(), f.summary());
@@ -2700,7 +2745,10 @@ fn cmd_comparability(args: &[String]) -> ExitCode {
 
     let mut captures = Vec::new();
     for p in &cap_paths {
-        match std::fs::read_to_string(p).ok().and_then(|s| parse_capture(&s)) {
+        match std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| parse_capture(&s))
+        {
             Some(c) => captures.push(c),
             None => {
                 eprintln!("comparability: could not parse capture {p}");
@@ -2716,7 +2764,8 @@ fn cmd_comparability(args: &[String]) -> ExitCode {
             cg::evaluate_law(&refs, stmt)
         }
         "subject-specific" => {
-            let (Some(subject), Some(contrast)) = (flag(args, "--subject"), flag(args, "--contrast"))
+            let (Some(subject), Some(contrast)) =
+                (flag(args, "--subject"), flag(args, "--contrast"))
             else {
                 eprintln!("subject-specific needs --subject and --contrast");
                 return usage();
@@ -2738,7 +2787,12 @@ fn cmd_comparability(args: &[String]) -> ExitCode {
             };
             let field_tools: Vec<String> = flag(args, "--field-tools")
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-                .unwrap_or_else(|| cg::FIELD_TOOL_ROSTER.iter().map(|s| s.to_string()).collect());
+                .unwrap_or_else(|| {
+                    cg::FIELD_TOOL_ROSTER
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                });
             let claim = cg::GateClaim::Settled {
                 subject: subject.to_string(),
                 field_tools,
@@ -2819,9 +2873,7 @@ fn cmd_memlife(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!(
-                "memlife: <run.json> | vs <A.json> <B.json> | growth <T1.json> <T8.json>"
-            );
+            eprintln!("memlife: <run.json> | vs <A.json> <B.json> | growth <T1.json> <T8.json>");
             ExitCode::from(2)
         }
     }
@@ -3052,22 +3104,20 @@ fn main() -> ExitCode {
         "run" => cmd_run(rest),
         "perturb" => cmd_perturb(rest),
         "invariants" => cmd_invariants(rest),
-        "score" => {
-            match score::args_from_cli(rest) {
-                Ok(a) => {
-                    if let Err(e) = score::run_score(&a) {
-                        eprintln!("fulcrum score: {e}");
-                        ExitCode::FAILURE
-                    } else {
-                        ExitCode::SUCCESS
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
-                    ExitCode::from(2)
+        "score" => match score::args_from_cli(rest) {
+            Ok(a) => {
+                if let Err(e) = score::run_score(&a) {
+                    eprintln!("fulcrum score: {e}");
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
+                ExitCode::from(2)
+            }
+        },
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

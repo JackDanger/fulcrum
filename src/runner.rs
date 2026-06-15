@@ -638,10 +638,7 @@ fn knob_consumers_for(spec: &RunSpec, given: &BTreeMap<String, i64>) -> BTreeMap
     out
 }
 
-fn oracles_for(
-    spec: &RunSpec,
-    fx: &Fixture,
-) -> OracleCounters {
+fn oracles_for(spec: &RunSpec, fx: &Fixture) -> OracleCounters {
     let mut out = BTreeMap::new();
     for o in &spec.oracles {
         let fc = fx.oracle_counters.get(&o.name).cloned().unwrap_or_default();
@@ -733,7 +730,12 @@ fn capture_live(spec: &RunSpec) -> Result<Captured, String> {
             corpus_raw_bytes.insert(c.id.clone(), b);
         }
         for &t in &spec.threads {
-            cells.push(measure_cell_live(spec, c, t, corpus_sha.get(&c.id).cloned())?);
+            cells.push(measure_cell_live(
+                spec,
+                c,
+                t,
+                corpus_sha.get(&c.id).cloned(),
+            )?);
         }
     }
 
@@ -928,10 +930,7 @@ fn measure_sweep_live(spec: &RunSpec, p: &PerturbSpec) -> Result<CapturedSweep, 
     let mut spin = BTreeMap::new();
     let mut sleep = BTreeMap::new();
     for pct in [10u32, 20, 30] {
-        spin.insert(
-            pct,
-            measure(&[(&p.slow_knob, pct.to_string())]),
-        );
+        spin.insert(pct, measure(&[(&p.slow_knob, pct.to_string())]));
         sleep.insert(
             pct,
             measure(&[
@@ -1286,7 +1285,11 @@ fn quantity_json(cell: &CapturedCell) -> String {
 fn finding_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCell) -> String {
     let gz_min = min_of(&cell.gz);
     let rg_min = min_of(&cell.rg);
-    let value = if rg_min > 0.0 { rg_min / gz_min } else { gz_min };
+    let value = if rg_min > 0.0 {
+        rg_min / gz_min
+    } else {
+        gz_min
+    };
     let dimension = if rg_min > 0.0 { "ratio" } else { "seconds" };
     let verdict = if rg_min > 0.0 {
         if rg_min / gz_min >= 0.99 {
@@ -1411,10 +1414,7 @@ fn sha256_file(path: &str) -> Option<String> {
 
 fn grep_consumers(repo: &Path, env: &str) -> i64 {
     let src = repo.join("src");
-    let out = Command::new("grep")
-        .args(["-rlF", env])
-        .arg(&src)
-        .output();
+    let out = Command::new("grep").args(["-rlF", env]).arg(&src).output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -1430,13 +1430,7 @@ fn timed_masked(mask: &str, bin: &str, args: &[&str]) -> (f64, String) {
     timed_masked_envs(mask, &[], bin, args)
 }
 
-fn timed_masked_env(
-    mask: &str,
-    var: &str,
-    val: &str,
-    bin: &str,
-    args: &[&str],
-) -> (f64, String) {
+fn timed_masked_env(mask: &str, var: &str, val: &str, bin: &str, args: &[&str]) -> (f64, String) {
     timed_masked_envs(mask, &[(var, val.to_string())], bin, args)
 }
 
@@ -1752,8 +1746,7 @@ mod tests {
             .join("perturb/ParallelSM_per_chunk/oracle_removed.txt")
             .exists());
         // gate wires
-        let capj =
-            fs::read_to_string(run_dir.join("gates/capture_silesia_T1.json")).unwrap();
+        let capj = fs::read_to_string(run_dir.join("gates/capture_silesia_T1.json")).unwrap();
         assert!(capj.contains("\"id\":\"gzippy-native\""));
         assert!(capj.contains("\"id\":\"rapidgzip\""));
         let fj = fs::read_to_string(run_dir.join("gates/finding_silesia_T1.json")).unwrap();

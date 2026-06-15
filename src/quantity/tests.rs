@@ -29,13 +29,21 @@ fn m(value: f64, tag: &str, cell: &str) -> Quantity {
 
 #[test]
 fn share_times_wall_has_dim_wall() {
-    let busy = mul(&m(0.86, "share", "c_share"), &m(0.329, "wall_seconds", "c_wall")).unwrap();
+    let busy = mul(
+        &m(0.86, "share", "c_share"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap();
     assert_eq!(busy.dim(), Dim::new(1, 0, 0, 0, 0));
 }
 
 #[test]
 fn product_is_tagged_wall_never_bytes() {
-    let busy = mul(&m(0.86, "share", "c_share"), &m(0.329, "wall_seconds", "c_wall")).unwrap();
+    let busy = mul(
+        &m(0.86, "share", "c_share"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap();
     assert_eq!(busy.tag, "wall_seconds");
 }
 
@@ -47,13 +55,21 @@ fn cycles_div_bytes_is_cyc_per_byte() {
 
 #[test]
 fn instructions_div_cycles_is_ipc() {
-    let ipc = div(&m(2.0e9, "instructions", "c_insn"), &m(1.0e9, "cycles", "c_cyc")).unwrap();
+    let ipc = div(
+        &m(2.0e9, "instructions", "c_insn"),
+        &m(1.0e9, "cycles", "c_cyc"),
+    )
+    .unwrap();
     assert_eq!(ipc.tag, "ipc");
 }
 
 #[test]
 fn cpu_div_wall_is_utilization() {
-    let util = div(&m(0.28, "cpu_seconds", "c_cpu"), &m(0.329, "wall_seconds", "c_wall")).unwrap();
+    let util = div(
+        &m(0.28, "cpu_seconds", "c_cpu"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap();
     assert_eq!(util.tag, "utilization");
 }
 
@@ -85,8 +101,15 @@ fn dimensionless_resolves_to_ratio_never_share() {
 
 #[test]
 fn share_times_wall_asserted_bytes_refused() {
-    let busy = mul(&m(0.86, "share", "c_share"), &m(0.329, "wall_seconds", "c_wall")).unwrap();
-    assert!(raises_named(require_dim(&busy, "bytes"), "DIMENSION-REFUSED"));
+    let busy = mul(
+        &m(0.86, "share", "c_share"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap();
+    assert!(raises_named(
+        require_dim(&busy, "bytes"),
+        "DIMENSION-REFUSED"
+    ));
 }
 
 #[test]
@@ -105,7 +128,11 @@ fn ratio_bytes_wall_refused() {
 
 #[test]
 fn require_dim_wall_on_busy_ok_control() {
-    let busy = mul(&m(0.86, "share", "c_share"), &m(0.329, "wall_seconds", "c_wall")).unwrap();
+    let busy = mul(
+        &m(0.86, "share", "c_share"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap();
     let ok = require_dim(&busy, "wall_seconds").unwrap();
     assert_eq!(ok.tag, "wall_seconds");
 }
@@ -126,7 +153,10 @@ fn share_of_0_86_accepted_control() {
 
 #[test]
 fn measured_without_cell_id_refused() {
-    assert!(raises_named(measured(0.5, "share", ""), "DIMENSION-REFUSED"));
+    assert!(raises_named(
+        measured(0.5, "share", ""),
+        "DIMENSION-REFUSED"
+    ));
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -134,12 +164,19 @@ fn measured_without_cell_id_refused() {
 // ──────────────────────────────────────────────────────────────────────────
 
 fn busy_q() -> Quantity {
-    mul(&m(0.86, "share", "c_share"), &m(0.329, "wall_seconds", "c_wall")).unwrap()
+    mul(
+        &m(0.86, "share", "c_share"),
+        &m(0.329, "wall_seconds", "c_wall"),
+    )
+    .unwrap()
 }
 
 #[test]
 fn wall_to_bytes_no_license_refused() {
-    assert!(raises_named(bridge(&busy_q(), "bytes", None), "LICENSE-REFUSED"));
+    assert!(raises_named(
+        bridge(&busy_q(), "bytes", None),
+        "LICENSE-REFUSED"
+    ));
 }
 
 #[test]
@@ -179,12 +216,17 @@ fn cross_arm_bytes_bridge_unequal_witness_refused() {
 
 #[test]
 fn measured_dim_correct_tie_witness_bridges_control() {
-    let tie = Verdict::raw("TIE", 0.0, 0.01, 0.0, 9, Some(50), "rates equal within spread");
-    let good = LicensingAssertion::with_witness(
-        m(6.4e8, "<byte^1 wall^-1>", "c_thr2"),
-        "throughput",
-        tie,
+    let tie = Verdict::raw(
+        "TIE",
+        0.0,
+        0.01,
+        0.0,
+        9,
+        Some(50),
+        "rates equal within spread",
     );
+    let good =
+        LicensingAssertion::with_witness(m(6.4e8, "<byte^1 wall^-1>", "c_thr2"), "throughput", tie);
     let bridged = bridge(&busy_q(), "bytes", Some(&good)).unwrap();
     assert_eq!(bridged.tag, "bytes");
 }

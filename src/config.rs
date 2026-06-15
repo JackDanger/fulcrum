@@ -560,10 +560,7 @@ impl Config {
                     // whereas rapidgzip's findDeflateBlocks confirms boundaries
                     // far more cheaply — visible as rg block-find ≈ 0.005s.)
                     name: "1·block-find".to_string(),
-                    matcher: Matcher::exact_of(&[
-                        "consumer.block_finder_get",
-                        "worker.seed_first",
-                    ]),
+                    matcher: Matcher::exact_of(&["consumer.block_finder_get", "worker.seed_first"]),
                 },
                 StageDef {
                     // 2 · partition + dispatch ↔ rapidgzip chunk dispatch / thread pool
@@ -609,10 +606,7 @@ impl Config {
                     // 4 · window publication (tail-window chain) ↔ rapidgzip getLastWindow
                     name: "4·window-publish".to_string(),
                     matcher: m(
-                        &[
-                            "consumer.get_last_window",
-                            "consumer.publish_windows",
-                        ],
+                        &["consumer.get_last_window", "consumer.publish_windows"],
                         &["consumer.window_"],
                         &[],
                         &[],
@@ -622,10 +616,7 @@ impl Config {
                     // 5 · marker resolution / apply_window ↔ rapidgzip applyWindow
                     name: "5·marker-resolve".to_string(),
                     matcher: m(
-                        &[
-                            "consumer.dispatch_post_process",
-                            "consumer.eager_postproc",
-                        ],
+                        &["consumer.dispatch_post_process", "consumer.eager_postproc"],
                         &["post_process."],
                         &[],
                         &[],

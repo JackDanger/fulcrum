@@ -12,8 +12,8 @@
 //!   * single-(arch,corpus) "law" — auto-stamped HYPOTHESIS (predicate 3).
 
 use fulcrum::comparability::{
-    evaluate, evaluate_law, ArmPresence, Capture, GateClaim, GateVerdict, WorkCounter,
-    EvidenceTier, FIELD_TOOL_ROSTER,
+    evaluate, evaluate_law, ArmPresence, Capture, EvidenceTier, GateClaim, GateVerdict,
+    WorkCounter, FIELD_TOOL_ROSTER,
 };
 use fulcrum::compare::{BinaryKind, ThreadCell};
 
@@ -232,7 +232,10 @@ fn cli_refusal_exits_nonzero() {
         ])
         .output()
         .expect("run fulcrum");
-    assert!(!out.status.success(), "one-build claim must be refused (nonzero exit)");
+    assert!(
+        !out.status.success(),
+        "one-build claim must be refused (nonzero exit)"
+    );
     let so = String::from_utf8_lossy(&out.stdout);
     assert!(so.contains("ONE-ARM-INCONCLUSIVE"), "stdout: {so}");
 }

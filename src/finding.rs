@@ -427,7 +427,9 @@ impl Finding {
     /// with a made-up id) fails here.
     pub fn is_citable(&self) -> Result<(), String> {
         if self.cell_id.is_empty() {
-            return Err("NON-CITABLE: empty cell_id (a claim with no cell_id is not a finding)".into());
+            return Err(
+                "NON-CITABLE: empty cell_id (a claim with no cell_id is not a finding)".into(),
+            );
         }
         if !self.cell_id.starts_with("F-") || self.cell_id.len() != 14 {
             return Err(format!(
@@ -567,9 +569,12 @@ impl SrcChangeOracle for GitSrcOracle {
             Err(e) => return SrcChange::Unknown(format!("git unavailable: {e}")),
         }
         let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.repo)
-            .args(["diff", "--quiet", &format!("{commit_sha}..HEAD"), "--"]);
+        cmd.arg("-C").arg(&self.repo).args([
+            "diff",
+            "--quiet",
+            &format!("{commit_sha}..HEAD"),
+            "--",
+        ]);
         for w in &self.watch {
             cmd.arg(w);
         }
@@ -711,9 +716,9 @@ impl Store {
     /// is unquotable by construction). Idempotent on `cell_id`: re-adding the
     /// same CELL is a no-op (the fingerprint already determined identity).
     pub fn append(&mut self, path: &Path, finding: Finding) -> std::io::Result<bool> {
-        finding.is_citable().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        finding
+            .is_citable()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if self.findings.iter().any(|f| f.cell_id == finding.cell_id) {
             return Ok(false); // already present
         }
@@ -1081,9 +1086,11 @@ mod tests {
     fn consult_surfaces_the_ledger() {
         let oracle = FakeOracle::new(SrcChange::Fresh).with("old1234", SrcChange::Stale);
         let mut store = Store::default();
-        store
-            .findings
-            .push(sample(EvidenceTier::WholeProgramAttribution, "old1234", amd_t4()));
+        store.findings.push(sample(
+            EvidenceTier::WholeProgramAttribution,
+            "old1234",
+            amd_t4(),
+        ));
         store
             .findings
             .push(sample(EvidenceTier::Perturbation, "head1234", amd_t4()));

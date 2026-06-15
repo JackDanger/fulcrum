@@ -109,7 +109,12 @@ pub enum ScoreError {
     /// `SCORE-PROVENANCE-FLAVOR-I`: gzippy-isal has 0 ISA-L inflate symbols.
     ProvenanceFlavorI,
     /// `SCORE-SHA-VERIFY`: run output sha != decomp-pin (Rule 4).
-    ShaVerify { binary: String, iteration: usize, got: String, expected: String },
+    ShaVerify {
+        binary: String,
+        iteration: usize,
+        got: String,
+        expected: String,
+    },
     /// Internal I/O or subprocess error.
     Internal(String),
 }
@@ -161,7 +166,12 @@ impl std::fmt::Display for ScoreError {
                  — not an ISA-L build. Rebuild with default features.",
                 self.invariant_name()
             ),
-            ScoreError::ShaVerify { binary, iteration, got, expected } => write!(
+            ScoreError::ShaVerify {
+                binary,
+                iteration,
+                got,
+                expected,
+            } => write!(
                 f,
                 "{}: {binary} output sha mismatch at iteration {iteration} \
                  (got {got}, expected {expected}) — wrong bytes is a loss (Rule 4). Cell VOID.",
@@ -238,7 +248,11 @@ pub fn check_comparator_native(version_ms: f64) -> Result<(), ScoreError> {
 /// `acknowledged` = `HOST_FROZEN=1` equivalent: MAY ONLY rescue the `NA` case
 /// (sysfs hidden). A CONCRETE-WRONG readable value (e.g. governor=`"powersave"`)
 /// CANNOT be overridden — it means the box is verifiably thawed.
-pub fn check_freeze_readback(gov: &str, no_turbo: &str, acknowledged: bool) -> Result<(), ScoreError> {
+pub fn check_freeze_readback(
+    gov: &str,
+    no_turbo: &str,
+    acknowledged: bool,
+) -> Result<(), ScoreError> {
     let want_gov = "performance";
     let want_turbo = "1";
     // A READABLE wrong value → hard fail regardless of acknowledged.
@@ -365,17 +379,14 @@ pub fn measure_version_wall(binary: &Path) -> f64 {
 /// Returns `("NA", "NA")` on an LXC where the sysfs is hidden.
 /// Callers pass this into [`check_freeze_readback`].
 pub fn read_freeze_state() -> (String, String) {
-    let gov = std::fs::read_to_string(
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-    )
-    .ok()
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|| "NA".into());
-    let turbo =
-        std::fs::read_to_string("/sys/devices/system/cpu/intel_pstate/no_turbo")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "NA".into());
+    let gov = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "NA".into());
+    let turbo = std::fs::read_to_string("/sys/devices/system/cpu/intel_pstate/no_turbo")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "NA".into());
     (gov, turbo)
 }
 
@@ -399,14 +410,13 @@ fn timed_run(
 ) -> Result<(f64, String), ScoreError> {
     // SINK LAW: remove prior node, create as plain file, assert it is regular.
     let _ = std::fs::remove_file(sink);
-    let sink_file = std::fs::File::create(sink).map_err(|e| {
-        ScoreError::Internal(format!("create sink {}: {e}", sink.display()))
-    })?;
+    let sink_file = std::fs::File::create(sink)
+        .map_err(|e| ScoreError::Internal(format!("create sink {}: {e}", sink.display())))?;
     {
         // Assert regular file (not symlink / FIFO).
-        let meta = sink_file.metadata().map_err(|e| {
-            ScoreError::Internal(format!("stat sink {}: {e}", sink.display()))
-        })?;
+        let meta = sink_file
+            .metadata()
+            .map_err(|e| ScoreError::Internal(format!("stat sink {}: {e}", sink.display())))?;
         if !meta.is_file() {
             return Err(ScoreError::Internal(format!(
                 "sink {} is not a regular file (SINK LAW violation)",
@@ -424,9 +434,9 @@ fn timed_run(
     }
 
     let t0 = Instant::now();
-    let status = cmd.status().map_err(|e| {
-        ScoreError::Internal(format!("spawn {}: {e}", binary.display()))
-    })?;
+    let status = cmd
+        .status()
+        .map_err(|e| ScoreError::Internal(format!("spawn {}: {e}", binary.display())))?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if !status.success() {
@@ -437,9 +447,8 @@ fn timed_run(
         ));
     }
 
-    let out_sha = sha256_file_hex(sink).map_err(|e| {
-        ScoreError::Internal(format!("sha256 sink {}: {e}", sink.display()))
-    })?;
+    let out_sha = sha256_file_hex(sink)
+        .map_err(|e| ScoreError::Internal(format!("sha256 sink {}: {e}", sink.display())))?;
     Ok((wall_ms, out_sha))
 }
 
@@ -498,14 +507,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             &gzippy_env,
             &mut log,
         )?;
-        let (rw, rsha) = timed_run(
-            &sink_rg,
-            &args.mask,
-            &args.rg,
-            &rg_args,
-            &[],
-            &mut log,
-        )?;
+        let (rw, rsha) = timed_run(&sink_rg, &args.mask, &args.rg, &rg_args, &[], &mut log)?;
 
         if i == 0 {
             log.push_str(&format!(
@@ -544,15 +546,26 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
 
     // Best = minimum wall; spread = max - min.
     let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
-    let worst_native = native_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let worst_native = native_walls
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     let best_isal = isal_walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let worst_isal = isal_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let worst_rg = rg_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
     // ratio = rg_wall / build_wall (>= 0.99 = PASS).
-    let ratio_native = if best_native > 0.0 { best_rg / best_native } else { 0.0 };
-    let ratio_isal = if best_isal > 0.0 { best_rg / best_isal } else { 0.0 };
+    let ratio_native = if best_native > 0.0 {
+        best_rg / best_native
+    } else {
+        0.0
+    };
+    let ratio_isal = if best_isal > 0.0 {
+        best_rg / best_isal
+    } else {
+        0.0
+    };
     let verdict_native: &'static str = if ratio_native >= 0.99 { "PASS" } else { "FAIL" };
     let verdict_isal: &'static str = if ratio_isal >= 0.99 { "PASS" } else { "FAIL" };
 
@@ -831,7 +844,10 @@ pub fn comparability_section(args: &ScoreArgs, capture: &CaptureResult) -> Strin
         &cap,
         &cg::GateClaim::Settled {
             subject: "gzippy-native".to_string(),
-            field_tools: cg::FIELD_TOOL_ROSTER.iter().map(|s| s.to_string()).collect(),
+            field_tools: cg::FIELD_TOOL_ROSTER
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             tie_bar: 0.99,
         },
     );
@@ -846,10 +862,7 @@ pub fn comparability_section(args: &ScoreArgs, capture: &CaptureResult) -> Strin
 pub fn run_score(args: &ScoreArgs) -> Result<(), ScoreError> {
     // 1. STRIKE-5: assert corpus sha == pin.
     let actual_sha = sha256_file_hex(&args.corpus_path).map_err(|e| {
-        ScoreError::Internal(format!(
-            "sha256 corpus {}: {e}",
-            args.corpus_path.display()
-        ))
+        ScoreError::Internal(format!("sha256 corpus {}: {e}", args.corpus_path.display()))
     })?;
     check_corpus_sha(&actual_sha, &args.corpus_pin)?;
     eprintln!("## SCORE-PROVENANCE-SHA: OK (sha={actual_sha})");
@@ -883,9 +896,9 @@ pub fn run_score(args: &ScoreArgs) -> Result<(), ScoreError> {
     // 5. Wall capture (the measurement).
     let mut capture = run_wall_capture(args)?;
     // Embed the actual freeze readback into the log and args for the cell.
-    capture.measurement_log.push_str(&format!(
-        "## freeze: {readback_str}\n"
-    ));
+    capture
+        .measurement_log
+        .push_str(&format!("## freeze: {readback_str}\n"));
 
     // 6. Emit cell file.
     // Build a copy of args with the live freeze readback string for the cell.
@@ -895,13 +908,11 @@ pub fn run_score(args: &ScoreArgs) -> Result<(), ScoreError> {
 
     let t_label = format!("t{}", args.threads);
     let cell_dir = args.out_dir.join(&args.arch_os).join(&t_label);
-    std::fs::create_dir_all(&cell_dir).map_err(|e| {
-        ScoreError::Internal(format!("create dir {}: {e}", cell_dir.display()))
-    })?;
+    std::fs::create_dir_all(&cell_dir)
+        .map_err(|e| ScoreError::Internal(format!("create dir {}: {e}", cell_dir.display())))?;
     let cell_path = cell_dir.join(format!("{}.md", args.corpus));
-    std::fs::write(&cell_path, &cell_text).map_err(|e| {
-        ScoreError::Internal(format!("write cell {}: {e}", cell_path.display()))
-    })?;
+    std::fs::write(&cell_path, &cell_text)
+        .map_err(|e| ScoreError::Internal(format!("write cell {}: {e}", cell_path.display())))?;
 
     eprintln!("## wrote {}", cell_path.display());
     // Echo the SCORE: line to stdout (greppable by callers).
@@ -1116,9 +1127,18 @@ mod tests {
         // per-cell PASS be read as a "settled tie": score measures only rg + the
         // two gzippy builds, so igzip/libdeflate/zlib-ng are unmeasured ⇒ VOID.
         let cell = emit_cell(&test_args(), &test_capture());
-        assert!(cell.contains("## COMPARABILITY"), "comparability section missing");
-        assert!(cell.contains("SETTLED-VOIDED"), "settled must be voided in score cell");
-        assert!(cell.contains("igzip"), "unmeasured field tool must be named");
+        assert!(
+            cell.contains("## COMPARABILITY"),
+            "comparability section missing"
+        );
+        assert!(
+            cell.contains("SETTLED-VOIDED"),
+            "settled must be voided in score cell"
+        );
+        assert!(
+            cell.contains("igzip"),
+            "unmeasured field tool must be named"
+        );
     }
 
     #[test]
@@ -1182,7 +1202,10 @@ mod tests {
     fn provenance_sha_trims_whitespace() {
         let sha = "a".repeat(64);
         let sha_nl = format!("{sha}\n");
-        assert!(check_corpus_sha(&sha_nl, &sha).is_ok(), "trailing newline must be trimmed");
+        assert!(
+            check_corpus_sha(&sha_nl, &sha).is_ok(),
+            "trailing newline must be trimmed"
+        );
     }
 
     #[test]
@@ -1200,7 +1223,10 @@ mod tests {
 
     #[test]
     fn provenance_comparator_fires_at_exactly_50ms() {
-        assert!(check_comparator_native(50.0).is_err(), "exactly 50ms must fire");
+        assert!(
+            check_comparator_native(50.0).is_err(),
+            "exactly 50ms must fire"
+        );
     }
 
     #[test]

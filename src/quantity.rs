@@ -749,12 +749,7 @@ pub fn bridge(q: &Quantity, tag: &str, license: Option<&LicensingAssertion>) -> 
         q.value * f.value,
         tag,
         None,
-        &format!(
-            "bridge[{}]({} × {})",
-            license.name,
-            q.desc(),
-            f.short()
-        ),
+        &format!("bridge[{}]({} × {})", license.name, q.desc(), f.short()),
         &q.scope,
     )
 }
@@ -1035,7 +1030,10 @@ pub fn assert_volume_counter_selftest_tol(
     output_bytes: &Quantity,
     tol_pct: f64,
 ) -> QResult<VolumeCounterValidated> {
-    for (q, nm) in [(decoded_bytes, "decoded_bytes"), (output_bytes, "output_bytes")] {
+    for (q, nm) in [
+        (decoded_bytes, "decoded_bytes"),
+        (output_bytes, "output_bytes"),
+    ] {
         if q.tag != "bytes" {
             return Err(QuantityRefusal::new(
                 "VOLUME-COUNTER-UNVALIDATED",
@@ -1082,10 +1080,7 @@ pub fn volume_ratio(
     validated_a: Option<&VolumeCounterValidated>,
     validated_b: Option<&VolumeCounterValidated>,
 ) -> QResult<Quantity> {
-    for (v, q, nm) in [
-        (validated_a, decoded_a, "A"),
-        (validated_b, decoded_b, "B"),
-    ] {
+    for (v, q, nm) in [(validated_a, decoded_a, "A"), (validated_b, decoded_b, "B")] {
         let Some(v) = v else {
             return Err(QuantityRefusal::new(
                 "VOLUME-COUNTER-UNVALIDATED",
@@ -1112,16 +1107,36 @@ pub fn volume_ratio(
 // ─── The legal-algebra table (rendered by `fulcrum quantity --algebra`) ─────────
 
 const LEGAL_ALGEBRA: &[(&str, &str, &str)] = &[
-    ("share × wall_seconds", "wall_seconds", "busy wall-time; NOT bytes"),
-    ("share × cpu_seconds", "cpu_seconds", "a fraction of cpu time"),
+    (
+        "share × wall_seconds",
+        "wall_seconds",
+        "busy wall-time; NOT bytes",
+    ),
+    (
+        "share × cpu_seconds",
+        "cpu_seconds",
+        "a fraction of cpu time",
+    ),
     (
         "cpu_seconds ÷ wall_seconds",
         "utilization",
         "the pool-fill ratio (a rate)",
     ),
-    ("bytes ÷ wall_seconds", "<byte^1 wall^-1>", "throughput (a rate)"),
-    ("bytes ÷ cpu_seconds", "<byte^1 cpu^-1>", "decode rate (a rate)"),
-    ("cycles ÷ bytes", "cyc_per_byte", "intensive, frequency-stable"),
+    (
+        "bytes ÷ wall_seconds",
+        "<byte^1 wall^-1>",
+        "throughput (a rate)",
+    ),
+    (
+        "bytes ÷ cpu_seconds",
+        "<byte^1 cpu^-1>",
+        "decode rate (a rate)",
+    ),
+    (
+        "cycles ÷ bytes",
+        "cyc_per_byte",
+        "intensive, frequency-stable",
+    ),
     ("instructions ÷ cycles", "ipc", "intensive"),
     (
         "wall_seconds ÷ wall_seconds",

@@ -197,13 +197,20 @@ fn gate_provenance(inp: &PipelineInput) -> Option<PipelineRefusal> {
                 "point the knob at an env the code actually reads (grep a \
                  consumer in src/ at this commit)"
             }
-            "DERIVED-SHA-CURRENT" => "re-run the measurement at HEAD (src/ moved since this commit)",
+            "DERIVED-SHA-CURRENT" => {
+                "re-run the measurement at HEAD (src/ moved since this commit)"
+            }
             "COMPARATOR-PRESENT" => {
                 "stage the native comparator ELF on the box and capture its A/A self-test"
             }
             _ => "re-capture the missing/failed provenance field",
         };
-        return Some(PipelineRefusal::new(G_PROVENANCE, &c.name, &c.reason, resolve));
+        return Some(PipelineRefusal::new(
+            G_PROVENANCE,
+            &c.name,
+            &c.reason,
+            resolve,
+        ));
     }
     None
 }
@@ -302,7 +309,11 @@ fn gate_finding(
         claim_scope: inp.scope(),
     };
     match store.cite(&cell.cell_id, &req, oracle) {
-        CiteOutcome::Granted { granted_as, freshness, .. } => Ok((
+        CiteOutcome::Granted {
+            granted_as,
+            freshness,
+            ..
+        } => Ok((
             cell,
             format!(
                 "citable as {} ({}) for {}",
@@ -331,10 +342,7 @@ fn gate_finding(
                     "NON-CITABLE",
                     "the cell must carry a derived cell_id (mint it, never hand-set)",
                 ),
-                CiteRefusal::NotFound => (
-                    "NOT-FOUND",
-                    "bank the cell before citing it",
-                ),
+                CiteRefusal::NotFound => ("NOT-FOUND", "bank the cell before citing it"),
             };
             Err(PipelineRefusal::new(
                 G_FINDING,
@@ -395,7 +403,7 @@ pub fn run_from_artifacts(
     store: &mut Store,
     store_path: &Path,
     oracle: &dyn SrcChangeOracle,
-) -> Result<Vec<(String, Result<PipelineResult, PipelineRefusal>)>, String> {
+) -> Result<Vec<CellOutcome>, String> {
     // 1. provenance (shared across cells) from the manifest.
     let manifest_path = run_dir.join("manifest.txt");
     let manifest_txt = std::fs::read_to_string(&manifest_path)
@@ -500,6 +508,10 @@ fn claim_from_capture(cap: &Capture) -> GateClaim {
         equal_spread: 0.05,
     }
 }
+
+/// One artifact cell's flow outcome: its label (the `finding_<stem>` slug) and
+/// either the CERTIFIED result or the typed gate refusal.
+pub type CellOutcome = (String, Result<PipelineResult, PipelineRefusal>);
 
 /// Render either arm of the pipeline result as text (for the CLI / brief).
 pub fn render_outcome(r: &Result<PipelineResult, PipelineRefusal>) -> String {

@@ -20,9 +20,7 @@ const SELF_S: f64 = SELF_MS / 1000.0;
 // ── deterministic sample/arm builders (mirror perturb/tests.rs) ──────────────
 
 fn samples(minval: f64) -> Vec<f64> {
-    (0..9)
-        .map(|i| minval + 0.002 * i as f64 / 8.0)
-        .collect()
+    (0..9).map(|i| minval + 0.002 * i as f64 / 8.0).collect()
 }
 
 fn linear_arm(crit: f64) -> BTreeMap<u32, Vec<f64>> {
@@ -296,7 +294,10 @@ fn every_refusal_names_a_resolving_measurement() {
         let mut a = base_input(None);
         a.provenance.ab_sinks.insert(
             "gz_vs_rg".into(),
-            vec![ArmSink::new("gz", "/dev/null"), ArmSink::new("rg", "regular-file")],
+            vec![
+                ArmSink::new("gz", "/dev/null"),
+                ArmSink::new("rg", "regular-file"),
+            ],
         );
         v.push(a);
         // one-arm
@@ -308,7 +309,11 @@ fn every_refusal_names_a_resolving_measurement() {
     for inp in &cases {
         let (mut store, path) = fresh_store();
         let r = run_pipeline(inp, &mut store, &path, &FixedOracle(SrcChange::Fresh)).unwrap_err();
-        assert!(!r.resolving_measurement.is_empty(), "gate {} gave no resolve", r.gate);
+        assert!(
+            !r.resolving_measurement.is_empty(),
+            "gate {} gave no resolve",
+            r.gate
+        );
         assert!(r.render().contains("resolve:"));
     }
 }
@@ -352,8 +357,13 @@ fn run_artifacts_flow_through_the_pipeline_and_bank() {
     let out = std::env::temp_dir().join(format!("fulcrum_e2e_{}", std::process::id()));
     let run_dir = runner::run(&spec, &out, Mode::Fixture).expect("runner emit");
 
-    let results = run_from_artifacts(&run_dir, &mut store, &store_path, &FixedOracle(SrcChange::Fresh))
-        .expect("artifact bridge");
+    let results = run_from_artifacts(
+        &run_dir,
+        &mut store,
+        &store_path,
+        &FixedOracle(SrcChange::Fresh),
+    )
+    .expect("artifact bridge");
     assert!(!results.is_empty(), "at least one cell flowed");
     let (label, outcome) = &results[0];
     let res = outcome
@@ -361,7 +371,9 @@ fn run_artifacts_flow_through_the_pipeline_and_bank() {
         .unwrap_or_else(|r| panic!("cell {label} refused: {}", r.render()));
     assert!(res.cell.cell_id.starts_with("F-"));
     // and it actually banked into the store on disk.
-    assert!(std::fs::read_to_string(&store_path).unwrap().contains(&res.cell.cell_id));
+    assert!(std::fs::read_to_string(&store_path)
+        .unwrap()
+        .contains(&res.cell.cell_id));
 }
 
 // ── the gate order is fixed and the tokens are stable ─────────────────────────

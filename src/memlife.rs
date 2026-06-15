@@ -299,9 +299,7 @@ pub fn render_vs(a: &MemlifeRun, b: &MemlifeRun) -> String {
         "MEMLIFE CROSS-TOOL — {} (A) vs {} (B), per-MB-decoded   [A T{} {:.0}MB | B T{} {:.0}MB]\n",
         a.tool, b.tool, a.workers, mba, b.workers, mbb
     ));
-    out.push_str(
-        "  (Δ = A − B per MB; positive Δ = gzippy heavier in that component+phase)\n\n",
-    );
+    out.push_str("  (Δ = A − B per MB; positive Δ = gzippy heavier in that component+phase)\n\n");
 
     // Union of component names, in A's order then any B-only.
     let mut names: Vec<String> = a.components.iter().map(|c| c.component.clone()).collect();
@@ -356,12 +354,18 @@ pub fn render_vs(a: &MemlifeRun, b: &MemlifeRun) -> String {
             }
             out.push_str(&format!(
                 "    {:<18} {:>12.0} {:>12.0} {:>+12.0}\n",
-                r.component, va, vb, va - vb
+                r.component,
+                va,
+                vb,
+                va - vb
             ));
         }
         out.push_str(&format!(
             "    {:<18} {:>12.0} {:>12.0} {:>+12.0}\n\n",
-            "TOTAL", sa, sb, sa - sb
+            "TOTAL",
+            sa,
+            sb,
+            sa - sb
         ));
     }
 
@@ -482,12 +486,15 @@ mod tests {
     #[test]
     fn closure_closes_when_components_sum_to_total() {
         let mut c = comp("data", 0, 0, 0, 0);
-        c.alloc_paths
-            .insert("rpmalloc-huge".into(), [1000, 1]);
+        c.alloc_paths.insert("rpmalloc-huge".into(), [1000, 1]);
         let mut run = run("gzippy", 8, vec![c]);
         run.allocator_total_bytes = 1000;
         let cl = Closure::compute(&run);
-        assert!(cl.alloc_residual_frac < CLOSURE_THRESHOLD, "residual {}", cl.alloc_residual_frac);
+        assert!(
+            cl.alloc_residual_frac < CLOSURE_THRESHOLD,
+            "residual {}",
+            cl.alloc_residual_frac
+        );
     }
 
     #[test]

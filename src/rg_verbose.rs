@@ -197,11 +197,7 @@ fn parse_pct(v: &str) -> f64 {
         }
     }
     // bare "34.4981 %"
-    v.trim()
-        .trim_end_matches('%')
-        .trim()
-        .parse()
-        .unwrap_or(0.0)
+    v.trim().trim_end_matches('%').trim().parse().unwrap_or(0.0)
 }
 
 #[cfg(test)]

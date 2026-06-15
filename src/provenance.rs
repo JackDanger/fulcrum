@@ -361,8 +361,18 @@ pub struct OracleProbe {
 }
 
 impl OracleProbe {
-    pub fn new(name: &str, on: Option<i64>, off: Option<i64>, expected: Option<i64>) -> OracleProbe {
-        OracleProbe { name: name.to_string(), on, off, expected }
+    pub fn new(
+        name: &str,
+        on: Option<i64>,
+        off: Option<i64>,
+        expected: Option<i64>,
+    ) -> OracleProbe {
+        OracleProbe {
+            name: name.to_string(),
+            on,
+            off,
+            expected,
+        }
     }
 }
 
@@ -376,7 +386,10 @@ pub struct ArmSink {
 
 impl ArmSink {
     pub fn new(label: &str, sink: &str) -> ArmSink {
-        ArmSink { label: label.to_string(), sink: sink.to_string() }
+        ArmSink {
+            label: label.to_string(),
+            sink: sink.to_string(),
+        }
     }
 }
 
@@ -442,7 +455,12 @@ pub struct GateCheck {
 
 impl GateCheck {
     fn new(name: &str, verdict: CheckVerdict, scope: String, reason: String) -> GateCheck {
-        GateCheck { name: name.to_string(), verdict, scope, reason }
+        GateCheck {
+            name: name.to_string(),
+            verdict,
+            scope,
+            reason,
+        }
     }
 }
 
@@ -743,7 +761,10 @@ pub fn check_sha_current(
                 DERIVED_SHA_CURRENT,
                 CheckVerdict::Stale,
                 run(),
-                format!("src/ changed since {} (live git-diff) — STALE", short12(commit_sha)),
+                format!(
+                    "src/ changed since {} (live git-diff) — STALE",
+                    short12(commit_sha)
+                ),
             );
         }
         return GateCheck::new(
@@ -906,7 +927,12 @@ impl GateReport {
             .into_iter()
             .map(|(k, v)| (k, v.label().to_string()))
             .collect();
-        GateStamp { commit_sha: commit_sha.to_string(), provenance_verdict, evidence_tier, checks }
+        GateStamp {
+            commit_sha: commit_sha.to_string(),
+            provenance_verdict,
+            evidence_tier,
+            checks,
+        }
     }
 }
 
@@ -941,7 +967,10 @@ pub fn run_gate(
         .filter(|c| c.verdict == CheckVerdict::Void)
         .map(|c| c.scope.clone())
         .collect();
-    let refusal = checks.iter().find(|c| c.verdict == CheckVerdict::Refused).cloned();
+    let refusal = checks
+        .iter()
+        .find(|c| c.verdict == CheckVerdict::Refused)
+        .cloned();
     let mut worst = CheckVerdict::Ok;
     for c in &checks {
         if c.verdict.severity() > worst.severity() {
@@ -1018,14 +1047,19 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
         .into_iter()
         .map(|(abid, arms)| {
             // sorted by arm label (Python sorts arms.items()).
-            let v: Vec<ArmSink> =
-                arms.into_iter().map(|(a, s)| ArmSink::new(&a, &s)).collect();
+            let v: Vec<ArmSink> = arms
+                .into_iter()
+                .map(|(a, s)| ArmSink::new(&a, &s))
+                .collect();
             (abid, v)
         })
         .collect();
 
     Provenance {
-        commit_sha: man.get("commit_sha").cloned().unwrap_or_else(|| "unknown".into()),
+        commit_sha: man
+            .get("commit_sha")
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
         head_sha: man.get("head_sha").cloned(),
         src_changed: man.get("src_changed_since_commit").cloned(),
         knob_consumers,
@@ -1040,7 +1074,9 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
             .cloned()
             .unwrap_or_else(|| "unknown".into()),
         comparator_present: man.get("comparator_present").and_then(|v| bool_or_none(v)),
-        comparator_aa_ratio: man.get("comparator_aa_ratio").and_then(|v| float_or_none(v)),
+        comparator_aa_ratio: man
+            .get("comparator_aa_ratio")
+            .and_then(|v| float_or_none(v)),
         comparator_aa_spread_pct: man
             .get("comparator_aa_spread_pct")
             .and_then(|v| float_or_none(v)),
@@ -1075,7 +1111,13 @@ pub fn git_src_differ(repo_dir: impl Into<std::path::PathBuf>) -> impl Fn(&str) 
         match Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["diff", "--quiet", &format!("{commit_sha}..HEAD"), "--", "src/"])
+            .args([
+                "diff",
+                "--quiet",
+                &format!("{commit_sha}..HEAD"),
+                "--",
+                "src/",
+            ])
             .output()
         {
             Ok(out) => !out.status.success(), // returncode != 0 == differences present
@@ -1225,21 +1267,39 @@ mod gate_tests {
     #[test]
     fn derived_oracle_fired() {
         // ON arm fired 0 times VOIDs (the env-var no-op'd to the normal path)
-        let z = check_oracle_fired(&oracles(vec![OracleProbe::new("o", Some(0), Some(0), None)]));
+        let z = check_oracle_fired(&oracles(vec![OracleProbe::new(
+            "o",
+            Some(0),
+            Some(0),
+            None,
+        )]));
         assert_eq!(z[0].verdict, CheckVerdict::Void);
         assert!(z[0].reason.contains("ZERO"));
         // ON counter == OFF counter VOIDs (no observable difference)
-        let same = check_oracle_fired(&oracles(vec![OracleProbe::new("o", Some(5), Some(5), None)]));
+        let same = check_oracle_fired(&oracles(vec![OracleProbe::new(
+            "o",
+            Some(5),
+            Some(5),
+            None,
+        )]));
         assert_eq!(same[0].verdict, CheckVerdict::Void);
         assert!(same[0].reason.contains("== OFF"));
         // partial firing (on=9 != expected=14) VOIDs
-        let part =
-            check_oracle_fired(&oracles(vec![OracleProbe::new("o", Some(9), Some(0), Some(14))]));
+        let part = check_oracle_fired(&oracles(vec![OracleProbe::new(
+            "o",
+            Some(9),
+            Some(0),
+            Some(14),
+        )]));
         assert_eq!(part[0].verdict, CheckVerdict::Void);
         assert!(part[0].reason.contains("expected 14"));
         // control: ON=14, OFF=0, expected=14 => OK (engaged + distinct)
-        let good =
-            check_oracle_fired(&oracles(vec![OracleProbe::new("o", Some(14), Some(0), Some(14))]));
+        let good = check_oracle_fired(&oracles(vec![OracleProbe::new(
+            "o",
+            Some(14),
+            Some(0),
+            Some(14),
+        )]));
         assert_eq!(good[0].verdict, CheckVerdict::Ok);
         // uncaptured counters => INCOMPLETE
         let inc2 = check_oracle_fired(&oracles(vec![OracleProbe::new("o", None, None, None)]));
@@ -1421,8 +1481,10 @@ mod gate_tests {
              comparator_present=1\ncomparator_aa_ratio=1.0\ncomparator_aa_spread_pct=1.0\n",
         );
         let rep = run_gate(&from_manifest(&man), None, true).unwrap();
-        assert!(rep.checks.iter().any(|c| c.name == DERIVED_SHA_CURRENT
-            && c.verdict == CheckVerdict::Stale));
+        assert!(rep
+            .checks
+            .iter()
+            .any(|c| c.name == DERIVED_SHA_CURRENT && c.verdict == CheckVerdict::Stale));
         assert_eq!(rep.stamp("old111").provenance_verdict, "STALE");
         assert_eq!(rep.run_verdict, CheckVerdict::Stale);
     }
@@ -1453,7 +1515,10 @@ mod gate_tests {
     fn e2e_pre_provenance_incomplete_not_refused() {
         let man = parse_manifest_text(""); // no provenance keys at all
         let rep = run_gate(&from_manifest(&man), None, true).unwrap();
-        assert_eq!(rep.stamp("unknown").provenance_verdict, "PROVENANCE-INCOMPLETE");
+        assert_eq!(
+            rep.stamp("unknown").provenance_verdict,
+            "PROVENANCE-INCOMPLETE"
+        );
         assert!(rep.refusal.is_none()); // not refused (graceful)
         assert_eq!(rep.run_verdict, CheckVerdict::Incomplete);
     }

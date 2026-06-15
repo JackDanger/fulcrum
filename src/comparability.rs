@@ -155,7 +155,10 @@ impl ArmPresence {
                     self.id,
                     self.aa_spread.max(AA_TOLERANCE)
                 ),
-                None => format!("'{}' has no A/A self-test (instrument unvalidated)", self.id),
+                None => format!(
+                    "'{}' has no A/A self-test (instrument unvalidated)",
+                    self.id
+                ),
             });
         }
         None
@@ -335,11 +338,7 @@ pub struct GateOutcome {
 /// PREDICATE 1 — two-arm requirement. A "subject-specific vs contrast" claim
 /// needs BOTH arms measured here and self-test clean. Returns the refusal if an
 /// arm is missing/defective, else `None`.
-pub fn predicate_two_arms(
-    cap: &Capture,
-    subject: &str,
-    contrast: &str,
-) -> Option<GateVerdict> {
+pub fn predicate_two_arms(cap: &Capture, subject: &str, contrast: &str) -> Option<GateVerdict> {
     let mut missing = Vec::new();
     let mut whys = Vec::new();
     for id in [subject, contrast] {
@@ -436,7 +435,10 @@ pub fn predicate_settled(
     if missing.is_empty() && losing.is_empty() {
         None
     } else {
-        Some(GateVerdict::SettledVoided { missing_tools: missing, losing })
+        Some(GateVerdict::SettledVoided {
+            missing_tools: missing,
+            losing,
+        })
     }
 }
 
@@ -472,9 +474,9 @@ pub fn evaluate(cap: &Capture, claim: &GateClaim) -> GateOutcome {
                 // Predicate 2: equal work ⇒ shared ⇒ refuse specificity.
                 if let Some(v) = predicate_shared(cap, subject, contrast, cn, *equal_spread) {
                     let (s, c) = match &v {
-                        GateVerdict::SharedRefused { subject, contrast, .. } => {
-                            (*subject, *contrast)
-                        }
+                        GateVerdict::SharedRefused {
+                            subject, contrast, ..
+                        } => (*subject, *contrast),
                         _ => (f64::NAN, f64::NAN),
                     };
                     (
@@ -515,10 +517,16 @@ pub fn evaluate(cap: &Capture, claim: &GateClaim) -> GateOutcome {
         } => {
             if let Some(v) = predicate_settled(cap, subject, field_tools, *tie_bar) {
                 let detail = match &v {
-                    GateVerdict::SettledVoided { missing_tools, losing } => {
+                    GateVerdict::SettledVoided {
+                        missing_tools,
+                        losing,
+                    } => {
                         let mut parts = Vec::new();
                         if !missing_tools.is_empty() {
-                            parts.push(format!("UNMEASURED field tools: {}", missing_tools.join(", ")));
+                            parts.push(format!(
+                                "UNMEASURED field tools: {}",
+                                missing_tools.join(", ")
+                            ));
                         }
                         if !losing.is_empty() {
                             parts.push(format!("LOSES to: {}", losing.join(", ")));
@@ -550,7 +558,9 @@ pub fn evaluate(cap: &Capture, claim: &GateClaim) -> GateOutcome {
             }
         }
         GateClaim::Law { .. } => (
-            GateVerdict::HypothesisOnly { arches: vec![cap.arch.clone()] },
+            GateVerdict::HypothesisOnly {
+                arches: vec![cap.arch.clone()],
+            },
             EvidenceTier::Hypothesis,
             "A law cannot be judged from a single capture — use evaluate_law over \
              captures from ≥2 arches."
@@ -586,7 +596,9 @@ pub fn evaluate_law(captures: &[&Capture], statement: &str) -> GateOutcome {
         )
     } else {
         (
-            GateVerdict::HypothesisOnly { arches: arches.clone() },
+            GateVerdict::HypothesisOnly {
+                arches: arches.clone(),
+            },
             format!(
                 "HYPOTHESIS only: seen on {} arch [{}] — a law needs ≥2 (e.g. AMD + Intel). \
                  A single-(arch,corpus) result cannot be a universal law.",
@@ -716,7 +728,11 @@ pub fn parse_capture(json: &str) -> Option<Capture> {
 
     let threads = match v.get("threads").and_then(|t| t.as_str()).unwrap_or("T1") {
         s if s.eq_ignore_ascii_case("auto") => ThreadCell::Auto,
-        s => ThreadCell::Fixed(s.trim_start_matches(['T', 't']).parse::<usize>().unwrap_or(1)),
+        s => ThreadCell::Fixed(
+            s.trim_start_matches(['T', 't'])
+                .parse::<usize>()
+                .unwrap_or(1),
+        ),
     };
 
     let parse_kind = |s: &str| -> BinaryKind {
@@ -736,7 +752,11 @@ pub fn parse_capture(json: &str) -> Option<Capture> {
     if let Some(arr) = v.get("arms").and_then(|a| a.as_array()) {
         for a in arr {
             arms.push(ArmPresence {
-                id: a.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                id: a
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 measured: a.get("measured").and_then(|x| x.as_bool()).unwrap_or(false),
                 binary_kind: a
                     .get("binary_kind")
@@ -757,7 +777,11 @@ pub fn parse_capture(json: &str) -> Option<Capture> {
     let mut counters = Vec::new();
     if let Some(arr) = v.get("counters").and_then(|a| a.as_array()) {
         for c in arr {
-            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let name = c
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let mut per_arm = std::collections::BTreeMap::new();
             if let Some(obj) = c.get("per_arm").and_then(|x| x.as_object()) {
                 for (k, val) in obj {
@@ -771,14 +795,37 @@ pub fn parse_capture(json: &str) -> Option<Capture> {
     }
 
     Some(Capture {
-        cell_id: v.get("cell_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        commit_sha: v.get("commit_sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        corpus: v.get("corpus").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        arch: v.get("arch").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        cell_id: v
+            .get("cell_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        commit_sha: v
+            .get("commit_sha")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        corpus: v
+            .get("corpus")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        arch: v
+            .get("arch")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         threads,
-        sink: v.get("sink").and_then(|x| x.as_str()).unwrap_or("regular-file").to_string(),
+        sink: v
+            .get("sink")
+            .and_then(|x| x.as_str())
+            .unwrap_or("regular-file")
+            .to_string(),
         n: v.get("n").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-        inter_run_spread: v.get("inter_run_spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        inter_run_spread: v
+            .get("inter_run_spread")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0),
         arms,
         counters,
     })
@@ -800,7 +847,10 @@ mod tests {
         arm.measured = true; // measured but never self-tested
         arm.binary_kind = BinaryKind::Native;
         assert!(!arm.aa_ok());
-        assert!(arm.comparator_defect().unwrap().contains("no A/A self-test"));
+        assert!(arm
+            .comparator_defect()
+            .unwrap()
+            .contains("no A/A self-test"));
     }
 
     #[test]
@@ -876,7 +926,10 @@ mod tests {
     #[test]
     fn both_arms_present_and_clean_admits() {
         let cap = cap_with(
-            vec![aa_clean("gzippy-native", 300.0), aa_clean("rapidgzip", 250.0)],
+            vec![
+                aa_clean("gzippy-native", 300.0),
+                aa_clean("rapidgzip", 250.0),
+            ],
             vec![],
         );
         let claim = GateClaim::SubjectSpecific {
@@ -899,7 +952,10 @@ mod tests {
             &[("gzippy-native", 1_000_000.0), ("rapidgzip", 1_000_000.0)],
         );
         let cap = cap_with(
-            vec![aa_clean("gzippy-native", 300.0), aa_clean("rapidgzip", 250.0)],
+            vec![
+                aa_clean("gzippy-native", 300.0),
+                aa_clean("rapidgzip", 250.0),
+            ],
             vec![markers],
         );
         let claim = GateClaim::SubjectSpecific {
@@ -922,7 +978,10 @@ mod tests {
             &[("gzippy-native", 1_300_000.0), ("rapidgzip", 1_000_000.0)],
         );
         let cap = cap_with(
-            vec![aa_clean("gzippy-native", 300.0), aa_clean("rapidgzip", 250.0)],
+            vec![
+                aa_clean("gzippy-native", 300.0),
+                aa_clean("rapidgzip", 250.0),
+            ],
             vec![markers],
         );
         let claim = GateClaim::SubjectSpecific {

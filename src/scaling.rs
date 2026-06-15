@@ -165,10 +165,7 @@ impl DecodeIndex {
     }
     /// 0-based position of `start_bit` in pipeline order, if it is a real chunk.
     fn rank(&self, start_bit: u64) -> Option<u64> {
-        self.order
-            .binary_search(&start_bit)
-            .ok()
-            .map(|i| i as u64)
+        self.order.binary_search(&start_bit).ok().map(|i| i as u64)
     }
 }
 
@@ -483,10 +480,7 @@ fn subdivide_wait_excl(
 pub fn partition(events: &[Event], cfg: &Config, t_override: Option<u64>) -> WallPartition {
     let spans = crate::trace::pair_spans(events);
     let cr = consumer::analyze(events, &cfg.consumer);
-    let t = t_override
-        .or(cr.parallelization)
-        .unwrap_or(1)
-        .max(1);
+    let t = t_override.or(cr.parallelization).unwrap_or(1).max(1);
 
     let wall = cr.consumer_span_us;
     let wait_total = *cr.by_class.get("WAIT").unwrap_or(&0.0);
@@ -600,13 +594,7 @@ impl ScalingDeficit {
         self.per_bucket
             .iter()
             .filter(|(_, x)| *x > 0.0)
-            .map(|(n, x)| {
-                (
-                    n.clone(),
-                    *x,
-                    if total > 0.0 { x / total } else { 0.0 },
-                )
-            })
+            .map(|(n, x)| (n.clone(), *x, if total > 0.0 { x / total } else { 0.0 }))
             .collect()
     }
 }
@@ -795,7 +783,10 @@ mod tests {
         let contribs = d.loss_contributors();
         assert_eq!(contribs[0].0, "window-serial");
         assert!((contribs[0].1 - 175.0).abs() < 1e-6);
-        assert!(contribs[0].2 > 0.99, "window-serial should be ~100% of loss");
+        assert!(
+            contribs[0].2 > 0.99,
+            "window-serial should be ~100% of loss"
+        );
     }
 
     /// Inject a load-imbalance bucket that GROWS with thread count; recover it.

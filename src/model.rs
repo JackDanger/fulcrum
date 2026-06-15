@@ -762,7 +762,13 @@ mod tests {
         // decode_chunk with its own mode arg — start_bit reset to 999_999 (no
         // matching decision event). The span IS classified via decode_mode()
         // reading its `mode` arg → n_decode_spans = 1.
-        events.extend(decode_span("worker.decode_chunk", "window_absent", 2, 0.0, 10_000.0));
+        events.extend(decode_span(
+            "worker.decode_chunk",
+            "window_absent",
+            2,
+            0.0,
+            10_000.0,
+        ));
         for e in &mut events {
             if e.name == "worker.decode_chunk" {
                 if let Some(o) = e.args.as_object_mut() {

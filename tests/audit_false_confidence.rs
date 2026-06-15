@@ -14,8 +14,22 @@ use fulcrum::trace::Event;
 fn span(name: &str, mode: &str, tid: u64, t0: f64, t1: f64) -> [Event; 2] {
     let args = serde_json::json!({ "mode": mode, "start_bit": (t0 as u64) });
     [
-        Event { name: name.into(), ph: "B".into(), ts: t0, pid: 1, tid, args: args.clone() },
-        Event { name: name.into(), ph: "E".into(), ts: t1, pid: 1, tid, args },
+        Event {
+            name: name.into(),
+            ph: "B".into(),
+            ts: t0,
+            pid: 1,
+            tid,
+            args: args.clone(),
+        },
+        Event {
+            name: name.into(),
+            ph: "E".into(),
+            ts: t1,
+            pid: 1,
+            tid,
+            args,
+        },
     ]
 }
 
@@ -59,20 +73,38 @@ fn model_residual_is_a_telescoping_tautology_when_publish_chain_binds() {
         // tiny decode spans, one per chunk, so worker-bound << publish-chain
         for (i, _) in pub_ts.iter().enumerate() {
             let t0 = 1.0 + i as f64; // 1µs spans near the start
-            ev.extend(span("worker.decode", "window_absent", 2 + (i as u64 % 4), t0, t0 + 1.0));
+            ev.extend(span(
+                "worker.decode",
+                "window_absent",
+                2 + (i as u64 % 4),
+                t0,
+                t0 + 1.0,
+            ));
         }
         for (i, &t) in pub_ts.iter().enumerate() {
             ev.push(publish(t, 1000 + i as u64 * 100));
         }
-        ev.push(Event { name: "drive".into(), ph: "B".into(), ts: 0.0, pid: 1, tid: 1,
-            args: serde_json::json!({ "parallelization": 4 }) });
-        ev.push(Event { name: "drive".into(), ph: "E".into(), ts: wall, pid: 1, tid: 1,
-            args: serde_json::Value::Null });
+        ev.push(Event {
+            name: "drive".into(),
+            ph: "B".into(),
+            ts: 0.0,
+            pid: 1,
+            tid: 1,
+            args: serde_json::json!({ "parallelization": 4 }),
+        });
+        ev.push(Event {
+            name: "drive".into(),
+            ph: "E".into(),
+            ts: wall,
+            pid: 1,
+            tid: 1,
+            args: serde_json::Value::Null,
+        });
         ev
     }
 
     let wall = 100_000.0; // 100ms
-    // Pattern A: uniform publishes 10ms..90ms.
+                          // Pattern A: uniform publishes 10ms..90ms.
     let a = trace_with(&[10_000.0, 30_000.0, 50_000.0, 70_000.0, 90_000.0], wall);
     // Pattern B: same first(10ms)/last(90ms), but ALL the gap in one giant stall.
     let b = trace_with(&[10_000.0, 11_000.0, 12_000.0, 13_000.0, 90_000.0], wall);
@@ -140,10 +172,17 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
         cell.wall_us = 600.0; // each thread's decode self-time, well under wall
         cell.counters.insert(
             C_MINFLT.to_string(),
-            AttributedValue { value: 2000.0, purity: 1.0 },
+            AttributedValue {
+                value: 2000.0,
+                purity: 1.0,
+            },
         );
         b.cells.insert(
-            CellKey { tid, region: "decode".into(), partition_idx: Some(tid) },
+            CellKey {
+                tid,
+                region: "decode".into(),
+                partition_idx: Some(tid),
+            },
             cell,
         );
     }
@@ -167,7 +206,8 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
          single-thread wall (modeled {:.0}µs over a {:.0}µs wall) — a cross-thread CPU sum \
          presented as a wall fraction. The VERDICT line prints this >100% number as the \
          'dominant NAMED mechanism (% of wall)'.",
-        pf.modeled_us, d.wall_us
+        pf.modeled_us,
+        d.wall_us
     );
 }
 
@@ -181,15 +221,34 @@ fn decompose_sums_faults_across_threads_can_exceed_wall() {
 #[test]
 #[ignore = "falsifier fixture — demonstrates false-confidence source D2 (named_residual_frac clamp hides over-attribution); run explicitly: cargo test --test audit_false_confidence"]
 fn named_residual_frac_clamp_hides_over_attribution() {
-    let mut b = ProfileBundle { wall_us: 10_000.0, ..Default::default() };
+    let mut b = ProfileBundle {
+        wall_us: 10_000.0,
+        ..Default::default()
+    };
     let mut cell = RegionCell::default();
     // 50_000 faults * 1µs = 50ms modeled, vs a residual of only ~6ms.
-    cell.counters.insert(C_MINFLT.to_string(), AttributedValue { value: 50_000.0, purity: 1.0 });
-    b.cells.insert(CellKey { tid: 1, region: "decode".into(), partition_idx: Some(0) }, cell);
+    cell.counters.insert(
+        C_MINFLT.to_string(),
+        AttributedValue {
+            value: 50_000.0,
+            purity: 1.0,
+        },
+    );
+    b.cells.insert(
+        CellKey {
+            tid: 1,
+            region: "decode".into(),
+            partition_idx: Some(0),
+        },
+        cell,
+    );
     let d = decompose::decompose(&b, 4_000.0); // residual = 6ms
 
     let raw_ratio = d.terms.iter().map(|t| t.modeled_us).sum::<f64>() / d.residual_us;
-    assert!(raw_ratio > 1.0, "setup: should over-attribute, got {raw_ratio}");
+    assert!(
+        raw_ratio > 1.0,
+        "setup: should over-attribute, got {raw_ratio}"
+    );
 
     // The reported frac is clamped to 1.0, hiding that we modeled 8x the residual.
     assert!(
@@ -205,7 +264,16 @@ use fulcrum::schedule::{self, StallClass};
 use fulcrum::trace::Span;
 
 fn sp(name: &str, tid: u64, start: f64, end: f64, args: serde_json::Value) -> Span {
-    Span { name: name.into(), parent: String::new(), pid: 1, tid, ts_start: start, ts_end: end, dur: end - start, args }
+    Span {
+        name: name.into(),
+        parent: String::new(),
+        pid: 1,
+        tid,
+        ts_start: start,
+        ts_end: end,
+        dur: end - start,
+        args,
+    }
 }
 
 /// FINDING S1 (MEDIUM — undecoded-chunk stall is silently charged to PLACEMENT).
@@ -226,7 +294,13 @@ fn sp(name: &str, tid: u64, start: f64, end: f64, args: serde_json::Value) -> Sp
 fn missing_decode_span_is_charged_to_placement_not_flagged_as_coverage_gap() {
     let spans = vec![
         // consumer stalls on chunk 5 for the whole 100µs.
-        sp("wait.block_fetcher_get", 1, 100.0, 200.0, serde_json::json!({"chunk_id": 5})),
+        sp(
+            "wait.block_fetcher_get",
+            1,
+            100.0,
+            200.0,
+            serde_json::json!({"chunk_id": 5}),
+        ),
         // NO worker.decode_chunk for chunk 5 anywhere in the trace.
         // an idle worker exists during the stall.
         sp("pool.pick.wait", 3, 100.0, 200.0, serde_json::json!({})),
@@ -242,6 +316,9 @@ fn missing_decode_span_is_charged_to_placement_not_flagged_as_coverage_gap() {
         "COVERAGE-GAP-AS-PLACEMENT CONFIRMED: a stall on a chunk with NO decode span \
          (placement_us={:.0} of dur={:.0}) is classified {:?} — a missing measurement \
          is rendered as a confident PLACEMENT verdict. winner={}",
-        v.placement_us, v.stalls[0].dur_us, v.stalls[0].class, v.winner()
+        v.placement_us,
+        v.stalls[0].dur_us,
+        v.stalls[0].class,
+        v.winner()
     );
 }
