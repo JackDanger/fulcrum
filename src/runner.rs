@@ -1894,10 +1894,18 @@ fn comparability_capture_json(spec: &RunSpec, cap: &Captured, cell: &CapturedCel
     // `!measured` first).
     for a in &cell.arms {
         let (aa_ratio, aa_spread): (Option<f64>, f64) = if a.id == "rapidgzip" {
-            // unchanged back-compat: the dedicated global rg A/A, wall-spread floor.
+            // rg's dedicated global A/A — emit its within-half noise as the SAME
+            // FRACTION the field tools use (`spread_pct / 100`), NOT the cell
+            // wall-spread in SECONDS. `aa_ok` compares `|aa_ratio−1|` against
+            // `aa_spread` as a FRACTION, so the old seconds form widened the
+            // tolerance on a large-wall cell (a 2% spread on a 3s cell →
+            // `spread_of` 0.06s read as a 6% tolerance), over-admitting a noisy
+            // rg. A missing spread defaults to 0.0 so the `AA_TOLERANCE` floor
+            // (0.03) applies — identical to a field tool. Only the A/A
+            // self-screen unit changes; rg's measured WALL is untouched.
             (
                 Some(cap.comparator_aa_ratio.unwrap_or(1.0)),
-                spread_of(&a.wall),
+                cap.comparator_aa_spread_pct.unwrap_or(0.0) / 100.0,
             )
         } else if !a.measured() {
             (None, 0.0)
@@ -3177,6 +3185,137 @@ mod tests {
         assert!(
             !zng.usable_as_comparator(),
             "the unstable arm is refused independently"
+        );
+    }
+
+    // ── BACKLOG #6: rapidgzip per-arm A/A spread UNIT mismatch (over-admission) ──
+    //
+    // The field tools emit their per-arm `aa_spread` as a FRACTION
+    // (`spread_pct / 100`), but the rapidgzip arm used to emit `spread_of(&wall)`
+    // in SECONDS while `aa_ok` compares `|aa_ratio−1|` against `aa_spread` as a
+    // FRACTION. On a LARGE-WALL cell the seconds value inflates the fractional
+    // tolerance (a 2% spread on a 3s cell → 0.06s read as a 6% tolerance), so a
+    // genuinely-noisy rg with 4% A/A drift was ADMITTED. These tests drive a
+    // capture all the way THROUGH `comparability_capture_json` + `parse_capture`
+    // and assert rg is now screened on the SAME fractional basis as the field
+    // tools. RED-BEFORE: with the seconds emit the noisy rg reads aa_spread 0.06
+    // and is admitted; GREEN-AFTER: it reads 0.02 (2%) and is refused.
+
+    /// rapidgzip on a 3s cell whose A/A drift (4%) exceeds its fractional
+    /// within-half noise (2%) but was hidden by the seconds→fraction unit bug.
+    #[test]
+    fn rg_large_cell_overadmit_now_refused() {
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"rapidgzip","bin":"/box/rg"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "comparator_aa_ratio":1.04,"comparator_aa_spread_pct":2.0,
+            "cells":{"silesia:1":{"gz_wall_ms":3300.0,"rg_wall_ms":3000.0,"spread_pct":2.0}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let rg = cap.arm("rapidgzip").expect("rapidgzip arm present");
+        assert!(rg.measured, "rg was measured this run");
+        // The arm's spread is now the FRACTION (2% → 0.02), NOT the wall seconds
+        // (0.06s). RED-BEFORE the fix this read ~0.06.
+        assert!(
+            (rg.aa_spread - 0.02).abs() < 1e-9,
+            "rg aa_spread must be the FRACTION 0.02, not 0.06s; got {}",
+            rg.aa_spread
+        );
+        // |1.04−1| = 0.04 > max(0.02, AA_TOLERANCE=0.03) = 0.03 ⇒ refused. With the
+        // old seconds form the tolerance was max(0.06, 0.03) = 0.06 ⇒ admitted.
+        assert!(
+            !rg.aa_ok(),
+            "a 4% A/A drift on a 3s cell must FAIL once the unit is fractional"
+        );
+        assert!(
+            !rg.usable_as_comparator(),
+            "a noisy rg must NOT be over-admitted by the seconds-as-fraction bug"
+        );
+        assert!(rg.comparator_defect().unwrap().contains("A/A self-test"));
+        // And at the GATE: the noisy rg cannot settle a two-arm claim.
+        use crate::comparability::{evaluate, GateClaim};
+        let claim = GateClaim::SubjectSpecific {
+            subject: "gzippy-native".into(),
+            contrast: "rapidgzip".into(),
+            counter: None,
+            equal_spread: 0.05,
+        };
+        assert!(
+            !evaluate(&cap, &claim).verdict.admitted(),
+            "an over-noisy rg comparator must not be admitted (VOID/ONE-ARM)"
+        );
+    }
+
+    /// A genuinely-stable rg on the SAME large cell must still be admitted — the
+    /// fix must not over-correct into a false refusal.
+    #[test]
+    fn rg_large_cell_stable_still_admitted() {
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"rapidgzip","bin":"/box/rg"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "comparator_aa_ratio":1.005,"comparator_aa_spread_pct":2.0,
+            "cells":{"silesia:1":{"gz_wall_ms":3300.0,"rg_wall_ms":3000.0,"spread_pct":2.0}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let rg = cap.arm("rapidgzip").expect("rapidgzip arm present");
+        assert!(
+            (rg.aa_spread - 0.02).abs() < 1e-9,
+            "rg aa_spread is the FRACTION; got {}",
+            rg.aa_spread
+        );
+        // |1.005−1| = 0.005 ≤ max(0.02, 0.03) = 0.03 ⇒ admitted.
+        assert!(rg.aa_ok(), "a stable rg A/A must still pass the self-test");
+        assert!(
+            rg.usable_as_comparator(),
+            "a stable, self-tested rg comparator is admitted (no over-correction)"
+        );
+        use crate::comparability::{evaluate, GateClaim};
+        let claim = GateClaim::SubjectSpecific {
+            subject: "gzippy-native".into(),
+            contrast: "rapidgzip".into(),
+            counter: None,
+            equal_spread: 0.05,
+        };
+        assert!(
+            evaluate(&cap, &claim).verdict.admitted(),
+            "a stable rg comparator on a large cell is admitted"
+        );
+    }
+
+    /// A SMALL-wall cell (~1s) where the seconds value numerically equals the
+    /// fraction (1s × 2% = 0.02s ≡ 0.02) — the unit bug vanishes, so the verdict
+    /// is identical old-vs-new. Regression guard that the fix changed nothing here.
+    #[test]
+    fn rg_small_cell_unit_neutral_unchanged() {
+        // 4% drift, 2% within-half noise on a 1s cell: refused both old and new.
+        let spec = r#"{
+          "arch":"amd","feature":"gzippy-native","gzippy_bin":"/box/gzippy",
+          "comparators":[{"id":"rapidgzip","bin":"/box/rg"}],
+          "corpora":[{"id":"silesia","path":"<BENCH_ROOT>/silesia.gz"}],
+          "threads":[1],"n":9,
+          "fixture":{"commit_sha":"deadbeef","comparator_present":true,
+            "comparator_aa_ratio":1.04,"comparator_aa_spread_pct":2.0,
+            "cells":{"silesia:1":{"gz_wall_ms":1100.0,"rg_wall_ms":1000.0,"spread_pct":2.0}}}
+        }"#;
+        let cap = field_aa_capture(spec);
+        let rg = cap.arm("rapidgzip").expect("rapidgzip arm present");
+        // At a 1s wall the OLD seconds spread (1s × 0.02 = 0.02s) numerically
+        // equals the NEW fraction (0.02), so aa_ok is identical either way.
+        assert!(
+            (rg.aa_spread - 0.02).abs() < 1e-9,
+            "1s cell: seconds and fraction coincide at 0.02; got {}",
+            rg.aa_spread
+        );
+        // |1.04−1| = 0.04 > max(0.02, 0.03) = 0.03 ⇒ refused (same old and new).
+        assert!(
+            !rg.aa_ok(),
+            "unchanged: a 4% drift is refused on a 1s cell too"
         );
     }
 }

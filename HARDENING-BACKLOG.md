@@ -93,7 +93,32 @@ Invariants every iteration must keep green:
 
 ## Newly-discovered (append as found)
 
-- **A/A spread UNIT mismatch (latent, watch).** The comparability gate compares
+- **[DONE — branch `harden/rg-aa-units`]** rapidgzip per-arm `aa_spread` UNIT
+  mismatch (over-admission). The rg arm emitted its per-arm `aa_spread =
+  spread_of(&a.wall)` in SECONDS while `aa_ok` compares `|aa_ratio−1|` against
+  `aa_spread` as a FRACTION (field tools already emitted `spread_pct / 100`). On a
+  LARGE-WALL cell a 2% rg spread became `~0.06s`, read as a 6% tolerance →
+  genuinely-noisy rg (up to ~6% A/A drift) ADMITTED as a comparator. Fix
+  (`src/runner.rs:1896` `comparability_capture_json`): rg's per-arm `aa_spread` now
+  emits `cap.comparator_aa_spread_pct.unwrap_or(0.0) / 100.0` — the SAME fractional
+  basis the field tools use; a missing spread defaults to 0.0 so the `AA_TOLERANCE`
+  (0.03) floor applies, identical to a field tool. rg's measured WALL is untouched;
+  only its A/A self-screen unit changes. 3 red-before/green-after tests in
+  `src/runner.rs` (`rg_large_cell_overadmit_now_refused`,
+  `rg_large_cell_stable_still_admitted`, `rg_small_cell_unit_neutral_unchanged`):
+  4% drift on a 3s cell is now REFUSED (was admitted via the 0.06s tolerance); a
+  stable rg on the same large cell is still admitted (no over-correction); a 1s
+  cell where seconds≈fraction is unchanged. 526 tests / 0 / 0; clippy 0-new; fmt
+  clean. NOTE for the rg-cell re-check: the T1 baseline on `f3a418c` has REAL rg
+  walls — this fix only tightens rg's A/A self-screen, so any already-banked rg
+  cell whose rg A/A drift exceeds its own within-half noise (and was previously
+  admitted only by the seconds-widened tolerance, i.e. drift in the
+  `(within-half-frac, wall-spread-seconds]` band) would now be SCREENED OUT.
+  Re-run rg's A/A on banked large-wall cells after this lands; small-wall (~1s)
+  cells are unaffected.
+
+- **A/A spread UNIT mismatch (latent, watch). [RESOLVED by the DONE item above.]**
+  The comparability gate compares
   `|aa_ratio−1|` against `aa_spread` as a FRACTION (with an `AA_TOLERANCE = 0.03`
   floor), while `aa_stats` returns the spread as a PERCENT. The capture-JSON emit
   now converts (`/100`) for field tools; the rapidgzip arm still emits its
