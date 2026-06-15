@@ -1178,6 +1178,54 @@ pub fn check_box_valid(cells: &[CellBoxStats]) -> Vec<GateCheck> {
             continue;
         }
 
+        // -- PREEMPTED-K1: absolute occupancy backstop at k == 1. ---------------
+        //    `effective_occupancy_min` RELATIVIZES the per-sample occupancy floor
+        //    to the cell's OWN median, so a UNIFORMLY-preempted cell (a single
+        //    steady competitor present the whole window) never trips CONTAMINATION
+        //    — its samples all sit near the depressed median, so none are
+        //    rejected. It then leans entirely on UNQUIET, which (strict `>` at bar
+        //    k+PROCS_RUNNING_SLACK) MISSES a single sustained competitor at k=1:
+        //    run-queue ≈ 2 == k+1 = 2. Both arms dodged ⇒ a half-preempted T1
+        //    cell certified silently — a real hole on a SHARED box.
+        //
+        //    The relativization is CORRECT for a serial-BY-DESIGN PARALLEL cell
+        //    (a T4 with a serial bootstrap legitimately reads aggregate occupancy
+        //    < 1 with NO preemption), so the absolute floor must NOT be applied at
+        //    k ≥ 2. But at k == 1 there is NO parallelism: a CPU-bound single
+        //    thread saturates its one core, so an occupancy_med well below
+        //    saturation can ONLY be off-core preemption — never serial-fraction
+        //    sub-saturation. So the absolute floor is sound at k == 1 ALONE.
+        //
+        //    Occupancy (OUR threads' utime+stime ÷ wall·k) is the SOUND signal
+        //    here, not procs_running: on a shared LXC the system-wide run-queue is
+        //    inflated by OTHER tenants on OTHER cores (which do not contend for our
+        //    pinned core), so tightening UNQUIET would false-VOID a quiet cell.
+        //    Occupancy drops only when a competitor lands ON our core.
+        //
+        //    Degrades to a no-op when occupancy was not captured (occupancy_med
+        //    == 0.0 — BSD `time` / a fixture): a running thread can never use zero
+        //    CPU, so 0.0 means "uncaptured", and skipping it is never a false VOID.
+        if c.k == 1 && c.occupancy_med > 0.0 && c.occupancy_med < crate::perturb::OCCUPANCY_MIN {
+            out.push(GateCheck::new(
+                BOX_VALID,
+                CheckVerdict::Void,
+                scope,
+                format!(
+                    "PREEMPTED-K1: k=1 cell median occupancy {:.2} < {} — the single \
+                     thread was preempted off its one pinned core for a sustained slice \
+                     of the wall (a steady competitor the relativized occupancy floor and \
+                     the UNQUIET run-queue bar both miss at k=1). A k=1 CPU-bound thread \
+                     should saturate its core; this wall measured the box's contention, \
+                     not the workload. Re-run on a quiet window where the k=1 cell keeps \
+                     median occupancy ≥ {}",
+                    c.occupancy_med,
+                    crate::perturb::OCCUPANCY_MIN,
+                    crate::perturb::OCCUPANCY_MIN,
+                ),
+            ));
+            continue;
+        }
+
         // -- DRIFT: control bracket swing > K×floor OR end-to-end > PCT. ---------
         if let Some(d) = bracket_drift(&c.ctrl_medians) {
             let swing_bar = DRIFT_VOID_K * c.ctrl_spread;
@@ -2343,6 +2391,110 @@ mod box_valid_tests {
         assert!(
             reason.contains("quiet window"),
             "names the resolving measurement"
+        );
+    }
+
+    // ── 4b. PREEMPTED-K1 (the single-sustained-competitor blind-spot at k=1) ─
+    //    A k=1 cell shares its ONE pinned core with a single steady competitor.
+    //    Every arm that should catch it is dodged:
+    //      * occupancy: effective_occupancy_min RELATIVIZES the floor to the
+    //        cell's own depressed median (ref≈0.5 < 0.90 ⇒ floor 0.45), so the
+    //        uniform ≈0.5 samples are NOT rejected ⇒ CONTAMINATION passes;
+    //      * UNQUIET: run-queue ≈ 2 = k+PROCS_RUNNING_SLACK = 1+1 = 2, and the
+    //        bar is strict `>` ⇒ 2.0 > 2.0 is false ⇒ UNQUIET passes;
+    //      * DRIFT: the contention is steady ⇒ no bracket swing.
+    //    The relativized floor is correct for a serial-BY-DESIGN PARALLEL cell
+    //    (a T4 with a serial bootstrap reads aggregate occ < 1 with no preempt),
+    //    but at k==1 there is NO parallelism: a CPU-bound single thread saturates
+    //    its one core, so an occupancy_med far below saturation can ONLY be
+    //    off-core preemption. The absolute occupancy backstop (k==1 only) catches
+    //    it. procs_running is a SYSTEM-WIDE counter (other tenants on OTHER cores
+    //    inflate it without contending for ours), so tightening UNQUIET would
+    //    false-VOID a quiet cell — occupancy measures OUR threads' actual core
+    //    time and is the sound discriminator.
+    //
+    //    RED-before/GREEN-after: with the PREEMPTED-K1 block stubbed `if false`,
+    //    the contended cell below returns OK (the silent-pass hole); GREEN-after
+    //    it VOIDs.
+    fn quiet_k1_cell() -> CellBoxStats {
+        CellBoxStats {
+            cell: "silesia:1".into(),
+            k: 1,
+            n_raw: 15,
+            rejected: 0,
+            clean: 15,
+            escalated: false,
+            occupancy_med: 0.99, // a CPU-bound single thread saturates its core
+            procs_running_med: 1.0,
+            mask_requested: "0".into(),   // 1 core for k=1
+            mask_readback: "0-15".into(), // pool ⊇ request → WRONG-MASK passes
+            ctrl_medians: vec![1.000, 1.000, 1.000],
+            ctrl_spread: 0.001,
+            cpu_phys: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn preempted_k1_voids_red_before_green_after() {
+        // GREEN control: a genuinely quiet k=1 cell (occ≈1.0, run-queue≈1)
+        // must STILL certify — no over-correction.
+        let (v, reason) = verdict_of(&quiet_k1_cell());
+        assert_eq!(
+            v,
+            CheckVerdict::Ok,
+            "a quiet k=1 cell must not false-VOID; reason: {reason}"
+        );
+
+        // RED-before / GREEN-after: a k=1 cell with ONE sustained competitor on
+        // its single core. occupancy_med≈0.5 (relativized away → 0 rejected),
+        // run-queue≈2.0 ( == k+1, so UNQUIET's strict `>` misses it), steady (no
+        // drift). Every prior arm passes — only the absolute-occupancy backstop
+        // can VOID it.
+        let mut c = quiet_k1_cell();
+        c.occupancy_med = 0.5; // half the wall the thread was preempted off-core
+        c.procs_running_med = 2.0; // one steady competitor: ≤ k+1 = 2 → UNQUIET miss
+        let (v, reason) = verdict_of(&c);
+        assert_eq!(
+            v,
+            CheckVerdict::Void,
+            "a uniformly half-preempted k=1 cell VOIDs (the single-competitor hole)"
+        );
+        assert!(reason.contains("PREEMPTED"), "names PREEMPTED: {reason}");
+        assert!(
+            reason.contains("Re-run"),
+            "names the resolving measurement: {reason}"
+        );
+
+        // GREEN-after guard 1 (no over-correction): occupancy AT the absolute
+        // floor still certifies (the floor is a backstop, not a hair-trigger).
+        let mut edge = quiet_k1_cell();
+        edge.occupancy_med = crate::perturb::OCCUPANCY_MIN; // exactly 0.90
+        assert_eq!(
+            verdict_of(&edge).0,
+            CheckVerdict::Ok,
+            "occupancy at the absolute floor is not preempted"
+        );
+
+        // GREEN-after guard 2 (the relativized floor is PRESERVED for k≥2): a
+        // serial-by-design T4 cell reads aggregate occ 0.5 with NO preemption —
+        // the absolute backstop must NOT fire above k==1, or it false-VOIDs every
+        // legitimately-serial parallel cell.
+        let mut serial_parallel = clean_cell(); // k=4
+        serial_parallel.occupancy_med = 0.5; // serial bootstrap, not contention
+        assert_eq!(
+            verdict_of(&serial_parallel).0,
+            CheckVerdict::Ok,
+            "a serial-by-design k≥2 cell keeps the relativized floor (no false VOID)"
+        );
+
+        // GRACEFUL: a k=1 cell with NO occupancy capture (occ_med == 0.0, e.g.
+        // BSD `time` / a fixture) degrades to a no-op — never a false VOID.
+        let mut uncaptured = quiet_k1_cell();
+        uncaptured.occupancy_med = 0.0;
+        assert_eq!(
+            verdict_of(&uncaptured).0,
+            CheckVerdict::Ok,
+            "no occupancy capture degrades PREEMPTED-K1 to a no-op"
         );
     }
 
