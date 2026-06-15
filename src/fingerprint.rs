@@ -23,6 +23,7 @@
 //! protocol identity of a pair.
 
 use crate::invariants::InvariantViolation;
+use serde::{Deserialize, Serialize};
 
 /// Fields that must MATCH (and be known) for two measurements to be comparable.
 /// Mirrors `fingerprint.COMPARE_FIELDS` and its ORDER (the order the reason
@@ -44,7 +45,13 @@ pub const UNKNOWN: &str = "unknown";
 /// A measurement fingerprint. Every field defaults to [`UNKNOWN`]; an unknown
 /// field blocks every comparison it participates in. Mirrors the frozen Python
 /// dataclass `Fingerprint`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` mirror Python `to_dict`/`from_dict`: the JSON keys
+/// are exactly the dataclass field names, and `#[serde(default)]` fills any
+/// ABSENT field with [`UNKNOWN`] (a partial dict deserializes the same way
+/// `from_dict` keeps only the known keys and leaves the rest at their default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Fingerprint {
     /// Sink class, e.g. "regular-file" | "devnull" | "pipe".
     pub sink: String,
