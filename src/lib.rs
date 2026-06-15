@@ -48,6 +48,8 @@ pub mod finding;
 pub mod fingerprint;
 pub mod flow;
 pub mod invariants;
+pub mod labels;
+pub mod locate;
 pub mod mech;
 pub mod mech_arch;
 pub mod memlife;
