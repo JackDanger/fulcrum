@@ -48,6 +48,7 @@ pub mod estimate;
 pub mod finding;
 pub mod fingerprint;
 pub mod flow;
+pub mod insn;
 pub mod invariants;
 pub mod mech;
 pub mod mech_arch;
