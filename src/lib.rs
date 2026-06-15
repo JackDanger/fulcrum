@@ -55,6 +55,7 @@ pub mod provenance;
 pub mod rank;
 pub mod region_hw;
 pub mod rg_verbose;
+pub mod runner;
 pub mod scaling;
 pub mod schedule;
 pub mod score;
