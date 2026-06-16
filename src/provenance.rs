@@ -1657,12 +1657,18 @@ pub fn check_env_invariant(env: Option<&EnvInvariant>) -> Vec<GateCheck> {
     ));
 
     // ── 4. corpus content sha vs the declared expected (corpus drift) ──────
-    let corpus_check = match (env.corpus_sha.as_deref(), env.corpus_sha_expected.as_deref()) {
+    let corpus_check = match (
+        env.corpus_sha.as_deref(),
+        env.corpus_sha_expected.as_deref(),
+    ) {
         (Some(c), Some(e)) if c.eq_ignore_ascii_case(e) => GateCheck::new(
             ENV_INVARIANT,
             CheckVerdict::Ok,
             "corpus".to_string(),
-            format!("corpus content sha {} matches the expected pin", short_sha(c)),
+            format!(
+                "corpus content sha {} matches the expected pin",
+                short_sha(c)
+            ),
         ),
         (Some(c), Some(e)) => GateCheck::new(
             ENV_INVARIANT,
@@ -2018,7 +2024,9 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
 fn parse_env_invariant(man: &BTreeMap<String, String>) -> Option<EnvInvariant> {
     let env = EnvInvariant {
         devnull_char_pre: man.get("devnull_is_char_pre").and_then(|v| bool_or_none(v)),
-        devnull_char_post: man.get("devnull_is_char_post").and_then(|v| bool_or_none(v)),
+        devnull_char_post: man
+            .get("devnull_is_char_post")
+            .and_then(|v| bool_or_none(v)),
         gzippy_bin_sha: man.get("gzippy_bin_sha256").cloned(),
         gzippy_bin_sha_pinned: man.get("gzippy_bin_sha256_pinned").cloned(),
         rapidgzip_bin_sha: man.get("rapidgzip_bin_sha256").cloned(),
