@@ -332,6 +332,48 @@ fn parse_count_event(s: &str) -> Option<(i64, &str)> {
     Some((count, raw))
 }
 
+/// Retired-instructions event aliases (the IPC numerator for `optgate`).
+const INSTRUCTIONS_ALIASES: &[&str] = &[
+    "instructions",
+    "inst_retired.any",
+    "inst_retired.any_p",
+    "cpu_core/instructions/",
+];
+
+/// Refusal: a `perf stat` capture lacks the cpu-cycles counter (no cyc/byte).
+pub const OPTGATE_NO_CYCLES: &str = "OPTGATE-NO-CYCLES";
+/// Refusal: a `perf stat` capture lacks the retired-instructions counter
+/// (no instr/byte, no IPC).
+pub const OPTGATE_NO_INSTRUCTIONS: &str = "OPTGATE-NO-INSTRUCTIONS";
+
+/// Extract `(cycles, instructions)` retired counts from a `perf stat` capture
+/// for the `optgate` cyc/byte + instr/byte + IPC metric. FAILS LOUD
+/// ([`OPTGATE_NO_CYCLES`] / [`OPTGATE_NO_INSTRUCTIONS`]) when either counter is
+/// absent — a cyc/byte verdict cannot be synthesized from a partial capture.
+///
+/// This is the single perf-stat parsing seam shared with `cycles` itself, so the
+/// gate and the TMA breakdown agree byte-for-byte on event canonicalization.
+pub fn cycles_and_instructions(text: &str) -> CyResult<(i64, i64)> {
+    let ev = parse_tma_stat(text)?;
+    let cyc = ev.lookup(CYCLES_ALIASES).ok_or_else(|| {
+        InvariantViolation::new(
+            OPTGATE_NO_CYCLES,
+            "perf stat capture has no cpu-cycles line (`cycles` / `cpu-cycles` / \
+             `cpu_core/cycles/`). cyc/byte is the optgate primary metric — capture \
+             with `perf stat -e cycles,instructions -- <cmd>`.",
+        )
+    })?;
+    let ins = ev.lookup(INSTRUCTIONS_ALIASES).ok_or_else(|| {
+        InvariantViolation::new(
+            OPTGATE_NO_INSTRUCTIONS,
+            "perf stat capture has no retired-instructions line (`instructions` / \
+             `inst_retired.any`). instr/byte + IPC need it — capture with \
+             `perf stat -e cycles,instructions -- <cmd>`.",
+        )
+    })?;
+    Ok((cyc, ins))
+}
+
 /// The closed TMA L1 ledger.
 #[derive(Debug, Clone)]
 pub struct Tma {

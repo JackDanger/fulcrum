@@ -64,6 +64,7 @@ pub mod mech_arch;
 pub mod memlife;
 pub mod microbench;
 pub mod model;
+pub mod optgate;
 pub mod perturb;
 pub mod pipeline;
 pub mod probe;

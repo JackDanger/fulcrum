@@ -26,8 +26,8 @@ use fulcrum::ledger::Ledger;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, cycles,
     decide, decompose, finding, flow, insn, invariants, locate, mech, mech_arch, memlife, model,
-    perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule, score, spans,
-    sweep, trace, validate, vs, vs_sweep, xtool,
+    optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule, score,
+    spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -64,6 +64,9 @@ USAGE:\n\
               (--fixture-oracle certifies a synthetic/dry-run commit; refused with --live)\n\
               (--spec-help for the spec fields; --live-help for the frozen-box invocation)\n\
   fulcrum perturb <sweep-dir> [--allow-thaw]   causal perturbation harness (PERTURBATION-OR-NO-LEVER)\n\
+  fulcrum optgate <artifact.json>   OPTIMIZATION A/B GATE (WALL-WIN-OR-NO-WIN): cyc/byte verdict on\n\
+              a base-vs-after-vs-rg artifact; refuses instruction-only/loaded-window/byte-mismatch/\n\
+              clean-regression/sub-spread/single-arch wins (exit 0 only on a banked WALL WIN)\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -3510,6 +3513,65 @@ fn cmd_cycles(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// optgate: the OPTIMIZATION A/B GATE — render a self-validated WALL-WIN verdict
+/// from a measurement-policy artifact (base + after + rg arms, byte shas, box
+/// run-queue, clean-path). The seven hard-won refusals are enforced by
+/// [`optgate::evaluate`]; this is just the artifact loader + renderer.
+///
+///   usage: fulcrum optgate <artifact.json>
+///
+/// Exit code: 0 for a banked WALL WIN (Win + Law), 1 for any non-win verdict
+/// (TIE / INSTRUCTION-ONLY / REGRESSION / UNDERPOWERED / VOID / NOT-YET-LAW), 2
+/// for a usage / artifact error — so CI can gate `ship` on a non-zero exit.
+fn cmd_optgate(args: &[String]) -> ExitCode {
+    let mut artifact: Option<String> = None;
+    let known = "<artifact.json> [--artifact <path>]";
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--artifact" => {
+                artifact = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--help" | "-h" => {
+                println!("usage: fulcrum optgate {known}");
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with("--") => {
+                artifact = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("optgate: unknown argument {other}; usage: fulcrum optgate {known}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(artifact) = artifact else {
+        eprintln!(
+            "optgate: an artifact path is required.\n      usage: fulcrum optgate {known}\n\n\
+             The artifact is the JSON your measurement policy writes: the base/after/rg arms \
+             (each a list of {{cycles, instructions, bytes, procs_running}} samples), the \
+             reference_sha, the clean_base/clean_after arms, k, arch, and cross_arch_replicated."
+        );
+        return ExitCode::from(2);
+    };
+    let input = match optgate::load_artifact(std::path::Path::new(&artifact)) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let verdict = optgate::evaluate(&input);
+    print!("{}", verdict.render());
+    if verdict.is_banked_wall_win() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
 fn cmd_ledger(args: &[String]) -> ExitCode {
     let verb = match args.first().map(String::as_str) {
@@ -3743,6 +3805,7 @@ fn main() -> ExitCode {
         "locate" => cmd_locate(rest),
         "insn" => cmd_insn(rest),
         "cycles" => cmd_cycles(rest),
+        "optgate" => cmd_optgate(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
         "score" => match score::args_from_cli(rest) {

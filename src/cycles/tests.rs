@@ -600,3 +600,41 @@ fn closure_violation_refuses_no_breakdown_emitted() {
         }
     }
 }
+
+// ── cycles_and_instructions (the optgate cyc/byte + IPC ingestion seam) ──────
+#[test]
+fn cycles_and_instructions_parses_both_counters() {
+    let text = "\
+ 1,234,567,890      cycles
+   987,654,321      instructions
+";
+    let (cyc, ins) = cycles_and_instructions(text).expect("both counters present");
+    assert_eq!(cyc, 1_234_567_890);
+    assert_eq!(ins, 987_654_321);
+}
+
+#[test]
+fn cycles_and_instructions_refuses_missing_cycles() {
+    let text = "   987,654,321      instructions\n";
+    let err = cycles_and_instructions(text).unwrap_err();
+    assert_eq!(err.invariant, OPTGATE_NO_CYCLES);
+}
+
+#[test]
+fn cycles_and_instructions_refuses_missing_instructions() {
+    let text = " 1,234,567,890      cycles\n";
+    let err = cycles_and_instructions(text).unwrap_err();
+    assert_eq!(err.invariant, OPTGATE_NO_INSTRUCTIONS);
+}
+
+#[test]
+fn cycles_and_instructions_accepts_pmu_prefixed_events() {
+    // Intel hybrid `cpu_core/...` PMU prefix + inst_retired.any alias.
+    let text = "\
+ 2,000,000,000      cpu_core/cycles/
+ 1,000,000,000      inst_retired.any
+";
+    let (cyc, ins) = cycles_and_instructions(text).expect("aliased counters");
+    assert_eq!(cyc, 2_000_000_000);
+    assert_eq!(ins, 1_000_000_000);
+}
