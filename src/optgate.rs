@@ -159,6 +159,10 @@ pub struct Sample {
     /// Decompressed output bytes (the cyc/byte denominator).
     pub bytes: f64,
     /// Run-queue depth observed during the run (`procs_running` / `runnable_avg`).
+    /// Optional in artifacts: the per-region EXCESS differential
+    /// ([`crate::excess`]) reuses this sample shape but is not run-queue gated, so
+    /// it omits the field; serde defaults it to `0.0` there.
+    #[serde(default)]
     pub procs_running: f64,
 }
 

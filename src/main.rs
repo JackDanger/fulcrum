@@ -25,9 +25,9 @@ use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
 use fulcrum::ledger::Ledger;
 use fulcrum::{
     audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, cycles,
-    decide, decompose, finding, flow, insn, invariants, locate, mech, mech_arch, memlife, model,
-    optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule, score,
-    spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    decide, decompose, excess, finding, flow, insn, invariants, locate, mech, mech_arch, memlife,
+    model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule,
+    score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -67,6 +67,10 @@ USAGE:\n\
   fulcrum optgate <artifact.json>   OPTIMIZATION A/B GATE (WALL-WIN-OR-NO-WIN): cyc/byte verdict on\n\
               a base-vs-after-vs-rg artifact; refuses instruction-only/loaded-window/byte-mismatch/\n\
               clean-regression/sub-spread/single-arch wins (exit 0 only on a banked WALL WIN)\n\
+  fulcrum excess <artifact.json>   EXCESS-VS-INTRINSIC differential: per-region verdict on whether a\n\
+              region is gz-recoverable EXCESS (gz/rg high on a LOSS corpus but vanishing on a\n\
+              CONTROL corpus) or INTRINSIC (both tools pay it); refuses excess without a control\n\
+              arm / on instr-only / on sub-spread gaps; emits the recoverable cyc/byte budget\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -3572,6 +3576,68 @@ fn cmd_optgate(args: &[String]) -> ExitCode {
     }
 }
 
+/// excess: the EXCESS-VS-INTRINSIC differential — render a per-region verdict on
+/// whether a region is gz-recoverable EXCESS or INTRINSIC, from a loss/control
+/// per-region artifact. The four refusals (instr-only, no-control,
+/// sub-spread, single-arch/provenance) are enforced by [`excess::evaluate`]; this
+/// is just the artifact loader + renderer.
+///
+///   usage: fulcrum excess <artifact.json>
+///
+/// Exit code: 0 iff the report names ≥1 EXCESS region AND the budget is law
+/// (cycle metric + cross-arch replicated); 1 for any other report (no excess,
+/// all intrinsic, instr-only, or single-arch NOT-YET-LAW); 2 for a usage /
+/// artifact error — so a pipeline can gate on a banked recoverable budget.
+fn cmd_excess(args: &[String]) -> ExitCode {
+    let mut artifact: Option<String> = None;
+    let known = "<artifact.json> [--artifact <path>]";
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--artifact" => {
+                artifact = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--help" | "-h" => {
+                println!("usage: fulcrum excess {known}");
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with("--") => {
+                artifact = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("excess: unknown argument {other}; usage: fulcrum excess {known}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(artifact) = artifact else {
+        eprintln!(
+            "excess: an artifact path is required.\n      usage: fulcrum excess {known}\n\n\
+             The artifact is the JSON your measurement policy writes: a list of regions, each \
+             with a loss-corpus {{gz, rg}} arm pair (lists of {{cycles, instructions, bytes}} \
+             samples) and an optional control-corpus arm pair; plus metric (cyc|instr), epsilon, \
+             loss_corpus, control_corpus, arch, cross_arch_replicated, gz_sha, rg_sha."
+        );
+        return ExitCode::from(2);
+    };
+    let input = match excess::load_artifact(std::path::Path::new(&artifact)) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let report = excess::evaluate(&input);
+    print!("{}", report.render());
+    if report.budget_is_law() && report.excess_regions().count() > 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
 fn cmd_ledger(args: &[String]) -> ExitCode {
     let verb = match args.first().map(String::as_str) {
@@ -3806,6 +3872,7 @@ fn main() -> ExitCode {
         "insn" => cmd_insn(rest),
         "cycles" => cmd_cycles(rest),
         "optgate" => cmd_optgate(rest),
+        "excess" => cmd_excess(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
         "score" => match score::args_from_cli(rest) {

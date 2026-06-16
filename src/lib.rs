@@ -51,6 +51,7 @@ pub mod cycles;
 pub mod decide;
 pub mod decompose;
 pub mod estimate;
+pub mod excess;
 pub mod finding;
 pub mod fingerprint;
 pub mod flow;
