@@ -319,6 +319,74 @@ fn parse_manifest_cell_meta() {
     assert_eq!(meta.get("sha_ok").map(String::as_str), Some("1"));
 }
 
+// --- multi-tool comparator arms: ingest + rank vs EACH champion. ----------
+// gzippy-native is the SUBJECT; libdeflate/igzip/zlibng/pigz are additional
+// comparator arms beside rapidgzip. Each `wall_<tool>.txt` is loaded into the
+// cell and surfaced as its own scoreboard line (ratio = tool/gz, bar 0.99x),
+// with an A/A self-stability label from `aa_<tool>_{a,b}.txt`.
+#[test]
+fn multitool_comparator_scoreboard() {
+    let ad = GzippyAdapter::new();
+    let d = scratch("fulcrum_decide_multitool");
+    let cdir = d.join("cell_silesia_T1");
+    std::fs::create_dir_all(&cdir).unwrap();
+    write_manifest(
+        &d,
+        "frozen",
+        "libdeflate_version=libdeflate 1.19\npigz_version=pigz 2.8\n\
+         sink_libdeflate_derived=regular-file\nsink_pigz_derived=regular-file\n\
+         comp_present=libdeflate,pigz\n",
+    );
+    write_samples(&cdir.join("wall_gz.txt"), &GZ); // gz min = 1.379
+    write_samples(&cdir.join("wall_rg.txt"), &RG);
+    // libdeflate SLOWER than gz -> ratio = 1.50/1.379 ≈ 1.088 >= 0.99 => PASS.
+    let ld = [1.500, 1.502, 1.499, 1.505, 1.501, 1.503, 1.500];
+    write_samples(&cdir.join("wall_libdeflate.txt"), &ld);
+    // pigz FASTER than gz -> ratio = 1.300/1.379 ≈ 0.943 < 0.99 => FAIL.
+    let pg = [1.300, 1.302, 1.299, 1.305, 1.301, 1.303, 1.300];
+    write_samples(&cdir.join("wall_pigz.txt"), &pg);
+    // A/A self-stability for libdeflate (two interleaved arms, ~1.0).
+    write_samples(&cdir.join("aa_libdeflate_a.txt"), &ld);
+    write_samples(&cdir.join("aa_libdeflate_b.txt"), &ld);
+
+    let run = load_run(&d, &ad).unwrap();
+    let cell = run.cells.get(&("silesia".to_string(), 1)).unwrap();
+    assert!(
+        cell.comparators.contains_key("libdeflate") && cell.comparators.contains_key("pigz"),
+        "comparator wall files loaded into the cell"
+    );
+    assert!(
+        !cell.comparators.contains_key("gz") && !cell.comparators.contains_key("rg"),
+        "gz/rg are NOT folded into the generic comparator map"
+    );
+    assert!(
+        cell.comparator_aa.contains_key("libdeflate"),
+        "A/A self-stability arms loaded"
+    );
+
+    let rep = analyze_run(&run, &ad, false, None, None).unwrap();
+    let board = rep.scoreboard.join("\n");
+    assert!(
+        board.contains("libdeflate") && board.contains("PASS"),
+        "libdeflate comparator line present and PASSes (gz within bar): {board}"
+    );
+    assert!(
+        board
+            .lines()
+            .any(|l| l.contains("pigz") && l.contains("FAIL")),
+        "pigz comparator line present and FAILs (gz misses bar): {board}"
+    );
+    assert!(
+        board.contains("A/A"),
+        "A/A self-stability label rendered on the comparator line: {board}"
+    );
+    // rapidgzip stays the primary scoreboard line (unchanged shape).
+    assert!(
+        board.contains("silesia:T1") && board.contains("ratio="),
+        "primary gz-vs-rg scoreboard line intact"
+    );
+}
+
 // --- canon_mask canonicalizes by MEANING, not formatting. -----------------
 #[test]
 fn canon_mask_parity() {

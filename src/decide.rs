@@ -124,6 +124,15 @@ pub struct Cell {
     pub dir: PathBuf,
     pub gz: Vec<f64>,
     pub rg: Vec<f64>,
+    /// Additional comparator champions beside rapidgzip (tool name ->
+    /// interleaved wall samples). Loaded from `wall_<tool>.txt` for any tool
+    /// that is not `gz` (the SUBJECT) or `rg` (the primary comparator). gzippy
+    /// is always ranked vs EACH of these at the 0.99x bar.
+    pub comparators: BTreeMap<String, Vec<f64>>,
+    /// Per-comparator A/A self-stability arms (`aa_<tool>_a.txt`,
+    /// `aa_<tool>_b.txt`): the same champion measured against itself so the
+    /// comparator gate can self-1.0 (Gate 0(b), binary-vs-itself).
+    pub comparator_aa: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
     pub knobs: BTreeMap<String, KnobData>,
     pub prof: Option<Prof>,
     pub trace: PathBuf,
@@ -344,6 +353,44 @@ fn match_effect_file(name: &str) -> Option<(String, String)> {
     None
 }
 
+/// Parse `wall_<tool>.txt` -> the comparator tool name, EXCLUDING the SUBJECT
+/// (`gz`) and the primary comparator (`rg`) which have dedicated fields. Tool
+/// names are lowercase-alnum/underscore (e.g. `libdeflate`, `igzip`, `zlibng`,
+/// `pigz`). Returns `None` for non-matches and for `gz`/`rg`.
+fn match_comparator_wall(name: &str) -> Option<String> {
+    let tool = name.strip_prefix("wall_")?.strip_suffix(".txt")?;
+    if tool.is_empty() || tool == "gz" || tool == "rg" {
+        return None;
+    }
+    if !tool
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    Some(tool.to_string())
+}
+
+/// Parse `aa_<tool>_<arm>.txt` (arm = `a`|`b`) -> (tool, arm) for the
+/// comparator A/A self-stability capture.
+fn match_comparator_aa(name: &str) -> Option<(String, char)> {
+    let stem = name.strip_prefix("aa_")?.strip_suffix(".txt")?;
+    let (tool, arm) = stem.rsplit_once('_')?;
+    let arm = match arm {
+        "a" => 'a',
+        "b" => 'b',
+        _ => return None,
+    };
+    if tool.is_empty()
+        || !tool
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    Some((tool.to_string(), arm))
+}
+
 /// Sorted directory entry names (mirrors `sorted(os.listdir(...))`).
 fn sorted_entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = match std::fs::read_dir(dir) {
@@ -425,12 +472,30 @@ pub fn load_run_documented<A: ProjectAdapter + ?Sized>(
         } else {
             None
         };
+        // Generic comparator arms (any wall_<tool>.txt that is not gz/rg) plus
+        // their A/A self-stability captures.
+        let mut comparators: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let mut aa_arms: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        for f in sorted_entries(&cdir) {
+            if let Some(tool) = match_comparator_wall(&f) {
+                comparators.insert(tool, read_samples(&cdir.join(&f)));
+            } else if let Some((tool, arm)) = match_comparator_aa(&f) {
+                let e = aa_arms.entry(tool).or_default();
+                if arm == 'a' {
+                    e.0 = read_samples(&cdir.join(&f));
+                } else {
+                    e.1 = read_samples(&cdir.join(&f));
+                }
+            }
+        }
         cells.insert(
             ck,
             Cell {
                 dir: cdir.clone(),
                 gz: read_samples(&cdir.join("wall_gz.txt")),
                 rg: read_samples(&cdir.join("wall_rg.txt")),
+                comparators,
+                comparator_aa: aa_arms,
                 knobs,
                 prof,
                 trace: cdir.join("trace.json"),
@@ -897,6 +962,13 @@ pub fn analyze_run(
         s.push_str(prov_cell_label);
         s.push_str(&fp_label);
         scoreboard.push(s);
+
+        // Additional comparator champions (libdeflate / igzip / zlibng / pigz /
+        // …): gzippy ranked vs EACH at the same bar, on the SAME interleave,
+        // sink, mask, and corpus pin. gz/rg keep their dedicated line above.
+        for line in comparator_lines(man, cell, &sg, adapter.tie_bar()) {
+            scoreboard.push(line);
+        }
     }
 
     // ---- ledger: contradiction scan + banking -----------------------------
@@ -1257,6 +1329,71 @@ pub fn analyze_run(
         cell_walls,
         provenance: prov_info,
     })
+}
+
+/// Per-cell scoreboard lines for the generic comparator champions (everything
+/// beside gz/rg). gzippy-native is the SUBJECT; each line reports
+/// `ratio = tool_min / gz_min` against the `tie_bar` (>=0.99x ⇒ PASS, i.e.
+/// gzippy is at-or-faster than that champion within 1%), plus the champion's
+/// own spread and an A/A self-stability label (binary-vs-itself ≈ 1.0, the
+/// comparator self-1.0 gate). A derived sink-class mismatch vs the gz arm is
+/// flagged (SINK-LAW) but never raises — these arms are additive to the
+/// certified gz↔rg ratio.
+fn comparator_lines(man: &Manifest, cell: &Cell, gz: &SampleStats, tie_bar: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    let gz_sink = man
+        .get("sink_gz_derived")
+        .or_else(|| man.get("sink_gz"))
+        .unwrap_or("unknown");
+    for (tool, samples) in &cell.comparators {
+        let Some(st) = sample_stats(samples) else {
+            continue;
+        };
+        let ratio = if gz.min != 0.0 { st.min / gz.min } else { 0.0 };
+        let verdict = if ratio >= tie_bar { "PASS" } else { "FAIL" };
+        let ver = man
+            .get(&format!("{tool}_version"))
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| format!(" ({v})"))
+            .unwrap_or_default();
+        // A/A self-stability: the champion measured against itself; ≈1.0 ⇒ OK.
+        let aa = match cell.comparator_aa.get(tool) {
+            Some((a, b)) => match (sample_stats(a), sample_stats(b)) {
+                (Some(sa), Some(sb)) if sa.min != 0.0 => {
+                    let self_ratio = sb.min / sa.min;
+                    let tol = (sa.spread_pct + sb.spread_pct) / 100.0 + 0.01;
+                    let ok = (self_ratio - 1.0).abs() <= tol;
+                    format!(
+                        " [A/A self={:.3}{}]",
+                        self_ratio,
+                        if ok { " OK" } else { " DRIFT-unstable" }
+                    )
+                }
+                _ => " [A/A: no-data]".to_string(),
+            },
+            None => " [A/A: none]".to_string(),
+        };
+        // Derived sink-class parity with the gz arm (SINK-LAW; label only).
+        let sink_tool = man
+            .get(&format!("sink_{tool}_derived"))
+            .or_else(|| man.get(&format!("sink_{tool}")));
+        let sink_label = match sink_tool {
+            Some(s) if s != gz_sink => {
+                format!(" SINK-MISMATCH(gz={gz_sink},{tool}={s} — not comparable)")
+            }
+            _ => String::new(),
+        };
+        out.push(format!(
+            "      vs {:11} {:7.1}ms ratio={:.3} {:4} spread={:.1}%{aa}{ver}{sink_label}",
+            tool,
+            st.min * 1000.0,
+            ratio,
+            verdict,
+            st.spread_pct,
+        ));
+    }
+    out
 }
 
 /// The decision brief: ACTION / WHY / PRECONDITIONS / COMMAND / FALSIFIER.
