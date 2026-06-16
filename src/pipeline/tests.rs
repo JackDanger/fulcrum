@@ -91,6 +91,7 @@ fn clean_provenance() -> Provenance {
         comparator_aa_ratio: Some(1.0),
         comparator_aa_spread_pct: Some(0.0),
         box_cells: Vec::new(),
+        env_invariant: None,
     }
 }
 

@@ -330,6 +330,18 @@ pub const COMPARATOR_PRESENT: &str = "COMPARATOR-PRESENT";
 /// by worst-severity at stamp aggregation, no extra pipeline wiring.
 pub const BOX_VALID: &str = "BOX-VALID";
 
+/// The ENVIRONMENT-INVARIANT sub-check (the two campaign-corrupting bugs:
+/// SINK-DELETION and BINARY-DRIFT). A cell measured while `/dev/null` was not a
+/// char device (silently replaced by a growing regular file mid-campaign), or
+/// against a binary whose re-read sha256 drifted from the campaign-PINNED sha
+/// (a stale/cross-agent binary), or against a corpus whose content sha drifted
+/// from the declared expected, or with an ABSOLUTE/cycle verdict claimed on an
+/// un-frozen box, CANNOT bank. Composes into PROVENANCE-OR-VOID by
+/// worst-severity at stamp aggregation, no extra pipeline wiring. Each
+/// concretely-bad invariant VOIDs; an uncaptured invariant is INCOMPLETE
+/// (graceful — a pre-this-field artifact never trips the gate).
+pub const ENV_INVARIANT: &str = "ENV-INVARIANT";
+
 /// The umbrella invariant name (the scar-name carried by a refusal).
 pub const PROVENANCE_OR_VOID: &str = "PROVENANCE-OR-VOID";
 
@@ -505,6 +517,74 @@ pub fn parse_cpu_mask(s: &str) -> Option<std::collections::BTreeSet<usize>> {
     }
 }
 
+/// The ENVIRONMENT-INVARIANT capture for ONE run, read back by the runner at
+/// run time. Every field is an `Option` whose `None` means "the runner did not
+/// capture it" — that aspect degrades to INCOMPLETE (graceful), never a false
+/// VOID. A CONCRETE bad value (devnull not a char device, a re-read sha that
+/// differs from the campaign-pinned sha, a corpus sha that differs from the
+/// declared expected, a thawed box under an absolute claim) VOIDs the cell.
+///
+/// This is the deterministic refusal for the two bugs that nearly corrupted the
+/// campaign: the `/dev/null`-deletion (caught by `devnull_char_pre/post`) and
+/// cross-agent BINARY DRIFT (caught by the captured-vs-pinned sha binding).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvInvariant {
+    /// `test -c /dev/null` BEFORE the run. `Some(false)` ⇒ the sink was not a
+    /// char device at start (deleted/replaced) ⇒ VOID. `None` ⇒ not captured.
+    pub devnull_char_pre: Option<bool>,
+    /// `test -c /dev/null` AFTER the run. `Some(false)` ⇒ the sink became a
+    /// regular file during the run (the deletion bug) ⇒ VOID.
+    pub devnull_char_post: Option<bool>,
+    /// sha256 of the gzippy binary, RE-READ from the actual file at run time.
+    pub gzippy_bin_sha: Option<String>,
+    /// the campaign-PINNED expected gzippy sha (declared by the run). A captured
+    /// sha that differs from this pin is BINARY DRIFT ⇒ VOID.
+    pub gzippy_bin_sha_pinned: Option<String>,
+    /// sha256 of the rapidgzip comparator binary, re-read at run time.
+    pub rapidgzip_bin_sha: Option<String>,
+    /// the campaign-PINNED expected rapidgzip sha (declared by the run).
+    pub rapidgzip_bin_sha_pinned: Option<String>,
+    /// the corpus content sha256 captured at run time.
+    pub corpus_sha: Option<String>,
+    /// the expected corpus sha (declared/pinned by the run). A captured sha that
+    /// differs from this expected is a corpus drift ⇒ VOID.
+    pub corpus_sha_expected: Option<String>,
+    /// freeze readback: turbo disabled (`intel_pstate/no_turbo == 1`).
+    pub freeze_no_turbo: Option<bool>,
+    /// freeze readback: the cpufreq governor (frozen ⇒ "performance").
+    pub freeze_governor: Option<String>,
+    /// freeze readback: boost ENABLED (`cpufreq/boost == 1`). Frozen ⇒ false.
+    pub freeze_boost: Option<bool>,
+    /// does THIS run claim an ABSOLUTE / cycle-count verdict? When `Some(true)`
+    /// the freeze is load-bearing: a thawed box VOIDs, and an uncaptured freeze
+    /// is INCOMPLETE (non-citable). When not an absolute claim, freeze is not
+    /// gated here (a ratio survives a thawed box — see fingerprint.rs).
+    pub claims_absolute: Option<bool>,
+    /// host identity (carried for the refusal message; gated by fingerprint.rs,
+    /// not here).
+    pub host_id: Option<String>,
+}
+
+impl EnvInvariant {
+    /// True iff at least one invariant field was captured (else the whole block
+    /// is absent and the check stays silent — a pre-this-field artifact).
+    fn any_captured(&self) -> bool {
+        self.devnull_char_pre.is_some()
+            || self.devnull_char_post.is_some()
+            || self.gzippy_bin_sha.is_some()
+            || self.gzippy_bin_sha_pinned.is_some()
+            || self.rapidgzip_bin_sha.is_some()
+            || self.rapidgzip_bin_sha_pinned.is_some()
+            || self.corpus_sha.is_some()
+            || self.corpus_sha_expected.is_some()
+            || self.freeze_no_turbo.is_some()
+            || self.freeze_governor.is_some()
+            || self.freeze_boost.is_some()
+            || self.claims_absolute.is_some()
+            || self.host_id.is_some()
+    }
+}
+
 /// Everything the gate needs for one run, derived by the runner at capture
 /// time. Absent fields stay at their incomplete sentinels so a pre-provenance
 /// artifact degrades to INCOMPLETE, never a refusal.
@@ -537,6 +617,10 @@ pub struct Provenance {
     /// NOISY-BOX validity per measured cell (occupancy/run-queue/mask/drift).
     /// Empty ⇒ no BOX-VALID check emitted (graceful: an old artifact is silent).
     pub box_cells: Vec<CellBoxStats>,
+    /// ENVIRONMENT-INVARIANT capture (devnull char-device pre/post, binary sha
+    /// vs campaign pin, corpus sha vs expected, freeze readback). `None` ⇒ no
+    /// ENV-INVARIANT check emitted (graceful: a pre-this-field artifact is silent).
+    pub env_invariant: Option<EnvInvariant>,
 }
 
 impl Default for Provenance {
@@ -554,6 +638,7 @@ impl Default for Provenance {
             comparator_aa_ratio: None,
             comparator_aa_spread_pct: None,
             box_cells: Vec::new(),
+            env_invariant: None,
         }
     }
 }
@@ -1443,6 +1528,242 @@ fn fmt_set(s: &std::collections::BTreeSet<usize>) -> String {
         .join(",")
 }
 
+/// First up-to-12 chars of a sha for a refusal message (char-boundary safe).
+fn short_sha(s: &str) -> String {
+    s.chars().take(12).collect()
+}
+
+/// A captured-vs-pinned sha sub-check, shared by the gzippy + rapidgzip arms.
+/// `scope` names the arm ("bin:gzippy" / "bin:rapidgzip"). Captured != pinned
+/// ⇒ VOID (BINARY DRIFT); equal ⇒ OK; either side absent ⇒ INCOMPLETE (no pin
+/// to bind against ⇒ drift cannot be ruled out, but is not asserted).
+fn check_pinned_sha(
+    scope: &str,
+    label: &str,
+    captured: Option<&str>,
+    pinned: Option<&str>,
+) -> GateCheck {
+    match (captured, pinned) {
+        (Some(c), Some(p)) if c.eq_ignore_ascii_case(p) => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Ok,
+            scope.to_string(),
+            format!(
+                "{label}: re-read sha {} matches the campaign-pinned sha",
+                short_sha(c)
+            ),
+        ),
+        (Some(c), Some(p)) => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Void,
+            scope.to_string(),
+            format!(
+                "BINARY-DRIFT: {label} re-read sha {} != campaign-pinned sha {} — the binary that \
+                 ran is NOT the pinned campaign artifact (stale/cross-agent drift). VOID; rebuild \
+                 the pinned binary or re-pin the campaign sha before banking",
+                short_sha(c),
+                short_sha(p),
+            ),
+        ),
+        _ => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Incomplete,
+            scope.to_string(),
+            format!(
+                "{label}: captured sha and/or campaign-pinned sha not both present — binary drift \
+                 cannot be ruled out (non-citable, not refused)"
+            ),
+        ),
+    }
+}
+
+/// ENV-INVARIANT: the deterministic refusal for the two campaign-corrupting
+/// bugs — SINK-DELETION (`/dev/null` silently replaced by a growing regular
+/// file) and BINARY-DRIFT (a stale/cross-agent binary whose re-read sha drifted
+/// from the campaign-pinned sha) — plus corpus-content drift and an absolute
+/// claim made on a thawed box. Each concretely-bad invariant VOIDs the cell; an
+/// uncaptured invariant is INCOMPLETE (graceful: a pre-this-field artifact never
+/// trips the gate). `None` env ⇒ no checks at all (silent). Returns one
+/// `GateCheck` per ASPECT (devnull, gzippy-bin, rapidgzip-bin, corpus, freeze).
+///
+/// NOTE: mask-narrower-than-k (the OVERSUBSCRIBED scar) is NOT re-checked here —
+/// it is already covered by [`check_box_valid`]'s OVERSUBSCRIBED / WRONG-MASK
+/// conditions, which key on the per-cell mask readback.
+pub fn check_env_invariant(env: Option<&EnvInvariant>) -> Vec<GateCheck> {
+    let Some(env) = env.filter(|e| e.any_captured()) else {
+        // No env-invariant block captured at all ⇒ silent (graceful), exactly
+        // like an empty box_cells: a pre-this-field artifact gains no annotation.
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    // ── 1. devnull is a char device PRE and POST (the SINK-DELETION guard) ──
+    //    A `/dev/null` that is not a char device means the sink was deleted /
+    //    replaced by a regular file: every "discarded" write actually grew a
+    //    file, inflating the writer-bound arm and manufacturing a phantom. The
+    //    POST check is the load-bearing one (the file may be created mid-run),
+    //    but a bad PRE is equally disqualifying.
+    let devnull_scope = "run".to_string();
+    match (env.devnull_char_pre, env.devnull_char_post) {
+        (Some(false), _) => out.push(GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Void,
+            devnull_scope,
+            "SINK-DELETION: /dev/null was NOT a char device BEFORE the run (deleted/replaced by a \
+             regular file) — discarded writes grew a file and inflated the writer-bound arm. VOID; \
+             restore /dev/null (`rm -f /dev/null && mknod -m 666 /dev/null c 1 3`) and re-run"
+                .into(),
+        )),
+        (_, Some(false)) => out.push(GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Void,
+            devnull_scope,
+            "SINK-DELETION: /dev/null was NOT a char device AFTER the run (it was replaced by a \
+             regular file DURING the run — the classic deletion bug) — discarded writes grew a \
+             file and inflated the writer-bound arm. VOID; restore /dev/null and re-run"
+                .into(),
+        )),
+        (None, None) => out.push(GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Incomplete,
+            devnull_scope,
+            "/dev/null char-device status not captured pre/post — the sink-deletion guard could \
+             not run (non-citable, not refused)"
+                .into(),
+        )),
+        // at least one captured and none captured-false ⇒ OK.
+        _ => out.push(GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Ok,
+            devnull_scope,
+            "/dev/null was a char device across the run (sink not deleted/replaced)".into(),
+        )),
+    }
+
+    // ── 2. gzippy binary sha vs the campaign-pinned sha (BINARY-DRIFT) ──────
+    out.push(check_pinned_sha(
+        "bin:gzippy",
+        "gzippy binary",
+        env.gzippy_bin_sha.as_deref(),
+        env.gzippy_bin_sha_pinned.as_deref(),
+    ));
+
+    // ── 3. rapidgzip comparator sha vs the campaign-pinned sha (BINARY-DRIFT) ─
+    out.push(check_pinned_sha(
+        "bin:rapidgzip",
+        "rapidgzip comparator",
+        env.rapidgzip_bin_sha.as_deref(),
+        env.rapidgzip_bin_sha_pinned.as_deref(),
+    ));
+
+    // ── 4. corpus content sha vs the declared expected (corpus drift) ──────
+    let corpus_check = match (env.corpus_sha.as_deref(), env.corpus_sha_expected.as_deref()) {
+        (Some(c), Some(e)) if c.eq_ignore_ascii_case(e) => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Ok,
+            "corpus".to_string(),
+            format!("corpus content sha {} matches the expected pin", short_sha(c)),
+        ),
+        (Some(c), Some(e)) => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Void,
+            "corpus".to_string(),
+            format!(
+                "CORPUS-DRIFT: corpus content sha {} != expected {} — a different corpus was \
+                 measured than the one the campaign pins; the cross-cell comparison is \
+                 contaminated. VOID; restore the pinned corpus or re-pin the expected sha",
+                short_sha(c),
+                short_sha(e),
+            ),
+        ),
+        _ => GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Incomplete,
+            "corpus".to_string(),
+            "corpus content sha and/or expected sha not both captured — corpus drift cannot be \
+             ruled out (non-citable, not refused)"
+                .into(),
+        ),
+    };
+    out.push(corpus_check);
+
+    // ── 5. freeze engaged when an ABSOLUTE / cycle verdict is claimed ──────
+    //    A thawed box (turbo on / non-performance governor / boost on) makes an
+    //    ABSOLUTE wall or cycle count frequency-confounded. Only gate this when
+    //    the run actually CLAIMS an absolute/cyc verdict — a RATIO survives a
+    //    thawed box (fingerprint.rs handles cross-freeze ratio refusal). When an
+    //    absolute claim is made but the freeze was not captured, the cell is
+    //    INCOMPLETE (non-citable, degrade) rather than silently trusted.
+    out.push(check_freeze(env));
+
+    out
+}
+
+/// The freeze sub-check of ENV-INVARIANT (see [`check_env_invariant`] item 5).
+fn check_freeze(env: &EnvInvariant) -> GateCheck {
+    let scope = "run".to_string();
+    let absolute = matches!(env.claims_absolute, Some(true));
+    // Collect concrete THAWED signals (a captured value that indicates the box
+    // was NOT frozen). An absent field is not a thawed signal.
+    let mut thawed: Vec<String> = Vec::new();
+    if env.freeze_no_turbo == Some(false) {
+        thawed.push("turbo ENABLED (no_turbo=0)".into());
+    }
+    if let Some(gov) = env.freeze_governor.as_deref() {
+        if !gov.eq_ignore_ascii_case("performance") {
+            thawed.push(format!("governor={gov} (not performance)"));
+        }
+    }
+    if env.freeze_boost == Some(true) {
+        thawed.push("boost ENABLED (boost=1)".into());
+    }
+    let any_freeze_captured = env.freeze_no_turbo.is_some()
+        || env.freeze_governor.is_some()
+        || env.freeze_boost.is_some();
+
+    if !absolute {
+        // Freeze is not load-bearing for a relative/ratio verdict.
+        return GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Ok,
+            scope,
+            "freeze not gated — no absolute/cycle verdict is claimed (a ratio survives a thawed \
+             box; cross-freeze ratios are refused by fingerprint.rs)"
+                .into(),
+        );
+    }
+    if !thawed.is_empty() {
+        return GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Void,
+            scope,
+            format!(
+                "THAWED-ABSOLUTE: an absolute/cycle verdict is claimed but the box was NOT frozen \
+                 ({}) — the absolute number is frequency-confounded. VOID; freeze the box \
+                 (governor=performance, turbo/boost off) and re-run, or claim a ratio only",
+                thawed.join(", ")
+            ),
+        );
+    }
+    if !any_freeze_captured {
+        return GateCheck::new(
+            ENV_INVARIANT,
+            CheckVerdict::Incomplete,
+            scope,
+            "an absolute/cycle verdict is claimed but the freeze state was not captured — the box \
+             could not be certified frozen (non-citable, not refused)"
+                .into(),
+        );
+    }
+    GateCheck::new(
+        ENV_INVARIANT,
+        CheckVerdict::Ok,
+        scope,
+        "freeze engaged (performance governor, turbo/boost off) for the absolute/cycle claim"
+            .into(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The gate — aggregate the five checks into per-scope verdicts + a CELL stamp.
 // ---------------------------------------------------------------------------
@@ -1553,6 +1874,7 @@ pub fn run_gate(
         &prov.comparator_path,
     ));
     checks.extend(check_box_valid(&prov.box_cells));
+    checks.extend(check_env_invariant(prov.env_invariant.as_ref()));
 
     let voided: std::collections::BTreeSet<String> = checks
         .iter()
@@ -1600,6 +1922,13 @@ pub fn run_gate(
 ///   ab_sink_<abid>_<arm>=<sink>            (arm: base|knob|gz|rg)
 ///   comparator_sink, comparator_path, comparator_present (0|1),
 ///   comparator_aa_ratio, comparator_aa_spread_pct
+///   ENV-INVARIANT (the sink-deletion + binary-drift guards; see [`EnvInvariant`]):
+///   devnull_is_char_pre / devnull_is_char_post (0|1),
+///   gzippy_bin_sha256 / gzippy_bin_sha256_pinned,
+///   rapidgzip_bin_sha256 / rapidgzip_bin_sha256_pinned,
+///   corpus_sha256 / corpus_sha256_expected,
+///   freeze_no_turbo (0|1), freeze_governor, freeze_boost (0|1),
+///   claims_absolute (0|1), env_host_id
 pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
     let mut knob_consumers: BTreeMap<String, Option<i64>> = BTreeMap::new();
     let mut oracles: BTreeMap<String, OracleProbe> = BTreeMap::new();
@@ -1678,6 +2007,34 @@ pub fn from_manifest(man: &BTreeMap<String, String>) -> Provenance {
             .get("comparator_aa_spread_pct")
             .and_then(|v| float_or_none(v)),
         box_cells,
+        env_invariant: parse_env_invariant(man),
+    }
+}
+
+/// Parse the ENV-INVARIANT manifest keys into an [`EnvInvariant`]. Returns
+/// `None` iff NONE of the keys are present (graceful: a pre-this-field artifact
+/// emits no ENV-INVARIANT check at all). Any single present key materializes the
+/// block; the absent fields stay `None` and degrade to INCOMPLETE per-aspect.
+fn parse_env_invariant(man: &BTreeMap<String, String>) -> Option<EnvInvariant> {
+    let env = EnvInvariant {
+        devnull_char_pre: man.get("devnull_is_char_pre").and_then(|v| bool_or_none(v)),
+        devnull_char_post: man.get("devnull_is_char_post").and_then(|v| bool_or_none(v)),
+        gzippy_bin_sha: man.get("gzippy_bin_sha256").cloned(),
+        gzippy_bin_sha_pinned: man.get("gzippy_bin_sha256_pinned").cloned(),
+        rapidgzip_bin_sha: man.get("rapidgzip_bin_sha256").cloned(),
+        rapidgzip_bin_sha_pinned: man.get("rapidgzip_bin_sha256_pinned").cloned(),
+        corpus_sha: man.get("corpus_sha256").cloned(),
+        corpus_sha_expected: man.get("corpus_sha256_expected").cloned(),
+        freeze_no_turbo: man.get("freeze_no_turbo").and_then(|v| bool_or_none(v)),
+        freeze_governor: man.get("freeze_governor").cloned(),
+        freeze_boost: man.get("freeze_boost").and_then(|v| bool_or_none(v)),
+        claims_absolute: man.get("claims_absolute").and_then(|v| bool_or_none(v)),
+        host_id: man.get("env_host_id").cloned(),
+    };
+    if env.any_captured() {
+        Some(env)
+    } else {
+        None
     }
 }
 
