@@ -3350,3 +3350,262 @@ mod box_valid_tests {
         assert_eq!(verdict_of(&c).0, CheckVerdict::Ok, "a clean line certifies");
     }
 }
+
+// ===========================================================================
+// ENV-INVARIANT self-tests — the deterministic refusal for the two
+// campaign-corrupting bugs (SINK-DELETION + BINARY-DRIFT) plus corpus drift and
+// thawed-box-under-absolute-claim. Each VOID condition is RED-planted (a bad
+// invariant trips the gate) with a GREEN control (the clean value certifies),
+// and an INCOMPLETE graceful-degradation case (an uncaptured invariant degrades,
+// never falsely VOIDs). The two e2e cases drive the value through from_manifest
+// + run_gate so the manifest-keys → stamp path is also covered.
+// ===========================================================================
+#[cfg(test)]
+mod env_invariant_tests {
+    use super::*;
+
+    /// Any ENV-INVARIANT check matching (verdict, reason-substring).
+    fn has(checks: &[GateCheck], v: CheckVerdict, needle: &str) -> bool {
+        checks
+            .iter()
+            .any(|c| c.name == ENV_INVARIANT && c.verdict == v && c.reason.contains(needle))
+    }
+
+    /// A fully-captured, all-good env block (devnull char pre+post, shas match
+    /// their pins, corpus matches expected, no absolute claim ⇒ freeze ungated).
+    fn good_env() -> EnvInvariant {
+        EnvInvariant {
+            devnull_char_pre: Some(true),
+            devnull_char_post: Some(true),
+            gzippy_bin_sha: Some("abc123def456".into()),
+            gzippy_bin_sha_pinned: Some("abc123def456".into()),
+            rapidgzip_bin_sha: Some("999888777666".into()),
+            rapidgzip_bin_sha_pinned: Some("999888777666".into()),
+            corpus_sha: Some("c0ffeec0ffee".into()),
+            corpus_sha_expected: Some("c0ffeec0ffee".into()),
+            freeze_no_turbo: Some(true),
+            freeze_governor: Some("performance".into()),
+            freeze_boost: Some(false),
+            claims_absolute: Some(false),
+            host_id: Some("<BENCH_HOST>".into()),
+        }
+    }
+
+    // ---- RED: /dev/null replaced by a regular file DURING the run -> VOID ----
+    #[test]
+    fn devnull_deleted_post_voids() {
+        let env = EnvInvariant {
+            devnull_char_pre: Some(true),
+            devnull_char_post: Some(false),
+            ..Default::default()
+        };
+        let checks = check_env_invariant(Some(&env));
+        assert!(has(&checks, CheckVerdict::Void, "SINK-DELETION"));
+        assert!(has(&checks, CheckVerdict::Void, "AFTER the run"));
+        // GREEN control: both char ⇒ OK, no VOID anywhere.
+        let ok = check_env_invariant(Some(&good_env()));
+        assert!(!ok.iter().any(|c| c.verdict == CheckVerdict::Void));
+    }
+
+    // a bad PRE is equally disqualifying.
+    #[test]
+    fn devnull_bad_pre_voids() {
+        let env = EnvInvariant {
+            devnull_char_pre: Some(false),
+            devnull_char_post: Some(true),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Void,
+            "BEFORE the run"
+        ));
+    }
+
+    // ---- RED: re-read binary sha != campaign-pinned sha -> VOID (drift) ----
+    #[test]
+    fn bin_sha_drift_voids() {
+        let env = EnvInvariant {
+            gzippy_bin_sha: Some("aaaaaaaaaaaa".into()),
+            gzippy_bin_sha_pinned: Some("bbbbbbbbbbbb".into()),
+            ..Default::default()
+        };
+        let checks = check_env_invariant(Some(&env));
+        assert!(has(&checks, CheckVerdict::Void, "BINARY-DRIFT"));
+        // GREEN control: matching sha ⇒ OK.
+        let ok = EnvInvariant {
+            gzippy_bin_sha: Some("aaaaaaaaaaaa".into()),
+            gzippy_bin_sha_pinned: Some("aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&ok)),
+            CheckVerdict::Ok,
+            "matches the campaign-pinned sha"
+        ));
+    }
+
+    // rapidgzip comparator drift trips the same guard.
+    #[test]
+    fn rapidgzip_sha_drift_voids() {
+        let env = EnvInvariant {
+            rapidgzip_bin_sha: Some("111111111111".into()),
+            rapidgzip_bin_sha_pinned: Some("222222222222".into()),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Void,
+            "BINARY-DRIFT"
+        ));
+    }
+
+    // a captured sha with NO pin to bind against ⇒ INCOMPLETE (graceful).
+    #[test]
+    fn bin_sha_no_pin_incomplete() {
+        let env = EnvInvariant {
+            gzippy_bin_sha: Some("aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Incomplete,
+            "binary drift cannot be ruled out"
+        ));
+    }
+
+    // ---- RED: corpus content sha != expected -> VOID (contamination) ----
+    #[test]
+    fn corpus_sha_mismatch_voids() {
+        let env = EnvInvariant {
+            corpus_sha: Some("deadbeef0000".into()),
+            corpus_sha_expected: Some("feedface1111".into()),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Void,
+            "CORPUS-DRIFT"
+        ));
+        // GREEN control: matching corpus ⇒ OK.
+        let ok = EnvInvariant {
+            corpus_sha: Some("deadbeef0000".into()),
+            corpus_sha_expected: Some("deadbeef0000".into()),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&ok)),
+            CheckVerdict::Ok,
+            "matches the expected pin"
+        ));
+    }
+
+    // ---- freeze: absent under an ABSOLUTE claim -> INCOMPLETE (degrade) ----
+    #[test]
+    fn freeze_absent_with_absolute_claim_degrades() {
+        let env = EnvInvariant {
+            claims_absolute: Some(true),
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Incomplete,
+            "freeze state was not captured"
+        ));
+    }
+
+    // ---- freeze: THAWED box under an ABSOLUTE claim -> VOID ----
+    #[test]
+    fn freeze_thawed_with_absolute_claim_voids() {
+        let env = EnvInvariant {
+            claims_absolute: Some(true),
+            freeze_no_turbo: Some(false), // turbo ON
+            ..Default::default()
+        };
+        assert!(has(
+            &check_env_invariant(Some(&env)),
+            CheckVerdict::Void,
+            "THAWED-ABSOLUTE"
+        ));
+        // a thawed box under a RATIO-only claim is NOT gated here (ratio survives).
+        let ratio = EnvInvariant {
+            claims_absolute: Some(false),
+            freeze_no_turbo: Some(false),
+            freeze_governor: Some("powersave".into()),
+            ..Default::default()
+        };
+        assert!(!check_env_invariant(Some(&ratio))
+            .iter()
+            .any(|c| c.verdict == CheckVerdict::Void));
+    }
+
+    // ---- GREEN: all invariants good -> no VOID/Incomplete/Refused ----
+    #[test]
+    fn all_good_passes() {
+        let checks = check_env_invariant(Some(&good_env()));
+        assert!(!checks.is_empty());
+        assert!(checks.iter().all(|c| c.verdict == CheckVerdict::Ok));
+    }
+
+    // ---- graceful: no env block captured -> SILENT (no checks emitted) ----
+    #[test]
+    fn no_env_block_is_silent() {
+        assert!(check_env_invariant(None).is_empty());
+        // a materialized-but-empty block (nothing captured) is also silent.
+        assert!(check_env_invariant(Some(&EnvInvariant::default())).is_empty());
+    }
+
+    // ---- e2e: a devnull-deleted manifest VOIDs the cell via run_gate ----
+    #[test]
+    fn e2e_devnull_deleted_voids_run() {
+        let man = parse_manifest_text(
+            "commit_sha=abc123\nhead_sha=abc123\n\
+             comparator_present=1\ncomparator_aa_ratio=1.0\ncomparator_aa_spread_pct=1.0\n\
+             devnull_is_char_pre=1\ndevnull_is_char_post=0\n",
+        );
+        let rep = run_gate(&from_manifest(&man), None, true).unwrap();
+        assert!(rep.checks.iter().any(|c| c.name == ENV_INVARIANT
+            && c.verdict == CheckVerdict::Void
+            && c.reason.contains("SINK-DELETION")));
+        assert_eq!(rep.stamp("abc123").provenance_verdict, "VOID");
+        assert_eq!(rep.run_verdict, CheckVerdict::Void);
+    }
+
+    // ---- e2e: a binary-drift manifest VOIDs the cell via run_gate ----
+    #[test]
+    fn e2e_bin_drift_voids_run() {
+        let man = parse_manifest_text(
+            "commit_sha=abc123\nhead_sha=abc123\n\
+             comparator_present=1\ncomparator_aa_ratio=1.0\ncomparator_aa_spread_pct=1.0\n\
+             gzippy_bin_sha256=aaaaaaaaaaaa\ngzippy_bin_sha256_pinned=bbbbbbbbbbbb\n",
+        );
+        let rep = run_gate(&from_manifest(&man), None, true).unwrap();
+        assert!(rep.checks.iter().any(|c| c.name == ENV_INVARIANT
+            && c.verdict == CheckVerdict::Void
+            && c.reason.contains("BINARY-DRIFT")));
+        assert_eq!(rep.stamp("abc123").provenance_verdict, "VOID");
+    }
+
+    // ---- e2e: a fully-good env block still CERTIFIES (does not break the gate) ----
+    #[test]
+    fn e2e_good_env_certifies() {
+        let man = parse_manifest_text(
+            "commit_sha=abc123\nhead_sha=abc123\n\
+             knob_consumer_GZIPPY_NO_HIT_DRIVE=2\n\
+             knob_consumer_GZIPPY_DIST_AMORT=2\n\
+             oracle_seed_windows_on=14\noracle_seed_windows_off=0\n\
+             oracle_seed_windows_expected=14\n\
+             ab_sink_hd_base=devnull\nab_sink_hd_knob=devnull\n\
+             comparator_sink=devnull\ncomparator_path=<BENCH_ROOT>/rg.elf\n\
+             comparator_present=1\ncomparator_aa_ratio=1.002\ncomparator_aa_spread_pct=1.0\n\
+             devnull_is_char_pre=1\ndevnull_is_char_post=1\n\
+             gzippy_bin_sha256=abc123\ngzippy_bin_sha256_pinned=abc123\n\
+             rapidgzip_bin_sha256=99ff88\nrapidgzip_bin_sha256_pinned=99ff88\n\
+             corpus_sha256=c0ffee\ncorpus_sha256_expected=c0ffee\n\
+             claims_absolute=0\n",
+        );
+        let rep = run_gate(&from_manifest(&man), None, true).unwrap();
+        assert_eq!(rep.stamp("abc123").provenance_verdict, "CERTIFIED");
+        assert_eq!(rep.run_verdict, CheckVerdict::Ok);
+    }
+}
