@@ -48,6 +48,7 @@
 
 use crate::cycles;
 use crate::stats::{resolution, Resolution};
+use std::collections::BTreeMap;
 use std::fmt;
 
 // ── Pre-registered constants ────────────────────────────────────────────────
@@ -64,6 +65,25 @@ pub const MIN_N: usize = 12;
 /// so the effective ceiling is `≤ 2` — the "runnable_avg ≤ ~2" rule.)
 pub const PROCS_RUNNING_SLACK: f64 = 1.0;
 
+/// PAIRED significance threshold (ADDITION 1). For the INTERLEAVED design the
+/// arms are measured back-to-back per rep, so the per-rep delta is the right,
+/// stronger yardstick than Δ-of-medians vs per-arm spread. A paired result is
+/// significant only when the distribution-free two-sided SIGN-TEST p-value is
+/// below this AND the sign is near-unanimous (see [`PAIRED_MINORITY_FRAC`]).
+pub const PAIRED_P_THRESHOLD: f64 = 0.01;
+
+/// Near-unanimity bound: the minority sign count must be `≤ max(1, this·n)`.
+/// One stray rep on N≈21 is tolerated; two flip it to NOT-significant (a real
+/// per-change win this small must be essentially unanimous rep-to-rep).
+pub const PAIRED_MINORITY_FRAC: f64 = 0.05;
+
+/// CONTENTION-INVARIANT flatness bound (ADDITION 2). The after/base cyc/B ratio
+/// must not TREND with the run-queue: the spread of per-stratum median ratios
+/// must be `≤ this · effect`, where `effect = |1 − overall_median_ratio|`. If
+/// the ratio trends with load, `after` and `base` have different
+/// contention-sensitivity and the ratio is confounded — VOID it.
+pub const CONTENTION_FLATNESS_FRAC: f64 = 0.25;
+
 // ── Verdict + scope ─────────────────────────────────────────────────────────
 
 /// The deterministic optgate verdict. Exactly one of these; the FIRST refusal in
@@ -72,8 +92,14 @@ pub const PROCS_RUNNING_SLACK: f64 = 1.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// cyc/byte improved by more than the arms' spread, with bytes exact, a quiet
-    /// window, N≥12, and no clean-path regression. The ONLY wall-win verdict.
+    /// window, N≥12, and no clean-path regression. The primary wall-win verdict.
     Win,
+    /// The window was NOT quiet (would have been [`Verdict::VoidQuiet`]) but the
+    /// after/base cyc/B RATIO certified CONTENTION-INVARIANT: the per-rep paired
+    /// sign-test is significant, the ratio does not trend across run-queue
+    /// strata, and (if present) the A/A arm resolves to 1.0. A sound wall win on
+    /// a CONTENDED box — same downstream standing as a quiet [`Verdict::Win`].
+    WinContentionInvariant,
     /// cyc/byte Δ is within the arms' spread (and instr/byte did not resolve an
     /// improvement either) — a TIE, never a win.
     Tie,
@@ -97,6 +123,7 @@ impl Verdict {
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Win => "WIN",
+            Verdict::WinContentionInvariant => "WALL WIN [CONTENTION-INVARIANT]",
             Verdict::Tie => "TIE",
             Verdict::InstructionOnly => "INSTRUCTION-ONLY",
             Verdict::Regression => "REGRESSION",
@@ -293,6 +320,343 @@ impl Arm {
     }
 }
 
+// ── Paired significance (ADDITION 1) ─────────────────────────────────────────
+
+/// Median of a slice (sorts a copy; empty ⇒ NaN).
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Linearly-interpolated percentile of a *sorted* slice (`p` in `[0,1]`).
+fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
+    match sorted.len() {
+        0 => f64::NAN,
+        1 => sorted[0],
+        n => {
+            let rank = p * (n - 1) as f64;
+            let lo = rank.floor() as usize;
+            let hi = rank.ceil() as usize;
+            let frac = rank - lo as f64;
+            sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+        }
+    }
+}
+
+/// Two-sided SIGN-TEST p-value for `n_pos`/`n_neg` non-tie signs, under the null
+/// that each non-tie sign is a fair coin. `p = min(1, 2·P(X ≤ min(n_pos,n_neg)))`
+/// with `X ~ Binomial(n_pos+n_neg, 0.5)`. Computed iteratively in `f64` (no
+/// factorials, no overflow, no external crates).
+pub fn sign_test_two_sided(n_pos: usize, n_neg: usize) -> f64 {
+    let n = n_pos + n_neg;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = n_pos.min(n_neg);
+    // pmf(0) = 0.5^n; pmf(i+1) = pmf(i)·(n−i)/(i+1).
+    let mut pmf = 0.5_f64.powi(n as i32);
+    let mut cum = pmf;
+    for i in 0..k {
+        pmf *= (n - i) as f64 / (i + 1) as f64;
+        cum += pmf;
+    }
+    (2.0 * cum).min(1.0)
+}
+
+/// The paired per-rep significance signal for the interleaved design. Built from
+/// two arms' *index-paired* per-rep deltas `d_i = base_i − after_i` (cyc/B), so a
+/// positive delta = `after` faster. `None` when the arms are not pairable
+/// (unequal n or empty) — the caller then falls back to the Δ-vs-spread signal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PairedStats {
+    /// Number of paired reps (`n_pos + n_neg + n_tie`).
+    pub n: usize,
+    /// Reps where `after` was faster (`d_i > 0`).
+    pub n_pos: usize,
+    /// Reps where `after` was slower (`d_i < 0`).
+    pub n_neg: usize,
+    /// Reps with an exactly-zero delta.
+    pub n_tie: usize,
+    /// Two-sided sign-test p-value.
+    pub p_value: f64,
+    /// Median paired delta (cyc/B; +ve = `after` faster).
+    pub median_delta: f64,
+    /// Median ± `1.57·IQR/√n` CI on the paired delta.
+    pub ci_low: f64,
+    pub ci_high: f64,
+    /// p < [`PAIRED_P_THRESHOLD`] AND minority sign ≤ `max(1, frac·n)`.
+    pub significant: bool,
+}
+
+impl PairedStats {
+    /// Build paired cyc/B stats from `base` and `after`. `None` if not pairable.
+    pub fn from_arms_cpb(base: &Arm, after: &Arm) -> Option<PairedStats> {
+        if base.n() == 0 || base.n() != after.n() {
+            return None;
+        }
+        let deltas: Vec<f64> = base
+            .samples
+            .iter()
+            .zip(after.samples.iter())
+            .map(|(b, a)| b.cyc_per_byte() - a.cyc_per_byte())
+            .filter(|d| d.is_finite())
+            .collect();
+        if deltas.is_empty() {
+            return None;
+        }
+        Some(Self::from_deltas(&deltas))
+    }
+
+    /// Build paired stats from an explicit delta vector (the unit-test seam).
+    pub fn from_deltas(deltas: &[f64]) -> PairedStats {
+        let n = deltas.len();
+        let n_pos = deltas.iter().filter(|&&d| d > 0.0).count();
+        let n_neg = deltas.iter().filter(|&&d| d < 0.0).count();
+        let n_tie = n - n_pos - n_neg;
+        let p_value = sign_test_two_sided(n_pos, n_neg);
+
+        let mut sorted = deltas.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_delta = percentile_sorted(&sorted, 0.5);
+        let q1 = percentile_sorted(&sorted, 0.25);
+        let q3 = percentile_sorted(&sorted, 0.75);
+        let iqr = q3 - q1;
+        let half = 1.57 * iqr / (n as f64).sqrt();
+        let ci_low = median_delta - half;
+        let ci_high = median_delta + half;
+
+        let minority = n_pos.min(n_neg) as f64;
+        let minority_bound = (PAIRED_MINORITY_FRAC * n as f64).max(1.0);
+        let significant = p_value < PAIRED_P_THRESHOLD && minority <= minority_bound;
+
+        PairedStats {
+            n,
+            n_pos,
+            n_neg,
+            n_tie,
+            p_value,
+            median_delta,
+            ci_low,
+            ci_high,
+            significant,
+        }
+    }
+
+    /// The certified direction: `true` = `after` faster (a win), `false` = slower.
+    pub fn after_is_faster(&self) -> bool {
+        self.median_delta > 0.0
+    }
+
+    /// One-line render for the verdict report.
+    pub fn line(&self) -> String {
+        format!(
+            "paired n={} (after faster {}/ slower {}/ tie {})  sign-test p={:.2e}  \
+             median Δ={:+.4} cyc/B  CI[{:+.4},{:+.4}]  {}",
+            self.n,
+            self.n_pos,
+            self.n_neg,
+            self.n_tie,
+            self.p_value,
+            self.median_delta,
+            self.ci_low,
+            self.ci_high,
+            if self.significant {
+                "SIGNIFICANT"
+            } else {
+                "not-significant"
+            },
+        )
+    }
+}
+
+// ── Contention-invariance certification (ADDITION 2) ─────────────────────────
+
+/// The contention-invariance certificate — the quiet-window SUBSTITUTE. Reachable
+/// only when the run-queue gate WOULD have fired VOID-QUIET. The after/base cyc/B
+/// ratio is unconfounded under STEADY SYMMETRIC contention *unless* the two
+/// binaries have different contention-sensitivity; that single confound is killed
+/// by certifying the ratio is FLAT across run-queue strata (plus paired
+/// significance and, when present, A/A apparatus symmetry).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContentionCert {
+    /// All three sub-checks passed ⇒ a sound WALL WIN on a contended box.
+    pub certified: bool,
+    /// Median over all reps of `r_i = after_i / base_i` (cyc/B).
+    pub overall_median_ratio: f64,
+    /// `|1 − overall_median_ratio|` — the magnitude of the effect.
+    pub effect: f64,
+    /// `max(stratum_median) − min(stratum_median)` over strata with n≥2.
+    pub cross_stratum_range: f64,
+    /// Per-stratum `(procs_running bucket, median ratio, rep count)`, sorted by load.
+    pub strata: Vec<(f64, f64, usize)>,
+    /// Number of strata with n≥2 (the only ones that count toward the range).
+    pub n_strata_ge2: usize,
+    /// Sub-check: ratio does NOT trend with load (range ≤ frac·effect).
+    pub ratio_flat: bool,
+    /// Sub-check: the paired sign-test (ADDITION 1) is significant.
+    pub paired_significant: bool,
+    /// Direction of the paired win (`true` = after faster).
+    pub after_is_faster: bool,
+    /// Whether an A/A arm was supplied (and pairable with base).
+    pub aa_present: bool,
+    /// Sub-check: base-vs-A/A paired ratio resolves to 1.0 within its own spread.
+    pub aa_symmetric: bool,
+    /// Base-vs-A/A median ratio (for the report; NaN when no A/A arm).
+    pub aa_median_ratio: f64,
+    /// Which sub-check failed (`None` when certified).
+    pub failure: Option<String>,
+}
+
+impl ContentionCert {
+    /// Run the certification on the targeted arms + an optional A/A arm.
+    pub fn certify(
+        base: &Arm,
+        after: &Arm,
+        aa: Option<&Arm>,
+        paired: Option<&PairedStats>,
+    ) -> ContentionCert {
+        let n = base.n().min(after.n());
+        let mut all_ratios: Vec<f64> = Vec::with_capacity(n);
+        let mut by_stratum: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+        for i in 0..n {
+            let b = base.samples[i].cyc_per_byte();
+            let a = after.samples[i].cyc_per_byte();
+            if !(b > 0.0 && a.is_finite()) {
+                continue;
+            }
+            let r = a / b;
+            all_ratios.push(r);
+            let bucket = ((base.samples[i].procs_running + after.samples[i].procs_running) / 2.0)
+                .round() as i64;
+            by_stratum.entry(bucket).or_default().push(r);
+        }
+        let overall_median_ratio = median(&all_ratios);
+        let effect = (1.0 - overall_median_ratio).abs();
+
+        let mut strata: Vec<(f64, f64, usize)> = Vec::new();
+        let mut ge2_medians: Vec<f64> = Vec::new();
+        for (bucket, rs) in &by_stratum {
+            let m = median(rs);
+            strata.push((*bucket as f64, m, rs.len()));
+            if rs.len() >= 2 {
+                ge2_medians.push(m);
+            }
+        }
+        let n_strata_ge2 = ge2_medians.len();
+        // With <2 multi-sample strata the load did not vary enough to detect a
+        // trend; range is 0 and flatness defers to the paired + A/A guards.
+        let cross_stratum_range = if ge2_medians.len() >= 2 {
+            let hi = ge2_medians
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let lo = ge2_medians.iter().cloned().fold(f64::INFINITY, f64::min);
+            hi - lo
+        } else {
+            0.0
+        };
+        let ratio_flat = cross_stratum_range <= CONTENTION_FLATNESS_FRAC * effect;
+
+        let paired_significant = paired.map(|p| p.significant).unwrap_or(false);
+        let after_is_faster = paired.map(|p| p.after_is_faster()).unwrap_or(false);
+
+        // A/A apparatus symmetry: base-vs-A/A paired ratio resolves to 1.0 within
+        // its own spread (no slot-position bias).
+        let (aa_present, aa_symmetric, aa_median_ratio) = match aa {
+            Some(a) if a.n() == base.n() && a.n() > 0 => {
+                let qs: Vec<f64> = base
+                    .samples
+                    .iter()
+                    .zip(a.samples.iter())
+                    .map(|(b, x)| b.cyc_per_byte() / x.cyc_per_byte())
+                    .filter(|q| q.is_finite())
+                    .collect();
+                if qs.is_empty() {
+                    (true, true, f64::NAN)
+                } else {
+                    let m = median(&qs);
+                    let hi = qs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let lo = qs.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let spread = hi - lo;
+                    ((true), (m - 1.0).abs() <= spread, m)
+                }
+            }
+            _ => (false, true, f64::NAN),
+        };
+
+        let certified = ratio_flat && paired_significant && (!aa_present || aa_symmetric);
+        let failure = if certified {
+            None
+        } else if !paired_significant {
+            Some("not-paired-significant".to_string())
+        } else if !ratio_flat {
+            Some("ratio-trended".to_string())
+        } else {
+            Some("A-A-failed".to_string())
+        };
+
+        ContentionCert {
+            certified,
+            overall_median_ratio,
+            effect,
+            cross_stratum_range,
+            strata,
+            n_strata_ge2,
+            ratio_flat,
+            paired_significant,
+            after_is_faster,
+            aa_present,
+            aa_symmetric,
+            aa_median_ratio,
+            failure,
+        }
+    }
+
+    /// Human render block for the verdict report.
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "   contention-invariant: overall after/base ratio {:.4} (effect {:.4}); \
+             cross-stratum range {:.4} ≤ {:.2}·effect ⇒ {}\n",
+            self.overall_median_ratio,
+            self.effect,
+            self.cross_stratum_range,
+            CONTENTION_FLATNESS_FRAC,
+            if self.ratio_flat { "FLAT" } else { "TRENDED" },
+        ));
+        for (bucket, m, cnt) in &self.strata {
+            s.push_str(&format!(
+                "      stratum procs_running≈{bucket:.0}: median ratio {m:.4} (n={cnt})\n"
+            ));
+        }
+        if self.aa_present {
+            s.push_str(&format!(
+                "   A/A apparatus: base-vs-A/A median ratio {:.4} ⇒ {}\n",
+                self.aa_median_ratio,
+                if self.aa_symmetric {
+                    "SYMMETRIC"
+                } else {
+                    "ASYMMETRIC (slot-position bias)"
+                },
+            ));
+        }
+        match &self.failure {
+            None => s.push_str("   ⇒ CONTENTION-INVARIANT certified\n"),
+            Some(why) => s.push_str(&format!("   ⇒ NOT certified ({why})\n")),
+        }
+        s
+    }
+}
+
 /// The full A/B gate input the project measurement policy assembles.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OptGateInput {
@@ -308,6 +672,12 @@ pub struct OptGateInput {
     pub clean_base: Arm,
     /// Clean-path (T1) AFTER arm.
     pub clean_after: Arm,
+    /// Optional A/A arm: the BASE binary measured a SECOND time, interleaved, so a
+    /// base-vs-base ratio drift (slot-position bias) is detectable. Used by the
+    /// CONTENTION-INVARIANT certification as the apparatus-symmetry guard. Absent
+    /// in older artifacts (serde default `None`).
+    #[serde(default)]
+    pub aa: Option<Arm>,
     /// Requested core count for the targeted cell (the quiet-window ceiling base).
     pub k: f64,
     /// Clean-path requested core count (typically 1).
@@ -375,6 +745,13 @@ pub struct OptGateVerdict {
     pub arch: String,
     pub base_commit: String,
     pub after_commit: String,
+
+    /// Paired per-rep significance (ADDITION 1) — the primary significance signal
+    /// when the arms are pairable. `None` ⇒ the Δ-vs-spread fallback was used.
+    pub paired: Option<PairedStats>,
+    /// The contention-invariance certificate (ADDITION 2) — `Some` only when the
+    /// run-queue gate WOULD have fired VOID-QUIET and this substitute path ran.
+    pub contention: Option<ContentionCert>,
 }
 
 impl OptGateVerdict {
@@ -383,13 +760,15 @@ impl OptGateVerdict {
     /// replicated cross-arch. The single source of truth for "should we ship +
     /// bank this".
     pub fn is_banked_wall_win(&self) -> bool {
-        self.verdict == Verdict::Win && self.scope == Scope::Law
+        self.is_wall_win_here() && self.scope == Scope::Law
     }
 
     /// True iff the targeted cell showed a real cyc/byte win HERE-AND-NOW
-    /// (all gates but the cross-arch stamp). A `Win` may be `NotYetLaw`.
+    /// (all gates but the cross-arch stamp). Either a quiet [`Verdict::Win`] or a
+    /// contended [`Verdict::WinContentionInvariant`] qualifies; either may be
+    /// `NotYetLaw`.
     pub fn is_wall_win_here(&self) -> bool {
-        self.verdict == Verdict::Win
+        matches!(self.verdict, Verdict::Win | Verdict::WinContentionInvariant)
     }
 
     /// THE STRUCTURAL CHOKEPOINT. Returns the one sentence that is allowed to
@@ -398,7 +777,7 @@ impl OptGateVerdict {
     /// single-arch Win) returns `Err`, so an attribution-voiced or premature win
     /// is impossible to type.
     pub fn wall_win_sentence(&self) -> Result<String, WallWinRefused> {
-        if self.verdict != Verdict::Win {
+        if !self.is_wall_win_here() {
             return Err(WallWinRefused {
                 verdict: self.verdict,
                 scope: self.scope,
@@ -417,6 +796,23 @@ impl OptGateVerdict {
                          needs cross-arch (AMD) replication before banking"
                     .to_string(),
             });
+        }
+        if self.verdict == Verdict::WinContentionInvariant {
+            let p = self.paired.as_ref().map(|p| p.p_value).unwrap_or(f64::NAN);
+            let cert = self.contention.as_ref();
+            let ratio = cert.map(|c| c.overall_median_ratio).unwrap_or(f64::NAN);
+            let strata = cert.map(|c| c.n_strata_ge2).unwrap_or(0);
+            return Ok(format!(
+                "WALL WIN [CONTENTION-INVARIANT]: window NOT quiet but after/base cyc/B ratio \
+                 {ratio:.4} certified contention-invariant (paired sign-test p={p:.2e}, ratio flat \
+                 across {strata} run-queue strata, A/A symmetric); gz/rg gap {:.3}→{:.3} \
+                 ({:.1}% closed); bytes exact; N={}; replicated cross-arch [{}]",
+                self.gz_rg_ratio_before,
+                self.gz_rg_ratio_after,
+                self.gap_closed_frac * 100.0,
+                self.n,
+                self.arch,
+            ));
         }
         Ok(format!(
             "WALL WIN: cyc/byte {:.4}→{:.4} (Δ {:+.4} > spread {:.4}); \
@@ -483,6 +879,12 @@ impl OptGateVerdict {
                 "no-regression"
             },
         ));
+        if let Some(p) = &self.paired {
+            s.push_str(&format!("   {}\n", p.line()));
+        }
+        if let Some(c) = &self.contention {
+            s.push_str(&c.render());
+        }
         s.push_str(&format!(
             "   N={}  arch={}  base={}  after={}\n",
             self.n, self.arch, self.base_commit, self.after_commit,
@@ -544,6 +946,10 @@ pub fn evaluate(input: &OptGateInput) -> OptGateVerdict {
     };
 
     let n = input.base.n().min(input.after.n());
+
+    // ADDITION 1: paired per-rep significance — the PRIMARY significance signal
+    // for the interleaved design (computed whenever the arms are pairable).
+    let paired_cpb = PairedStats::from_arms_cpb(&input.base, &input.after);
 
     // cyc/byte resolution (significance of the targeted-cell delta).
     let (cpb_resolution, _) = resolution(
@@ -615,6 +1021,8 @@ pub fn evaluate(input: &OptGateInput) -> OptGateVerdict {
         arch: input.arch.clone(),
         base_commit: input.base_commit.clone(),
         after_commit: input.after_commit.clone(),
+        paired: paired_cpb.clone(),
+        contention: None,
     };
 
     // ── refusal order ──
@@ -652,13 +1060,44 @@ pub fn evaluate(input: &OptGateInput) -> OptGateVerdict {
         return v;
     }
 
-    // Refusal 2: QUIET-WINDOW-OR-VOID. cyc/byte is contention-sensitive.
+    // Refusal 2: QUIET-WINDOW-OR-VOID — with the ADDITION-2 contention-invariant
+    // substitute. cyc/byte (absolute) is contention-sensitive, but the
+    // INTERLEAVED after/base RATIO is not, UNLESS the two binaries have different
+    // contention-sensitivity. When the window is NOT quiet we do not blindly VOID:
+    // we try to CERTIFY the ratio is contention-invariant (flat across run-queue
+    // strata + paired-significant + A/A-symmetric). Only if that fails do we VOID.
     let ceiling = input.k + PROCS_RUNNING_SLACK;
     let base_rq = input.base.med_procs_running();
     let after_rq = input.after.med_procs_running();
     if base_rq > ceiling || after_rq > ceiling {
+        let cert = ContentionCert::certify(
+            &input.base,
+            &input.after,
+            input.aa.as_ref(),
+            paired_cpb.as_ref(),
+        );
+        if cert.certified && cert.after_is_faster {
+            v.verdict = Verdict::WinContentionInvariant;
+            v.reason = format!(
+                "window NOT quiet (median run-queue base={base_rq:.1} after={after_rq:.1} > \
+                 k+slack={ceiling:.1}) — but the interleaved after/base cyc/B ratio \
+                 {:.4} CERTIFIED contention-invariant (paired-significant, flat across {} \
+                 run-queue strata, A/A symmetric): a SOUND wall win on a contended box",
+                cert.overall_median_ratio, cert.n_strata_ge2,
+            );
+            v.contention = Some(cert);
+            return v;
+        }
+        // Certification failed (or the paired direction was a slowdown): VOID,
+        // naming which sub-check failed.
         v.verdict = Verdict::VoidQuiet;
-        // degrade to the instruction-only signal, explicitly NOT a wall verdict.
+        let why = if cert.certified && !cert.after_is_faster {
+            "ratio certified-flat but the paired direction is a SLOWDOWN".to_string()
+        } else {
+            cert.failure
+                .clone()
+                .unwrap_or_else(|| "uncertified".to_string())
+        };
         let instr_note = if v.ipb_resolution == Resolution::Resolved && delta_ipb > 0.0 {
             format!("(instr/byte did resolve {delta_ipb:+.4}, but cyc/byte is VOID — NOT a wall verdict)")
         } else {
@@ -666,9 +1105,9 @@ pub fn evaluate(input: &OptGateInput) -> OptGateVerdict {
         };
         v.reason = format!(
             "window not quiet: median run-queue base={base_rq:.1} after={after_rq:.1} > k+slack={ceiling:.1}; \
-             cpufreq is read-only so frequency cancels in same-window ratios, but contention does NOT — \
-             cyc/byte verdict VOID {instr_note}"
+             contention-invariant certification did NOT hold [{why}] — cyc/byte verdict VOID {instr_note}"
         );
+        v.contention = Some(cert);
         return v;
     }
 
@@ -683,23 +1122,51 @@ pub fn evaluate(input: &OptGateInput) -> OptGateVerdict {
         return v;
     }
 
-    // Refusals 1 + 6 (Δ vs spread): the cyc/byte verdict.
-    if cpb_resolution == Resolution::Resolved {
-        if delta_cpb > 0.0 {
+    // Refusals 1 + 6: the cyc/byte verdict. ADDITION 1 — when the arms are
+    // pairable the PAIRED sign-test is the significance signal (stronger than
+    // Δ-of-medians vs per-arm spread for interleaved data); otherwise fall back
+    // to the Δ-vs-spread resolution.
+    let cyc_resolved_improvement: Option<bool> = match &paired_cpb {
+        Some(ps) if ps.significant => Some(ps.after_is_faster()),
+        Some(_) => None, // pairable but not paired-significant ⇒ not resolved
+        None => {
+            if cpb_resolution == Resolution::Resolved {
+                Some(delta_cpb > 0.0)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(improved) = cyc_resolved_improvement {
+        if improved {
             v.verdict = Verdict::Win;
-            v.reason = format!(
-                "cyc/byte improved {:.4}→{:.4} (Δ {:+.4} > spread {:.4}); {:.1}% of the gz/rg gap closed",
-                base_cpb,
-                after_cpb,
-                delta_cpb,
-                spread_cpb,
-                gap_closed_frac * 100.0
-            );
+            v.reason = match &paired_cpb {
+                Some(ps) => format!(
+                    "cyc/byte improved {base_cpb:.4}→{after_cpb:.4} (paired sign-test p={:.2e}, \
+                     after faster in {}/{} reps); {:.1}% of the gz/rg gap closed",
+                    ps.p_value,
+                    ps.n_pos,
+                    ps.n,
+                    gap_closed_frac * 100.0
+                ),
+                None => format!(
+                    "cyc/byte improved {base_cpb:.4}→{after_cpb:.4} (Δ {delta_cpb:+.4} > spread \
+                     {spread_cpb:.4}); {:.1}% of the gz/rg gap closed",
+                    gap_closed_frac * 100.0
+                ),
+            };
         } else {
             v.verdict = Verdict::Regression;
-            v.reason = format!(
-                "cyc/byte REGRESSED {base_cpb:.4}→{after_cpb:.4} (Δ {delta_cpb:+.4} significantly negative)"
-            );
+            v.reason = match &paired_cpb {
+                Some(ps) => format!(
+                    "cyc/byte REGRESSED {base_cpb:.4}→{after_cpb:.4} (paired sign-test p={:.2e}, \
+                     after SLOWER in {}/{} reps)",
+                    ps.p_value, ps.n_neg, ps.n
+                ),
+                None => format!(
+                    "cyc/byte REGRESSED {base_cpb:.4}→{after_cpb:.4} (Δ {delta_cpb:+.4} significantly negative)"
+                ),
+            };
         }
         return v;
     }

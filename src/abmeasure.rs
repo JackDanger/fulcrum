@@ -324,6 +324,7 @@ pub fn assemble_input(
     base: Arm,
     after: Arm,
     rg: Arm,
+    aa: Option<Arm>,
     reference_sha: String,
     arch: String,
     cross_arch: bool,
@@ -336,6 +337,7 @@ pub fn assemble_input(
         base,
         after,
         rg,
+        aa,
         reference_sha,
         k: 1.0,
         clean_k: 1.0,
@@ -363,10 +365,22 @@ pub fn summary_line(corpus: &str, v: &optgate::OptGateVerdict, rg_label: &str) -
     } else {
         f64::NAN
     };
+    let paired = match &v.paired {
+        Some(p) => format!(
+            "  paired p={:.2e} ({}+/{}-/{}=){}",
+            p.p_value,
+            p.n_pos,
+            p.n_neg,
+            p.n_tie,
+            if p.significant { " SIG" } else { "" },
+        ),
+        None => String::new(),
+    };
     format!(
-        "ABMEASURE {corpus}: base {:.3} cyc/B  after {:.3} (Δ {:+.1}% spread ±{:.1}%)  \
+        "ABMEASURE {corpus}: [{}] base {:.3} cyc/B  after {:.3} (Δ {:+.1}% spread ±{:.1}%)  \
          instr/B base {:.2} after {:.2}  IPC base/after {:.2}/{:.2}  {rg_label} {:.3} cyc/B  \
-         after/{rg_label} {:.3}",
+         after/{rg_label} {:.3}{paired}",
+        v.verdict.label(),
         v.base_cpb,
         v.after_cpb,
         delta_pct,
@@ -548,11 +562,14 @@ fn run_corpus(cfg: &AbConfig, corpus: &str) -> Result<(OptGateInput, PathBuf), S
         }
     }
 
-    // 5. Assemble + serialize.
+    // 5. Assemble + serialize (the A/A arm is persisted so the downstream
+    // CONTENTION-INVARIANT certification can use it as the apparatus-symmetry
+    // guard — ADDITION 2/3).
     let input = assemble_input(
         base,
         after,
         rg,
+        Some(aa),
         reference_sha,
         cfg.arch.clone(),
         cfg.cross_arch,

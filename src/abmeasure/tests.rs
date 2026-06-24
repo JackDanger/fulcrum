@@ -258,10 +258,12 @@ fn assemble_input_roundtrips_through_serde() {
     let base = arm("base", 12, 10.0, 20.0, 1.0, 0.05).with_sha("REF");
     let after = arm("after", 12, 9.0, 18.0, 1.0, 0.05).with_sha("REF");
     let rg = arm("igzip", 12, 8.0, 16.0, 1.0, 0.05);
+    let aa = arm("base_AA", 12, 10.0, 20.0, 1.0, 0.05);
     let input = assemble_input(
         base,
         after,
         rg,
+        Some(aa),
         "REF".to_string(),
         "test-arch".to_string(),
         true,
@@ -277,6 +279,8 @@ fn assemble_input_roundtrips_through_serde() {
     assert_eq!(back.clean_k, 1.0);
     // clean arms mirror the targeted arms (the -p1 run IS the T1 clean path).
     assert_eq!(back.clean_base.n(), back.base.n());
+    // the A/A arm round-trips (used by the contention-invariant certification).
+    assert_eq!(back.aa.as_ref().map(|a| a.n()), Some(12));
 }
 
 #[test]
@@ -288,6 +292,7 @@ fn assemble_input_clear_win_is_banked_when_cross_arch() {
         base,
         after,
         rg,
+        None,
         "REF".to_string(),
         "arch".to_string(),
         true, // cross-arch → Scope::Law eligible
@@ -313,6 +318,7 @@ fn assemble_input_sha_mismatch_is_not_a_win() {
         base,
         after,
         rg,
+        None,
         "REF".to_string(),
         "arch".to_string(),
         true,
@@ -334,6 +340,7 @@ fn assemble_input_single_arch_win_is_not_yet_law() {
         base,
         after,
         rg,
+        None,
         "REF".to_string(),
         "arch".to_string(),
         false, // single-arch
