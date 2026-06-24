@@ -24,10 +24,10 @@
 use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
 use fulcrum::ledger::Ledger;
 use fulcrum::{
-    audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath, cycles,
-    decide, decompose, excess, finding, flow, insn, invariants, locate, mech, mech_arch, memlife,
-    model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling, schedule,
-    score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    abmeasure, audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath,
+    cycles, decide, decompose, excess, finding, flow, insn, invariants, locate, mech, mech_arch,
+    memlife, model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling,
+    schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -67,6 +67,9 @@ USAGE:\n\
   fulcrum optgate <artifact.json>   OPTIMIZATION A/B GATE (WALL-WIN-OR-NO-WIN): cyc/byte verdict on\n\
               a base-vs-after-vs-rg artifact; refuses instruction-only/loaded-window/byte-mismatch/\n\
               clean-regression/sub-spread/single-arch wins (exit 0 only on a banked WALL WIN)\n\
+  fulcrum abmeasure --base-bin <p> --corpus <f.gz> [--after-bin <p>] [--n N] [--core c] [--cross-arch]\n\
+              LIVE interleaved A/B/comparator perf-stat -> optgate verdict; LOAD-IMMUNE (no\n\
+              freeze/governor/SIGSTOP — replaces the hand-rolled frozen_*.sh scripts); --help for flags\n\
   fulcrum excess <artifact.json>   EXCESS-VS-INTRINSIC differential: per-region verdict on whether a\n\
               region is gz-recoverable EXCESS (gz/rg high on a LOSS corpus but vanishing on a\n\
               CONTROL corpus) or INTRINSIC (both tools pay it); refuses excess without a control\n\
@@ -3576,6 +3579,39 @@ fn cmd_optgate(args: &[String]) -> ExitCode {
     }
 }
 
+/// abmeasure: the LIVE interleaved A/B/comparator measurement half. Shells out
+/// to `perf stat` under background contention (LOAD-IMMUNE: never freezes the
+/// box, changes the governor, or SIGSTOPs/kills any process), assembles the
+/// optgate artifact, and renders the gated verdict — replacing the hand-rolled
+/// `/tmp/frozen_*.sh` scripts. The gate logic itself is [`optgate::evaluate`].
+///
+///   usage: fulcrum abmeasure --base-bin <p> --corpus <f.gz> [flags]  (--help)
+///
+/// Exit code: 0 iff every corpus gates to a banked WALL WIN (or `--no-gate`); 1
+/// if any did not; 2 for a usage error / refused instrument (perf missing / no
+/// permission / oracle failure).
+fn cmd_abmeasure(args: &[String]) -> ExitCode {
+    let cfg = match abmeasure::parse_args(args) {
+        Ok(c) => c,
+        Err(e) if e == "HELP" => {
+            println!("{}", abmeasure::HELP);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("abmeasure: {e}\n\n{}", abmeasure::HELP);
+            return ExitCode::from(2);
+        }
+    };
+    match abmeasure::run(cfg) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// excess: the EXCESS-VS-INTRINSIC differential — render a per-region verdict on
 /// whether a region is gz-recoverable EXCESS or INTRINSIC, from a loss/control
 /// per-region artifact. The four refusals (instr-only, no-control,
@@ -3872,6 +3908,7 @@ fn main() -> ExitCode {
         "insn" => cmd_insn(rest),
         "cycles" => cmd_cycles(rest),
         "optgate" => cmd_optgate(rest),
+        "abmeasure" => cmd_abmeasure(rest),
         "excess" => cmd_excess(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),

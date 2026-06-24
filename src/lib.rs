@@ -34,6 +34,7 @@
 /// Mirrors `decide/fulcrum/__init__.py::PROTOCOL_VERSION`.
 pub const PROTOCOL_VERSION: &str = "fulcrum-v3";
 
+pub mod abmeasure;
 pub mod alloc;
 pub mod audit;
 pub mod binloc;
