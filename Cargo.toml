@@ -35,6 +35,7 @@ coz = { version = "0.1", optional = true }
 # (ledger.rs, faithful port of decide/fulcrum/core/ledger.py): each appended
 # record carries sha256(prev_chain + canonical_json(record))[:16].
 sha2 = "0.10"
+iced-x86 = "1.21.0"
 
 # CLOCK_MONOTONIC for absolute trace timestamps, so probe spans line up with
 # `perf record -k CLOCK_MONOTONIC` PEBS samples in the per-region HW correlator

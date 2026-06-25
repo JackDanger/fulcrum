@@ -1,9 +1,10 @@
-//! `fulcrum insn-attr` - a Linux perf capture plan for instruction-category attribution.
-//!
-//! This is intentionally a plan generator plus taxonomy pin, not a macOS-untested
-//! perf parser. It prints the exact capture commands needed to feed a later
-//! instruction-level analyzer while reusing the existing closed `insn` ledger for
-//! Gate-0 total conservation.
+//! `fulcrum insn-attr` - perf capture and instruction-category attribution.
+
+use iced_x86::{Decoder, DecoderOptions, Instruction};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -36,122 +37,182 @@ pub struct TaxonomyRow {
     pub note: &'static str,
 }
 
+pub const CATEGORY_ORDER: &[&str] = &[
+    "scalar-load",
+    "scalar-store",
+    "scalar-mov-reg",
+    "vector-load",
+    "vector-store",
+    "vector-alu",
+    "bmi2",
+    "crc/pclmul",
+    "branch-cond",
+    "branch-uncond/call",
+    "alu",
+    "shift",
+    "lea",
+    "nop/other",
+];
+
 pub const X86_TAXONOMY: &[TaxonomyRow] = &[
     TaxonomyRow {
-        category: "vector_copy",
+        category: "scalar-load",
+        mnemonics: &["mov", "movzx", "movsx", "movsxd", "cmp", "test"],
+        note: "Scalar instructions whose sampled operand reads memory.",
+    },
+    TaxonomyRow {
+        category: "scalar-store",
+        mnemonics: &["mov", "xchg", "cmpxchg", "push", "stos"],
+        note: "Scalar instructions whose sampled destination writes memory.",
+    },
+    TaxonomyRow {
+        category: "scalar-mov-reg",
+        mnemonics: &["mov", "movzx", "movsx", "movsxd"],
+        note: "Register-to-register scalar moves and extensions.",
+    },
+    TaxonomyRow {
+        category: "vector-load",
+        mnemonics: &[
+            "vmovdqu", "vmovdqa", "vmovups", "vmovaps", "movdqu", "movdqa", "movups", "movaps",
+        ],
+        note: "SIMD/AVX copies whose sampled operand reads memory.",
+    },
+    TaxonomyRow {
+        category: "vector-store",
         mnemonics: &[
             "vmovdqu", "vmovdqa", "vmovups", "vmovaps", "movdqu", "movdqa", "movups", "movaps",
             "movntdq", "movntps",
         ],
-        note: "SIMD/AVX load-store copies; operands decide whether a generic mov is vector.",
+        note: "SIMD/AVX copies whose sampled destination writes memory.",
     },
     TaxonomyRow {
-        category: "string_copy",
-        mnemonics: &["rep", "movsb", "movsw", "movsd", "movsq", "stosb", "stosq"],
-        note: "REP/string move or store primitives.",
-    },
-    TaxonomyRow {
-        category: "scalar_load_store",
-        mnemonics: &["mov", "movzx", "movsx", "movsxd", "xchg", "cmpxchg"],
-        note: "Scalar register/memory traffic; operand parsing should refine load vs store.",
-    },
-    TaxonomyRow {
-        category: "branch",
-        mnemonics: &["j", "call", "ret", "loop"],
-        note: "Direct/indirect calls, returns, loops, and conditional/unconditional jumps.",
-    },
-    TaxonomyRow {
-        category: "shift_bit_extract",
+        category: "vector-alu",
         mnemonics: &[
-            "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "pext", "pdep", "bzhi",
-            "bsf", "bsr", "tzcnt", "lzcnt", "popcnt",
+            "pxor", "vpxor", "pand", "vpand", "por", "vpor", "padd", "vpadd", "psub", "vpsub",
+            "pshuf", "vpshuf", "punpck", "vpunpck", "vperm", "palignr", "vpalignr", "vmov",
+            "movdqu", "movdqa",
         ],
-        note: "Bit extraction, bit scans, rotates, shifts, and population count.",
+        note: "Vector arithmetic, shuffles, and register-only SIMD copies.",
     },
     TaxonomyRow {
-        category: "simd_shuffle",
-        mnemonics: &[
-            "pshuf", "vpshuf", "punpck", "vpunpck", "vperm", "palignr", "vpalignr",
-        ],
-        note: "Vector permutes, byte shuffles, unpacks, and aligns.",
+        category: "bmi2",
+        mnemonics: &["pext", "pdep", "shrx", "shlx", "sarx", "bzhi", "mulx"],
+        note: "BMI2 bit extraction, variable shifts, zero-high, and wide multiply helpers.",
     },
     TaxonomyRow {
-        category: "simd_alu",
-        mnemonics: &[
-            "pxor", "vpxor", "pand", "vpand", "por", "vpor", "padd", "vpadd",
-        ],
-        note: "Vector integer arithmetic and logic.",
+        category: "crc/pclmul",
+        mnemonics: &["crc32", "pclmulqdq", "vpclmulqdq"],
+        note: "CRC and carryless multiply helper instructions.",
     },
     TaxonomyRow {
-        category: "scalar_alu",
+        category: "branch-cond",
+        mnemonics: &["jcc", "loop"],
+        note: "Conditional jumps and counted loops.",
+    },
+    TaxonomyRow {
+        category: "branch-uncond/call",
+        mnemonics: &["jmp", "call", "ret"],
+        note: "Unconditional jumps, calls, and returns.",
+    },
+    TaxonomyRow {
+        category: "alu",
         mnemonics: &[
             "add", "sub", "cmp", "test", "and", "or", "xor", "inc", "dec", "imul", "mul", "adc",
-            "sbb", "lea",
+            "sbb", "neg", "not",
         ],
-        note: "Scalar integer arithmetic, address arithmetic, and compares.",
+        note: "Scalar integer arithmetic, logic, and compares.",
     },
     TaxonomyRow {
-        category: "crc_crypto",
-        mnemonics: &["crc32", "pclmulqdq", "vpclmulqdq", "aes"],
-        note: "CRC, carryless multiply, and crypto helper instructions.",
+        category: "shift",
+        mnemonics: &[
+            "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "bsf", "bsr", "tzcnt",
+            "lzcnt", "popcnt",
+        ],
+        note: "Shifts, rotates, scans, and population count not covered by BMI2.",
     },
     TaxonomyRow {
-        category: "stack",
-        mnemonics: &["push", "pop", "enter", "leave"],
-        note: "Stack frame traffic.",
+        category: "lea",
+        mnemonics: &["lea"],
+        note: "Address-generation arithmetic.",
+    },
+    TaxonomyRow {
+        category: "nop/other",
+        mnemonics: &["nop", "pause"],
+        note: "No-op, pause, and instructions outside the closed categories above.",
     },
 ];
 
 pub const AARCH64_TAXONOMY: &[TaxonomyRow] = &[
     TaxonomyRow {
-        category: "vector_copy",
+        category: "scalar-load",
+        mnemonics: &["ldr", "ldp", "ldrb", "ldrh", "ldur"],
+        note: "Scalar load encodings.",
+    },
+    TaxonomyRow {
+        category: "scalar-store",
+        mnemonics: &["str", "stp", "strb", "strh", "stur"],
+        note: "Scalar store encodings.",
+    },
+    TaxonomyRow {
+        category: "scalar-mov-reg",
+        mnemonics: &["mov", "movz", "movn", "movk"],
+        note: "Register moves and move-wide forms.",
+    },
+    TaxonomyRow {
+        category: "vector-load",
+        mnemonics: &["ld1", "ld2", "ld3", "ld4"],
+        note: "NEON/SIMD structure loads.",
+    },
+    TaxonomyRow {
+        category: "vector-store",
         mnemonics: &["ld1", "st1", "ld2", "st2", "ld3", "st3", "ld4", "st4"],
-        note: "NEON/SIMD structure loads and stores; ldr/str q/v operands also land here.",
+        note: "NEON/SIMD structure stores.",
     },
     TaxonomyRow {
-        category: "scalar_load_store",
+        category: "vector-alu",
         mnemonics: &[
-            "ldr", "str", "ldp", "stp", "ldrb", "strb", "ldrh", "strh", "ldur", "stur",
+            "addv", "addp", "eor", "orr", "and", "bic", "movi", "dup", "tbl", "tbx",
         ],
-        note: "Scalar load/store traffic; q/v operands are promoted to vector_copy.",
+        note: "NEON arithmetic, logic, shuffles, and register copies.",
     },
     TaxonomyRow {
-        category: "branch",
-        mnemonics: &["b", "bl", "blr", "br", "ret", "cbz", "cbnz", "tbz", "tbnz"],
-        note: "Branches, calls, returns, and test-and-branch forms.",
+        category: "crc/pclmul",
+        mnemonics: &["crc32", "crc32b", "crc32h", "crc32w", "crc32x", "pmull"],
+        note: "CRC and polynomial multiply helpers.",
     },
     TaxonomyRow {
-        category: "shift_bit_extract",
+        category: "branch-cond",
+        mnemonics: &["b.cond", "cbz", "cbnz", "tbz", "tbnz"],
+        note: "Conditional and test-and-branch encodings.",
+    },
+    TaxonomyRow {
+        category: "branch-uncond/call",
+        mnemonics: &["b", "bl", "blr", "br", "ret"],
+        note: "Unconditional branches, calls, and returns.",
+    },
+    TaxonomyRow {
+        category: "alu",
+        mnemonics: &[
+            "add", "sub", "subs", "cmp", "cmn", "and", "orr", "eor", "mul", "madd",
+        ],
+        note: "Scalar arithmetic, logic, multiply, and compares.",
+    },
+    TaxonomyRow {
+        category: "shift",
         mnemonics: &[
             "lsl", "lsr", "asr", "ror", "extr", "ubfx", "sbfx", "bfxil", "rbit", "clz",
         ],
         note: "Shifts, rotates, extracts, and bitfield operations.",
     },
     TaxonomyRow {
-        category: "simd_shuffle",
-        mnemonics: &[
-            "tbl", "tbx", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2", "ext",
-        ],
-        note: "NEON table lookups, zips, unzips, transposes, and extracts.",
+        category: "lea",
+        mnemonics: &["adr", "adrp", "add"],
+        note: "PC-relative and address-generation arithmetic.",
     },
     TaxonomyRow {
-        category: "simd_alu",
-        mnemonics: &["addv", "addp", "eor", "orr", "and", "bic", "movi", "dup"],
-        note: "Vector arithmetic, logic, and lane broadcast forms.",
-    },
-    TaxonomyRow {
-        category: "scalar_alu",
-        mnemonics: &[
-            "add", "sub", "subs", "cmp", "cmn", "and", "orr", "eor", "mul", "madd", "adrp", "adr",
-        ],
-        note: "Scalar arithmetic, address generation, and compares.",
-    },
-    TaxonomyRow {
-        category: "crc_crypto",
-        mnemonics: &[
-            "crc32", "crc32b", "crc32h", "crc32w", "crc32x", "pmull", "aes",
-        ],
-        note: "CRC, polynomial multiply, and crypto helpers.",
+        category: "nop/other",
+        mnemonics: &["nop", "yield"],
+        note: "No-op and instructions outside the closed categories above.",
     },
 ];
 
@@ -183,13 +244,45 @@ pub fn classify_instruction(arch: Arch, instruction: &str) -> &'static str {
 }
 
 fn classify_x86(mnemonic: &str, operands: &str) -> &'static str {
-    if mnemonic.starts_with('j') || matches!(mnemonic, "call" | "ret" | "loop") {
-        return "branch";
+    if mnemonic == "jmp" || matches!(mnemonic, "call" | "ret") {
+        return "branch-uncond/call";
+    }
+    if mnemonic.starts_with('j') || mnemonic == "loop" {
+        return "branch-cond";
+    }
+    if mnemonic == "lea" {
+        return "lea";
+    }
+    if matches!(
+        mnemonic,
+        "pext" | "pdep" | "shrx" | "shlx" | "sarx" | "bzhi" | "mulx"
+    ) {
+        return "bmi2";
+    }
+    if mnemonic.contains("pclmul") || mnemonic.starts_with("crc32") {
+        return "crc/pclmul";
     }
     if (mnemonic.starts_with('v') || mnemonic.starts_with("mov"))
         && (operands.contains("xmm") || operands.contains("ymm") || operands.contains("zmm"))
     {
-        return "vector_copy";
+        if operands.starts_with('[')
+            || operands.contains("ptr [") && operands.starts_with("xmmword ptr")
+        {
+            return "vector-store";
+        }
+        if operands.contains('[') {
+            return "vector-load";
+        }
+        return "vector-alu";
+    }
+    if matches!(mnemonic, "mov" | "movzx" | "movsx" | "movsxd") {
+        if operands.starts_with('[') || operands.contains("ptr [") && !operands.starts_with('r') {
+            return "scalar-store";
+        }
+        if operands.contains('[') {
+            return "scalar-load";
+        }
+        return "scalar-mov-reg";
     }
     classify_by_taxonomy(Arch::X86, mnemonic)
 }
@@ -198,7 +291,20 @@ fn classify_aarch64(mnemonic: &str, operands: &str) -> &'static str {
     if matches!(mnemonic, "ldr" | "str" | "ldp" | "stp" | "ldur" | "stur")
         && (operands.starts_with('q') || operands.starts_with('v'))
     {
-        return "vector_copy";
+        return if mnemonic.starts_with("st") {
+            "vector-store"
+        } else {
+            "vector-load"
+        };
+    }
+    if matches!(mnemonic, "b" | "bl" | "blr" | "br" | "ret") {
+        return "branch-uncond/call";
+    }
+    if mnemonic.starts_with("b.") || matches!(mnemonic, "cbz" | "cbnz" | "tbz" | "tbnz") {
+        return "branch-cond";
+    }
+    if matches!(mnemonic, "adr" | "adrp") {
+        return "lea";
     }
     classify_by_taxonomy(Arch::Aarch64, mnemonic)
 }
@@ -251,21 +357,136 @@ impl Default for PlanConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeConfig {
+    pub gz_script: String,
+    pub cmp_script: String,
+    pub gz_total_instructions: u64,
+    pub cmp_total_instructions: u64,
+    pub output_bytes: u64,
+    pub arch: Arch,
+    pub gz_label: String,
+    pub cmp_label: String,
+    pub min_samples: u64,
+    pub max_decode_failure_fraction: f64,
+    pub oracle_sha: Option<String>,
+    pub gz_sha: Option<String>,
+    pub cmp_sha: Option<String>,
+}
+
+impl Default for AnalyzeConfig {
+    fn default() -> AnalyzeConfig {
+        AnalyzeConfig {
+            gz_script: String::new(),
+            cmp_script: String::new(),
+            gz_total_instructions: 0,
+            cmp_total_instructions: 0,
+            output_bytes: 0,
+            arch: Arch::X86,
+            gz_label: "gzippy".to_string(),
+            cmp_label: "comparator".to_string(),
+            min_samples: 1_000,
+            max_decode_failure_fraction: 0.01,
+            oracle_sha: None,
+            gz_sha: None,
+            cmp_sha: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSample {
+    pub ip: String,
+    pub symbol: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSummary {
+    pub label: String,
+    pub total_samples: u64,
+    pub classified_samples: u64,
+    pub decode_failures: u64,
+    pub missing_field_samples: u64,
+    pub category_counts: BTreeMap<&'static str, u64>,
+    pub symbol_counts: BTreeMap<String, BTreeMap<&'static str, u64>>,
+}
+
+impl ScriptSummary {
+    fn new(label: &str) -> ScriptSummary {
+        let mut category_counts = BTreeMap::new();
+        for category in CATEGORY_ORDER {
+            category_counts.insert(*category, 0);
+        }
+        ScriptSummary {
+            label: label.to_string(),
+            total_samples: 0,
+            classified_samples: 0,
+            decode_failures: 0,
+            missing_field_samples: 0,
+            category_counts,
+            symbol_counts: BTreeMap::new(),
+        }
+    }
+
+    fn category_count(&self, category: &str) -> u64 {
+        self.category_counts.get(category).copied().unwrap_or(0)
+    }
+
+    fn decode_failure_fraction(&self) -> f64 {
+        if self.total_samples == 0 {
+            1.0
+        } else {
+            self.decode_failures as f64 / self.total_samples as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffRow {
+    pub category: &'static str,
+    pub gz_samples: u64,
+    pub cmp_samples: u64,
+    pub gz_share: f64,
+    pub cmp_share: f64,
+    pub gz_instr_per_byte: f64,
+    pub cmp_instr_per_byte: f64,
+    pub delta_instr_per_byte: f64,
+    pub surplus_rank: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffReport {
+    pub gz: ScriptSummary,
+    pub cmp: ScriptSummary,
+    pub rows: Vec<DiffRow>,
+    pub gate_notes: Vec<String>,
+    pub warnings: Vec<String>,
+    pub output_bytes: u64,
+    pub gz_total_instructions: u64,
+    pub cmp_total_instructions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
     Help,
     Taxonomy(Arch),
     Plan(PlanConfig),
+    Analyze(AnalyzeConfig),
 }
 
 pub const HELP: &str = "\
-fulcrum insn-attr - Linux perf plan for instruction-category attribution
+fulcrum insn-attr - Linux perf instruction-category attribution
 
 USAGE:
   fulcrum insn-attr --gz-bin <path> --corpus <file.gz> [flags]
+  fulcrum insn-attr --analyze --gz-script <perf.data|script> --cmp-script <perf.data|script> \\
+      --gz-total-instructions <N> --cmp-total-instructions <N> --output-bytes <N> \\
+      --oracle-sha <sha-or-file> --gz-sha <sha-or-file> --cmp-sha <sha-or-file> [flags]
   fulcrum insn-attr --taxonomy [--arch x86_64|aarch64]
 
 FLAGS:
+  --analyze             parse perf script/raw perf.data and emit category diff
   --gz-bin <path>        gzippy binary to measure (REQUIRED for plan)
   --gz-args \"<args>\"     gzippy args before the corpus (default: \"-d -c -p1\")
   --cmp-cmd \"<cmd>\"      comparator command before the corpus (default: \"igzip -d -c\")
@@ -279,20 +500,44 @@ FLAGS:
   --stdin                print FIFO/attach mode for short commands that can read stdin
   --gz-dso <path>        DSO allowlist entry for gz side (repeatable)
   --cmp-dso <path>       DSO allowlist entry for comparator side, e.g. libisal.so (repeatable)
+  --gz-script <path>     perf script text or perf.data for gzippy analysis
+  --cmp-script <path>    perf script text or perf.data for comparator analysis
+  --gz-total-instructions <N>   exact gz retired instructions from perf stat
+  --cmp-total-instructions <N>  exact comparator retired instructions from perf stat
+  --output-bytes <N>     exact decoded output bytes shared by both arms
+  --oracle-sha <sha|path> trusted oracle sha256 or sha256sum output file
+  --gz-sha <sha|path>    gz output sha256 or sha256sum output file
+  --cmp-sha <sha|path>   comparator output sha256 or sha256sum output file
+  --min-samples <N>      Gate-0 sample floor per arm (default: 1000)
+  --max-unknown-frac <P> Gate-0 decode/classify failure tolerance (default: 0.01)
   --taxonomy             print the instruction-category taxonomy and exit
   --help, -h             this help
 
 The generated plan records instructions:u for both binaries, emits perf stat/report/script/
 annotate files, closes the per-symbol instruction ledger with `fulcrum insn`, and lists the
-Gate-0 checks that must pass before trusting an instruction-category diff.";
+Gate-0 checks that must pass before trusting an instruction-category diff. The analyzer
+uses sampled instruction categories only as a relative distribution, then scales them by
+the exact perf-stat retired-instruction total divided by decoded output bytes.";
 
 pub fn split_args(s: &str) -> Vec<String> {
     s.split_whitespace().map(|t| t.to_string()).collect()
 }
 
+fn parse_count(s: &str, name: &str) -> Result<u64, String> {
+    let cleaned = s
+        .chars()
+        .filter(|c| *c != ',' && *c != '_')
+        .collect::<String>();
+    cleaned
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a positive integer"))
+}
+
 pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut cfg = PlanConfig::default();
+    let mut analyze = AnalyzeConfig::default();
     let mut taxonomy_only = false;
+    let mut analyze_mode = false;
     let mut i = 0;
     let need = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i + 1)
@@ -303,6 +548,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--help" | "-h" => return Ok(Parsed::Help),
             "--taxonomy" => {
                 taxonomy_only = true;
+                i += 1;
+            }
+            "--analyze" => {
+                analyze_mode = true;
                 i += 1;
             }
             "--gz-bin" | "--base-bin" => {
@@ -319,6 +568,11 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--cmp-label" | "--rg-label" => {
                 cfg.cmp_label = need(i, "--cmp-label")?.clone();
+                analyze.cmp_label = cfg.cmp_label.clone();
+                i += 2;
+            }
+            "--gz-label" => {
+                analyze.gz_label = need(i, "--gz-label")?.clone();
                 i += 2;
             }
             "--oracle-cmd" => {
@@ -345,6 +599,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--arch" => {
                 cfg.arch = Arch::parse(need(i, "--arch")?)?;
+                analyze.arch = cfg.arch;
                 i += 2;
             }
             "--stdin" => {
@@ -359,11 +614,93 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 cfg.cmp_dso.push(need(i, "--cmp-dso")?.clone());
                 i += 2;
             }
+            "--gz-script" => {
+                analyze.gz_script = need(i, "--gz-script")?.clone();
+                analyze_mode = true;
+                i += 2;
+            }
+            "--cmp-script" => {
+                analyze.cmp_script = need(i, "--cmp-script")?.clone();
+                analyze_mode = true;
+                i += 2;
+            }
+            "--gz-total-instructions" => {
+                analyze.gz_total_instructions = parse_count(
+                    need(i, "--gz-total-instructions")?,
+                    "--gz-total-instructions",
+                )?;
+                analyze_mode = true;
+                i += 2;
+            }
+            "--cmp-total-instructions" => {
+                analyze.cmp_total_instructions = parse_count(
+                    need(i, "--cmp-total-instructions")?,
+                    "--cmp-total-instructions",
+                )?;
+                analyze_mode = true;
+                i += 2;
+            }
+            "--output-bytes" => {
+                analyze.output_bytes = parse_count(need(i, "--output-bytes")?, "--output-bytes")?;
+                analyze_mode = true;
+                i += 2;
+            }
+            "--oracle-sha" => {
+                analyze.oracle_sha = Some(need(i, "--oracle-sha")?.clone());
+                analyze_mode = true;
+                i += 2;
+            }
+            "--gz-sha" => {
+                analyze.gz_sha = Some(need(i, "--gz-sha")?.clone());
+                analyze_mode = true;
+                i += 2;
+            }
+            "--cmp-sha" => {
+                analyze.cmp_sha = Some(need(i, "--cmp-sha")?.clone());
+                analyze_mode = true;
+                i += 2;
+            }
+            "--min-samples" => {
+                analyze.min_samples = parse_count(need(i, "--min-samples")?, "--min-samples")?;
+                analyze_mode = true;
+                i += 2;
+            }
+            "--max-unknown-frac" => {
+                analyze.max_decode_failure_fraction = need(i, "--max-unknown-frac")?
+                    .parse::<f64>()
+                    .map_err(|_| "--max-unknown-frac must be a fraction".to_string())?;
+                analyze_mode = true;
+                i += 2;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
     if taxonomy_only {
         return Ok(Parsed::Taxonomy(cfg.arch));
+    }
+    if analyze_mode {
+        if analyze.gz_script.is_empty() {
+            return Err("--gz-script is required for --analyze".to_string());
+        }
+        if analyze.cmp_script.is_empty() {
+            return Err("--cmp-script is required for --analyze".to_string());
+        }
+        if analyze.gz_total_instructions == 0 {
+            return Err("--gz-total-instructions is required for --analyze".to_string());
+        }
+        if analyze.cmp_total_instructions == 0 {
+            return Err("--cmp-total-instructions is required for --analyze".to_string());
+        }
+        if analyze.output_bytes == 0 {
+            return Err("--output-bytes is required for --analyze".to_string());
+        }
+        if analyze.min_samples == 0 {
+            return Err("--min-samples must be >= 1".to_string());
+        }
+        if !(0.0..=1.0).contains(&analyze.max_decode_failure_fraction) {
+            return Err("--max-unknown-frac must be in [0, 1]".to_string());
+        }
+        return Ok(Parsed::Analyze(analyze));
     }
     if cfg.gz_bin.is_empty() {
         return Err("--gz-bin is required".to_string());
@@ -477,6 +814,24 @@ pub fn render_plan(cfg: &PlanConfig) -> String {
     ));
     out.push_str("  --threshold 5 --tol 2 | tee \"$OUT/insn-ledger.txt\"\n\n");
 
+    out.push_str(
+        "# Analyzer: category distribution from samples, scaled by exact perf-stat totals/byte.\n",
+    );
+    out.push_str(
+        "GZ_INSNS=$(awk -F, '$3==\"instructions:u\" {print $1; exit}' \"$OUT/gz.stat.csv\")\n",
+    );
+    out.push_str(
+        "CMP_INSNS=$(awk -F, '$3==\"instructions:u\" {print $1; exit}' \"$OUT/cmp.stat.csv\")\n",
+    );
+    out.push_str("fulcrum insn-attr --analyze --gz-script \"$OUT/gz.script\" --cmp-script \"$OUT/cmp.script\" \\\n");
+    out.push_str("  --gz-total-instructions \"$GZ_INSNS\" --cmp-total-instructions \"$CMP_INSNS\" --output-bytes \"$BYTES\" \\\n");
+    out.push_str("  --oracle-sha \"$OUT/oracle.sha\" --gz-sha \"$OUT/gz.sha\" --cmp-sha \"$OUT/cmp.sha\" \\\n");
+    out.push_str(&format!(
+        "  --arch {} --cmp-label {} | tee \"$OUT/insn-attr.txt\"\n\n",
+        cfg.arch.label(),
+        sh_quote(&cfg.cmp_label)
+    ));
+
     out.push_str("# Gate 0e checklist before trusting the WHERE:\n");
     out.push_str("# - symbol resolution: gz.report and cmp.report contain non-empty symbols, not only [unknown]\n");
     out.push_str("# - sample sufficiency: each perf.data has enough instruction samples for the hot region (target >= 10k)\n");
@@ -489,6 +844,569 @@ pub fn render_plan(cfg: &PlanConfig) -> String {
     out.push_str(cfg.arch.label());
     out.push('\n');
     out
+}
+
+pub fn analyze_from_files(cfg: &AnalyzeConfig) -> Result<DiffReport, String> {
+    let gz_text = load_perf_script(&cfg.gz_script)?;
+    let cmp_text = load_perf_script(&cfg.cmp_script)?;
+    analyze_scripts(&gz_text, &cmp_text, cfg)
+}
+
+pub fn analyze_scripts(
+    gz_script: &str,
+    cmp_script: &str,
+    cfg: &AnalyzeConfig,
+) -> Result<DiffReport, String> {
+    let gz = summarize_script(gz_script, cfg.arch, &cfg.gz_label);
+    let cmp = summarize_script(cmp_script, cfg.arch, &cfg.cmp_label);
+    let mut gate_notes = Vec::new();
+    let mut warnings = Vec::new();
+    run_analysis_gates(cfg, &gz, &cmp, &mut gate_notes, &mut warnings)?;
+    let rows = build_diff_rows(cfg, &gz, &cmp);
+    Ok(DiffReport {
+        gz,
+        cmp,
+        rows,
+        gate_notes,
+        warnings,
+        output_bytes: cfg.output_bytes,
+        gz_total_instructions: cfg.gz_total_instructions,
+        cmp_total_instructions: cfg.cmp_total_instructions,
+    })
+}
+
+pub fn render_analysis(report: &DiffReport) -> String {
+    let mut out = String::new();
+    out.push_str("fulcrum insn-attr analysis\n");
+    out.push_str("==========================\n");
+    for note in &report.gate_notes {
+        out.push_str(&format!("Gate-0 OK: {note}\n"));
+    }
+    for warning in &report.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "scale: samples are a relative category distribution; exact retired instructions/byte are {:.6} ({}) and {:.6} ({})\n",
+        report.gz_total_instructions as f64 / report.output_bytes as f64,
+        report.gz.label,
+        report.cmp_total_instructions as f64 / report.output_bytes as f64,
+        report.cmp.label
+    ));
+    out.push_str(&format!(
+        "samples: {} {} classified / {} total; {} {} classified / {} total\n\n",
+        report.gz.label,
+        report.gz.classified_samples,
+        report.gz.total_samples,
+        report.cmp.label,
+        report.cmp.classified_samples,
+        report.cmp.total_samples
+    ));
+    out.push_str(&format!(
+        "{:<18} {:>11} {:>11} {:>11} {:>9} {:>9} {}\n",
+        "category", "gz insn/B", "cmp insn/B", "delta", "gz share", "cmp share", "flag"
+    ));
+    out.push_str(
+        "--------------------------------------------------------------------------------\n",
+    );
+    for row in &report.rows {
+        let flag = row
+            .surplus_rank
+            .map(|rank| format!("SURPLUS#{rank}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{:<18} {:>11.4} {:>11.4} {:>+11.4} {:>8.2}% {:>8.2}% {}\n",
+            row.category,
+            row.gz_instr_per_byte,
+            row.cmp_instr_per_byte,
+            row.delta_instr_per_byte,
+            row.gz_share * 100.0,
+            row.cmp_share * 100.0,
+            flag
+        ));
+    }
+    out
+}
+
+fn load_perf_script(path: &str) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    if text.contains("insn:") {
+        return Ok(text.into_owned());
+    }
+    let output = Command::new("perf")
+        .args(["script", "-i", path, "-F", "ip,sym,insn"])
+        .output()
+        .map_err(|e| format!("{path}: failed to run `perf script`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{path}: `perf script -i {path} -F ip,sym,insn` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("{path}: perf script output was not UTF-8: {e}"))
+}
+
+pub fn summarize_script(script: &str, arch: Arch, label: &str) -> ScriptSummary {
+    let mut summary = ScriptSummary::new(label);
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.contains("insn:") {
+            continue;
+        }
+        summary.total_samples += 1;
+        let sample = match parse_perf_script_line(trimmed) {
+            Ok(sample) => sample,
+            Err(_) => {
+                summary.missing_field_samples += 1;
+                continue;
+            }
+        };
+        if sample.symbol.trim().is_empty()
+            || sample.symbol == "[unknown]"
+            || sample.symbol == "(unknown)"
+            || sample.symbol == "0"
+            || sample.symbol.starts_with("0x")
+        {
+            summary.missing_field_samples += 1;
+            continue;
+        }
+        let Some(category) = classify_opcode_bytes(arch, &sample.bytes) else {
+            summary.decode_failures += 1;
+            continue;
+        };
+        summary.classified_samples += 1;
+        *summary.category_counts.entry(category).or_insert(0) += 1;
+        *summary
+            .symbol_counts
+            .entry(sample.symbol)
+            .or_default()
+            .entry(category)
+            .or_insert(0) += 1;
+    }
+    summary
+}
+
+pub fn parse_perf_script_line(line: &str) -> Result<ScriptSample, String> {
+    let Some(insn_pos) = line.find("insn:") else {
+        return Err("missing insn field".to_string());
+    };
+    let prefix = line[..insn_pos].trim();
+    let bytes_part = line[insn_pos + "insn:".len()..].trim();
+    let fields = prefix.split_whitespace().collect::<Vec<_>>();
+    let ip_index = fields
+        .windows(2)
+        .position(|pair| is_hex_address(pair[0]) && !is_hex_address(pair[1]))
+        .ok_or_else(|| "missing ip/sym fields".to_string())?;
+    let ip = fields[ip_index].to_string();
+    let symbol = fields
+        .get(ip_index + 1)
+        .ok_or_else(|| "missing symbol field".to_string())?
+        .to_string();
+    let mut bytes = Vec::new();
+    for token in bytes_part.split_whitespace() {
+        if token.len() != 2 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            break;
+        }
+        bytes.push(u8::from_str_radix(token, 16).map_err(|_| "bad opcode byte".to_string())?);
+    }
+    if bytes.is_empty() {
+        return Err("missing opcode bytes".to_string());
+    }
+    Ok(ScriptSample { ip, symbol, bytes })
+}
+
+pub fn classify_opcode_bytes(arch: Arch, bytes: &[u8]) -> Option<&'static str> {
+    match arch {
+        Arch::X86 => classify_x86_bytes(bytes),
+        Arch::Aarch64 => classify_aarch64_bytes(bytes),
+    }
+}
+
+fn classify_x86_bytes(bytes: &[u8]) -> Option<&'static str> {
+    let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        return None;
+    }
+    Some(classify_x86_instruction(&instruction))
+}
+
+fn classify_x86_instruction(instruction: &Instruction) -> &'static str {
+    let mnemonic = format!("{:?}", instruction.mnemonic()).to_ascii_lowercase();
+    if mnemonic == "jmp" || matches!(mnemonic.as_str(), "call" | "ret") {
+        return "branch-uncond/call";
+    }
+    if mnemonic.starts_with('j')
+        || mnemonic == "loop"
+        || mnemonic == "loope"
+        || mnemonic == "loopne"
+    {
+        return "branch-cond";
+    }
+    if mnemonic == "lea" {
+        return "lea";
+    }
+    if matches!(
+        mnemonic.as_str(),
+        "pext" | "pdep" | "shrx" | "shlx" | "sarx" | "bzhi" | "mulx"
+    ) {
+        return "bmi2";
+    }
+    if mnemonic.contains("pclmul") || mnemonic == "crc32" {
+        return "crc/pclmul";
+    }
+    if is_vector_mnemonic(&mnemonic) {
+        if op_is_memory(instruction, 0) {
+            return "vector-store";
+        }
+        if has_memory_operand(instruction) {
+            return "vector-load";
+        }
+        return "vector-alu";
+    }
+    if is_scalar_move_mnemonic(&mnemonic) {
+        if op_is_memory(instruction, 0) {
+            return "scalar-store";
+        }
+        if has_memory_operand(instruction) {
+            return "scalar-load";
+        }
+        return "scalar-mov-reg";
+    }
+    if matches!(
+        mnemonic.as_str(),
+        "push" | "stosb" | "stosw" | "stosd" | "stosq"
+    ) {
+        return "scalar-store";
+    }
+    if matches!(
+        mnemonic.as_str(),
+        "pop" | "lodsb" | "lodsw" | "lodsd" | "lodsq"
+    ) {
+        return "scalar-load";
+    }
+    if is_shift_mnemonic(&mnemonic) {
+        return "shift";
+    }
+    if is_alu_mnemonic(&mnemonic) {
+        return "alu";
+    }
+    "nop/other"
+}
+
+fn op_is_memory(instruction: &Instruction, op: u32) -> bool {
+    if op >= instruction.op_count() {
+        return false;
+    }
+    format!("{:?}", instruction.op_kind(op)).contains("Memory")
+}
+
+fn has_memory_operand(instruction: &Instruction) -> bool {
+    (0..instruction.op_count()).any(|op| op_is_memory(instruction, op))
+}
+
+fn is_vector_mnemonic(mnemonic: &str) -> bool {
+    mnemonic.starts_with('v')
+        || mnemonic.contains("xmm")
+        || mnemonic.contains("ymm")
+        || mnemonic.contains("zmm")
+        || matches!(
+            mnemonic,
+            "movdqu"
+                | "movdqa"
+                | "movups"
+                | "movaps"
+                | "movntdq"
+                | "movntps"
+                | "paddb"
+                | "paddw"
+                | "paddd"
+                | "paddq"
+                | "psubb"
+                | "psubw"
+                | "psubd"
+                | "psubq"
+                | "pxor"
+                | "pand"
+                | "por"
+                | "pshufb"
+                | "pshufd"
+                | "punpcklbw"
+                | "punpckhbw"
+                | "palignr"
+        )
+}
+
+fn is_scalar_move_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "mov" | "movzx" | "movsx" | "movsxd" | "xchg" | "cmpxchg"
+    )
+}
+
+fn is_shift_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "shl"
+            | "shr"
+            | "sar"
+            | "sal"
+            | "rol"
+            | "ror"
+            | "shld"
+            | "shrd"
+            | "bsf"
+            | "bsr"
+            | "tzcnt"
+            | "lzcnt"
+            | "popcnt"
+    )
+}
+
+fn is_alu_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "add"
+            | "sub"
+            | "cmp"
+            | "test"
+            | "and"
+            | "or"
+            | "xor"
+            | "inc"
+            | "dec"
+            | "imul"
+            | "mul"
+            | "adc"
+            | "sbb"
+            | "neg"
+            | "not"
+    )
+}
+
+fn classify_aarch64_bytes(bytes: &[u8]) -> Option<&'static str> {
+    let word = first_aarch64_word(bytes)?;
+    if word == 0xd503201f {
+        return Some("nop/other");
+    }
+    if (word & 0x7c00_0000) == 0x1400_0000
+        || (word & 0xffff_fc1f) == 0xd61f_0000
+        || (word & 0xffff_fc1f) == 0xd63f_0000
+        || (word & 0xffff_fc1f) == 0xd65f_0000
+    {
+        return Some("branch-uncond/call");
+    }
+    if (word & 0xff00_0010) == 0x5400_0000
+        || (word & 0x7e00_0000) == 0x3400_0000
+        || (word & 0x7e00_0000) == 0x3600_0000
+    {
+        return Some("branch-cond");
+    }
+    if (word & 0x9f00_0000) == 0x1000_0000 || (word & 0x9f00_0000) == 0x9000_0000 {
+        return Some("lea");
+    }
+    if (word & 0x3b00_0000) == 0x2900_0000 || (word & 0x3b00_0000) == 0x3900_0000 {
+        let is_load = (word & (1 << 22)) != 0;
+        let is_vector = (word & (1 << 26)) != 0;
+        return Some(match (is_vector, is_load) {
+            (true, true) => "vector-load",
+            (true, false) => "vector-store",
+            (false, true) => "scalar-load",
+            (false, false) => "scalar-store",
+        });
+    }
+    if (word & 0x7f80_0000) == 0x5300_0000 || (word & 0x7f80_0000) == 0x1300_0000 {
+        return Some("shift");
+    }
+    if (word & 0x1f00_0000) == 0x0b00_0000
+        || (word & 0x1f00_0000) == 0x0a00_0000
+        || (word & 0x1f00_0000) == 0x1b00_0000
+    {
+        return Some("alu");
+    }
+    Some("nop/other")
+}
+
+fn first_aarch64_word(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn run_analysis_gates(
+    cfg: &AnalyzeConfig,
+    gz: &ScriptSummary,
+    cmp: &ScriptSummary,
+    gate_notes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    gate_sha_evidence(cfg, gate_notes)?;
+    gate_summary(cfg, gz, gate_notes, warnings)?;
+    gate_summary(cfg, cmp, gate_notes, warnings)?;
+    let gz_sum: u64 = gz.category_counts.values().sum();
+    let cmp_sum: u64 = cmp.category_counts.values().sum();
+    if gz_sum != gz.classified_samples || cmp_sum != cmp.classified_samples {
+        return Err(format!(
+            "category counts do not sum to classified samples ({}: {gz_sum} vs {}, {}: {cmp_sum} vs {})",
+            gz.label, gz.classified_samples, cmp.label, cmp.classified_samples
+        ));
+    }
+    gate_notes.push("category counts sum to 100% of classified samples".to_string());
+    Ok(())
+}
+
+fn gate_sha_evidence(cfg: &AnalyzeConfig, gate_notes: &mut Vec<String>) -> Result<(), String> {
+    let oracle_arg = cfg
+        .oracle_sha
+        .as_deref()
+        .ok_or_else(|| "REFUSED: --oracle-sha is required for Gate-0 byte identity".to_string())?;
+    let gz_arg = cfg
+        .gz_sha
+        .as_deref()
+        .ok_or_else(|| "REFUSED: --gz-sha is required for Gate-0 byte identity".to_string())?;
+    let cmp_arg = cfg
+        .cmp_sha
+        .as_deref()
+        .ok_or_else(|| "REFUSED: --cmp-sha is required for Gate-0 byte identity".to_string())?;
+    let oracle = read_sha_arg(oracle_arg)?;
+    let gz = read_sha_arg(gz_arg)?;
+    let cmp = read_sha_arg(cmp_arg)?;
+    if oracle != gz || oracle != cmp {
+        return Err(format!(
+            "REFUSED: decoded outputs are not byte-identical to oracle (oracle {oracle}, gz {gz}, cmp {cmp})"
+        ));
+    }
+    gate_notes.push(format!("oracle/gz/comparator sha256 match ({oracle})"));
+    Ok(())
+}
+
+fn gate_summary(
+    cfg: &AnalyzeConfig,
+    summary: &ScriptSummary,
+    gate_notes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if summary.total_samples < cfg.min_samples {
+        return Err(format!(
+            "REFUSED: {} has {} samples, below --min-samples {} (perf's rate cap may require a longer run or lower period)",
+            summary.label, summary.total_samples, cfg.min_samples
+        ));
+    }
+    if summary.classified_samples == 0 {
+        return Err(format!(
+            "REFUSED: {} has no classified samples",
+            summary.label
+        ));
+    }
+    if summary.missing_field_samples > 0 {
+        return Err(format!(
+            "REFUSED: {} has {} samples with empty symbol/insn fields; this voids stripped-binary attribution",
+            summary.label, summary.missing_field_samples
+        ));
+    }
+    let frac = summary.decode_failure_fraction();
+    if frac > cfg.max_decode_failure_fraction {
+        return Err(format!(
+            "REFUSED: {} decode/classify failures {:.3}% exceed --max-unknown-frac {:.3}%",
+            summary.label,
+            frac * 100.0,
+            cfg.max_decode_failure_fraction * 100.0
+        ));
+    }
+    if summary.total_samples < 10_000 {
+        warnings.push(format!(
+            "{} has {} samples; usable, but below the 10k target from the capture checklist",
+            summary.label, summary.total_samples
+        ));
+    }
+    gate_notes.push(format!(
+        "{}: {} samples, {} classified, {:.3}% decode/classify failures",
+        summary.label,
+        summary.total_samples,
+        summary.classified_samples,
+        frac * 100.0
+    ));
+    Ok(())
+}
+
+fn build_diff_rows(cfg: &AnalyzeConfig, gz: &ScriptSummary, cmp: &ScriptSummary) -> Vec<DiffRow> {
+    let gz_instr_per_byte = cfg.gz_total_instructions as f64 / cfg.output_bytes as f64;
+    let cmp_instr_per_byte = cfg.cmp_total_instructions as f64 / cfg.output_bytes as f64;
+    // Perf instruction samples are a distribution only: throttling changes their
+    // absolute count. Scale category shares by exact perf-stat totals per byte.
+    let mut rows = CATEGORY_ORDER
+        .iter()
+        .map(|category| {
+            let gz_samples = gz.category_count(category);
+            let cmp_samples = cmp.category_count(category);
+            let gz_share = gz_samples as f64 / gz.classified_samples as f64;
+            let cmp_share = cmp_samples as f64 / cmp.classified_samples as f64;
+            let gz_category_ipb = gz_share * gz_instr_per_byte;
+            let cmp_category_ipb = cmp_share * cmp_instr_per_byte;
+            DiffRow {
+                category: *category,
+                gz_samples,
+                cmp_samples,
+                gz_share,
+                cmp_share,
+                gz_instr_per_byte: gz_category_ipb,
+                cmp_instr_per_byte: cmp_category_ipb,
+                delta_instr_per_byte: gz_category_ipb - cmp_category_ipb,
+                surplus_rank: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut surplus = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.delta_instr_per_byte > 0.0)
+        .map(|(idx, row)| (idx, row.delta_instr_per_byte))
+        .collect::<Vec<_>>();
+    surplus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (idx, _)) in surplus.into_iter().take(3).enumerate() {
+        rows[idx].surplus_rank = Some(rank + 1);
+    }
+    rows.sort_by(|a, b| {
+        b.delta_instr_per_byte
+            .partial_cmp(&a.delta_instr_per_byte)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| category_index(a.category).cmp(&category_index(b.category)))
+    });
+    rows
+}
+
+fn category_index(category: &str) -> usize {
+    CATEGORY_ORDER
+        .iter()
+        .position(|c| *c == category)
+        .unwrap_or(CATEGORY_ORDER.len())
+}
+
+fn read_sha_arg(arg: &str) -> Result<String, String> {
+    let trimmed = arg.trim();
+    if is_sha256(trimmed) {
+        return Ok(trimmed.to_ascii_lowercase());
+    }
+    let text = fs::read_to_string(Path::new(arg)).map_err(|e| format!("{arg}: {e}"))?;
+    text.split_whitespace()
+        .find(|token| is_sha256(token))
+        .map(|token| token.to_ascii_lowercase())
+        .ok_or_else(|| format!("{arg}: no sha256 digest found"))
+}
+
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_hex_address(s: &str) -> bool {
+    let trimmed = s.trim_start_matches("0x");
+    trimmed.len() >= 4 && trimmed.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn split_with_bin(bin: &str, args: &[String]) -> Vec<String> {
@@ -582,16 +1500,16 @@ mod tests {
     fn classify_x86_copy_shapes() {
         assert_eq!(
             classify_instruction(Arch::X86, "vmovdqu ymm0, ymmword ptr [rsi]"),
-            "vector_copy"
+            "vector-load"
         );
         assert_eq!(
             classify_instruction(Arch::X86, "mov rax, qword ptr [rsi]"),
-            "scalar_load_store"
+            "scalar-load"
         );
-        assert_eq!(classify_instruction(Arch::X86, "je 0x1234"), "branch");
+        assert_eq!(classify_instruction(Arch::X86, "je 0x1234"), "branch-cond");
         assert_eq!(
             classify_instruction(Arch::X86, "pext rax, rbx, rcx"),
-            "shift_bit_extract"
+            "bmi2"
         );
     }
 
@@ -599,15 +1517,15 @@ mod tests {
     fn classify_aarch64_copy_shapes() {
         assert_eq!(
             classify_instruction(Arch::Aarch64, "ldr q0, [x1]"),
-            "vector_copy"
+            "vector-load"
         );
         assert_eq!(
             classify_instruction(Arch::Aarch64, "ldr x0, [x1]"),
-            "scalar_load_store"
+            "scalar-load"
         );
         assert_eq!(
             classify_instruction(Arch::Aarch64, "cbnz x0, .L1"),
-            "branch"
+            "branch-cond"
         );
     }
 
@@ -624,5 +1542,129 @@ mod tests {
         assert!(plan.contains("fulcrum insn --a-stat"));
         assert!(plan.contains("--dsos /usr/lib/libisal.so"));
         assert!(plan.contains("cmp -s \"$OUT/oracle.out\" \"$OUT/cmp.out\""));
+    }
+
+    #[test]
+    fn parse_analyze_args() {
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = parse_args(&[
+            "--analyze".into(),
+            "--gz-script".into(),
+            "gz.script".into(),
+            "--cmp-script".into(),
+            "cmp.script".into(),
+            "--gz-total-instructions".into(),
+            "1,000".into(),
+            "--cmp-total-instructions".into(),
+            "900".into(),
+            "--output-bytes".into(),
+            "100".into(),
+            "--oracle-sha".into(),
+            sha.into(),
+            "--gz-sha".into(),
+            sha.into(),
+            "--cmp-sha".into(),
+            sha.into(),
+            "--min-samples".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        let Parsed::Analyze(cfg) = parsed else {
+            panic!("expected analyze");
+        };
+        assert_eq!(cfg.gz_total_instructions, 1_000);
+        assert_eq!(cfg.output_bytes, 100);
+        assert_eq!(cfg.min_samples, 1);
+    }
+
+    #[test]
+    fn decode_x86_opcode_categories() {
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0xf3, 0x0f, 0x7f, 0x02]),
+            Some("vector-store")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0xc5, 0xfe, 0x6f, 0x74, 0x16, 0xc0]),
+            Some("vector-load")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0xc4, 0x42, 0x8b, 0xf7, 0xc0]),
+            Some("bmi2")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0xc4, 0xe3, 0x69, 0x44, 0xec, 0x00]),
+            Some("crc/pclmul")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0x48, 0x89, 0xd8]),
+            Some("scalar-mov-reg")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0x41, 0x83, 0xe4, 0x03]),
+            Some("alu")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0x74, 0x05]),
+            Some("branch-cond")
+        );
+        assert_eq!(
+            classify_opcode_bytes(Arch::X86, &[0xe9, 0x00, 0x00, 0x00, 0x00]),
+            Some("branch-uncond/call")
+        );
+    }
+
+    #[test]
+    fn parse_perf_script_raw_insn_line() {
+        let sample =
+            parse_perf_script_line("5f5978a43e58 gzippy::inflate::run_contig insn: f3 0f 7f 02")
+                .unwrap();
+        assert_eq!(sample.ip, "5f5978a43e58");
+        assert_eq!(sample.symbol, "gzippy::inflate::run_contig");
+        assert_eq!(sample.bytes, vec![0xf3, 0x0f, 0x7f, 0x02]);
+    }
+
+    #[test]
+    fn analyze_fixture_files_emit_category_diff() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gz_script = "\
+5f5978a43e58 gzippy::run_contig insn: f3 0f 7f 02
+5f5978a43df8 gzippy::run_contig insn: c4 42 8b f7 c0
+5f5978a43c45 gzippy::run_contig insn: 41 83 e4 03
+";
+        let cmp_script = "\
+756b243a9cb1 __memmove_avx_unaligned_erms insn: c5 fe 6f 74 16 c0
+756b243a9cb8 __memmove_avx_unaligned_erms insn: 48 89 d8
+756b243a9cc0 __memmove_avx_unaligned_erms insn: 74 05
+";
+        let dir = std::env::temp_dir();
+        let suffix = format!("{}-{}", std::process::id(), "insn-attr");
+        let gz_path = dir.join(format!("gz-{suffix}.script"));
+        let cmp_path = dir.join(format!("cmp-{suffix}.script"));
+        fs::write(&gz_path, gz_script).unwrap();
+        fs::write(&cmp_path, cmp_script).unwrap();
+        let cfg = AnalyzeConfig {
+            gz_script: gz_path.to_string_lossy().into_owned(),
+            cmp_script: cmp_path.to_string_lossy().into_owned(),
+            gz_total_instructions: 900,
+            cmp_total_instructions: 600,
+            output_bytes: 100,
+            min_samples: 1,
+            oracle_sha: Some(sha.into()),
+            gz_sha: Some(sha.into()),
+            cmp_sha: Some(sha.into()),
+            ..AnalyzeConfig::default()
+        };
+        let report = analyze_from_files(&cfg).unwrap();
+        let bmi2 = report
+            .rows
+            .iter()
+            .find(|row| row.category == "bmi2")
+            .unwrap();
+        assert_eq!(bmi2.gz_samples, 1);
+        assert_eq!(bmi2.cmp_samples, 0);
+        assert!(bmi2.delta_instr_per_byte > 0.0);
+        assert!(render_analysis(&report).contains("SURPLUS#"));
+        let _ = fs::remove_file(gz_path);
+        let _ = fs::remove_file(cmp_path);
     }
 }

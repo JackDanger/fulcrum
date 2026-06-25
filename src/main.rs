@@ -3475,6 +3475,16 @@ fn cmd_insn_attr(args: &[String]) -> ExitCode {
             print!("{}", insn_attr::render_plan(&cfg));
             ExitCode::SUCCESS
         }
+        Ok(insn_attr::Parsed::Analyze(cfg)) => match insn_attr::analyze_from_files(&cfg) {
+            Ok(report) => {
+                print!("{}", insn_attr::render_analysis(&report));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                println!("\n[INSTRUMENT REFUSED] {e}");
+                ExitCode::from(2)
+            }
+        },
         Err(e) => {
             eprintln!("insn-attr: {e}\n\n{}", insn_attr::HELP);
             ExitCode::from(2)
