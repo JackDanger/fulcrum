@@ -57,6 +57,7 @@ pub mod finding;
 pub mod fingerprint;
 pub mod flow;
 pub mod insn;
+pub mod insn_attr;
 pub mod invariants;
 pub mod labels;
 pub mod ledger;

@@ -25,9 +25,9 @@ use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
 use fulcrum::ledger::Ledger;
 use fulcrum::{
     abmeasure, audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath,
-    cycles, decide, decompose, excess, finding, flow, insn, invariants, locate, mech, mech_arch,
-    memlife, model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose, scaling,
-    schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants, locate, mech,
+    mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose,
+    scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,6 +70,8 @@ USAGE:\n\
   fulcrum abmeasure --base-bin <p> --corpus <f.gz> [--after-bin <p>] [--n N] [--core c] [--cross-arch]\n\
               LIVE interleaved A/B/comparator perf-stat -> optgate verdict; LOAD-IMMUNE (no\n\
               freeze/governor/SIGSTOP — replaces the hand-rolled frozen_*.sh scripts); --help for flags\n\
+  fulcrum insn-attr --gz-bin <p> --corpus <f.gz> [--cmp-cmd \"igzip -d -c\"]\n\
+              Linux perf plan for instruction-category attribution; --taxonomy prints opcode buckets\n\
   fulcrum excess <artifact.json>   EXCESS-VS-INTRINSIC differential: per-region verdict on whether a\n\
               region is gz-recoverable EXCESS (gz/rg high on a LOSS corpus but vanishing on a\n\
               CONTROL corpus) or INTRINSIC (both tools pay it); refuses excess without a control\n\
@@ -3458,6 +3460,28 @@ fn cmd_insn(args: &[String]) -> ExitCode {
     }
 }
 
+/// insn-attr: Linux perf capture plan for instruction-category attribution.
+fn cmd_insn_attr(args: &[String]) -> ExitCode {
+    match insn_attr::parse_args(args) {
+        Ok(insn_attr::Parsed::Help) => {
+            println!("{}", insn_attr::HELP);
+            ExitCode::SUCCESS
+        }
+        Ok(insn_attr::Parsed::Taxonomy(arch)) => {
+            print!("{}", insn_attr::render_taxonomy(arch));
+            ExitCode::SUCCESS
+        }
+        Ok(insn_attr::Parsed::Plan(cfg)) => {
+            print!("{}", insn_attr::render_plan(&cfg));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("insn-attr: {e}\n\n{}", insn_attr::HELP);
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// cycles: TMA top-down stall-breakdown (TMA-CLOSURE-OR-NO-BREAKDOWN).
 /// Mirrors `cli.cycles_main`.
 fn cmd_cycles(args: &[String]) -> ExitCode {
@@ -3906,6 +3930,7 @@ fn main() -> ExitCode {
         "total" => cmd_total(rest),
         "locate" => cmd_locate(rest),
         "insn" => cmd_insn(rest),
+        "insn-attr" => cmd_insn_attr(rest),
         "cycles" => cmd_cycles(rest),
         "optgate" => cmd_optgate(rest),
         "abmeasure" => cmd_abmeasure(rest),
