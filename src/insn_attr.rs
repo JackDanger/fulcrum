@@ -54,6 +54,8 @@ pub const CATEGORY_ORDER: &[&str] = &[
     "nop/other",
 ];
 
+const MAX_MISSING_INSN_FRACTION: f64 = 0.02;
+
 pub const X86_TAXONOMY: &[TaxonomyRow] = &[
     TaxonomyRow {
         category: "scalar-load",
@@ -369,6 +371,7 @@ pub struct AnalyzeConfig {
     pub cmp_label: String,
     pub min_samples: u64,
     pub max_decode_failure_fraction: f64,
+    pub require_symbols: bool,
     pub oracle_sha: Option<String>,
     pub gz_sha: Option<String>,
     pub cmp_sha: Option<String>,
@@ -387,6 +390,7 @@ impl Default for AnalyzeConfig {
             cmp_label: "comparator".to_string(),
             min_samples: 1_000,
             max_decode_failure_fraction: 0.01,
+            require_symbols: false,
             oracle_sha: None,
             gz_sha: None,
             cmp_sha: None,
@@ -407,7 +411,8 @@ pub struct ScriptSummary {
     pub total_samples: u64,
     pub classified_samples: u64,
     pub decode_failures: u64,
-    pub missing_field_samples: u64,
+    pub missing_insn_samples: u64,
+    pub missing_symbol_samples: u64,
     pub category_counts: BTreeMap<&'static str, u64>,
     pub symbol_counts: BTreeMap<String, BTreeMap<&'static str, u64>>,
 }
@@ -423,7 +428,8 @@ impl ScriptSummary {
             total_samples: 0,
             classified_samples: 0,
             decode_failures: 0,
-            missing_field_samples: 0,
+            missing_insn_samples: 0,
+            missing_symbol_samples: 0,
             category_counts,
             symbol_counts: BTreeMap::new(),
         }
@@ -433,11 +439,24 @@ impl ScriptSummary {
         self.category_counts.get(category).copied().unwrap_or(0)
     }
 
-    fn decode_failure_fraction(&self) -> f64 {
+    fn insn_samples(&self) -> u64 {
+        self.total_samples.saturating_sub(self.missing_insn_samples)
+    }
+
+    fn missing_insn_fraction(&self) -> f64 {
         if self.total_samples == 0 {
             1.0
         } else {
-            self.decode_failures as f64 / self.total_samples as f64
+            self.missing_insn_samples as f64 / self.total_samples as f64
+        }
+    }
+
+    fn decode_failure_fraction(&self) -> f64 {
+        let insn_samples = self.insn_samples();
+        if insn_samples == 0 {
+            1.0
+        } else {
+            self.decode_failures as f64 / insn_samples as f64
         }
     }
 }
@@ -510,6 +529,7 @@ FLAGS:
   --cmp-sha <sha|path>   comparator output sha256 or sha256sum output file
   --min-samples <N>      Gate-0 sample floor per arm (default: 1000)
   --max-unknown-frac <P> Gate-0 decode/classify failure tolerance (default: 0.01)
+  --require-symbols      refuse samples with empty/[unknown] symbols (default: off)
   --taxonomy             print the instruction-category taxonomy and exit
   --help, -h             this help
 
@@ -517,7 +537,8 @@ The generated plan records instructions:u for both binaries, emits perf stat/rep
 annotate files, closes the per-symbol instruction ledger with `fulcrum insn`, and lists the
 Gate-0 checks that must pass before trusting an instruction-category diff. The analyzer
 uses sampled instruction categories only as a relative distribution, then scales them by
-the exact perf-stat retired-instruction total divided by decoded output bytes.";
+the exact perf-stat retired-instruction total divided by decoded output bytes. Symbols are
+optional for the category diff; opcode bytes from the `insn:` field are required.";
 
 pub fn split_args(s: &str) -> Vec<String> {
     s.split_whitespace().map(|t| t.to_string()).collect()
@@ -671,6 +692,11 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     .map_err(|_| "--max-unknown-frac must be a fraction".to_string())?;
                 analyze_mode = true;
                 i += 2;
+            }
+            "--require-symbols" => {
+                analyze.require_symbols = true;
+                analyze_mode = true;
+                i += 1;
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -833,7 +859,12 @@ pub fn render_plan(cfg: &PlanConfig) -> String {
     ));
 
     out.push_str("# Gate 0e checklist before trusting the WHERE:\n");
-    out.push_str("# - symbol resolution: gz.report and cmp.report contain non-empty symbols, not only [unknown]\n");
+    out.push_str(
+        "# - opcode bytes: gz.script and cmp.script contain insn: bytes for nearly all samples\n",
+    );
+    out.push_str(
+        "# - symbol resolution: required only for per-symbol attribution or --require-symbols\n",
+    );
     out.push_str("# - sample sufficiency: each perf.data has enough instruction samples for the hot region (target >= 10k)\n");
     out.push_str(
         "# - closure: report periods close to perf stat instructions within the ledger tolerance\n",
@@ -894,13 +925,22 @@ pub fn render_analysis(report: &DiffReport) -> String {
         report.cmp.label
     ));
     out.push_str(&format!(
-        "samples: {} {} classified / {} total; {} {} classified / {} total\n\n",
+        "samples: {} {} classified / {} total; {} {} classified / {} total\n",
         report.gz.label,
         report.gz.classified_samples,
         report.gz.total_samples,
         report.cmp.label,
         report.cmp.classified_samples,
         report.cmp.total_samples
+    ));
+    out.push_str(&format!(
+        "dropped missing-insn samples: {} {} ({:.3}%); {} {} ({:.3}%)\n\n",
+        report.gz.label,
+        report.gz.missing_insn_samples,
+        report.gz.missing_insn_fraction() * 100.0,
+        report.cmp.label,
+        report.cmp.missing_insn_samples,
+        report.cmp.missing_insn_fraction() * 100.0
     ));
     out.push_str(&format!(
         "{:<18} {:>11} {:>11} {:>11} {:>9} {:>9} {}\n",
@@ -955,25 +995,21 @@ pub fn summarize_script(script: &str, arch: Arch, label: &str) -> ScriptSummary 
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        summary.total_samples += 1;
         if !trimmed.contains("insn:") {
+            summary.missing_insn_samples += 1;
             continue;
         }
-        summary.total_samples += 1;
         let sample = match parse_perf_script_line(trimmed) {
             Ok(sample) => sample,
             Err(_) => {
-                summary.missing_field_samples += 1;
+                summary.missing_insn_samples += 1;
                 continue;
             }
         };
-        if sample.symbol.trim().is_empty()
-            || sample.symbol == "[unknown]"
-            || sample.symbol == "(unknown)"
-            || sample.symbol == "0"
-            || sample.symbol.starts_with("0x")
-        {
-            summary.missing_field_samples += 1;
-            continue;
+        let missing_symbol = is_missing_symbol(&sample.symbol);
+        if missing_symbol {
+            summary.missing_symbol_samples += 1;
         }
         let Some(category) = classify_opcode_bytes(arch, &sample.bytes) else {
             summary.decode_failures += 1;
@@ -981,12 +1017,14 @@ pub fn summarize_script(script: &str, arch: Arch, label: &str) -> ScriptSummary 
         };
         summary.classified_samples += 1;
         *summary.category_counts.entry(category).or_insert(0) += 1;
-        *summary
-            .symbol_counts
-            .entry(sample.symbol)
-            .or_default()
-            .entry(category)
-            .or_insert(0) += 1;
+        if !missing_symbol {
+            *summary
+                .symbol_counts
+                .entry(sample.symbol)
+                .or_default()
+                .entry(category)
+                .or_insert(0) += 1;
+        }
     }
     summary
 }
@@ -997,16 +1035,6 @@ pub fn parse_perf_script_line(line: &str) -> Result<ScriptSample, String> {
     };
     let prefix = line[..insn_pos].trim();
     let bytes_part = line[insn_pos + "insn:".len()..].trim();
-    let fields = prefix.split_whitespace().collect::<Vec<_>>();
-    let ip_index = fields
-        .windows(2)
-        .position(|pair| is_hex_address(pair[0]) && !is_hex_address(pair[1]))
-        .ok_or_else(|| "missing ip/sym fields".to_string())?;
-    let ip = fields[ip_index].to_string();
-    let symbol = fields
-        .get(ip_index + 1)
-        .ok_or_else(|| "missing symbol field".to_string())?
-        .to_string();
     let mut bytes = Vec::new();
     for token in bytes_part.split_whitespace() {
         if token.len() != 2 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1017,7 +1045,31 @@ pub fn parse_perf_script_line(line: &str) -> Result<ScriptSample, String> {
     if bytes.is_empty() {
         return Err("missing opcode bytes".to_string());
     }
+    let fields = prefix.split_whitespace().collect::<Vec<_>>();
+    let ip_index = fields
+        .windows(2)
+        .position(|pair| is_hex_address(pair[0]) && !is_hex_address(pair[1]))
+        .or_else(|| fields.iter().rposition(|field| is_hex_address(field)));
+    let ip = ip_index
+        .and_then(|idx| fields.get(idx))
+        .copied()
+        .unwrap_or_default()
+        .to_string();
+    let symbol = fields
+        .get(ip_index.map(|idx| idx + 1).unwrap_or(fields.len()))
+        .copied()
+        .unwrap_or_default()
+        .to_string();
     Ok(ScriptSample { ip, symbol, bytes })
+}
+
+fn is_missing_symbol(symbol: &str) -> bool {
+    let symbol = symbol.trim();
+    symbol.is_empty()
+        || symbol == "[unknown]"
+        || symbol == "(unknown)"
+        || symbol == "0"
+        || symbol.starts_with("0x")
 }
 
 pub fn classify_opcode_bytes(arch: Arch, bytes: &[u8]) -> Option<&'static str> {
@@ -1292,10 +1344,11 @@ fn gate_summary(
     gate_notes: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
-    if summary.total_samples < cfg.min_samples {
+    let insn_samples = summary.insn_samples();
+    if insn_samples < cfg.min_samples {
         return Err(format!(
-            "REFUSED: {} has {} samples, below --min-samples {} (perf's rate cap may require a longer run or lower period)",
-            summary.label, summary.total_samples, cfg.min_samples
+            "REFUSED: {} has {} opcode-bearing samples, below --min-samples {} (perf's rate cap may require a longer run or lower period)",
+            summary.label, insn_samples, cfg.min_samples
         ));
     }
     if summary.classified_samples == 0 {
@@ -1304,10 +1357,20 @@ fn gate_summary(
             summary.label
         ));
     }
-    if summary.missing_field_samples > 0 {
+    let missing_insn_frac = summary.missing_insn_fraction();
+    if missing_insn_frac > MAX_MISSING_INSN_FRACTION {
         return Err(format!(
-            "REFUSED: {} has {} samples with empty symbol/insn fields; this voids stripped-binary attribution",
-            summary.label, summary.missing_field_samples
+            "REFUSED: {} dropped {} samples without opcode bytes ({:.3}%), exceeding Gate-0 tolerance {:.3}%",
+            summary.label,
+            summary.missing_insn_samples,
+            missing_insn_frac * 100.0,
+            MAX_MISSING_INSN_FRACTION * 100.0
+        ));
+    }
+    if cfg.require_symbols && summary.missing_symbol_samples > 0 {
+        return Err(format!(
+            "REFUSED: {} has {} opcode-bearing samples with empty/[unknown] symbols and --require-symbols is set",
+            summary.label, summary.missing_symbol_samples
         ));
     }
     let frac = summary.decode_failure_fraction();
@@ -1319,16 +1382,24 @@ fn gate_summary(
             cfg.max_decode_failure_fraction * 100.0
         ));
     }
-    if summary.total_samples < 10_000 {
+    if insn_samples < 10_000 {
         warnings.push(format!(
-            "{} has {} samples; usable, but below the 10k target from the capture checklist",
-            summary.label, summary.total_samples
+            "{} has {} opcode-bearing samples; usable, but below the 10k target from the capture checklist",
+            summary.label, insn_samples
+        ));
+    }
+    if !cfg.require_symbols && summary.missing_symbol_samples > 0 {
+        warnings.push(format!(
+            "{} has {} opcode-bearing samples without symbols; category attribution kept them, per-symbol attribution omits them",
+            summary.label, summary.missing_symbol_samples
         ));
     }
     gate_notes.push(format!(
-        "{}: {} samples, {} classified, {:.3}% decode/classify failures",
+        "{}: {} opcode-bearing samples ({} dropped missing insn, {:.3}%), {} classified, {:.3}% decode/classify failures",
         summary.label,
-        summary.total_samples,
+        insn_samples,
+        summary.missing_insn_samples,
+        missing_insn_frac * 100.0,
         summary.classified_samples,
         frac * 100.0
     ));
@@ -1575,6 +1646,37 @@ mod tests {
         assert_eq!(cfg.gz_total_instructions, 1_000);
         assert_eq!(cfg.output_bytes, 100);
         assert_eq!(cfg.min_samples, 1);
+        assert!(!cfg.require_symbols);
+    }
+
+    #[test]
+    fn parse_analyze_require_symbols_flag() {
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = parse_args(&[
+            "--analyze".into(),
+            "--gz-script".into(),
+            "gz.script".into(),
+            "--cmp-script".into(),
+            "cmp.script".into(),
+            "--gz-total-instructions".into(),
+            "1000".into(),
+            "--cmp-total-instructions".into(),
+            "900".into(),
+            "--output-bytes".into(),
+            "100".into(),
+            "--oracle-sha".into(),
+            sha.into(),
+            "--gz-sha".into(),
+            sha.into(),
+            "--cmp-sha".into(),
+            sha.into(),
+            "--require-symbols".into(),
+        ])
+        .unwrap();
+        let Parsed::Analyze(cfg) = parsed else {
+            panic!("expected analyze");
+        };
+        assert!(cfg.require_symbols);
     }
 
     #[test]
@@ -1624,6 +1726,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_perf_script_line_allows_missing_symbol() {
+        let sample = parse_perf_script_line("756b243a9cb8 insn: 48 89 d8").unwrap();
+        assert_eq!(sample.ip, "756b243a9cb8");
+        assert_eq!(sample.symbol, "");
+        assert_eq!(sample.bytes, vec![0x48, 0x89, 0xd8]);
+    }
+
+    #[test]
     fn analyze_fixture_files_emit_category_diff() {
         let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let gz_script = "\
@@ -1666,5 +1776,73 @@ mod tests {
         assert!(render_analysis(&report).contains("SURPLUS#"));
         let _ = fs::remove_file(gz_path);
         let _ = fs::remove_file(cmp_path);
+    }
+
+    #[test]
+    fn analyze_categorizes_empty_symbol_samples_with_insn_bytes() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gz_script = "\
+5f5978a43e58 gzippy::run_contig insn: f3 0f 7f 02
+5f5978a43c45 gzippy::run_contig insn: 41 83 e4 03
+";
+        let cmp_script = "\
+756b243a9cb1 [unknown] insn: c5 fe 6f 74 16 c0
+756b243a9cb8 insn: 48 89 d8
+";
+        let cfg = AnalyzeConfig {
+            gz_total_instructions: 200,
+            cmp_total_instructions: 200,
+            output_bytes: 100,
+            min_samples: 1,
+            oracle_sha: Some(sha.into()),
+            gz_sha: Some(sha.into()),
+            cmp_sha: Some(sha.into()),
+            ..AnalyzeConfig::default()
+        };
+        let report = analyze_scripts(gz_script, cmp_script, &cfg).unwrap();
+        let vector_load = report
+            .rows
+            .iter()
+            .find(|row| row.category == "vector-load")
+            .unwrap();
+        let scalar_mov = report
+            .rows
+            .iter()
+            .find(|row| row.category == "scalar-mov-reg")
+            .unwrap();
+        assert_eq!(report.cmp.classified_samples, 2);
+        assert_eq!(report.cmp.missing_symbol_samples, 2);
+        assert_eq!(report.cmp.missing_insn_samples, 0);
+        assert_eq!(vector_load.cmp_samples, 1);
+        assert_eq!(scalar_mov.cmp_samples, 1);
+        assert!(render_analysis(&report).contains("dropped missing-insn samples: gzippy 0"));
+    }
+
+    #[test]
+    fn analyze_refuses_when_missing_insn_fraction_exceeds_gate() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let valid = "756b243a9cb1 [unknown] insn: c5 fe 6f 74 16 c0\n".repeat(100);
+        let cmp_script = format!(
+            "{valid}\
+756b243a9cb2 [unknown]\n\
+756b243a9cb3 [unknown]\n\
+756b243a9cb4 [unknown]\n"
+        );
+        let cfg = AnalyzeConfig {
+            gz_total_instructions: 1000,
+            cmp_total_instructions: 1000,
+            output_bytes: 100,
+            min_samples: 1,
+            oracle_sha: Some(sha.into()),
+            gz_sha: Some(sha.into()),
+            cmp_sha: Some(sha.into()),
+            ..AnalyzeConfig::default()
+        };
+        let err = analyze_scripts(&valid, &cmp_script, &cfg).unwrap_err();
+        assert!(
+            err.contains("dropped 3 samples without opcode bytes"),
+            "{err}"
+        );
+        assert!(err.contains("exceeding Gate-0 tolerance 2.000%"), "{err}");
     }
 }
