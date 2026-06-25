@@ -40,6 +40,7 @@ pub mod audit;
 pub mod binloc;
 pub mod bundle;
 pub mod causal;
+pub mod chainlat;
 pub mod comparability;
 pub mod compare;
 pub mod compare_cli;

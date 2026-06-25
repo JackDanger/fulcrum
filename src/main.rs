@@ -24,10 +24,10 @@
 use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
 use fulcrum::ledger::Ledger;
 use fulcrum::{
-    abmeasure, audit, bundle, causal, compare, compare_cli, consumer, coz, coz_jsonl, critpath,
-    cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants, locate, mech,
-    mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report, rg_verbose,
-    scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    abmeasure, audit, bundle, causal, chainlat, compare, compare_cli, consumer, coz, coz_jsonl,
+    critpath, cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants,
+    locate, mech, mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report,
+    rg_verbose, scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,6 +76,9 @@ USAGE:\n\
               region is gz-recoverable EXCESS (gz/rg high on a LOSS corpus but vanishing on a\n\
               CONTROL corpus) or INTRINSIC (both tools pay it); refuses excess without a control\n\
               arm / on instr-only / on sub-spread gaps; emits the recoverable cyc/byte budget\n\
+  fulcrum chainlat --asm gz.s --cmp-asm igzip.s [--path literal-fast]\n\
+              CRITICAL-RECURRENCE / CHAIN-LATENCY loop analysis via llvm-mca; compares steady-state\n\
+              cycles/iter, critical sequence, and port pressure for one linear decode path slice\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -3708,6 +3711,31 @@ fn cmd_excess(args: &[String]) -> ExitCode {
     }
 }
 
+/// chainlat: static steady-state loop recurrence analysis via llvm-mca.
+fn cmd_chainlat(args: &[String]) -> ExitCode {
+    let cfg = match chainlat::parse_args(args) {
+        Ok(c) => c,
+        Err(e) if e == "HELP" => {
+            println!("{}", chainlat::HELP);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("chainlat: {e}\n\n{}", chainlat::HELP);
+            return ExitCode::from(2);
+        }
+    };
+    match chainlat::run(&cfg) {
+        Ok(report) => {
+            print!("{}", report.render());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
 fn cmd_ledger(args: &[String]) -> ExitCode {
     let verb = match args.first().map(String::as_str) {
@@ -3945,6 +3973,7 @@ fn main() -> ExitCode {
         "optgate" => cmd_optgate(rest),
         "abmeasure" => cmd_abmeasure(rest),
         "excess" => cmd_excess(rest),
+        "chainlat" => cmd_chainlat(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
         "score" => match score::args_from_cli(rest) {

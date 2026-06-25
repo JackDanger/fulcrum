@@ -99,6 +99,8 @@ fulcrum flow run.json                 # per-stage wall-critical vs slack
 fulcrum flow run.json --whatif transform:2   # predicted gain if 2× faster
 fulcrum vs a.json b.json              # compare two traces
 fulcrum validate run.json             # check ranking against known ground truth
+fulcrum chainlat --asm gz.s --cmp-asm igzip.s --path literal-fast
+                                      # llvm-mca loop recurrence / critical-chain diff
 ```
 
 On Linux, `fulcrum plan` prints the exact capture commands for your binary and `fulcrum rank` fuses a trace, Coz profile, and perf report into the full ranked list.
@@ -132,6 +134,8 @@ measurement tell you anything at all.
 ## Limitations
 
 - Coz and perf are Linux-only
+- `chainlat` models one linear loop path slice at a time; data-dependent Huffman
+  paths need separate runs and a corpus-weighted mix outside the tool
 - Short programs need looping — Coz needs many epochs; a 30ms run yields ~one
 - Best fit is an in-order streaming pipeline; without an in-order consumer, on-path attribution is less precise
 - Mechanism attribution is function-level, not per-span
