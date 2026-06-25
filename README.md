@@ -134,8 +134,9 @@ measurement tell you anything at all.
 ## Limitations
 
 - Coz and perf are Linux-only
-- `chainlat` models one linear loop path slice at a time; data-dependent Huffman
-  paths need separate runs and a corpus-weighted mix outside the tool
+- `chainlat` models one complete synthetic loop iteration at a time; non-contiguous
+  Huffman paths must concatenate every basic block in that iteration, and corpus
+  impact still needs a weighted path mix outside the tool
 - Short programs need looping — Coz needs many epochs; a 30ms run yields ~one
 - Best fit is an in-order streaming pipeline; without an in-order consumer, on-path attribution is less precise
 - Mechanism attribution is function-level, not per-span

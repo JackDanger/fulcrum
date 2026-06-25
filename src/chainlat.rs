@@ -1,8 +1,9 @@
 //! `fulcrum chainlat` — CRITICAL-RECURRENCE / CHAIN-LATENCY analysis.
 //!
-//! The input is one linear loop path slice per tool. `llvm-mca` models that
-//! slice as the steady-state body, so data-dependent decode paths must be
-//! analyzed separately and weighted by the corpus' path mix outside this tool.
+//! The input is one complete loop-iteration path per tool. `llvm-mca` models
+//! that synthetic body as steady-state, so non-contiguous decode paths must be
+//! assembled from all basic blocks in the iteration and weighted by the corpus'
+//! path mix outside this tool.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,8 +20,8 @@ fulcrum chainlat — CRITICAL-RECURRENCE / CHAIN-LATENCY loop analysis
 
 USAGE:
   fulcrum chainlat --asm gz.s --cmp-asm igzip.s --label gz --cmp-label igzip --path literal-fast [flags]
-  fulcrum chainlat --bin <p> --symbol <sym> --start 0xA --stop 0xB \\
-      --cmp-bin <p> --cmp-symbol <sym> --cmp-start 0xC --cmp-stop 0xD [flags]
+  fulcrum chainlat --bin <p> --symbol <sym> --start 0xA --stop 0xB [--start 0xE --stop 0xF ...] \\
+      --cmp-bin <p> --cmp-symbol <sym> --cmp-start 0xC --cmp-stop 0xD [--cmp-start 0xG --cmp-stop 0xH ...] [flags]
 
 FLAGS:
   --asm <path>              pre-extracted assembly/path slice for the primary loop
@@ -29,8 +30,8 @@ FLAGS:
   --cmp-bin <path>          comparator binary; requires --cmp-symbol --cmp-start --cmp-stop
   --symbol <name>           primary symbol name (provenance label for objdump extraction)
   --cmp-symbol <name>       comparator symbol name
-  --start/--stop <addr>     primary loop range, hex or decimal
-  --cmp-start/--cmp-stop    comparator loop range, hex or decimal
+  --start/--stop <addr>     primary loop range, hex or decimal; repeat to concatenate ranges
+  --cmp-start/--cmp-stop    comparator loop range, hex or decimal; repeat to concatenate ranges
   --label <s>               primary label (default: candidate)
   --cmp-label <s>           comparator label (default: comparator)
   --path <s>                path-slice label for both loops (default: path-slice)
@@ -44,14 +45,15 @@ FLAGS:
   --uica <path>             uiCA command override for --engine uica
   --mtriple <triple>        llvm target triple (default: x86_64-unknown-linux-gnu)
   --mcpu <cpu>              llvm CPU model; unknown models fall back loudly to generic
+  --dump-asm <path>         write the cleaned synthetic asm bodies for inspection
   --help, -h                this help
 
 Gate-0 refuses if llvm-mca is absent, a slice is empty, iterations are below the
 floor, a loop/back-edge is not detected and --assert-loop is absent, or the hot
-address falls outside the extracted range. Huffman decode branches are
-data-dependent: analyze one linear path at a time (literal fast path,
-short-backref path, exit path, etc.); the wall is the weighted mix of those path
-recurrences for the corpus.";
+address falls outside the extracted ranges. The caller must assemble each
+possibly non-contiguous slice into a complete iteration from its basic blocks.
+Cross-tool absolute cycles/iter is valid only when both slices are complete
+iterations; corpus wall impact still needs the weighted path mix.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
@@ -65,9 +67,14 @@ pub enum InputSpec {
     BinaryRange {
         bin: PathBuf,
         symbol: String,
-        start: u64,
-        stop: u64,
+        ranges: Vec<AddrRange>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddrRange {
+    pub start: u64,
+    pub stop: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +96,7 @@ pub struct ChainlatConfig {
     pub mtriple: String,
     pub mcpu: Option<String>,
     pub assert_loop: bool,
+    pub dump_asm: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,12 +184,12 @@ pub fn parse_args(args: &[String]) -> Result<ChainlatConfig, String> {
     };
     let mut p_bin: Option<PathBuf> = None;
     let mut p_symbol: Option<String> = None;
-    let mut p_start: Option<u64> = None;
-    let mut p_stop: Option<u64> = None;
+    let mut p_starts: Vec<u64> = Vec::new();
+    let mut p_stops: Vec<u64> = Vec::new();
     let mut c_bin: Option<PathBuf> = None;
     let mut c_symbol: Option<String> = None;
-    let mut c_start: Option<u64> = None;
-    let mut c_stop: Option<u64> = None;
+    let mut c_starts: Vec<u64> = Vec::new();
+    let mut c_stops: Vec<u64> = Vec::new();
     let mut cfg = ChainlatConfig {
         primary: primary.clone(),
         comparator: comparator.clone(),
@@ -192,6 +200,7 @@ pub fn parse_args(args: &[String]) -> Result<ChainlatConfig, String> {
         mtriple: DEFAULT_MTRIPLE.to_string(),
         mcpu: None,
         assert_loop: false,
+        dump_asm: None,
     };
 
     let mut i = 0;
@@ -227,19 +236,19 @@ pub fn parse_args(args: &[String]) -> Result<ChainlatConfig, String> {
                 i += 2;
             }
             "--start" => {
-                p_start = Some(parse_addr(need(i, "--start")?)?);
+                p_starts.push(parse_addr(need(i, "--start")?)?);
                 i += 2;
             }
             "--stop" => {
-                p_stop = Some(parse_addr(need(i, "--stop")?)?);
+                p_stops.push(parse_addr(need(i, "--stop")?)?);
                 i += 2;
             }
             "--cmp-start" => {
-                c_start = Some(parse_addr(need(i, "--cmp-start")?)?);
+                c_starts.push(parse_addr(need(i, "--cmp-start")?)?);
                 i += 2;
             }
             "--cmp-stop" => {
-                c_stop = Some(parse_addr(need(i, "--cmp-stop")?)?);
+                c_stops.push(parse_addr(need(i, "--cmp-stop")?)?);
                 i += 2;
             }
             "--label" => {
@@ -301,6 +310,10 @@ pub fn parse_args(args: &[String]) -> Result<ChainlatConfig, String> {
                 cfg.mcpu = Some(need(i, "--mcpu")?.clone());
                 i += 2;
             }
+            "--dump-asm" => {
+                cfg.dump_asm = Some(PathBuf::from(need(i, "--dump-asm")?));
+                i += 2;
+            }
             "--assert-loop" => {
                 cfg.assert_loop = true;
                 i += 1;
@@ -310,10 +323,10 @@ pub fn parse_args(args: &[String]) -> Result<ChainlatConfig, String> {
     }
 
     if primary.input.is_none() {
-        primary.input = binary_input("--bin", p_bin, p_symbol, p_start, p_stop)?;
+        primary.input = binary_input("--bin", p_bin, p_symbol, p_starts, p_stops)?;
     }
     if comparator.input.is_none() {
-        comparator.input = binary_input("--cmp-bin", c_bin, c_symbol, c_start, c_stop)?;
+        comparator.input = binary_input("--cmp-bin", c_bin, c_symbol, c_starts, c_stops)?;
     }
     require_input("primary", &primary)?;
     require_input("comparator", &comparator)?;
@@ -333,22 +346,37 @@ fn binary_input(
     flag: &str,
     bin: Option<PathBuf>,
     symbol: Option<String>,
-    start: Option<u64>,
-    stop: Option<u64>,
+    starts: Vec<u64>,
+    stops: Vec<u64>,
 ) -> Result<Option<InputSpec>, String> {
-    match (bin, symbol, start, stop) {
-        (None, None, None, None) => Ok(None),
-        (Some(bin), Some(symbol), Some(start), Some(stop)) if start < stop => {
+    let has_ranges = !starts.is_empty() || !stops.is_empty();
+    match (bin, symbol, has_ranges) {
+        (None, None, false) => Ok(None),
+        (Some(bin), Some(symbol), true) => {
+            if starts.len() != stops.len() {
+                return Err(format!(
+                    "{flag} extraction requires each --start to have a matching --stop"
+                ));
+            }
+            let mut ranges = Vec::with_capacity(starts.len());
+            for (start, stop) in starts.into_iter().zip(stops.into_iter()) {
+                if start >= stop {
+                    return Err(format!(
+                        "{flag} extraction requires start < stop for every range"
+                    ));
+                }
+                ranges.push(AddrRange { start, stop });
+            }
+            if ranges.is_empty() {
+                return Err(format!("{flag} extraction needs at least one range"));
+            }
             Ok(Some(InputSpec::BinaryRange {
                 bin,
                 symbol,
-                start,
-                stop,
+                ranges,
             }))
         }
-        (Some(_), _, _, _) => Err(format!(
-            "{flag} extraction requires symbol/start/stop and start < stop"
-        )),
+        (Some(_), _, _) => Err(format!("{flag} extraction requires symbol/start/stop")),
         _ => Err(format!("{flag} extraction is incomplete")),
     }
 }
@@ -378,6 +406,9 @@ fn parse_addr(s: &str) -> Result<u64, String> {
 pub fn run(cfg: &ChainlatConfig) -> Result<ChainlatReport, String> {
     let primary = prepare_loop(&cfg.primary, cfg.assert_loop)?;
     let comparator = prepare_loop(&cfg.comparator, cfg.assert_loop)?;
+    if let Some(path) = &cfg.dump_asm {
+        write_dump_asm(path, &primary, &comparator)?;
+    }
     let mut warnings = Vec::new();
     warnings.extend(primary.warnings.clone());
     warnings.extend(comparator.warnings.clone());
@@ -411,21 +442,21 @@ pub fn prepare_loop(spec: &LoopSpec, assert_loop: bool) -> Result<PreparedLoop, 
         InputSpec::BinaryRange {
             bin,
             symbol,
-            start,
-            stop,
+            ranges,
         } => {
             if let Some(hot) = spec.hot_addr {
-                if hot < *start || hot >= *stop {
+                if !ranges.iter().any(|r| hot >= r.start && hot < r.stop) {
                     return Err(format!(
-                        "REFUSED: hot address 0x{hot:x} is outside {}:{} 0x{start:x}..0x{stop:x}",
+                        "REFUSED: hot address 0x{hot:x} is outside {}:{} {}",
                         bin.display(),
-                        symbol
+                        symbol,
+                        format_ranges(ranges)
                     ));
                 }
             }
             (
-                extract_objdump(bin, symbol, *start, *stop)?,
-                Some((*start, *stop)),
+                extract_objdump_ranges(bin, symbol, ranges)?,
+                Some(ranges.clone()),
             )
         }
     };
@@ -451,10 +482,12 @@ pub fn prepare_loop(spec: &LoopSpec, assert_loop: bool) -> Result<PreparedLoop, 
             spec.label, spec.path
         ));
     }
-    if let Some((start, stop)) = range {
+    if let Some(ranges) = range {
         warnings.push(format!(
-            "{}: extracted {} instructions from 0x{start:x}..0x{stop:x}",
-            spec.label, instruction_count
+            "{}: extracted {} instructions from {}",
+            spec.label,
+            instruction_count,
+            format_ranges(&ranges)
         ));
     }
     Ok(PreparedLoop {
@@ -465,6 +498,21 @@ pub fn prepare_loop(spec: &LoopSpec, assert_loop: bool) -> Result<PreparedLoop, 
         has_backedge,
         warnings,
     })
+}
+
+fn extract_objdump_ranges(
+    bin: &Path,
+    symbol: &str,
+    ranges: &[AddrRange],
+) -> Result<String, String> {
+    let mut out = String::new();
+    for range in ranges {
+        out.push_str(&extract_objdump(bin, symbol, range.start, range.stop)?);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 fn extract_objdump(bin: &Path, symbol: &str, start: u64, stop: u64) -> Result<String, String> {
@@ -489,21 +537,49 @@ fn extract_objdump(bin: &Path, symbol: &str, start: u64, stop: u64) -> Result<St
 }
 
 pub fn normalize_asm(text: &str) -> String {
+    normalize_asm_ranges([text])
+}
+
+pub fn normalize_asm_ranges<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = Vec::new();
-    for line in text.lines() {
-        if let Some(clean) = clean_asm_line(line) {
-            out.push(clean);
+    let mut needs_local_target = false;
+    for text in texts {
+        for line in text.lines() {
+            if let Some((clean, normalized_branch)) = clean_asm_line(line) {
+                needs_local_target |= normalized_branch;
+                out.push(clean);
+            }
         }
+    }
+    if needs_local_target {
+        out.push(".Lc:".to_string());
     }
     out.join("\n") + "\n"
 }
 
-fn clean_asm_line(line: &str) -> Option<String> {
+fn write_dump_asm(
+    path: &Path,
+    primary: &PreparedLoop,
+    comparator: &PreparedLoop,
+) -> Result<(), String> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# primary: {} [{}]\n{}\n",
+        primary.label, primary.path, primary.asm
+    ));
+    out.push_str(&format!(
+        "# comparator: {} [{}]\n{}",
+        comparator.label, comparator.path, comparator.asm
+    ));
+    fs::write(path, out).map_err(|e| format!("failed to write --dump-asm {}: {e}", path.display()))
+}
+
+fn clean_asm_line(line: &str) -> Option<(String, bool)> {
     let mut s = line.trim();
     if s.is_empty()
         || s.starts_with('#')
         || s.starts_with("Disassembly of")
-        || s.starts_with("file format")
+        || s.contains("file format")
         || s.starts_with("...")
     {
         return None;
@@ -513,7 +589,7 @@ fn clean_asm_line(line: &str) -> Option<String> {
         if label.contains('<') || label.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
-        return Some(format!("{label}:"));
+        return Some((format!("{label}:"), false));
     }
     if let Some((addr, rest)) = s.split_once(':') {
         if addr.trim().chars().all(|c| c.is_ascii_hexdigit()) {
@@ -526,13 +602,66 @@ fn clean_asm_line(line: &str) -> Option<String> {
     } else {
         s = strip_leading_objdump_bytes(s);
     }
-    s = s.split('#').next().unwrap_or(s).trim();
-    s = s.split(';').next().unwrap_or(s).trim();
-    if s.is_empty() || is_asm_directive(s) {
+    let without_symbols = strip_angle_annotations(s);
+    let mut cleaned = without_symbols.as_str();
+    cleaned = cleaned.split('#').next().unwrap_or(cleaned).trim();
+    cleaned = cleaned.split(';').next().unwrap_or(cleaned).trim();
+    if cleaned.is_empty() || is_asm_directive(cleaned) {
         None
+    } else if let Some(branch) = normalize_objdump_branch(cleaned) {
+        Some((branch, true))
     } else {
-        Some(s.to_string())
+        Some((cleaned.to_string(), false))
     }
+}
+
+fn strip_angle_annotations(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_angle = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_angle = true,
+            '>' if in_angle => in_angle = false,
+            _ if !in_angle => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn normalize_objdump_branch(s: &str) -> Option<String> {
+    let (mnemonic, operand) = split_mnemonic_operand(s)?;
+    if !is_x86_jump_mnemonic(mnemonic) || !looks_like_direct_objdump_target(operand) {
+        return None;
+    }
+    Some(format!("{mnemonic} .Lc"))
+}
+
+fn is_x86_jump_mnemonic(mnemonic: &str) -> bool {
+    let m = mnemonic.to_ascii_lowercase();
+    m.starts_with('j') && m.chars().all(|c| c.is_ascii_lowercase())
+}
+
+fn looks_like_direct_objdump_target(operand: &str) -> bool {
+    let token = operand
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(',')
+        .trim_start_matches("0x");
+    token.len() >= 2 && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn format_ranges(ranges: &[AddrRange]) -> String {
+    ranges
+        .iter()
+        .map(|r| format!("0x{:x}..0x{:x}", r.start, r.stop))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn clean_asm_line_for_backedge(line: &str) -> Option<String> {
+    clean_asm_line(line).map(|(line, _)| line)
 }
 
 fn strip_leading_objdump_bytes(s: &str) -> &str {
@@ -585,7 +714,7 @@ pub fn has_backedge(text: &str) -> bool {
                 }
             }
         }
-        if let Some(insn) = clean_asm_line(trimmed) {
+        if let Some(insn) = clean_asm_line_for_backedge(trimmed) {
             let Some((mnemonic, operand)) = split_mnemonic_operand(&insn) else {
                 continue;
             };
@@ -1218,7 +1347,7 @@ impl ChainlatReport {
                 out.push_str(&format!("! {w}\n"));
             }
         }
-        out.push_str("\nLIMITATION: llvm-mca repeats the supplied linear path slice. For Huffman decode, run literal/backref/exit paths separately; the wall is the weighted mix of those path recurrences for the corpus.\n");
+        out.push_str("\nLIMITATION: llvm-mca repeats the supplied synthetic body. For non-contiguous Huffman decode paths, concatenate every basic block needed for one complete iteration; cross-tool absolute cycles/iter is only valid when both bodies are complete iterations, and corpus wall impact still needs the weighted path mix.\n");
         out
     }
 }
@@ -1379,6 +1508,128 @@ Resource pressure per iteration:
         assert!(normalized.contains("mov    (%rsi),%rax"));
         assert!(normalized.contains("jne    .Lloop"));
         assert_eq!(count_instructions(&normalized), 3);
+    }
+
+    #[test]
+    fn cleans_raw_objdump_annotations_to_mca_shape() {
+        let raw = "\
+/tmp/gz:     file format elf64-x86-64
+
+Disassembly of section .text:
+
+00000000000c4c05 <_ZN2gz10run_contig17h1234567890abcdefE>:
+   c4c05:\tmovzbl (%rsi),%eax
+   c4c09:\tadd    $0x1,%rsi # trailing comment
+   c4c0d:\tjae    c5061 <_ZN2gz10run_contig17h1234567890abcdefE+0x4c1>
+   c4c13:\t62 f2 7d 28 f7 c1\tshrx   %ecx,%r8d,%r8d
+   c4c1a:\t75 e9\tjne    c4c05 <_ZN2gz10run_contig17h1234567890abcdefE>
+";
+        let normalized = normalize_asm(raw);
+        assert_eq!(
+            normalized,
+            "\
+movzbl (%rsi),%eax
+add    $0x1,%rsi
+jae .Lc
+shrx   %ecx,%r8d,%r8d
+jne .Lc
+.Lc:
+"
+        );
+        assert_mca_shaped(&normalized);
+    }
+
+    #[test]
+    fn concatenates_multiple_ranges_into_one_synthetic_body() {
+        let first = "\
+   c4c05:\tmovzbl (%rsi),%eax
+   c4c0d:\tjae    c5061 <_ZN2gz10run_contig17h1234567890abcdefE+0x4c1>
+";
+        let second = "\
+   c5061:\tadd    $0x8,%rdi
+   c5065:\tmov    %rdi,(%rdx)
+";
+        let normalized = normalize_asm_ranges([first, second]);
+        assert_eq!(
+            normalized,
+            "\
+movzbl (%rsi),%eax
+jae .Lc
+add    $0x8,%rdi
+mov    %rdi,(%rdx)
+.Lc:
+"
+        );
+        assert_eq!(normalized.matches(".Lc:").count(), 1);
+        assert_eq!(count_instructions(&normalized), 4);
+    }
+
+    #[test]
+    fn parses_repeated_binary_ranges_in_order() {
+        let cfg = parse_args(&[
+            "--bin".into(),
+            "gz".into(),
+            "--symbol".into(),
+            "run_contig".into(),
+            "--start".into(),
+            "0xc4c05".into(),
+            "--stop".into(),
+            "0xc4cb7".into(),
+            "--start".into(),
+            "0xc5061".into(),
+            "--stop".into(),
+            "0xc5090".into(),
+            "--cmp-bin".into(),
+            "igzip".into(),
+            "--cmp-symbol".into(),
+            "decode".into(),
+            "--cmp-start".into(),
+            "0x100".into(),
+            "--cmp-stop".into(),
+            "0x140".into(),
+            "--assert-loop".into(),
+        ])
+        .unwrap();
+        match cfg.primary.input.unwrap() {
+            InputSpec::BinaryRange { ranges, .. } => assert_eq!(
+                ranges,
+                vec![
+                    AddrRange {
+                        start: 0xc4c05,
+                        stop: 0xc4cb7
+                    },
+                    AddrRange {
+                        start: 0xc5061,
+                        stop: 0xc5090
+                    }
+                ]
+            ),
+            InputSpec::AsmFile(_) => panic!("expected binary ranges"),
+        }
+    }
+
+    fn assert_mca_shaped(asm: &str) {
+        for line in asm.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.ends_with(':') {
+                continue;
+            }
+            assert!(!trimmed.contains("file format"));
+            assert!(!trimmed.contains('<'));
+            assert!(!trimmed.contains('>'));
+            assert!(!trimmed.contains('#'));
+            if let Some((addr, _)) = trimmed.split_once(':') {
+                assert!(
+                    !addr.trim().chars().all(|c| c.is_ascii_hexdigit()),
+                    "leftover objdump address column: {trimmed}"
+                );
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            assert!(
+                !(first.len() <= 2 && first.chars().all(|c| c.is_ascii_hexdigit())),
+                "leftover raw opcode bytes: {trimmed}"
+            );
+        }
     }
 
     #[test]
