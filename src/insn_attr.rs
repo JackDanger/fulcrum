@@ -492,6 +492,32 @@ pub enum Parsed {
     Taxonomy(Arch),
     Plan(PlanConfig),
     Analyze(AnalyzeConfig),
+    SymbolScope(SymbolScopeConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolScopeConfig {
+    pub script: String,
+    pub arch: Arch,
+    /// Restrict the ranking to this category (e.g. "branch-uncond/call"); when
+    /// empty, rank symbols by total classified samples across all categories.
+    pub category: String,
+    /// Only count symbols whose name contains this substring (case-sensitive);
+    /// empty = all symbols.
+    pub name_filter: String,
+    pub top: usize,
+}
+
+impl Default for SymbolScopeConfig {
+    fn default() -> SymbolScopeConfig {
+        SymbolScopeConfig {
+            script: String::new(),
+            arch: Arch::X86,
+            category: String::new(),
+            name_filter: String::new(),
+            top: 40,
+        }
+    }
 }
 
 pub const HELP: &str = "\
@@ -557,8 +583,10 @@ fn parse_count(s: &str, name: &str) -> Result<u64, String> {
 pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut cfg = PlanConfig::default();
     let mut analyze = AnalyzeConfig::default();
+    let mut scope = SymbolScopeConfig::default();
     let mut taxonomy_only = false;
     let mut analyze_mode = false;
+    let mut scope_mode = false;
     let mut i = 0;
     let need = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i + 1)
@@ -621,6 +649,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--arch" => {
                 cfg.arch = Arch::parse(need(i, "--arch")?)?;
                 analyze.arch = cfg.arch;
+                scope.arch = cfg.arch;
                 i += 2;
             }
             "--stdin" => {
@@ -698,11 +727,42 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 analyze_mode = true;
                 i += 1;
             }
+            "--symbol-scope" => {
+                scope.script = need(i, "--symbol-scope")?.clone();
+                scope_mode = true;
+                i += 2;
+            }
+            "--scope-category" => {
+                scope.category = need(i, "--scope-category")?.clone();
+                scope_mode = true;
+                i += 2;
+            }
+            "--scope-name" => {
+                scope.name_filter = need(i, "--scope-name")?.clone();
+                scope_mode = true;
+                i += 2;
+            }
+            "--scope-top" => {
+                scope.top = need(i, "--scope-top")?
+                    .parse()
+                    .map_err(|_| "--scope-top must be a positive integer".to_string())?;
+                scope_mode = true;
+                i += 2;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
     if taxonomy_only {
         return Ok(Parsed::Taxonomy(cfg.arch));
+    }
+    if scope_mode {
+        if scope.script.is_empty() {
+            return Err("--symbol-scope <script> is required for symbol-scope mode".to_string());
+        }
+        if scope.top == 0 {
+            return Err("--scope-top must be >= 1".to_string());
+        }
+        return Ok(Parsed::SymbolScope(scope));
     }
     if analyze_mode {
         if analyze.gz_script.is_empty() {
@@ -966,6 +1026,110 @@ pub fn render_analysis(report: &DiffReport) -> String {
         ));
     }
     out
+}
+
+/// Symbol-scoped attribution: rank symbols by how many samples they contribute
+/// to a focus category (or to all classified samples). Surfaces the already-
+/// computed `symbol_counts` so a surplus can be split inner-loop vs scaffold.
+pub fn render_symbol_scope(cfg: &SymbolScopeConfig) -> Result<String, String> {
+    let text = load_perf_script(&cfg.script)?;
+    let summary = summarize_script(&text, cfg.arch, "scope");
+    let focus = cfg.category.trim();
+    let focus_cat: Option<&'static str> = if focus.is_empty() {
+        None
+    } else {
+        Some(
+            CATEGORY_ORDER
+                .iter()
+                .copied()
+                .find(|c| *c == focus)
+                .ok_or_else(|| format!("unknown --scope-category '{focus}'"))?,
+        )
+    };
+
+    // perf renders the symbol field as "name+0xoffset" (sym concatenated with
+    // symoff). Group by the base function name so the ranking is per-function,
+    // not per-instruction-address.
+    let mut by_fn: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for (sym, cats) in &summary.symbol_counts {
+        let base = sym.split('+').next().unwrap_or(sym).to_string();
+        if !cfg.name_filter.is_empty() && !base.contains(&cfg.name_filter) {
+            continue;
+        }
+        let total: u64 = cats.values().sum();
+        let focus_count = match focus_cat {
+            Some(c) => cats.get(c).copied().unwrap_or(0),
+            None => total,
+        };
+        let entry = by_fn.entry(base).or_insert((0, 0));
+        entry.0 += focus_count;
+        entry.1 += total;
+    }
+
+    // Per-symbol count for the focus dimension + per-symbol total classified.
+    let mut rows: Vec<(String, u64, u64)> = Vec::new();
+    let mut grand_focus: u64 = 0;
+    for (sym, (focus_count, total)) in by_fn {
+        if focus_count == 0 {
+            continue;
+        }
+        grand_focus += focus_count;
+        rows.push((sym, focus_count, total));
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut out = String::new();
+    out.push_str("fulcrum insn-attr symbol-scope\n");
+    out.push_str("==============================\n");
+    out.push_str(&format!("script: {}\n", cfg.script));
+    out.push_str(&format!(
+        "focus category: {}\n",
+        focus_cat.unwrap_or("<all classified>")
+    ));
+    if !cfg.name_filter.is_empty() {
+        out.push_str(&format!("name filter (contains): {}\n", cfg.name_filter));
+    }
+    out.push_str(&format!(
+        "samples: {} classified / {} total; {} symbols carry focus category (grand focus = {} samples)\n\n",
+        summary.classified_samples, summary.total_samples,
+        rows.len(), grand_focus
+    ));
+    out.push_str(&format!(
+        "{:>10} {:>8} {:>10} {:>8}  {}\n",
+        "focus", "%focus", "sym-total", "%insym", "symbol"
+    ));
+    out.push_str(
+        "--------------------------------------------------------------------------------\n",
+    );
+    let mut shown_focus: u64 = 0;
+    for (sym, focus_count, total) in rows.iter().take(cfg.top) {
+        let pct_focus = if grand_focus > 0 {
+            *focus_count as f64 / grand_focus as f64 * 100.0
+        } else {
+            0.0
+        };
+        let pct_insym = if *total > 0 {
+            *focus_count as f64 / *total as f64 * 100.0
+        } else {
+            0.0
+        };
+        shown_focus += *focus_count;
+        out.push_str(&format!(
+            "{:>10} {:>7.2}% {:>10} {:>7.2}%  {}\n",
+            focus_count, pct_focus, total, pct_insym, sym
+        ));
+    }
+    let shown_pct = if grand_focus > 0 {
+        shown_focus as f64 / grand_focus as f64 * 100.0
+    } else {
+        0.0
+    };
+    out.push_str(&format!(
+        "\ntop {} symbols cover {:.2}% of the focus category\n",
+        cfg.top.min(rows.len()),
+        shown_pct
+    ));
+    Ok(out)
 }
 
 fn load_perf_script(path: &str) -> Result<String, String> {

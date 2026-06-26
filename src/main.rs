@@ -3488,6 +3488,16 @@ fn cmd_insn_attr(args: &[String]) -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Ok(insn_attr::Parsed::SymbolScope(cfg)) => match insn_attr::render_symbol_scope(&cfg) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                println!("\n[INSTRUMENT REFUSED] {e}");
+                ExitCode::from(2)
+            }
+        },
         Err(e) => {
             eprintln!("insn-attr: {e}\n\n{}", insn_attr::HELP);
             ExitCode::from(2)
