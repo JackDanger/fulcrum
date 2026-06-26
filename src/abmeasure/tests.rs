@@ -27,6 +27,50 @@ fn arm(label: &str, n: usize, cpb: f64, ipb: f64, rq: f64, j: f64) -> Arm {
     Arm::new(label, s)
 }
 
+// ── wall capture (T>1 verdict metric) ────────────────────────────────────────
+
+#[test]
+fn parse_wall_seconds_reads_perf_elapsed() {
+    let txt = "\n Performance counter stats for 'taskset':\n\n     1234567890      cycles\n     9876543210      instructions\n\n       2.345678901 seconds time elapsed\n\n       8.111 seconds user\n       0.222 seconds sys\n";
+    let w = super::parse_wall_seconds(txt);
+    assert!((w - 2.345678901).abs() < 1e-9, "got {w}");
+}
+
+#[test]
+fn parse_wall_seconds_absent_is_zero() {
+    assert_eq!(super::parse_wall_seconds("no elapsed line here"), 0.0);
+}
+
+#[test]
+fn parse_wall_seconds_strips_locale_commas() {
+    let txt = "       1,234.567 seconds time elapsed\n";
+    let w = super::parse_wall_seconds(txt);
+    assert!((w - 1234.567).abs() < 1e-3, "got {w}");
+}
+
+#[test]
+fn wall_summary_paired_ratio_and_vs_rg() {
+    // after consistently faster than base; both vs rg.
+    let base = vec![1.00, 1.02, 0.98, 1.00];
+    let after = vec![0.90, 0.92, 0.88, 0.90];
+    let rg = vec![0.95, 0.97, 0.93, 0.95];
+    let s = super::render_wall_summary("c.gz", &base, &after, &rg, "rg");
+    // after/base median ≈ 0.9 (after faster on all 4 reps).
+    assert!(s.contains("4+/0-/0="), "sign test wrong: {s}");
+    assert!(s.contains("after/base 0.9"), "paired ratio wrong: {s}");
+    // base/rg ≈ 1.0526, after/rg ≈ 0.947.
+    assert!(s.contains("after/rg 0.94") || s.contains("after/rg 0.95"), "after/rg wrong: {s}");
+}
+
+#[test]
+fn wall_summary_suppressed_on_missing_wall() {
+    // A zero (unparseable) wall in any arm/rep ⇒ no fabricated number.
+    let base = vec![1.0, 0.0];
+    let after = vec![0.9, 0.9];
+    let rg = vec![0.95, 0.95];
+    assert_eq!(super::render_wall_summary("c.gz", &base, &after, &rg, "rg"), "");
+}
+
 // ── parse_env ───────────────────────────────────────────────────────────────
 
 #[test]

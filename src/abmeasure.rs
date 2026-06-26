@@ -394,6 +394,84 @@ pub fn summary_line(corpus: &str, v: &optgate::OptGateVerdict, rg_label: &str) -
     )
 }
 
+/// Median of a slice (sorted copy; NaN-safe-ish via partial_cmp). Empty ⇒ NaN.
+fn median_of(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+/// Render the WALL summary line(s) from the per-rep interleaved walls.
+///
+/// `after/base` is the CONTENTION-INVARIANT PAIRED ratio: per-rep
+/// `after_w[i]/base_w[i]` (both measured back-to-back so the run-queue is
+/// shared), reported as a median + a sign-test count (after faster = a smaller
+/// wall). `after/<rg>` and `base/<rg>` are the gz-vs-comparator wall ratios
+/// (median over reps). Returns "" (suppressed, NO fake number) unless every arm
+/// produced a positive parseable wall on every rep. PURE — unit-tested.
+pub fn render_wall_summary(
+    corpus: &str,
+    base_w: &[f64],
+    after_w: &[f64],
+    rg_w: &[f64],
+    rg_label: &str,
+) -> String {
+    let n = base_w.len();
+    if n == 0 || after_w.len() != n || rg_w.len() != n {
+        return String::new();
+    }
+    // Every arm/rep must have a positive wall, else suppress (never fabricate).
+    let all_pos = base_w.iter().chain(after_w).chain(rg_w).all(|&w| w > 0.0);
+    if !all_pos {
+        return String::new();
+    }
+    let base_med = median_of(base_w);
+    let after_med = median_of(after_w);
+    let rg_med = median_of(rg_w);
+
+    // Paired after/base sign test (after faster ⇒ smaller wall ⇒ ratio < 1).
+    let mut ratios: Vec<f64> = Vec::with_capacity(n);
+    let (mut faster, mut slower, mut tie) = (0usize, 0usize, 0usize);
+    for i in 0..n {
+        ratios.push(after_w[i] / base_w[i]);
+        if after_w[i] < base_w[i] {
+            faster += 1;
+        } else if after_w[i] > base_w[i] {
+            slower += 1;
+        } else {
+            tie += 1;
+        }
+    }
+    let ratio_med = median_of(&ratios);
+    let after_over_rg = if rg_med > 0.0 { after_med / rg_med } else { f64::NAN };
+    let base_over_rg = if rg_med > 0.0 { base_med / rg_med } else { f64::NAN };
+    let delta_pct = (1.0 - ratio_med) * 100.0; // + = after faster
+
+    format!(
+        "ABMEASURE-WALL {corpus}: base {:.0}ms  after {:.0}ms  {rg_label} {:.0}ms  \
+         after/base {:.4} (paired {}+/{}-/{}=, Δ {:+.1}%)  \
+         base/{rg_label} {:.4}  after/{rg_label} {:.4}\n",
+        base_med * 1000.0,
+        after_med * 1000.0,
+        rg_med * 1000.0,
+        ratio_med,
+        faster,
+        slower,
+        tie,
+        delta_pct,
+        base_over_rg,
+        after_over_rg,
+    )
+}
+
 // ── perf / process shelling (the thin layer the unit tests bypass) ──────────
 
 /// Snapshot `/proc/stat`'s `procs_running` (the run-queue witness). Unavailable
@@ -479,9 +557,35 @@ fn run_gz_sha(
     Ok(hex32(&sha256(&out.stdout)))
 }
 
+/// Parse the wall-clock seconds from a `perf stat` capture's
+/// `"<N> seconds time elapsed"` line. Returns 0.0 if absent (the WALL summary
+/// is then suppressed — never a fake number). PURE — unit-tested.
+///
+/// WALL is the T>1 verdict metric: cyc/B is TOTAL CPU work (load-immune, sums
+/// every thread's cycles) and CANNOT see a utilization deficit — two arms with
+/// identical cyc/B can have different walls if one spreads across more cores.
+/// At T>1 (fewer/larger chunks → less marker work but a longer serial tail) the
+/// cyc/B win can OVERSTATE the wall win, so the paired wall ratio is required.
+pub fn parse_wall_seconds(text: &str) -> f64 {
+    for line in text.lines() {
+        if line.contains("seconds time elapsed") {
+            // e.g. "       1.234567890 seconds time elapsed"
+            if let Some(tok) = line.split_whitespace().next() {
+                // perf renders thousands with a locale separator sometimes; strip commas.
+                if let Ok(v) = tok.replace(',', "").parse::<f64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    0.0
+}
+
 /// One interleaved `perf stat` sample of an arm. stdout → /dev/null (sink
 /// symmetry across all arms), stderr captured + parsed via the canonical parser.
-fn measure_once(perf_argv: &[String], bytes: f64) -> Result<Sample, String> {
+/// Returns the `Sample` (cyc/instr/bytes) AND the wall-clock seconds parsed from
+/// the same capture (0.0 if unparseable).
+fn measure_once(perf_argv: &[String], bytes: f64) -> Result<(Sample, f64), String> {
     let procs = snapshot_procs_running();
     let out = Command::new("perf")
         .args(perf_argv)
@@ -490,14 +594,16 @@ fn measure_once(perf_argv: &[String], bytes: f64) -> Result<Sample, String> {
         .output()
         .map_err(|e| format!("cannot spawn perf: {e} (is `perf` installed and on PATH?)"))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Sample::from_stat_text(&stderr, bytes, procs).map_err(|e| {
+    let wall_s = parse_wall_seconds(&stderr);
+    let sample = Sample::from_stat_text(&stderr, bytes, procs).map_err(|e| {
         format!(
             "perf stat capture unusable ({e}); perf exit {:?}. \
              Likely perf missing/unprivileged (kernel.perf_event_paranoid) — \
              [INSTRUMENT REFUSED], no fake numbers emitted.\n--- perf stderr ---\n{stderr}",
             out.status.code()
         )
-    })
+    })?;
+    Ok((sample, wall_s))
 }
 
 /// Measure ONE corpus end-to-end: oracle → sha-gate → interleaved A/B/rg+A/A →
@@ -536,12 +642,34 @@ fn run_corpus(cfg: &AbConfig, corpus: &str) -> Result<(OptGateInput, PathBuf), S
     let mut after_s = Vec::with_capacity(cfg.n);
     let mut rg_s = Vec::with_capacity(cfg.n);
     let mut aa_s = Vec::with_capacity(cfg.n);
+    // WALL vectors, parallel to the sample vectors (per-rep, interleaved so
+    // common-mode contention cancels in the paired ratio below).
+    let mut base_w = Vec::with_capacity(cfg.n);
+    let mut after_w = Vec::with_capacity(cfg.n);
+    let mut rg_w = Vec::with_capacity(cfg.n);
     for _rep in 0..cfg.n {
-        base_s.push(measure_once(&base_argv, bytes)?);
-        after_s.push(measure_once(&after_argv, bytes)?);
-        rg_s.push(measure_once(&rg_argv, bytes)?);
-        aa_s.push(measure_once(&base_argv, bytes)?);
+        let (bs, bw) = measure_once(&base_argv, bytes)?;
+        base_s.push(bs);
+        base_w.push(bw);
+        let (as_, aw) = measure_once(&after_argv, bytes)?;
+        after_s.push(as_);
+        after_w.push(aw);
+        let (rs, rw) = measure_once(&rg_argv, bytes)?;
+        rg_s.push(rs);
+        rg_w.push(rw);
+        let (aas, _aaw) = measure_once(&base_argv, bytes)?;
+        aa_s.push(aas);
     }
+
+    // 3b. WALL SUMMARY (T>1 verdict metric — see `parse_wall_seconds`). Printed
+    // only when every arm produced a parseable wall (else suppressed, no fake
+    // number). The after/base ratio is the contention-invariant PAIRED ratio
+    // (per-rep, sign-tested); after/rg and base/rg are the gz-vs-comparator wall
+    // ratios (median over the interleaved reps).
+    print!(
+        "{}",
+        render_wall_summary(corpus, &base_w, &after_w, &rg_w, &cfg.rg_label)
+    );
 
     let base = Arm::new("base", base_s).with_sha(base_sha);
     let after = Arm::new("after", after_s).with_sha(after_sha);
