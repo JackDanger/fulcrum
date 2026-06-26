@@ -1,0 +1,26 @@
+{
+  "cell": "PLUMBING-DEMO-synthetic-NOT-a-verdict",
+  "arch": "x86_64",
+  "mcpu": "skylake-avx512",
+  "mtriple": "x86_64-unknown-linux-gnu",
+  "date": "2026-06-25",
+  "iterations": 100,
+  "llvm_mca": "/opt/homebrew/opt/llvm/bin/llvm-mca",
+  "scope": {
+    "gz_sha": "SYNTHETIC-no-real-binary",
+    "competitors": [
+      {"name": "igzip", "version": "2.31.1"}
+    ]
+  },
+  "recurrences": [
+    {"id": "R2", "name": "litlen/dist decode", "wall_owed": false,
+     "gz_asm": "gz.R2.s", "tools": {"igzip": "igzip.R2.s"}}
+  ],
+  "ports": {
+    "gz_asm": "gz.loop.s",
+    "tools": {"igzip": "igzip.loop.s"}
+  },
+  "completeness": {
+    "gz_script": "gz.script"
+  }
+}

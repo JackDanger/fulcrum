@@ -3712,6 +3712,123 @@ fn cmd_excess(args: &[String]) -> ExitCode {
 }
 
 /// chainlat: static steady-state loop recurrence analysis via llvm-mca.
+fn cmd_optimality(args: &[String]) -> ExitCode {
+    use fulcrum::insn_attr::Arch;
+    use fulcrum::optimality::{self, Manifest};
+
+    // arg parse
+    let mut manifest: Option<String> = None;
+    let mut self_cal_script: Option<String> = None;
+    let mut gen_fixture: Option<String> = None;
+    let mut arch_s = "x86_64".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{}", optimality::HELP);
+                return ExitCode::SUCCESS;
+            }
+            "--manifest" => {
+                manifest = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--self-cal" => {
+                i += 1;
+            }
+            "--script" => {
+                self_cal_script = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--gen-fixture" => {
+                gen_fixture = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--arch" => {
+                if let Some(a) = args.get(i + 1) {
+                    arch_s = a.clone();
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!("optimality: unexpected arg '{other}'\n\n{}", optimality::HELP);
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // gen-fixture mode
+    if let Some(out) = gen_fixture {
+        let fixture = optimality::gen_fixture();
+        if out == "-" {
+            print!("{fixture}");
+        } else if let Err(e) = std::fs::write(&out, &fixture) {
+            eprintln!("optimality: writing fixture {out}: {e}");
+            return ExitCode::from(2);
+        } else {
+            eprintln!("wrote self-cal fixture to {out}");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // self-cal-only mode
+    if let Some(script_path) = self_cal_script {
+        let arch = match Arch::parse(&arch_s) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("optimality: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let script = match std::fs::read_to_string(&script_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("optimality: {script_path}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let sc = optimality::run_self_cal(&script, arch, None);
+        print!("{}", optimality::render_self_cal(&sc));
+        return if sc.passed {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    // full manifest mode
+    let Some(manifest_path) = manifest else {
+        eprintln!("optimality: need --manifest, --self-cal --script, or --gen-fixture\n\n{}", optimality::HELP);
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("optimality: {manifest_path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let m: Manifest = match serde_json::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("optimality: {manifest_path}: invalid manifest JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match optimality::run(&m) {
+        Ok(report) => {
+            print!("{}", optimality::render(&report));
+            match report.dominant {
+                Some(true) => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn cmd_chainlat(args: &[String]) -> ExitCode {
     let cfg = match chainlat::parse_args(args) {
         Ok(c) => c,
@@ -3974,6 +4091,7 @@ fn main() -> ExitCode {
         "abmeasure" => cmd_abmeasure(rest),
         "excess" => cmd_excess(rest),
         "chainlat" => cmd_chainlat(rest),
+        "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
         "score" => match score::args_from_cli(rest) {

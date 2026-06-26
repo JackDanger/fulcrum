@@ -69,6 +69,7 @@ pub mod memlife;
 pub mod microbench;
 pub mod model;
 pub mod optgate;
+pub mod optimality;
 pub mod perturb;
 pub mod pipeline;
 pub mod probe;
