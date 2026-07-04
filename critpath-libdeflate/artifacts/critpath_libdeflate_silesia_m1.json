@@ -1,0 +1,139 @@
+{
+  "aa_floor_pct": 1.2509769217253845,
+  "arch": "arm64 Apple M1 Pro",
+  "cntfrq_hz": 24000000,
+  "corpus": "/tmp/silesia.gz",
+  "corpus_bytes": 67647553,
+  "gate0": {
+    "all_pass": true,
+    "conservation_overcount_pct": -95.89969357413852,
+    "overlapped_beta": -0.005918266624759399,
+    "serial_beta": 0.7944712886695678,
+    "serial_r2": 0.989092831313725
+  },
+  "marker_tax_per_fire_ticks": 0.00756185,
+  "oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "out_len": 211968000,
+  "regions": [
+    {
+      "active_pct": 2.5930229475239797,
+      "active_ticks": 179956.0,
+      "active_ticks_tax_adjusted": 1028.405160149996,
+      "beta_ci95": 0.29340943997150476,
+      "criticality_beta": 1.7339325387718154,
+      "dose_linearity_r2": 0.9853115756894023,
+      "fires": 23661881.0,
+      "region": "refill",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 0.01778220129112236,
+      "wall_ticks_added": 1234.0861921799951,
+      "wall_us_added": 51.4202580074998
+    },
+    {
+      "active_pct": 5.018654157171,
+      "active_ticks": 348295.0,
+      "active_ticks_tax_adjusted": 1715.231922350009,
+      "beta_ci95": 0.21276813909736925,
+      "criticality_beta": 1.573668578201982,
+      "dose_linearity_r2": 0.9905726242259784,
+      "fires": 45832669.0,
+      "region": "table_load",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 0.02965815467100341,
+      "wall_ticks_added": 2058.2783068200106,
+      "wall_us_added": 85.76159611750043
+    },
+    {
+      "active_pct": 5.030512933126301,
+      "active_ticks": 349118.0,
+      "active_ticks_tax_adjusted": 1657.7906031499733,
+      "beta_ci95": 0.09625222470371228,
+      "criticality_beta": 1.6490794436643732,
+      "dose_linearity_r2": 0.9982295377714365,
+      "fires": 45949101.0,
+      "region": "consume",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 0.028664934158288694,
+      "wall_ticks_added": 1989.348723779968,
+      "wall_us_added": 82.88953015749867
+    },
+    {
+      "active_pct": 3.1048235102899016,
+      "active_ticks": 215475.0,
+      "active_ticks_tax_adjusted": 1635.9316986500053,
+      "beta_ci95": 0.22364863677891358,
+      "criticality_beta": 1.64786357842917,
+      "dose_linearity_r2": 0.99050132746638,
+      "fires": 28278671.0,
+      "region": "store",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 0.028286970827411242,
+      "wall_ticks_added": 1963.1180383800063,
+      "wall_us_added": 81.79658493250027
+    },
+    {
+      "active_pct": 5.916794332225554,
+      "active_ticks": 410626.0,
+      "active_ticks_tax_adjusted": 277910.6172975,
+      "beta_ci95": 0.5599669657543422,
+      "criticality_beta": 2.109524409760971,
+      "dose_linearity_r2": 0.9646143422740822,
+      "fires": 17550650.0,
+      "region": "match_copy",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 4.80536536495347,
+      "wall_ticks_added": 333492.740757,
+      "wall_us_added": 13895.530864875
+    },
+    {
+      "active_pct": 1.9211649323747177,
+      "active_ticks": 133329.0,
+      "active_ticks_tax_adjusted": 613.6172974999936,
+      "beta_ci95": 0.47101279885908104,
+      "criticality_beta": 1.8400926140626672,
+      "dose_linearity_r2": 0.96701348494279,
+      "fires": 17550650.0,
+      "region": "dist_lookup",
+      "validity_flags": [
+        "interference"
+      ],
+      "wall_pct_added": 0.010610085132466595,
+      "wall_ticks_added": 736.3407569999923,
+      "wall_us_added": 30.680864874999678
+    },
+    {
+      "active_pct": 0.0,
+      "active_ticks": 0.0,
+      "active_ticks_tax_adjusted": 0.0,
+      "beta_ci95": null,
+      "criticality_beta": 0.0,
+      "dose_linearity_r2": 0.0,
+      "fires": 0.0,
+      "region": "crc",
+      "validity_flags": [
+        "no_fires"
+      ],
+      "wall_pct_added": 0.0,
+      "wall_ticks_added": 0.0,
+      "wall_us_added": 0.0
+    }
+  ],
+  "residual_pct": 95.89969357413852,
+  "subject": "libdeflate 1.25 (C, instrumented)",
+  "threads": 1,
+  "ticks_per_inject_iter": 0.023010975,
+  "tool": "fulcrum critpath (CNTVCT slope-attribution)",
+  "wall_ms_median": 289.16700000000003,
+  "wall_spread_pct": 0.9698908128059794,
+  "wall_ticks_median": 6940008.0
+}

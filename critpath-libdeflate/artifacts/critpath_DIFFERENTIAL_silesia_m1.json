@@ -1,0 +1,134 @@
+{
+  "tool": "fulcrum critpath differential kernel localizer (gz vs instrumented libdeflate 1.25)",
+  "arch": "arm64 Apple M1 Pro",
+  "threads": 1,
+  "corpus": "/tmp/silesia.gz",
+  "corpus_gz_sha256": "e7154dbcb01c9076f14b1fd16ebbef7bd73f80a6b5da9bf9fff530748217c4a2",
+  "decoded_oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "libdeflate_version": "1.25 (vendored; public symbols cpld_-prefixed)",
+  "cntfrq_hz": 24000000,
+  "gz_wall_ms_instrumented": 490.2,
+  "ld_wall_ms_instrumented": 289.2,
+  "semantic_alignment": {
+    "refill": "every REFILL_BITS_IN_FASTLOOP() (8-byte LE bitbuf fill)",
+    "table_load": "litlen MAIN decode-table indexed load (subtable loads NOT bracketed, matching gz)",
+    "consume": "litlen bit-consume (saved=bitbuf; bitbuf>>=; bitsleft-=) for main+subtable litlen entries; OFFSET consume NOT bracketed (matching gz)",
+    "store": "literal byte store (*out_next++ = lit)",
+    "match_copy": "the LZ77 back-copy block",
+    "dist_lookup": "offset MAIN decode-table indexed load (offset subtable NOT bracketed)"
+  },
+  "marker_tax_per_fire_ticks": {
+    "gz": 0.00764705,
+    "ld": 0.00756185
+  },
+  "aa_floor_pct": {
+    "gz": 1.403513941549422,
+    "ld": 1.2509769217253845
+  },
+  "gate0_serial_beta": {
+    "gz": 0.8414504963659667,
+    "ld": 0.7944712886695678
+  },
+  "byte_correct_both": true,
+  "primary_metric": "tax-adjusted active-time per region (us). Criticality-weighting is CLEAN on gz (beta<1) but CONTAMINATED on libdeflate (beta>1.15, 'interference' on every region: injecting an independent ALU chain into libdeflate's fully software-pipelined C loop perturbs scheduling super-linearly), so active-time is the trusted differential.",
+  "fire_count_alignment_check": "PASS \u2014 gz and ld fire each region the same count (<0.001% diff), an independent proof the regions are the same operations (counts are stream properties).",
+  "differential": [
+    {
+      "region": "refill",
+      "gz_active_us": 0.0,
+      "ld_active_us": 42.9,
+      "gz_minus_ld_us": -42.9,
+      "gz_over_ld_ratio": 0.0,
+      "gz_fires": 23702447.0,
+      "ld_fires": 23661881.0,
+      "gz_criticality_beta": 0.9418127435480291,
+      "ld_criticality_beta": 1.7339325387718154,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    },
+    {
+      "region": "table_load",
+      "gz_active_us": 3110.1,
+      "ld_active_us": 71.5,
+      "gz_minus_ld_us": 3038.7,
+      "gz_over_ld_ratio": 43.52,
+      "gz_fires": 45832665.0,
+      "ld_fires": 45832669.0,
+      "gz_criticality_beta": 0.8827602221456574,
+      "ld_criticality_beta": 1.573668578201982,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    },
+    {
+      "region": "consume",
+      "gz_active_us": 0.0,
+      "ld_active_us": 69.1,
+      "gz_minus_ld_us": -69.1,
+      "gz_over_ld_ratio": 0.0,
+      "gz_fires": 45949097.0,
+      "ld_fires": 45949101.0,
+      "gz_criticality_beta": 0.7651151258591216,
+      "ld_criticality_beta": 1.6490794436643732,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    },
+    {
+      "region": "store",
+      "gz_active_us": 3019.4,
+      "ld_active_us": 68.2,
+      "gz_minus_ld_us": 2951.2,
+      "gz_over_ld_ratio": 44.3,
+      "gz_fires": 28278671.0,
+      "ld_fires": 28278671.0,
+      "gz_criticality_beta": 0.8649803770290282,
+      "ld_criticality_beta": 1.64786357842917,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    },
+    {
+      "region": "match_copy",
+      "gz_active_us": 28078.3,
+      "ld_active_us": 11579.6,
+      "gz_minus_ld_us": 16498.7,
+      "gz_over_ld_ratio": 2.42,
+      "gz_fires": 17550646.0,
+      "ld_fires": 17550650.0,
+      "gz_criticality_beta": 0.5290972544542372,
+      "ld_criticality_beta": 2.109524409760971,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    },
+    {
+      "region": "dist_lookup",
+      "gz_active_us": 980.3,
+      "ld_active_us": 25.6,
+      "gz_minus_ld_us": 954.7,
+      "gz_over_ld_ratio": 38.34,
+      "gz_fires": 17550646.0,
+      "ld_fires": 17550650.0,
+      "gz_criticality_beta": 0.9288890531608631,
+      "ld_criticality_beta": 1.8400926140626672,
+      "ld_criticality_flags": [
+        "interference"
+      ]
+    }
+  ],
+  "differential_lever": {
+    "region": "match_copy",
+    "gz_active_us": 28078.3,
+    "ld_active_us": 11579.6,
+    "gz_excess_us": 16498.7,
+    "gz_over_ld_ratio": 2.42
+  },
+  "caveats": [
+    "M1-only; x86/M4 replication owed (Gate-3).",
+    "Walls are marker-instrumented (~57ms tax on each, equal & near-cancelling in the differential) AND gz runs its full parallel-SM T1 pipeline (scaffolding) vs libdeflate bare single-shot, so the ABSOLUTE wall gap (490 vs 289ms) overstates the real gz/libdeflate gap; the per-region KERNEL active-time differential is the valid comparison.",
+    "Only ~5% of each wall is inside the six bracketed ops (residual ~92-96% is loop control, table build, offset consume/subtable, crc, framing); match_copy is the largest LOCATED differential, not the whole gap.",
+    "libdeflate criticality slopes are interference-flagged; criticality-WEIGHTED wall_added is reported per-subject but the cross-decoder differential rests on active-time."
+  ]
+}

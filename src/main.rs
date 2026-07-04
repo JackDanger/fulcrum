@@ -27,8 +27,14 @@ use fulcrum::{
     abmeasure, audit, bundle, causal, chainlat, compare, compare_cli, consumer, coz, coz_jsonl,
     critpath, cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants,
     locate, mech, mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report,
-    rg_verbose, scaling, schedule, score, spans, sweep, trace, validate, vs, vs_sweep, xtool,
+    rg_verbose, scaling, scaling_matrix, schedule, score, spans, sweep, trace, validate, vs,
+    vs_sweep, xtool,
 };
+// counterdiff's perf-based command is the fallback whenever the macOS kpc
+// backend (fulcrum::macmeasure) is NOT compiled in — i.e. off macOS, or on
+// macOS without the `in-process-gzippy` feature.
+#[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+use fulcrum::counterdiff;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -89,6 +95,8 @@ USAGE:\n\
   fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
   fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...] [--config gzippy]\n\
               SCALING-DEFICIT DECOMPOSITION: why the parallel decode scales worse as T grows\n\
+  fulcrum scaling --box <host> --gz <p> --rg <p> --corpus <f.gz> --oracle-sha <sha> [--threads L] [--n N]\n\
+              COMPETITIVE THREAD-SCALING MATRIX: does gz beat rg at ALL T? (Gate-0 baked, WIN/TIE/LOSS)\n\
   fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
   fulcrum alloc <trace.json>   per-(tid,region) fault localization (needs --features rpmalloc-stats)\n\
   fulcrum memlife <run.json>   cross-tool per-buffer memory-lifecycle attribution\n\
@@ -802,6 +810,49 @@ fn cmd_spans(args: &[String]) -> ExitCode {
     }
 }
 
+fn cmd_occupancy(args: &[String]) -> ExitCode {
+    let pos = positional(args);
+    if pos.is_empty() {
+        eprintln!(
+            "usage: fulcrum occupancy <trace.json> [--json out.json]\n\n\
+             Per-WORKER pool-thread occupancy: DECODE vs IDLE-no-work vs\n\
+             BLOCKED-on-dependency, with mean-busy-workers (the X/N concurrency\n\
+             headline) and per-worker conservation (decode+idle==window)."
+        );
+        return ExitCode::FAILURE;
+    }
+    let json_out = flag(args, "--json");
+    let mut any_unreconciled = false;
+    let mut last_json = serde_json::Value::Null;
+    for path in &pos {
+        let events = match fulcrum::trace::load_events(Path::new(path)) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("fulcrum: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = fulcrum::occupancy::analyze(&events);
+        if !report.all_reconciled {
+            any_unreconciled = true;
+        }
+        fulcrum::occupancy::print_report(path, &report);
+        last_json = fulcrum::occupancy::to_json(path, &report);
+    }
+    if let Some(out) = json_out {
+        if let Err(e) = std::fs::write(out, serde_json::to_string_pretty(&last_json).unwrap()) {
+            eprintln!("fulcrum: write {out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {out}");
+    }
+    if any_unreconciled {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn cmd_consumer(args: &[String]) -> ExitCode {
     let pos = positional(args);
     if pos.is_empty() {
@@ -1019,6 +1070,17 @@ fn cmd_schedule(args: &[String]) -> ExitCode {
 /// interpretation. Optional `--rg-wall T:ms` supplies the reference tool's wall
 /// per thread count as the near-ideal-scaling witness.
 fn cmd_scaling(args: &[String]) -> ExitCode {
+    // DISPATCH: `--box` selects the COMPETITIVE THREAD-SCALING MATRIX (race the
+    // two real binaries head-to-head, Gate-0 baked); `--at` (below) selects the
+    // trace-based scaling-deficit DECOMPOSITION. They share the `scaling` verb
+    // by design — one asks "do we win the wall at every T", the other "why do we
+    // scale worse". `--help`/`-h` with `--box` also routes here.
+    if args.iter().any(|a| a == "--box")
+        || (args.iter().any(|a| a == "--gz") && args.iter().any(|a| a == "--rg"))
+    {
+        return scaling_matrix::cmd(args);
+    }
+
     // Collect repeatable --at T:trace.json and --rg-wall T:ms.
     let mut at_specs: Vec<String> = Vec::new();
     let mut rg_specs: Vec<String> = Vec::new();
@@ -1509,11 +1571,30 @@ fn print_model_delta(a: &model::ModelParams, b: &model::ModelParams) {
 /// Side-by-side per-span comparison: which code A burns more time in / gates the
 /// wall more than the same-named span in B.
 fn cmd_vs(args: &[String]) -> ExitCode {
+    // Binary head-to-head mode: `fulcrum vs --gz BIN --ref BIN --corpus f.gz`.
+    // sha-pinned, self-validating steady-wall A/B (macmeasure). Distinguished
+    // from the trace-span comparator by the presence of --gz + --corpus.
+    if flag(args, "--gz").is_some() || flag(args, "--ref").is_some() {
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        {
+            return fulcrum::macmeasure::cmd_vs_wall(args);
+        }
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        {
+            eprintln!(
+                "fulcrum vs --gz/--ref (steady-wall A/B) is the macOS kpc backend and needs the \
+                 in-process gzippy decode subject: rebuild with `--features in-process-gzippy`. \
+                 On Linux use `fulcrum counterdiff` (perf instr/B) + `fulcrum classhist` (per-class)."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let pos = positional(args);
     let (Some(a), Some(b)) = (pos.first(), pos.get(1)) else {
         eprintln!(
             "usage: fulcrum vs <A-trace.json> <B-trace.json> [--labels gzippy,rapidgzip]\n  \
-                   fulcrum vs <A> <B> --by-role [--threads N]  (pipeline-role busy + wall-critical)"
+                   fulcrum vs <A> <B> --by-role [--threads N]  (pipeline-role busy + wall-critical)\n  \
+                   fulcrum vs --gz BIN --ref BIN --corpus f.gz [--threads N] [--json out.json]  (steady-wall A/B)"
         );
         return ExitCode::FAILURE;
     };
@@ -3626,6 +3707,38 @@ fn cmd_optgate(args: &[String]) -> ExitCode {
     }
 }
 
+/// counterdiff: the LIVE paired hardware-COUNTER differ + microarch attribution.
+/// Interleaves subject vs comparator(s) under `perf stat` with an arch-aware
+/// counter set, sha-gates + A/A-noise-gates every arm, and renders the per-counter
+/// table + ranked stall-cycle attribution + one-line VERDICT. See
+/// [`counterdiff`] for the self-validation gates baked in.
+///
+/// On macOS the `counterdiff` subcommand routes to the Apple-Silicon kpc backend
+/// (`fulcrum::macmeasure::cmd_counterdiff`) instead — this perf-based path is the
+/// Linux implementation.
+#[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+fn cmd_counterdiff(args: &[String]) -> ExitCode {
+    let cfg = match counterdiff::parse_args(args) {
+        Ok(c) => c,
+        Err(e) if e == "HELP" => {
+            println!("{}", counterdiff::HELP);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("counterdiff: {e}\n\n{}", counterdiff::HELP);
+            return ExitCode::from(2);
+        }
+    };
+    match counterdiff::run(cfg) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// abmeasure: the LIVE interleaved A/B/comparator measurement half. Shells out
 /// to `perf stat` under background contention (LOAD-IMMUNE: never freezes the
 /// box, changes the governor, or SIGSTOPs/kills any process), assembles the
@@ -4058,11 +4171,21 @@ fn main() -> ExitCode {
     };
     let rest = &args[1..];
     match sub.as_str() {
+        // On Apple Silicon (with in-process-gzippy), `critpath` is the kpc/CNTVCT
+        // slope-attribution tool (per-region wall-causal localization). Elsewhere
+        // it is the Chrome-trace consumer-anchored analyzer; that stays reachable
+        // as `critpath-trace`.
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "critpath" => fulcrum::macmeasure::cmd_critpath(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "critpath-trace" => cmd_critpath(rest),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
         "critpath" => cmd_critpath(rest),
         "flow" => cmd_flow(rest),
         "causal" => cmd_causal(rest),
         "stats" => cmd_stats(rest),
         "consumer" => cmd_consumer(rest),
+        "occupancy" => cmd_occupancy(rest),
         "spans" => cmd_spans(rest),
         "schedule" => cmd_schedule(rest),
         "scaling" => cmd_scaling(rest),
@@ -4099,6 +4222,32 @@ fn main() -> ExitCode {
         "cycles" => cmd_cycles(rest),
         "optgate" => cmd_optgate(rest),
         "abmeasure" => cmd_abmeasure(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "counterdiff" => fulcrum::macmeasure::cmd_counterdiff(rest),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        "counterdiff" => cmd_counterdiff(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "topdown" => fulcrum::macmeasure::cmd_topdown(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "wall" => fulcrum::macmeasure::cmd_wall(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "assay" => fulcrum::macmeasure::cmd_assay(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "scalewall" => fulcrum::macmeasure::cmd_scalewall(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "oracle" => fulcrum::macmeasure::cmd_oracle(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "phaseprof" => fulcrum::macmeasure::cmd_phaseprof(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "insndiff" => fulcrum::macmeasure::cmd_insndiff(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "classhist" => fulcrum::macmeasure::cmd_classhist(rest),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        "classhist" => fulcrum::classhist::cmd_classhist(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "insnattr" => fulcrum::macmeasure::cmd_insnattr(rest),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        "kpcphase" => fulcrum::macmeasure::cmd_kpcphase(rest),
         "excess" => cmd_excess(rest),
         "chainlat" => cmd_chainlat(rest),
         "optimality" => cmd_optimality(rest),

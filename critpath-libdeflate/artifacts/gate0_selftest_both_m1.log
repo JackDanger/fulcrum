@@ -1,0 +1,31 @@
+########## GZ ##########
+corpus=/tmp/silesia.gz bytes=67647553 cntfrq=24000000 Hz active_trials=7 dose_trials=5 dose_steps=3
+pinned_to_pcluster=true (Apple Silicon DVFS is per-cluster)
+-- Gate-0 self-validation (BLOCKING) --
+  [Gate-0] PASS :: markers-ON decode sha == gzip -dc oracle [028bd002c89c…]
+  [Gate-0] PASS :: perturbed decode sha == oracle (independent injection cannot change output)
+  [Gate-0] PASS :: perturbation NON-INERT: injected_ticks=155210407 (>0 ⇒ the dose actually fired)
+  [Gate-0] PASS :: A/A wall ratio=0.9991 spread=0.96% (same-vs-same ≈ 1)
+  [Gate-0] PASS :: known-SERIAL criticality β=0.840 ±0.141 (expect ≈ 1)  R²=0.986
+  [Gate-0] PASS :: known-OVERLAPPED criticality β=0.297 < serial (hidden ⇒ low)  R²=0.688
+  [Gate-0] PASS :: serial-calib dose LINEARITY R²=0.986 (≥0.90)
+  marker tax/fire = 0.0075 ticks (subtracted per region)
+  [Gate-0] PASS :: CONSERVATION: Σ active(adj)=903847 ≤ wall=11374460 (over-count -92.05% ≤ 5%)
+-- Gate-0: ALL PASS (findings valid) --
+--selftest-only: Gate-0 passed; localization not run.
+
+########## LIBDEFLATE ##########
+corpus=/tmp/silesia.gz bytes=67647553 cntfrq=24000000 Hz active_trials=7 dose_trials=5 dose_steps=3
+pinned_to_pcluster=true (Apple Silicon DVFS is per-cluster)
+-- Gate-0 self-validation (BLOCKING) --
+  [Gate-0] PASS :: markers-ON decode sha == gzip -dc oracle [028bd002c89c…]
+  [Gate-0] PASS :: perturbed decode sha == oracle (independent injection cannot change output)
+  [Gate-0] PASS :: perturbation NON-INERT: injected_ticks=37386385 (>0 ⇒ the dose actually fired)
+  [Gate-0] PASS :: A/A wall ratio=0.9995 spread=1.31% (same-vs-same ≈ 1)
+  [Gate-0] PASS :: known-SERIAL criticality β=0.810 ±0.152 (expect ≈ 1)  R²=0.982
+  [Gate-0] PASS :: known-OVERLAPPED criticality β=0.046 < serial (hidden ⇒ low)  R²=0.927
+  [Gate-0] PASS :: serial-calib dose LINEARITY R²=0.982 (≥0.90)
+  marker tax/fire = 0.0074 ticks (subtracted per region)
+  [Gate-0] PASS :: CONSERVATION: Σ active(adj)=286754 ≤ wall=6909761 (over-count -95.85% ≤ 5%)
+-- Gate-0: ALL PASS (findings valid) --
+--selftest-only: Gate-0 passed; localization not run.

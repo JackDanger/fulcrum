@@ -1,0 +1,13 @@
+{
+  "title": "M1-T1 silesia coarse per-phase retired-instruction differential (gz vs libdeflate, SAME kpc method both sides)",
+  "arch": "arm64 Apple M1 Pro", "threads": 1, "corpus": "/tmp/silesia.gz", "N": 9,
+  "oracle_sha256_prefix": "028bd002c89c9a90",
+  "output_bytes": 211968000,
+  "method": "coarse per-deflate-block fx_phase_switch state machine reading FIXED_INSTRUCTIONS via kpc; identical instrument on both decoders; tax = whole(armed)-whole(off), subtracted per-phase weighted by segment count",
+  "whole_decode_off": {"gz_M": 1881.62, "ld_M": 1471.81, "gz_minus_ld_M": 409.82, "gz_minus_ld_pct": 27.84},
+  "gz": {"name":"gz","whole_off_M":1881.62,"whole_armed_M":2086.28,"tax_M":204.66,"tax_pct":10.877,"switches":16984,"conservation_pct":0.0016,"phases":[{"phase":"other","retired_raw_M":194.16,"retired_adj_M":153.78,"fires":3351},{"phase":"header","retired_raw_M":158.35,"retired_adj_M":75.73,"fires":6856},{"phase":"build","retired_raw_M":138.75,"retired_adj_M":97.45,"fires":3428},{"phase":"fastloop","retired_raw_M":1594.99,"retired_adj_M":1554.62,"fires":3350}]},
+  "ld": {"name":"ld","whole_off_M":1471.81,"whole_armed_M":1592.87,"tax_M":121.06,"tax_pct":8.225,"switches":10047,"conservation_pct":0.0018,"phases":[{"phase":"other","retired_raw_M":53.03,"retired_adj_M":53.00,"fires":2},{"phase":"header","retired_raw_M":56.67,"retired_adj_M":16.31,"fires":3350},{"phase":"build","retired_raw_M":78.26,"retired_adj_M":37.91,"fires":3348},{"phase":"fastloop","retired_raw_M":1404.88,"retired_adj_M":1364.54,"fires":3348}]},
+  "differential_adj": [{"phase":"other","gz_minus_ld_M":100.77},{"phase":"header","gz_minus_ld_M":59.43},{"phase":"build","gz_minus_ld_M":59.53},{"phase":"fastloop","gz_minus_ld_M":190.08}],
+  "fastloop_surplus_M": 190.08,
+  "largest_surplus_phase": "fastloop"
+}

@@ -24,6 +24,15 @@ default = []
 # there is no `coz` dependency at all and the probe's Coz hooks compile to
 # nothing; the Chrome-trace timeline backend is always available regardless.
 coz = ["dep:coz"]
+# IN-PROCESS gzippy decode subject (the macOS `macmeasure` measurement family:
+# critpath / assay / counterdiff / topdown / wall / oracle / phaseprof /
+# insndiff / classhist / insnattr / kpcphase, plus `vs --gz` steady-wall A/B).
+# OFF by default so the crate — and `fulcrum scaling`, which shells out to
+# EXTERNAL gz/rg binaries and needs no in-process gzippy — builds with the
+# gzippy / libdeflater / critpath-libdeflate deps ABSENT. Turn ON only with a
+# gzippy checkout carrying the `fulcrum_phase` runtime markers at the path in
+# the [macos] deps below:  cargo build --release --features in-process-gzippy
+in-process-gzippy = ["dep:gzippy", "dep:libdeflater", "dep:critpath-libdeflate"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +52,29 @@ iced-x86 = "1.21.0"
 # this dependency is absent.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# macOS / Apple-Silicon measurement backends (src/macmeasure.rs): per-thread kpc
+# via kperf/kperfdata (libc dlopen/dlsym), an IN-PROCESS gzippy decode (the
+# production pure-Rust path = the measurement SUBJECT), and libdeflate (the C
+# comparator, statically linked — never a python wheel). These power the
+# `counterdiff` / `topdown` / `wall` macOS subcommands. The gzippy / libdeflater
+# / critpath-libdeflate deps are OPTIONAL behind `in-process-gzippy` so the
+# DEFAULT macOS build (and `fulcrum scaling`) pulls in none of them.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+libdeflater = { version = "=1.25.2", optional = true }
+# critpath + assay: gzippy with the runtime region markers AND the global
+# instruction-tax knob. OPTIONAL — only compiled under `--features
+# in-process-gzippy`. Default builds (incl. `fulcrum scaling`, which shells out
+# to external gz/rg) never load it, so the crate builds even when this path is
+# stale/absent. When you DO enable the feature, point `path` at a gzippy checkout
+# that exposes `fulcrum_phase` (e.g. /Users/jackdanger/www/gzippy-matchcopy-3d59).
+gzippy = { path = "/Users/jackdanger/www/gzippy-matchcopy-3d59", default-features = false, features = ["pure-rust-inflate", "fulcrum_phase"], optional = true }
+# critpath DIFFERENTIAL: instrumented libdeflate 1.25 carrying the SAME region
+# markers, for `fulcrum critpath --target libdeflate`. Public symbols are cpld_-
+# prefixed so this never collides with the `libdeflater` crate above. OPTIONAL —
+# only under `in-process-gzippy`.
+critpath-libdeflate = { path = "critpath-libdeflate", optional = true }
 
 [profile.release]
 opt-level = 3

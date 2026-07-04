@@ -41,11 +41,13 @@ pub mod binloc;
 pub mod bundle;
 pub mod causal;
 pub mod chainlat;
+pub mod classhist;
 pub mod comparability;
 pub mod compare;
 pub mod compare_cli;
 pub mod config;
 pub mod consumer;
+pub mod counterdiff;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
@@ -63,11 +65,16 @@ pub mod invariants;
 pub mod labels;
 pub mod ledger;
 pub mod locate;
+// macmeasure drives the IN-PROCESS gzippy decode subject, so it only builds
+// when the optional `gzippy` dep is present (`--features in-process-gzippy`).
+#[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+pub mod macmeasure;
 pub mod mech;
 pub mod mech_arch;
 pub mod memlife;
 pub mod microbench;
 pub mod model;
+pub mod occupancy;
 pub mod optgate;
 pub mod optimality;
 pub mod perturb;
@@ -81,6 +88,7 @@ pub mod report;
 pub mod rg_verbose;
 pub mod runner;
 pub mod scaling;
+pub mod scaling_matrix;
 pub mod schedule;
 pub mod score;
 pub mod spans;

@@ -1,0 +1,13 @@
+[package]
+name = "critpath-libdeflate"
+version = "0.1.0"
+edition = "2021"
+description = "Instrumented libdeflate 1.25 (gzip decode) carrying the gzippy critpath region markers, for fulcrum's differential kernel localizer. The C is byte-for-byte vendored libdeflate 1.25 plus CNTVCT region brackets aligned to gzippy::critpath_rt; public symbols are prefixed (cpld_) so it never collides with the `libdeflater` crate."
+license = "MIT"
+
+[lib]
+name = "critpath_libdeflate"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"

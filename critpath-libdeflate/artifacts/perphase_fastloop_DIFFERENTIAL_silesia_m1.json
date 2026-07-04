@@ -1,0 +1,115 @@
+{
+  "title": "M1-T1 silesia: gz-vs-libdeflate FASTLOOP per-phase retired-instruction differential (attribution-wall breaker)",
+  "arch": "arm64 Apple M1 Pro",
+  "threads": 1,
+  "corpus": "/tmp/silesia.gz",
+  "oracle_sha256_prefix": "028bd002c89c9a90",
+  "gz_commit_base": "909fe5988d9061ccc7a5e4262d580509ed429ce8",
+  "ld_version": "1.25 (vendored; cpld_-prefixed)",
+  "sources": {
+    "gz_fastloop_retired_deterministic": 1512645146,
+    "gz_fastloop_retired_insnattr_corrob": 1521300000,
+    "ld_monolith_retired_kpc": 1342300000,
+    "ld_nonfastloop_upper_bound": 15000000,
+    "output_bytes": 211968000,
+    "oracle_sha256_prefix": "028bd002c89c9a90",
+    "gz_commit_base": "909fe5988d9061ccc7a5e4262d580509ed429ce8",
+    "ld_version": "1.25 (vendored; cpld_-prefixed)",
+    "arch": "arm64 Apple M1 Pro",
+    "threads": 1,
+    "corpus": "/tmp/silesia.gz"
+  },
+  "HEADLINE_wall_break": {
+    "gz_fastloop_retired": 1512645146,
+    "ld_fastloop_retired_range": [
+      1327300000,
+      1342300000
+    ],
+    "gz_fastloop_exceeds_ld_WHOLE_decode": true,
+    "fastloop_surplus_LOWER_bound_M": 170.3,
+    "gz_fastloop_instr_per_byte": 7.136,
+    "ld_fastloop_instr_per_byte_upper": 6.333,
+    "delta_instr_per_byte_LOWER": 0.804
+  },
+  "gz_fastloop_ledger_M": {
+    "iter_entry": 70.9,
+    "literals": 336.1,
+    "match_residual": 1097.7,
+    "rare_subtable": 8.0,
+    "SUM": 1512.6
+  },
+  "common_path_perfire_ledger": [
+    {
+      "phase": "iter_entry",
+      "gz_perfire": 3,
+      "ld_perfire": 3,
+      "fires": 23622691,
+      "gz_instr_M": 70.9,
+      "ld_instr_M": 70.9,
+      "gz_minus_ld_M": 0.0
+    },
+    {
+      "phase": "lit_primary",
+      "gz_perfire": 12,
+      "ld_perfire": 11,
+      "fires": 14080504,
+      "gz_instr_M": 169.0,
+      "ld_instr_M": 154.9,
+      "gz_minus_ld_M": 14.1
+    },
+    {
+      "phase": "lit2",
+      "gz_perfire": 11,
+      "ld_perfire": 11,
+      "fires": 8129469,
+      "gz_instr_M": 89.4,
+      "ld_instr_M": 89.4,
+      "gz_minus_ld_M": 0.0
+    },
+    {
+      "phase": "lit3",
+      "gz_perfire": 13,
+      "ld_perfire": 12,
+      "fires": 5977343,
+      "gz_instr_M": 77.7,
+      "ld_instr_M": 71.7,
+      "gz_minus_ld_M": 6.0
+    },
+    {
+      "phase": "match_main",
+      "gz_perfire": 52,
+      "ld_perfire": 54,
+      "fires": 17528751,
+      "gz_instr_M": 911.5,
+      "ld_instr_M": 946.6,
+      "gz_minus_ld_M": -35.1
+    }
+  ],
+  "phase_map_audit": {
+    "libdeflate_fastloop_extent": "0x4fc .. 0x710 (loop-back b.lo 0x4fc @0x70c; b 0x808 exit). 0x808+ = generic_loop (non-fastloop).",
+    "ld_iter_entry": "0x4fc lsr(consume-sh) / 0x500 sub(bitsleft) / 0x504 tbnz(literal)  = 3",
+    "ld_lit1": "0x658..0x680  lsr(lit)/and+ldr(load)/lsr+sub(consume)/mov/strb(store)/tbnz/mov,mov/tbz = ~11",
+    "ld_match_common": "0x514..0x5d0 (dist-load 0x51c, len+off compute, validate 0x550, off-consume 0x568, uncond refill 0x570, preload litlen 0x58c, 5-word copy 0x5a4-0x5c8, len<41 done) + loop-tail 0x6f8..0x70c = ~54",
+    "ld_off1_rle": "0x618..0x654  dup.2d/stp q0 (~16)   [vs gz off==1 ~45, autovectorized fill]",
+    "gz_iter_entry": "consume! + literal-test  (C_iter_entry=3, attribution json)",
+    "gz_match_residual": "conservation residual 62.6/match (dist+len+off+2 refills+preload+copy_match_fast, all variants weighted)",
+    "gz_off1_rle": "gz_fastloop_disasm.txt lines 155-199 (dup.2d + vectorized fill loop) ~45 static"
+  },
+  "conservation": {
+    "gz_side": "iter+literals+match_residual+subtable == gz_fastloop 1512.6M (EXACT, residual construction)",
+    "ld_side": "ld_fastloop in [1327300000, 1342300000]; ld_nonfastloop(header+generic) < 15000000 bounded => ld_fastloop ~= monolith",
+    "fire_alignment": "gz~ld per phase < 0.001% (critpath) => same operations, same counts"
+  },
+  "VERDICT": {
+    "wall_broken": "YES. gz fastloop 1512.6M > libdeflate WHOLE decode 1342.3M (both gated: gz deterministic pathcount x disasm + insnattr corrob; ld insnattr kpc N=9). Since ld_fastloop < ld_monolith, the true fastloop surplus is >= 170.3M (>= 0.80 instr/output-byte). 'fastloop at per-symbol PARITY' is REFUTED. NOT a floor.",
+    "surplus_is_NOT_in_common_sequence": "op-for-op COMMON path is at parity: match-common gz 52 vs ld 54 (gz -35M), literals gz 11-13 vs ld 11-12 (gz +20M), iter-entry 3==3. Common-path net ~ -15M (gz slightly AHEAD). So the >=170M surplus is NOT the common literal/match instruction stream.",
+    "surplus_LOCALIZED_to": "MATCH-path VARIANT TAIL. gz match RESIDUAL 62.6/match (1097.7M, corroborated by direct block-count 56-62) sits +186M above the gz match COMMON-path count (911M @52/match). That +186M tail = the non-common match work (offset==1 RLE, offset<WORDBYTES general copy, copy-loop iterations for long matches, conditional-refill-taken), and it is the same order as the >=170M fastloop surplus.",
+    "leading_named_lever_HYPOTHESIS": {
+      "what": "copy_match_fast variant codegen. gz's offset==1 (RLE) path autovectorizes to ~45 static instr (dup.2d + stp q0,q0 + a vectorized fill loop, gz_disasm 155-199) vs libdeflate's compact ~16 (decompress_template.h:666-691). gz's offset<WORDBYTES general path (per-offset scalar loop) is likewise heavier than vendor:692-712.",
+      "byte_exact_change": "gz copy_match_fast (consume_first_decode.rs:516-599) is already a faithful SOURCE port of vendor 633-712 (it cites the lines); the divergence is rustc autovectorizing the offset==1/offset<8 fill loops to wide NEON (dup.2d/stp q0). Candidate: force the compact scalar vendor word-store codegen (e.g. #[inline] split + no-autovec on the fill, or a hand word-store loop) to cut static/setup instr. Output byte-identical either way.",
+      "CAVEAT_not_a_sure_win": "the NEON widening emits MORE static/setup instr but FEWER per-byte for LONG runs (32 B/stp), so retired-instr impact flips with the offset==1 run-length distribution -> it may be net-neutral or negative. MUST be gated by the histogram below before shipping; do NOT ship on the disasm alone.",
+      "gate5_tier": "HYPOTHESIS (disasm-static + un-measured offset/run-length distribution)."
+    },
+    "pulled_next_measurement": "extend pathcount to bucket matches by offset==1 / offset<WORDBYTES / offset>=WORDBYTES and by copy-loop-iteration count -> turns the +186M variant tail from a residual into a gated per-variant retired split, which GATES the copy_match_fast lever above. (Static disasm cannot gate a branchy phase's per-variant retired without per-variant fire counts.)"
+  }
+}
