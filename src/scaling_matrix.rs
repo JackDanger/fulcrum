@@ -13,6 +13,26 @@
 //! `gz/rg < 1` AND `Δ > spread`, a LOSS only when `gz/rg > 1` AND `Δ > spread`,
 //! else a TIE — "Δ < spread ⇒ TIE, full stop", the anti-bias law).
 //!
+//! ## LOAD-IMMUNE by construction (measures UNDER load — never waits for a quiet box)
+//!
+//! A box whose llama is pegged INDEFINITELY never goes quiet, so this matrix
+//! must be VALID UNDER LOAD, not gated on idleness. It is, because the verdict
+//! is a *ratio* measured by INTERLEAVED paired A/B: within each rep gz and rg (and
+//! rg-AA) decode back-to-back, so any background load hits ALL arms symmetrically
+//! — absolute walls inflate together, but the gz/rg ratio is preserved.
+//!
+//! The VALIDITY CERTIFICATE for each cell is the comparator SELF-1.0 UNDER LOAD:
+//! interleave rg-vs-rg (the AA arm) and check `median(rgA)/median(rgB) ≈ 1.0 ±
+//! spread`. If self-1.0 holds DESPITE the load, the A/B symmetry held and that
+//! cell's gz/rg ratio is trustworthy → the cell is `LOAD-IMMUNE-CERTIFIED` and its
+//! WIN/TIE/LOSS is emitted. If self-1.0 strays past spread (the load fluctuated
+//! ASYMMETRICALLY across the rep), that cell is `VOID(load-noise)` — no ratio is
+//! emitted for it; it is auto-retried up to `--retry K` times, and if still void
+//! is reported as needing re-measure. Crucially, a VOID cell voids ONLY ITSELF —
+//! it NEVER refuses the whole run (the old "re-run in a quieter window" behavior,
+//! which was a quiet-box precondition, is REMOVED). PRE/POST load is captured for
+//! REPORTING only; it never gates the measurement.
+//!
 //! ## Why a SEPARATE view from `scaling` (the deficit-decomposition)
 //!
 //! `fulcrum scaling --at T:trace.json ...` decomposes WHY the in-order decoder
@@ -26,9 +46,13 @@
 //! These are the exact violations that manufactured phantom findings all
 //! campaign; each is a blocking pre-flight before ANY wall number is recorded:
 //!
-//!   (a) COMPARATOR SELF-1.0 — an rg-vs-rg (A/A) interleave at every T must read
-//!       ≈ 1.0 ± spread; else the comparator is not self-consistent this run and
-//!       no gz/rg ratio at that T can be trusted.
+//!   (a) COMPARATOR SELF-1.0 (the LOAD-IMMUNITY CERTIFICATE) — an rg-vs-rg (A/A)
+//!       interleave at each T must read ≈ 1.0 ± spread; else the paired symmetry
+//!       broke under asymmetric load and no gz/rg ratio at that T can be trusted.
+//!       UNLIKE (b)–(e), this is a PER-CELL gate: a failing T is marked
+//!       VOID(load-noise) and auto-retried, but it does NOT abort the run — the
+//!       certified cells still emit their verdicts (this is what makes the matrix
+//!       usable on a permanently-loaded box).
 //!   (b) SHA == ORACLE — BOTH gz and rg must decode the corpus to `--oracle-sha`;
 //!       else the two arms are not decoding the same bytes and the race is void.
 //!   (c) SINK-LAW — BOTH arms decode to /dev/null (a file sink penalizes the
@@ -74,6 +98,10 @@ pub struct ScalingConfig {
     pub gz_env: Vec<(String, String)>,
     /// Artifact output path (JSON). `None` ⇒ default temp path.
     pub out: Option<String>,
+    /// Max auto-retries for a cell that comes back VOID(load-noise) before it is
+    /// reported as needing re-measure. Load-immune runs re-race a void cell rather
+    /// than abort the run. Default 2.
+    pub retry: usize,
 }
 
 impl Default for ScalingConfig {
@@ -90,6 +118,7 @@ impl Default for ScalingConfig {
             rg_tmpl: "-d -c -P {T}".to_string(),
             gz_env: parse_env("GZIPPY_FORCE_PARALLEL_SM=1"),
             out: None,
+            retry: 2,
         }
     }
 }
@@ -98,10 +127,17 @@ pub const HELP: &str = "\
 fulcrum scaling --box <host> --gz <path> --rg <path> --corpus <f.gz> --oracle-sha <sha> [flags]
   THE COMPETITIVE THREAD-SCALING MATRIX: does gz beat rg at ALL thread counts?
 
-Runs, per thread count, an interleaved best-of-N gz-vs-rg wall race (both to
-/dev/null) and classifies each cell WIN/TIE/LOSS with a Δ-vs-spread gate. Gate-0
-(self-1.0 comparator, sha==oracle, sink-law, path=ParallelSM, binary fingerprint)
-is BAKED and refuses to run if violated.
+LOAD-IMMUNE by construction: measures UNDER arbitrary background load (never
+waits for / requires a quiet box). Per thread count it runs an interleaved
+best-of-N paired gz-vs-rg wall race (both to /dev/null) — the paired A/B means
+load hits both arms symmetrically so the gz/rg RATIO survives the load — and
+classifies each cell WIN/TIE/LOSS with a Δ-vs-spread gate. Each cell carries a
+LOAD-IMMUNITY CERTIFICATE: an rg-vs-rg self-1.0 measured UNDER THE SAME LOAD; a
+cell only emits a verdict if certified (self-1.0 within spread), else it is
+VOID(load-noise), auto-retried up to --retry times, and reported as re-measure.
+A VOID cell voids only itself — it never aborts the run. Gate-0 (sha==oracle,
+sink-law, path=ParallelSM, binary fingerprint) is BAKED and refuses to run if
+violated; PRE/POST load is captured for REPORTING only and never gates the run.
 
 FLAGS:
   --box <host>        provenance label for the box this runs on (REQUIRED)
@@ -111,6 +147,7 @@ FLAGS:
   --oracle-sha <sha>  the 32-hex decode sha BOTH tools must reproduce (REQUIRED)
   --threads <list>    comma list, e.g. 1,2,3,4,5,6,7,8,12,16 (default: that list)
   --n <N>             interleaved reps per arm, >=15 recommended (default: 15)
+  --retry <K>         auto-retries for a VOID(load-noise) cell (default: 2)
   --gz-tmpl \"<args>\"  gz arg template, {T}=threads (default: \"-d -c -p{T}\")
   --rg-tmpl \"<args>\"  rg arg template, {T}=threads (default: \"-d -c -P {T}\")
   --gz-env \"K=V K=V\"  extra gz env (default: \"GZIPPY_FORCE_PARALLEL_SM=1\")
@@ -120,8 +157,9 @@ FLAGS:
 NOTE: separate from `fulcrum scaling --at T:trace.json` (the deficit
 decomposition); --box selects THIS matrix, --at selects that one.
 
-EXIT: 0 iff goal met on this box (every T WIN-or-TIE, none LOSS); 1 if any LOSS
-or the gate is unmet; 2 on usage error / refused instrument (Gate-0 failure).";
+EXIT: 0 iff goal met on the CERTIFIED cells (every certified T WIN-or-TIE, none
+LOSS, >=1 certified); 1 if any certified LOSS or nothing certified; 2 on usage
+error / refused instrument (Gate-0 b/c/d/e failure).";
 
 // ─────────────────────── pure helpers (unit-tested) ───────────────────────
 
@@ -231,6 +269,65 @@ impl Verdict {
     }
 }
 
+/// A per-cell LOAD-IMMUNITY certificate outcome. A cell only emits a WIN/TIE/LOSS
+/// verdict when `Certified`; a `Void` cell's ratio is untrustworthy (the paired
+/// A/B symmetry broke under asymmetric load) and needs re-measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellStatus {
+    /// self-1.0 held under load — the gz/rg ratio is load-immune-valid.
+    Certified,
+    /// self-1.0 strayed past spread — load fluctuated asymmetrically; VOID.
+    Void,
+}
+
+impl CellStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            CellStatus::Certified => "CERTIFIED",
+            CellStatus::Void => "VOID(load-noise)",
+        }
+    }
+    pub fn is_certified(self) -> bool {
+        matches!(self, CellStatus::Certified)
+    }
+}
+
+/// Map the Gate-0(a) self-1.0 outcome to a load-immunity certificate. This is the
+/// whole per-cell gate: self-consistent ⇒ CERTIFIED, else VOID(load-noise).
+pub fn cell_status(self_consistent: bool) -> CellStatus {
+    if self_consistent {
+        CellStatus::Certified
+    } else {
+        CellStatus::Void
+    }
+}
+
+/// Count `(certified, void)` cells from their statuses — the summary the verdict
+/// must state ("how many cells certified").
+pub fn count_status(statuses: &[CellStatus]) -> (usize, usize) {
+    let certified = statuses.iter().filter(|s| s.is_certified()).count();
+    (certified, statuses.len() - certified)
+}
+
+/// The gz/rg ratio a cell is allowed to EMIT: `Some(ratio)` iff the cell is
+/// load-immune-CERTIFIED, else `None` (a VOID cell emits NO ratio — its number is
+/// untrustworthy under asymmetric load and must be re-measured).
+pub fn certified_ratio(status: CellStatus, ratio: f64) -> Option<f64> {
+    match status {
+        CellStatus::Certified => Some(ratio),
+        CellStatus::Void => None,
+    }
+}
+
+/// Parse the 1-minute load average out of either a Linux `/proc/loadavg`
+/// (`"0.52 0.48 0.44 1/234 5678"`) or a macOS `sysctl vm.loadavg`
+/// (`"{ 0.52 0.48 0.44 }"`) string. Returns `None` if no leading float is found.
+pub fn parse_load_1min(raw: &str) -> Option<f64> {
+    raw.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .find(|tok| !tok.is_empty())
+        .and_then(|tok| tok.parse::<f64>().ok())
+}
+
 /// Classify one cell from the two tools' median walls and the combined
 /// significance threshold `spread` (a relative fraction). `Δ = |1 − gz/rg|`.
 /// WIN iff gz faster (ratio<1) AND Δ>spread; LOSS iff gz slower AND Δ>spread;
@@ -334,10 +431,16 @@ pub struct Cell {
     pub ratio: f64,
     /// combined significance threshold used for the verdict.
     pub spread: f64,
+    /// The competitive verdict. ONLY MEANINGFUL when `status == Certified`; for a
+    /// `Void` cell the ratio is untrustworthy and this value must be ignored.
     pub verdict: Verdict,
     /// The Gate-0(a) rg self-1.0 ratio at this T (rg_med/rg_aa_med).
     pub self_ratio: f64,
     pub self_consistent: bool,
+    /// The load-immunity certificate: Certified (emit verdict) or Void (re-measure).
+    pub status: CellStatus,
+    /// How many extra re-races this cell needed before this result (0 = first try).
+    pub retries_used: usize,
 }
 
 /// The full matrix artifact for one box.
@@ -352,10 +455,17 @@ pub struct ScalingReport {
     pub rg_sha256: String,
     pub n: usize,
     pub cells: Vec<Cell>,
-    /// goal met on this box: every T WIN-or-TIE, none LOSS.
+    /// goal met on this box: every CERTIFIED T WIN-or-TIE, none LOSS, >=1 certified.
     pub goal_met: bool,
-    /// strict goal: every T a WIN.
+    /// strict goal: every CERTIFIED T a WIN.
     pub strict_goal_met: bool,
+    /// LOAD-IMMUNITY summary: how many cells certified vs void.
+    pub certified_cells: usize,
+    pub void_cells: usize,
+    /// Background load (1-min average) captured BEFORE / AFTER the matrix, for
+    /// REPORTING only — it never gates the measurement (load-immune by design).
+    pub load_pre: String,
+    pub load_post: String,
 }
 
 /// Compute (goal_met, strict_goal_met) from the classified cells.
@@ -410,6 +520,12 @@ pub fn parse_args(args: &[String]) -> Result<ScalingConfig, String> {
                 cfg.n = need(i, "--n")?
                     .parse()
                     .map_err(|_| "--n must be a positive integer".to_string())?;
+                i += 2;
+            }
+            "--retry" => {
+                cfg.retry = need(i, "--retry")?
+                    .parse()
+                    .map_err(|_| "--retry must be a non-negative integer".to_string())?;
                 i += 2;
             }
             "--gz-tmpl" => {
@@ -517,6 +633,67 @@ fn wall_once(bin: &str, args: &[String], env: &[(String, String)], corpus: &str)
 /// [`wall_once`], which hard-codes `Stdio::null()`).
 const SINK: &str = "/dev/null";
 
+/// Capture the current 1-min load average as a human string (REPORTING only —
+/// this never gates the run; the matrix is load-immune by construction). Reads
+/// `/proc/loadavg` on Linux, `sysctl -n vm.loadavg` on macOS. On failure returns
+/// `"unknown"` — a missing load reading must never abort a load-immune run.
+fn capture_load() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/loadavg") {
+        if let Some(v) = parse_load_1min(&s) {
+            return format!("{v:.2} (1-min, /proc/loadavg)");
+        }
+    }
+    if let Ok(out) = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .stderr(Stdio::null())
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(v) = parse_load_1min(&s) {
+            return format!("{v:.2} (1-min, vm.loadavg)");
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Measure ONE T cell: `n` interleaved [gz, rg, rgAA] reps, compute medians,
+/// spreads, the gz/rg verdict and the Gate-0(a) self-1.0 certificate. `retries`
+/// counts how many prior re-races produced a VOID at this T (recorded on the cell).
+/// Load-immune: a VOID here means the paired symmetry broke, NOT that we abort.
+fn measure_cell(cfg: &ScalingConfig, t: usize, retries: usize) -> Result<Cell, String> {
+    let gz_argv = render_tmpl(&cfg.gz_tmpl, t);
+    let rg_argv = render_tmpl(&cfg.rg_tmpl, t);
+    let mut gz_s: Vec<f64> = Vec::with_capacity(cfg.n);
+    let mut rg_s: Vec<f64> = Vec::with_capacity(cfg.n);
+    let mut rg_aa: Vec<f64> = Vec::with_capacity(cfg.n);
+    // Interleave [gz, rg, rgAA] per rep so all three see the same contention.
+    for _ in 0..cfg.n {
+        gz_s.push(wall_once(&cfg.gz_bin, &gz_argv, &cfg.gz_env, &cfg.corpus)?);
+        rg_s.push(wall_once(&cfg.rg_bin, &rg_argv, &[], &cfg.corpus)?);
+        rg_aa.push(wall_once(&cfg.rg_bin, &rg_argv, &[], &cfg.corpus)?);
+    }
+    let gz_med = median(&gz_s);
+    let rg_med = median(&rg_s);
+    let rg_aa_med = median(&rg_aa);
+    let rg_sp = rel_spread(&rg_s);
+    let self_ok = self_consistent(rg_med, rg_aa_med, rg_sp);
+    let spread = combined_spread(&gz_s, &rg_s);
+    Ok(Cell {
+        threads: t,
+        gz_median_ms: gz_med,
+        rg_median_ms: rg_med,
+        gz_rel_spread: rel_spread(&gz_s),
+        rg_rel_spread: rg_sp,
+        ratio: if rg_med > 0.0 { gz_med / rg_med } else { f64::NAN },
+        spread,
+        verdict: classify(gz_med, rg_med, spread),
+        self_ratio: if rg_aa_med > 0.0 { rg_med / rg_aa_med } else { f64::NAN },
+        self_consistent: self_ok,
+        status: cell_status(self_ok),
+        retries_used: retries,
+    })
+}
+
 /// Run the full matrix on THIS box. `Ok(true)` iff the goal is met (no LOSS);
 /// `Ok(false)` if any LOSS; `Err` for a usage / refused-instrument / Gate-0
 /// failure (caller maps `Err` → exit 2). This is the reconnect-validated layer.
@@ -547,58 +724,49 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
     check_path(&dbg)?;
     eprintln!("   Gate-0(d) OK: gz path=ParallelSM");
 
-    // ── Per-T interleaved measurement + Gate-0(a) self-1.0 at each T ───────
+    // ── Load state PRE (informational — the run is load-immune, never gated) ─
+    let load_pre = capture_load();
+    eprintln!("   load PRE: {load_pre}   (informational — measurement is LOAD-IMMUNE, not gated on idle)");
+
+    // ── Per-T interleaved measurement + Gate-0(a) self-1.0 (LOAD-IMMUNITY
+    //    CERTIFICATE) at each T. A VOID(load-noise) cell is auto-retried up to
+    //    cfg.retry times; if still void it is KEPT as VOID (no verdict emitted)
+    //    but does NOT abort the run — certified cells still yield verdicts. ─────
     let mut cells: Vec<Cell> = Vec::with_capacity(cfg.threads.len());
-    let mut gate0a_failures: Vec<usize> = Vec::new();
     for &t in &cfg.threads {
-        let gz_argv = render_tmpl(&cfg.gz_tmpl, t);
-        let rg_argv = render_tmpl(&cfg.rg_tmpl, t);
-        let mut gz_s: Vec<f64> = Vec::with_capacity(cfg.n);
-        let mut rg_s: Vec<f64> = Vec::with_capacity(cfg.n);
-        let mut rg_aa: Vec<f64> = Vec::with_capacity(cfg.n);
-        // Interleave [gz, rg, rgAA] per rep so all three see the same contention.
-        for _ in 0..cfg.n {
-            gz_s.push(wall_once(&cfg.gz_bin, &gz_argv, &cfg.gz_env, &cfg.corpus)?);
-            rg_s.push(wall_once(&cfg.rg_bin, &rg_argv, &[], &cfg.corpus)?);
-            rg_aa.push(wall_once(&cfg.rg_bin, &rg_argv, &[], &cfg.corpus)?);
+        let mut cell = measure_cell(cfg, t, 0)?;
+        let mut attempt = 0;
+        while !cell.self_consistent && attempt < cfg.retry {
+            attempt += 1;
+            eprintln!(
+                "   T={t}: VOID(load-noise) self-1.0={:.4} strayed past spread — re-racing (retry {attempt}/{})",
+                cell.self_ratio, cfg.retry
+            );
+            cell = measure_cell(cfg, t, attempt)?;
         }
-        let gz_med = median(&gz_s);
-        let rg_med = median(&rg_s);
-        let rg_aa_med = median(&rg_aa);
-        let rg_sp = rel_spread(&rg_s);
-        let self_ok = self_consistent(rg_med, rg_aa_med, rg_sp);
-        if !self_ok {
-            gate0a_failures.push(t);
-        }
-        let spread = combined_spread(&gz_s, &rg_s);
-        let verdict = classify(gz_med, rg_med, spread);
-        cells.push(Cell {
-            threads: t,
-            gz_median_ms: gz_med,
-            rg_median_ms: rg_med,
-            gz_rel_spread: rel_spread(&gz_s),
-            rg_rel_spread: rg_sp,
-            ratio: if rg_med > 0.0 { gz_med / rg_med } else { f64::NAN },
-            spread,
-            verdict,
-            self_ratio: if rg_aa_med > 0.0 { rg_med / rg_aa_med } else { f64::NAN },
-            self_consistent: self_ok,
-        });
+        eprintln!(
+            "   T={t}: {} self-1.0={:.4} gz/rg={:.4} → {}",
+            cell.status.label(),
+            cell.self_ratio,
+            cell.ratio,
+            if cell.status.is_certified() { cell.verdict.label() } else { "(no verdict — re-measure)" },
+        );
+        cells.push(cell);
     }
 
-    // Gate-0(a) is BLOCKING: if the comparator was not self-consistent at any T,
-    // that T's ratio is untrustworthy — refuse to emit a verdict.
-    if !gate0a_failures.is_empty() {
-        print_table(&cfg.box_host, &cfg.corpus, &cells);
-        return Err(format!(
-            "Gate-0(a) comparator not self-consistent at T={:?} (rg-vs-rg strayed past spread) — \
-             verdict REFUSED for this run; re-run in a quieter window",
-            gate0a_failures
-        ));
-    }
+    // ── Load state POST (informational) ─────────────────────────────────────
+    let load_post = capture_load();
+    eprintln!("   load POST: {load_post}");
 
-    let verdicts: Vec<Verdict> = cells.iter().map(|c| c.verdict).collect();
-    let (goal_met, strict_goal_met) = goal_status(&verdicts);
+    // Goal is computed over CERTIFIED cells ONLY — void cells emit no verdict.
+    let statuses: Vec<CellStatus> = cells.iter().map(|c| c.status).collect();
+    let (certified_cells, void_cells) = count_status(&statuses);
+    let certified_verdicts: Vec<Verdict> = cells
+        .iter()
+        .filter(|c| c.status.is_certified())
+        .map(|c| c.verdict)
+        .collect();
+    let (goal_met, strict_goal_met) = goal_status(&certified_verdicts);
 
     let report = ScalingReport {
         box_host: cfg.box_host.clone(),
@@ -612,11 +780,24 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
         cells,
         goal_met,
         strict_goal_met,
+        certified_cells,
+        void_cells,
+        load_pre,
+        load_post,
     };
 
     print_table(&report.box_host, &report.corpus, &report.cells);
     println!(
-        "GOAL on {}: {} (every T WIN-or-TIE, none LOSS)   STRICT (every T WIN): {}",
+        "LOAD-IMMUNITY: {}/{} cells CERTIFIED, {} VOID(load-noise){}   (load PRE={} POST={})",
+        report.certified_cells,
+        report.certified_cells + report.void_cells,
+        report.void_cells,
+        if report.void_cells > 0 { " — VOID cells need re-measure" } else { "" },
+        report.load_pre,
+        report.load_post,
+    );
+    println!(
+        "GOAL on {}: {} (every CERTIFIED T WIN-or-TIE, none LOSS, >=1 certified)   STRICT (every certified T WIN): {}",
         report.box_host,
         if report.goal_met { "MET" } else { "NOT MET" },
         if report.strict_goal_met { "MET" } else { "not met" },
@@ -653,25 +834,33 @@ pub fn report_out_path(out: &Option<String>, box_host: &str, corpus: &str) -> St
         .to_string()
 }
 
-/// Human-readable per-T matrix table.
+/// Human-readable per-T matrix table. The `cell` column shows the WIN/TIE/LOSS
+/// verdict for a CERTIFIED cell, or `VOID` for a load-noise cell (whose ratio is
+/// untrustworthy). `self1.0` is the rg-vs-rg load-immunity certificate ratio.
 pub fn print_table(box_host: &str, corpus: &str, cells: &[Cell]) {
     println!("SCALING MATRIX  box={box_host}  corpus={corpus}");
     println!(
-        "  {:>4}  {:>11}  {:>11}  {:>8}  {:>9}  {:>7}  {:>6}",
-        "T", "gz ms", "rg ms", "gz/rg", "Δ", "spread", "cell"
+        "  {:>4}  {:>11}  {:>11}  {:>8}  {:>9}  {:>7}  {:>7}  {:>6}",
+        "T", "gz ms", "rg ms", "gz/rg", "Δ", "spread", "self1.0", "cell"
     );
     for c in cells {
         let delta = (1.0 - c.ratio).abs();
+        let cell_label = if c.status.is_certified() { c.verdict.label() } else { "VOID" };
         println!(
-            "  {:>4}  {:>11.2}  {:>11.2}  {:>8.4}  {:>+9.4}  {:>7.4}  {:>6}{}",
+            "  {:>4}  {:>11.2}  {:>11.2}  {:>8.4}  {:>+9.4}  {:>7.4}  {:>7.4}  {:>6}{}",
             c.threads,
             c.gz_median_ms,
             c.rg_median_ms,
             c.ratio,
             delta,
             c.spread,
-            c.verdict.label(),
-            if c.self_consistent { "" } else { "  [self-1.0 FAIL]" },
+            c.self_ratio,
+            cell_label,
+            if c.status.is_certified() {
+                String::new()
+            } else {
+                format!("  [load-noise, {} retries]", c.retries_used)
+            },
         );
     }
 }

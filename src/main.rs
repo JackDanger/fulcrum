@@ -96,7 +96,7 @@ USAGE:\n\
   fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...] [--config gzippy]\n\
               SCALING-DEFICIT DECOMPOSITION: why the parallel decode scales worse as T grows\n\
   fulcrum scaling --box <host> --gz <p> --rg <p> --corpus <f.gz> --oracle-sha <sha> [--threads L] [--n N]\n\
-              COMPETITIVE THREAD-SCALING MATRIX: does gz beat rg at ALL T? (Gate-0 baked, WIN/TIE/LOSS)\n\
+              COMPETITIVE THREAD-SCALING MATRIX: does gz beat rg at ALL T? LOAD-IMMUNE (per-cell self-1.0 certificate), WIN/TIE/LOSS\n\
   fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
   fulcrum alloc <trace.json>   per-(tid,region) fault localization (needs --features rpmalloc-stats)\n\
   fulcrum memlife <run.json>   cross-tool per-buffer memory-lifecycle attribution\n\

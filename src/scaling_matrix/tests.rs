@@ -253,6 +253,124 @@ fn parse_args_n_zero_rejected() {
     assert!(parse_args(&a).is_err());
 }
 
+// ── LOAD-IMMUNITY CERTIFICATE: cell_status / certified_ratio ────────────────
+
+#[test]
+fn self_within_spread_certifies_cell_and_emits_ratio() {
+    // rg 100 vs rgAA 101 under load → self-1.0 = 0.990 within 5% spread → CERTIFIED.
+    let ok = self_consistent(100.0, 101.0, 0.05);
+    assert!(ok);
+    let status = cell_status(ok);
+    assert_eq!(status, CellStatus::Certified);
+    assert!(status.is_certified());
+    // A certified cell EMITS its gz/rg ratio.
+    assert_eq!(certified_ratio(status, 0.83), Some(0.83));
+}
+
+#[test]
+fn self_outside_spread_voids_cell_and_suppresses_ratio() {
+    // rg 100 vs rgAA 130 → self-1.0 = 0.769, drift 0.23 > spread 0.03 → VOID.
+    let ok = self_consistent(100.0, 130.0, 0.03);
+    assert!(!ok);
+    let status = cell_status(ok);
+    assert_eq!(status, CellStatus::Void);
+    assert!(!status.is_certified());
+    assert_eq!(status.label(), "VOID(load-noise)");
+    // A VOID cell emits NO ratio (needs re-measure).
+    assert_eq!(certified_ratio(status, 0.83), None);
+}
+
+// ── verdict summary: certified vs void counts ───────────────────────────────
+
+#[test]
+fn count_status_tallies_certified_and_void() {
+    let statuses = [
+        CellStatus::Certified,
+        CellStatus::Void,
+        CellStatus::Certified,
+        CellStatus::Certified,
+        CellStatus::Void,
+    ];
+    assert_eq!(count_status(&statuses), (3, 2));
+    // all certified
+    assert_eq!(count_status(&[CellStatus::Certified, CellStatus::Certified]), (2, 0));
+    // all void
+    assert_eq!(count_status(&[CellStatus::Void]), (0, 1));
+    // empty
+    assert_eq!(count_status(&[]), (0, 0));
+}
+
+#[test]
+fn goal_computed_over_certified_cells_only() {
+    // A matrix where the ONLY loss is on a VOID cell must NOT fail the goal —
+    // void cells emit no verdict, so they are excluded from goal_status.
+    let cells = [
+        (Verdict::Win, CellStatus::Certified),
+        (Verdict::Loss, CellStatus::Void), // load-noise loss — excluded
+        (Verdict::Tie, CellStatus::Certified),
+    ];
+    let certified: Vec<Verdict> = cells
+        .iter()
+        .filter(|(_, s)| s.is_certified())
+        .map(|(v, _)| *v)
+        .collect();
+    let (met, strict) = goal_status(&certified);
+    assert!(met, "a LOSS on a VOID cell must not sink the goal");
+    assert!(!strict);
+    // But a certified LOSS DOES fail the goal.
+    let with_cert_loss = [Verdict::Win, Verdict::Loss];
+    let (met2, _) = goal_status(&with_cert_loss);
+    assert!(!met2);
+    // And if NOTHING is certified, the goal is not met (empty ⇒ false).
+    let (met3, _) = goal_status(&[]);
+    assert!(!met3);
+}
+
+// ── load-state capture: parse_load_1min (Linux + macOS formats) ─────────────
+
+#[test]
+fn parse_load_1min_linux_proc_loadavg() {
+    // /proc/loadavg: "0.52 0.48 0.44 1/234 5678"
+    assert_eq!(parse_load_1min("0.52 0.48 0.44 1/234 5678"), Some(0.52));
+    assert_eq!(parse_load_1min("  12.34 5.6 7.8 2/99 1"), Some(12.34));
+}
+
+#[test]
+fn parse_load_1min_macos_sysctl() {
+    // sysctl -n vm.loadavg: "{ 4.74 4.15 4.06 }"
+    assert_eq!(parse_load_1min("{ 4.74 4.15 4.06 }"), Some(4.74));
+    assert_eq!(parse_load_1min("{ 0.00 0.01 0.05 }"), Some(0.0));
+}
+
+#[test]
+fn parse_load_1min_rejects_garbage() {
+    assert_eq!(parse_load_1min(""), None);
+    assert_eq!(parse_load_1min("   "), None);
+    assert_eq!(parse_load_1min("{ }"), None);
+    assert_eq!(parse_load_1min("unknown"), None);
+}
+
+// ── --retry arg parsing ─────────────────────────────────────────────────────
+
+#[test]
+fn parse_args_retry_default_and_override() {
+    let base = sv(&[
+        "--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "s",
+    ]);
+    assert_eq!(parse_args(&base).unwrap().retry, 2); // default
+    let mut a = base.clone();
+    a.extend(sv(&["--retry", "5"]));
+    assert_eq!(parse_args(&a).unwrap().retry, 5);
+    // retry 0 is legal (no auto-retry).
+    let mut a0 = base.clone();
+    a0.extend(sv(&["--retry", "0"]));
+    assert_eq!(parse_args(&a0).unwrap().retry, 0);
+    // non-numeric rejected.
+    let mut bad = base.clone();
+    bad.extend(sv(&["--retry", "x"]));
+    assert!(parse_args(&bad).is_err());
+}
+
 // ── end-to-end classification of a synthetic matrix ─────────────────────────
 
 #[test]
