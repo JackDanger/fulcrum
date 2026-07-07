@@ -1,0 +1,206 @@
+{
+  "arch": "arm64 Apple M1 Pro",
+  "corpus": "/tmp/silesia.gz",
+  "corpus_sha256": "e7154dbcb01c9076f14b1fd16ebbef7bd73f80a6b5da9bf9fff530748217c4a2",
+  "gate0": {
+    "all_pass": true,
+    "gz_gzippy_code_share": 0.9343591741332294,
+    "gz_retired_aa_spread_pct": 0.03453696044199218,
+    "gz_sample_leaf": 5134,
+    "ld_sample_leaf": 5179,
+    "top_symbol_aa_delta_pp": 0.008003463358075003
+  },
+  "gz_commit": "3d590738",
+  "gz_phase": {
+    "block_finder": 4033384.402415271,
+    "clean_decode": 1521319262.329178,
+    "copy": 38133816.16828983,
+    "crc": 56834052.94312427,
+    "lut_build": 180768955.49006623,
+    "other": 81401030.66692638
+  },
+  "gz_top_symbols": [
+    {
+      "bucket": "clean_decode",
+      "key": "h:3859bab24d91784f",
+      "retired_instr": 1521319262.329178,
+      "share": 0.8081417997662641,
+      "symbol": "gzippy::decompress::inflate::consume_first_decode::decode_huffman_fastloop_bounded_pipelined::h3859bab24d91784f"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:49b82e5e9c3211ff",
+      "retired_instr": 98267910.89520842,
+      "share": 0.052201012855473315,
+      "symbol": "gzippy::decompress::inflate::libdeflate_entry::LitLenTable::build::h49b82e5e9c3211ff"
+    },
+    {
+      "bucket": "other",
+      "key": "n:poll",
+      "retired_instr": 63800807.82002338,
+      "share": 0.03389170237631477,
+      "symbol": "poll"
+    },
+    {
+      "bucket": "crc",
+      "key": "h:cd6532c5a8ea3006",
+      "retired_instr": 56834052.94312427,
+      "share": 0.030190884300740163,
+      "symbol": "gzippy::decompress::parallel::crc32::CRC32Calculator::update::hcd6532c5a8ea3006"
+    },
+    {
+      "bucket": "copy",
+      "key": "n:platform_memmove",
+      "retired_instr": 38133816.16828983,
+      "share": 0.02025710946630308,
+      "symbol": "_platform_memmove"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:ef4f67c188475ddb",
+      "retired_instr": 28967033.435527854,
+      "share": 0.01538761199844176,
+      "symbol": "gzippy::decompress::parallel::marker_inflate::Block::read_dynamic_huffman_coding::hef4f67c188475ddb"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:f3d1657acbc022aa",
+      "retired_instr": 16133537.609661084,
+      "share": 0.008570315543435918,
+      "symbol": "gzippy::decompress::parallel::lut_huffman::set_and_expand_lit_len_huffcode::hf3d1657acbc022aa"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:7aa6d733c555f1d8",
+      "retired_instr": 15766866.300350605,
+      "share": 0.008375535644721465,
+      "symbol": "gzippy::decompress::parallel::lut_huffman::make_inflate_huff_code_lit_len::h7aa6d733c555f1d8"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:b0cf4fb116fa7f2a",
+      "retired_instr": 11366810.588624854,
+      "share": 0.006038176860148033,
+      "symbol": "gzippy::decompress::parallel::lut_huffman::LutLitLenCode::rebuild_from_multisym::hb0cf4fb116fa7f2a"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "h:9f84a1f13b569b47",
+      "retired_instr": 10266796.660693416,
+      "share": 0.005453837164004675,
+      "symbol": "gzippy::decompress::inflate::libdeflate_entry::DistTable::rebuild::h9f84a1f13b569b47"
+    },
+    {
+      "bucket": "other",
+      "key": "h:ce1ef9c11c62cfde",
+      "retired_instr": 5133398.330346708,
+      "share": 0.0027269185820023374,
+      "symbol": "std::thread::local::LocalKey$LT$T$GT$::with::hce1ef9c11c62cfde"
+    },
+    {
+      "bucket": "other",
+      "key": "n:platform_memset",
+      "retired_instr": 5133398.330346708,
+      "share": 0.0027269185820023374,
+      "symbol": "_platform_memset"
+    },
+    {
+      "bucket": "other",
+      "key": "n:bzero",
+      "retired_instr": 4033384.402415271,
+      "share": 0.0021425788858589795,
+      "symbol": "__bzero"
+    },
+    {
+      "bucket": "block_finder",
+      "key": "h:9577b9930b29004e",
+      "retired_instr": 4033384.402415271,
+      "share": 0.0021425788858589795,
+      "symbol": "memchr::memmem::searcher::searcher_kind_neon::h9577b9930b29004e"
+    },
+    {
+      "bucket": "other",
+      "key": "n:read",
+      "retired_instr": 3300041.7837943123,
+      "share": 0.001753019088430074,
+      "symbol": "read"
+    }
+  ],
+  "ld_phase": {
+    "copy": 6255309.573276694,
+    "crc": 30423551.106391195,
+    "lut_build": 38384854.19965245,
+    "other": 1397493025.1206796
+  },
+  "ld_top_symbols": [
+    {
+      "bucket": "other",
+      "key": "n:libdeflate_deflate_decompress_ex",
+      "retired_instr": 1342332567.9745126,
+      "share": 0.9115659393705349,
+      "symbol": "libdeflate_deflate_decompress_ex"
+    },
+    {
+      "bucket": "other",
+      "key": "n:poll",
+      "retired_instr": 49189479.82622128,
+      "share": 0.03340413207182854,
+      "symbol": "poll"
+    },
+    {
+      "bucket": "lut_build",
+      "key": "n:build_decode_table",
+      "retired_instr": 38384854.19965245,
+      "share": 0.02606680826414366,
+      "symbol": "build_decode_table"
+    },
+    {
+      "bucket": "crc",
+      "key": "n:crc32_arm_pmullx12_crc_eor3",
+      "retired_instr": 30423551.106391195,
+      "share": 0.02066035914269164,
+      "symbol": "crc32_arm_pmullx12_crc_eor3"
+    },
+    {
+      "bucket": "copy",
+      "key": "n:platform_memmove",
+      "retired_instr": 6255309.573276694,
+      "share": 0.004247924309712299,
+      "symbol": "_platform_memmove"
+    },
+    {
+      "bucket": "other",
+      "key": "n:bzero",
+      "retired_instr": 3127654.786638347,
+      "share": 0.0021239621548561497,
+      "symbol": "__bzero"
+    },
+    {
+      "bucket": "other",
+      "key": "n:read",
+      "retired_instr": 2843322.533307588,
+      "share": 0.0019308746862328635,
+      "symbol": "read"
+    }
+  ],
+  "limit": "distribution time-weighted (Gate-5); retired-exact only under uniform per-symbol IPC; no xctrace (Xcode absent) / no PMI sampler built",
+  "method": "kpc whole-program retired TOTAL x /usr/bin/sample per-symbol distribution",
+  "n_kpc": 9,
+  "oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "out_len": 211968000,
+  "sample_secs": 7.0,
+  "threads": 1,
+  "tool": "fulcrum insnattr (per-symbol retired-instruction attribution)",
+  "whole_program": {
+    "gz_cycles": 745094529.0,
+    "gz_instr_per_byte": 8.88101270946558,
+    "gz_ipc": 2.5265123131779164,
+    "gz_retired": 1882490502.0,
+    "ld_cycles": 637307028.0,
+    "ld_instr_per_byte": 6.947070972977053,
+    "ld_ipc": 2.3105923445112238,
+    "ld_retired": 1472556740.0,
+    "retired_ratio": 1.278382320262919,
+    "surplus": 409933762.0
+  }
+}

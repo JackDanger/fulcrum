@@ -1,0 +1,60 @@
+{
+  "tool": "fulcrum insnattr — CLOSED per-region gz - libdeflate differential (M1 silesia T1)",
+  "arch": "arm64 Apple M1 Pro",
+  "threads": 1,
+  "corpus": "/tmp/silesia.gz",
+  "corpus_sha256": "e7154dbcb01c9076f14b1fd16ebbef7bd73f80a6b5da9bf9fff530748217c4a2",
+  "oracle_sha256": "028bd002c89c9a909ccdbc2af0a223de285348edb014ccc8e27d297f52cb410f",
+  "gz_commit_measured": "3d590738 (gzippy-matchcopy-3d59, the checkout fulcrum-mac links)",
+  "note_head": "HEAD of reimplement-isa-l = 909fe598; the only diff 3d59..909fe598 is the multi-symbol litlen-LUT skip in the MARKER path (lut_huffman.rs); LitLenTable::build (libdeflate_entry.rs) is BYTE-IDENTICAL at both commits, so the BUILD differential below holds at HEAD.",
+  "method": "kpc whole-program retired TOTAL (load-immune, median N=9, A/A spread 0.11%) x /usr/bin/sample per-symbol distribution. Gate-0 ALL PASS both arms (sha==oracle, kpc stable, sample non-inert, decode-dominated, A/A-stable).",
+  "limit_gate5": "per-symbol split is TIME-weighted sample distribution (retired-exact only under uniform per-symbol IPC; gz/ld whole-program IPC ratio 1.093). Per-symbol SHARE sampling noise observed ~12M across runs (LitLenTable::build 86.6M..98.3M). A build change below ~12M cannot be gated by insnattr; a dedicated build-microbench (kpc over N isolated build calls) is the PULLED prerequisite to gate a build lever.",
+  "whole_program": {
+    "gz_retired": 1882490502,
+    "ld_retired": 1472556740,
+    "surplus": 409933762,
+    "retired_ratio": 1.278,
+    "gz_instr_per_byte": 8.881,
+    "ld_instr_per_byte": 6.947
+  },
+  "STEP1_libdeflate_is_separate_not_inlined": {
+    "build_decode_table": "SEPARATE non-inlined symbol = 38.4M (proven via ld_top_symbols)",
+    "fastloop_monolith": "libdeflate_deflate_decompress_ex = 1342.3M (91.2% of ld) — fastloop+header+offset+loop-control, NOT splittable by symbol",
+    "crc": "crc32_arm_pmullx12_crc_eor3 = 30.4M",
+    "copy": "_platform_memmove = 6.3M",
+    "harness_poll": "poll = 49.2M (sample-harness loop; appears in BOTH arms, ~cancels)"
+  },
+  "STEP2_closed_per_region_differential": [
+    {"region": "fastloop+header", "gz_instr_M": 1582.2, "ld_instr_M": 1342.3, "gz_minus_ld_M": 239.9, "share_of_surplus_pct": 58.5,
+     "gz_detail": "clean_decode (decode_huffman_fastloop_bounded_pipelined) 1521.3M + gz header (read_dynamic 29.0 + set_and_expand 16.1 + make_inflate_huff_code 15.8) 60.9M",
+     "ld_detail": "the monolith (includes ld's own header parse + offset + loop-control)",
+     "verdict": "DOMINANT but NOT splittable in instructions on M1 (monolith + time-weighting = the documented attribution wall). CROSS-CHECK FLAG (HYPOTHESIS, not asserted): gz clean_decode ALONE (1521.3M) EXCEEDS ld's ENTIRE decode (1472.6M); time-weighting bias (gz IPC higher) does NOT rescue parity, so the prior 'fastloop at per-symbol PARITY' claim is CONTRADICTED by whole-symbol attribution and must be RE-MEASURED, not assumed."},
+    {"region": "table_BUILD", "gz_instr_M": 119.9, "ld_instr_M": 38.4, "gz_minus_ld_M": 81.5, "ratio": 3.12, "share_of_surplus_pct": 19.9,
+     "gz_detail": "LitLenTable::build 98.3M + DistTable::rebuild 10.3M + LutLitLenCode::rebuild_from_multisym 11.4M",
+     "ld_detail": "build_decode_table 38.4M (covers precode+litlen+offset)",
+     "verdict": "CONFIRMED clean surplus (both are isolated table-construction symbols). The HAVE's '~87M candidate' is CONFIRMED (+81.5M, 3.12x). Single largest CLEANLY-ATTRIBUTABLE per-region surplus."},
+    {"region": "crc", "gz_instr_M": 56.8, "ld_instr_M": 30.4, "gz_minus_ld_M": 26.4, "ratio": 1.87, "share_of_surplus_pct": 6.4,
+     "verdict": "gz CRC32Calculator::update is ~1.9x ld's crc32_arm_pmullx12_crc_eor3 in INSTRUCTIONS (contradicts the HAVE 'gz crc AHEAD' which was active-TIME). Candidate clean lever: adopt eor3-pmull. Separate from build."},
+    {"region": "copy", "gz_instr_M": 38.1, "ld_instr_M": 6.3, "gz_minus_ld_M": 31.8, "share_of_surplus_pct": 7.8,
+     "verdict": "gz _platform_memmove >> ld. Likely ParallelSM chunk-output assembly (apply_window/replace_markers), i.e. architecture overhead, NOT the inner match copy. (Inner match_copy differential is the active-time critpath artifact's 2.42x.)"},
+    {"region": "harness_scaffold", "gz_instr_M": 85.4, "ld_instr_M": 55.2, "gz_minus_ld_M": 30.2, "share_of_surplus_pct": 7.4,
+     "verdict": "ParallelSM T1 pipeline overhead (thread-local, memset for chunk buffers, block_finder) that ld's bare single-shot lacks. poll (~50M) cancels. Architecture, out of inner-loop scope."}
+  ],
+  "conservation_check": "239.9+81.5+26.4+31.8+30.2 = 409.8M ~= measured surplus 409.9M. Both sides conservation-closed to their kpc retired totals.",
+  "STEP3_build_attack_assessment": {
+    "build_surplus_confirmed": true,
+    "structural_reasons_gz_heavier (read of LitLenTable::build vs libdeflate build_decode_table)": [
+      "STRIDED scalar stores per symbol (entries[idx]=e; idx+=stride) — libdeflate explicitly AVOIDS this via incremental table-DOUBLING (memcpy first-half->second-half, vectorizable). This is the dominant cost driver.",
+      "PER-BLOCK Vec alloc + zero-init (vec![LitLenEntry(0); N]) — libdeflate reuses a fixed buffer in the decompressor struct and never zero-inits (a complete code fills every entry). gz's zero-init is LOAD-BEARING for incomplete-litlen-code correctness, so it is NOT safely removable.",
+      "LENGTH PRE-EXPANSION (gz bakes extra-bits into separate main-table entries for length codes) — libdeflate defers extra-bits to decode time. This is EXTRA build work gz does deliberately to speed the fastloop."
+    ],
+    "is_a_clean_local_byte_exact_streamline_available": false,
+    "why_not": [
+      "The dominant driver (strided stores -> table-doubling) is ENTANGLED with pre-expansion: doubling fills one canonical entry per codeword in lex order, which pre-expansion's sub-stride multi-entry fills break. Adopting doubling cleanly means dropping pre-expansion (a fastloop RE-TRADE, not a free build win) OR a doubling-then-overwrite-length-slots rewrite.",
+      "Buffer-reuse + zero-init removal save only ~9-15M (memset/bzero) and zero-init is unsafe to remove (incomplete codes).",
+      "Any sub-rewrite saving < ~12M is BELOW the M1 insnattr per-symbol sampling noise floor and cannot pass Gate-1 (Δ<spread = TIE)."
+    ],
+    "pulled_next_tool": "fulcrum buildbench — isolate LitLenTable::build vs libdeflate build_decode_table on the REAL per-block silesia code-length sets, kpc over N iterations -> tight-CI build-only retired count. This is the prerequisite to GATE the doubling/buffer-reuse rewrite below the 12M noise."
+  },
+  "PLAIN_VERDICT": "The +21%/+27.8% M1-T1 gz-libdeflate instruction gap is BOTH: (1) a DOMINANT fastloop+header surplus (+239.9M, 58.5% of surplus) that is NOT splittable in instructions on M1 and whose 'per-symbol parity' is CONTRADICTED by whole-symbol attribution (gz clean_decode alone > ld whole decode) — RE-MEASURE, do not assume parity; and (2) a CONFIRMED table-BUILD surplus (+81.5M, 3.12x, 19.9% of surplus) — the largest cleanly-attributable lever, but its reduction requires a structural table-doubling/buffer-reuse rewrite entangled with the pre-expansion fastloop trade (NOT a clean local byte-exact change), and is gateable only with a dedicated build-microbench. Secondary clean candidates: crc eor3-pmull (+26M), copy/memmove (+32M, mostly ParallelSM architecture)."
+}

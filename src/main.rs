@@ -27,8 +27,8 @@ use fulcrum::{
     abmeasure, audit, bundle, causal, chainlat, compare, compare_cli, consumer, coz, coz_jsonl,
     critpath, cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants,
     locate, mech, mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report,
-    rg_verbose, scaling, scaling_matrix, schedule, score, spans, sweep, trace, validate, vs,
-    vs_sweep, xtool,
+    rg_verbose, scaling, scaling_matrix, schedule, score, scoreboard, spans, sweep, trace, validate,
+    vs, vs_sweep, xtool,
 };
 // counterdiff's perf-based command is the fallback whenever the macOS kpc
 // backend (fulcrum::macmeasure) is NOT compiled in — i.e. off macOS, or on
@@ -62,6 +62,10 @@ USAGE:\n\
               --native <path> --isal <path> --rg <path>\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
+  fulcrum scoreboard run       --spec <spec.json> [--dry-run]\n\
+  fulcrum scoreboard diff      <before.json> <after.json>\n\
+  fulcrum scoreboard render    <artifact.json>\n\
+  fulcrum scoreboard recertify <artifact.json>\n\
   fulcrum quantity [--demo|--algebra]   dimensioned-quantity evaluator (refuses share×wall→bytes etc.)\n\
   fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
   fulcrum run <spec.json> [--out DIR] [--dry-run|--live] [--gate] [--store P] [--fixture-oracle]   the live-capture RUNNER half:\n\
@@ -4267,6 +4271,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

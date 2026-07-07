@@ -1,0 +1,45 @@
+{
+  "_comment": "AMD-Zen2 mm-grid residual-vs-rg resolution. N=25, /dev/null both arms, A/A arms built-in. Subject=gz-fixed 321dc151 (c579185e). Comparators: rapidgzip-native 0.16 (parity bar) and gz-baseline c4918aa2 (bb7b6463, recovery A/B). No spec.quiesce: llama is FULLY stopped for the whole sweep externally (per-cell SIGSTOP-cycling avoided).",
+  "n": 25,
+  "src_sha": "321dc151",
+  "criteria": {
+    "tie_margin_pct": 1.0,
+    "aa_spread_cap_pct": 5.0,
+    "aa_win_mult": 1.5,
+    "loaded_run_queue": 2.0
+  },
+  "boxes": [
+    {
+      "id": "solvency-amd-zen2",
+      "exec": { "ssh": "ssh -o ConnectTimeout=15 root@10.0.2.240" },
+      "platform": "linux",
+      "cpu": "AMD EPYC Zen2",
+      "subject": {
+        "label": "gz-fixed-321dc151",
+        "bin": "/root/gzippy-scanfix/target/release/gzippy",
+        "args_tmpl": "-d -c -p {T}"
+      },
+      "comparators": [
+        {
+          "label": "rapidgzip-0.16",
+          "bin": "/root/rapidgzip-native",
+          "args_tmpl": "-d -c -f -P {T}"
+        },
+        {
+          "label": "gz-baseline-c4918aa2",
+          "bin": "/root/gzippy-prescan/target/release/gzippy",
+          "args_tmpl": "-d -c -p {T}"
+        }
+      ],
+      "corpora": [
+        {
+          "name": "mmB2_comp",
+          "path": "/root/mmiso/mmB2_comp.gz",
+          "pin_sha256": "4e5a3a0f94cb68cd8512ca9ab63a34dbab4bd43572ab6d7e9d501b90ae75f36b",
+          "decompressed_sha256": "3495725746d30557dd1a6a348b215f48ed509ee1b79183f93b99ee21ea596115"
+        }
+      ],
+      "threads": [4, 8, 16]
+    }
+  ]
+}

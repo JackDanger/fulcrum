@@ -91,6 +91,7 @@ pub mod scaling;
 pub mod scaling_matrix;
 pub mod schedule;
 pub mod score;
+pub mod scoreboard;
 pub mod spans;
 pub mod stats;
 pub mod sweep;
