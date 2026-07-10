@@ -800,6 +800,45 @@ impl Capture {
             counters: Vec::new(),
         }
     }
+
+    /// Same as [`Capture::score_like`], but for a 2-WAY capture (native vs rg
+    /// only — no isal binary measured, e.g. because ISA-L decode has been
+    /// removed from gzippy). `gzippy-isal` is present as ABSENT (same
+    /// treatment as the unmeasured field tools) so predicate 4 still refuses a
+    /// "settled" reading that would require it.
+    pub fn score_like_2way(
+        cell_id: &str,
+        commit_sha: &str,
+        corpus: &str,
+        arch: &str,
+        threads: ThreadCell,
+        n: usize,
+        rg_wall_ms: f64,
+        native_wall_ms: f64,
+        native_aa_spread: f64,
+    ) -> Capture {
+        let mut native = ArmPresence::native("gzippy-native", native_wall_ms);
+        native.aa_spread = native_aa_spread;
+        Capture {
+            cell_id: cell_id.to_string(),
+            commit_sha: commit_sha.to_string(),
+            corpus: corpus.to_string(),
+            arch: arch.to_string(),
+            threads,
+            sink: "regular-file".to_string(),
+            n,
+            inter_run_spread: native_aa_spread,
+            arms: vec![
+                ArmPresence::native("rapidgzip", rg_wall_ms).requiring_native_elf(),
+                native,
+                ArmPresence::absent("gzippy-isal"),
+                ArmPresence::absent("igzip"),
+                ArmPresence::absent("libdeflate"),
+                ArmPresence::absent("zlib-ng"),
+            ],
+            counters: Vec::new(),
+        }
+    }
 }
 
 /// The standard field-tool roster a "settled/tie" claim must clear. A cell may

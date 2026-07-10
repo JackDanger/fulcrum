@@ -70,6 +70,17 @@ pub struct ScoreArgs {
     pub lever: String,
 }
 
+impl ScoreArgs {
+    /// True when no isal binary was given (`--isal` omitted/empty) — `run_score`
+    /// then runs a 2-WAY interleaved capture (native vs rg only): no isal arm is
+    /// spawned/measured and `check_flavor_isal` (`SCORE-PROVENANCE-FLAVOR-I`) is
+    /// not invoked. Every other gate (FLAVOR-N, corpus/decomp SHA pins,
+    /// comparator self-test, SINK LAW, N>=7 best-of-N) still applies.
+    pub fn is_two_way(&self) -> bool {
+        self.isal.as_os_str().is_empty()
+    }
+}
+
 impl Default for ScoreArgs {
     fn default() -> Self {
         ScoreArgs {
@@ -199,12 +210,15 @@ pub struct BuildMeasurement {
     pub flavor: &'static str,
 }
 
-/// The complete 3-way interleaved capture result.
+/// The complete interleaved capture result — 3-way (native/isal/rg) when an
+/// isal binary was given, 2-way (native/rg) when it was not
+/// ([`ScoreArgs::is_two_way`]). `isal` is `None` in 2-way mode: the isal arm
+/// was never spawned/measured, not merely omitted from the report.
 #[derive(Debug, Clone)]
 pub struct CaptureResult {
     pub rg: BuildMeasurement,
     pub native: BuildMeasurement,
-    pub isal: BuildMeasurement,
+    pub isal: Option<BuildMeasurement>,
     /// Distribution verdict: `"RESOLVED"`, `"BIMODAL"`, or `"NOISY"`.
     pub distribution: &'static str,
     pub samples: usize,
@@ -452,14 +466,21 @@ fn timed_run(
     Ok((wall_ms, out_sha))
 }
 
-// ─── 3-way interleaved wall capture ───────────────────────────────────────────
+// ─── 3-way / 2-way interleaved wall capture ────────────────────────────────────
 
-/// Run the 3-way interleaved wall capture (native / isal / rg), best-of-N,
-/// sha-verify every run against `args.decomp_pin`.
+/// Run the interleaved wall capture — 3-way (native / isal / rg) when
+/// `args.isal` is set, 2-way (native / rg) when it is not
+/// ([`ScoreArgs::is_two_way`]) — best-of-N, sha-verify every run against
+/// `args.decomp_pin`.
 ///
-/// The warmup iteration (i = 0) is dropped. Each real iteration
-/// sha-verifies all 3 outputs; any mismatch fires `SCORE-SHA-VERIFY`.
+/// In 2-way mode the isal binary is never spawned/measured (not merely
+/// dropped from the report): no `timed_run` call is made for it, and its sha
+/// is excluded from the per-iteration verify set.
+///
+/// The warmup iteration (i = 0) is dropped. Each real iteration sha-verifies
+/// every measured output; any mismatch fires `SCORE-SHA-VERIFY`.
 pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
+    let two_way = args.is_two_way();
     let mut log = String::new();
     let tmpdir = std::env::temp_dir();
     let sink_native = tmpdir.join("fulcrum_score_sink_native.bin");
@@ -473,17 +494,29 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
     let gzippy_env: [(&str, &str); 1] = [("GZIPPY_FORCE_PARALLEL_SM", "1")];
 
     log.push_str(&format!(
-        "## fulcrum score — 3-way interleaved capture (N={}, mask={})\n",
-        args.samples, args.mask
+        "## fulcrum score — {}-way interleaved capture (N={}, mask={})\n",
+        if two_way { 2 } else { 3 },
+        args.samples,
+        args.mask
     ));
-    log.push_str(&format!(
-        "## native:  {}\n## isal:    {}\n## rg:      {}\n## corpus:  {} pin={}\n",
-        args.native.display(),
-        args.isal.display(),
-        args.rg.display(),
-        args.corpus_path.display(),
-        &args.corpus_pin[..8.min(args.corpus_pin.len())],
-    ));
+    if two_way {
+        log.push_str(&format!(
+            "## native:  {}\n## rg:      {}\n## corpus:  {} pin={}\n",
+            args.native.display(),
+            args.rg.display(),
+            args.corpus_path.display(),
+            &args.corpus_pin[..8.min(args.corpus_pin.len())],
+        ));
+    } else {
+        log.push_str(&format!(
+            "## native:  {}\n## isal:    {}\n## rg:      {}\n## corpus:  {} pin={}\n",
+            args.native.display(),
+            args.isal.display(),
+            args.rg.display(),
+            args.corpus_path.display(),
+            &args.corpus_pin[..8.min(args.corpus_pin.len())],
+        ));
+    }
 
     let mut native_walls: Vec<f64> = Vec::with_capacity(args.samples);
     let mut isal_walls: Vec<f64> = Vec::with_capacity(args.samples);
@@ -499,25 +532,39 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             &gzippy_env,
             &mut log,
         )?;
-        let (iw, isha) = timed_run(
-            &sink_isal,
-            &args.mask,
-            &args.isal,
-            &gzippy_args,
-            &gzippy_env,
-            &mut log,
-        )?;
+        // 2-way: no isal arm is spawned at all.
+        let isal_run = if two_way {
+            None
+        } else {
+            Some(timed_run(
+                &sink_isal,
+                &args.mask,
+                &args.isal,
+                &gzippy_args,
+                &gzippy_env,
+                &mut log,
+            )?)
+        };
         let (rw, rsha) = timed_run(&sink_rg, &args.mask, &args.rg, &rg_args, &[], &mut log)?;
 
         if i == 0 {
-            log.push_str(&format!(
-                "## warmup (dropped): native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms\n"
-            ));
+            match &isal_run {
+                Some((iw, _)) => log.push_str(&format!(
+                    "## warmup (dropped): native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms\n"
+                )),
+                None => log.push_str(&format!(
+                    "## warmup (dropped): native={nw:.0}ms rg={rw:.0}ms\n"
+                )),
+            }
             continue;
         }
 
-        // sha-verify all 3 against the decompressed-corpus pin.
-        for (label, sha) in [("native", &nsha), ("isal", &isha), ("rg", &rsha)] {
+        // sha-verify every measured output against the decompressed-corpus pin.
+        let mut checks: Vec<(&str, &String)> = vec![("native", &nsha), ("rg", &rsha)];
+        if let Some((_, isha)) = &isal_run {
+            checks.push(("isal", isha));
+        }
+        for (label, sha) in checks {
             if sha.trim() != args.decomp_pin.trim() {
                 let _ = std::fs::remove_file(&sink_native);
                 let _ = std::fs::remove_file(&sink_isal);
@@ -532,11 +579,18 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         }
 
         native_walls.push(nw);
-        isal_walls.push(iw);
         rg_walls.push(rw);
-        log.push_str(&format!(
-            "## i={i}: native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms sha=OK\n"
-        ));
+        match &isal_run {
+            Some((iw, _)) => {
+                isal_walls.push(*iw);
+                log.push_str(&format!(
+                    "## i={i}: native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms sha=OK\n"
+                ));
+            }
+            None => {
+                log.push_str(&format!("## i={i}: native={nw:.0}ms rg={rw:.0}ms sha=OK\n"));
+            }
+        }
     }
 
     // Clean up sinks.
@@ -550,8 +604,6 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         .iter()
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max);
-    let best_isal = isal_walls.iter().cloned().fold(f64::INFINITY, f64::min);
-    let worst_isal = isal_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let worst_rg = rg_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -561,29 +613,51 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
     } else {
         0.0
     };
-    let ratio_isal = if best_isal > 0.0 {
-        best_rg / best_isal
-    } else {
-        0.0
-    };
     let verdict_native: &'static str = if ratio_native >= 0.99 { "PASS" } else { "FAIL" };
-    let verdict_isal: &'static str = if ratio_isal >= 0.99 { "PASS" } else { "FAIL" };
 
     let distribution = compute_distribution(&native_walls);
 
     // Binary sha256 (the binary files themselves — build identity).
     let native_sha = sha256_file_hex(&args.native).unwrap_or_else(|_| "unknown".into());
-    let isal_sha = sha256_file_hex(&args.isal).unwrap_or_else(|_| "unknown".into());
     let rg_sha = sha256_file_hex(&args.rg).unwrap_or_else(|_| "unknown".into());
+
+    let isal_measurement = if two_way {
+        None
+    } else {
+        let best_isal = isal_walls.iter().cloned().fold(f64::INFINITY, f64::min);
+        let worst_isal = isal_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let ratio_isal = if best_isal > 0.0 {
+            best_rg / best_isal
+        } else {
+            0.0
+        };
+        let verdict_isal: &'static str = if ratio_isal >= 0.99 { "PASS" } else { "FAIL" };
+        let isal_sha = sha256_file_hex(&args.isal).unwrap_or_else(|_| "unknown".into());
+        Some(BuildMeasurement {
+            wall_ms: best_isal,
+            spread_ms: worst_isal - best_isal,
+            sha256_bin: isal_sha,
+            ratio: ratio_isal,
+            verdict: verdict_isal,
+            flavor: "isal",
+        })
+    };
+
+    let isal_result_line = match &isal_measurement {
+        Some(m) => format!(
+            "## isal:   best={:.0}ms spread={:.0}ms ratio={:.2} {}\n",
+            m.wall_ms, m.spread_ms, m.ratio, m.verdict
+        ),
+        None => String::new(),
+    };
 
     log.push_str(&format!(
         "## RESULTS\n\
          ## native: best={best_native:.0}ms spread={:.0}ms ratio={ratio_native:.2} {verdict_native}\n\
-         ## isal:   best={best_isal:.0}ms spread={:.0}ms ratio={ratio_isal:.2} {verdict_isal}\n\
+         {isal_result_line}\
          ## rg:     best={best_rg:.0}ms spread={:.0}ms ratio=1.00 COMPARATOR\n\
          ## distribution: {distribution}\n",
         worst_native - best_native,
-        worst_isal - best_isal,
         worst_rg - best_rg,
     ));
 
@@ -604,14 +678,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             verdict: verdict_native,
             flavor: "pure-rust-inflate",
         },
-        isal: BuildMeasurement {
-            wall_ms: best_isal,
-            spread_ms: worst_isal - best_isal,
-            sha256_bin: isal_sha,
-            ratio: ratio_isal,
-            verdict: verdict_isal,
-            flavor: "isal",
-        },
+        isal: isal_measurement,
         distribution,
         samples: args.samples,
         measurement_log: log,
@@ -627,60 +694,106 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
 /// `## FINDINGS`, and `## RE-VERIFY`.
 pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
     let t_label = format!("t{}", args.threads);
-    let native_vs_isal = if capture.isal.wall_ms > 0.0 {
-        capture.native.wall_ms / capture.isal.wall_ms
+    let capture_mode = if capture.isal.is_some() {
+        "3-way"
     } else {
-        0.0
+        "2-way"
     };
 
-    // SCORE: line — line 1, greppable, single line.
+    // SCORE: line — line 1, greppable, single line. Segment-based so the isal
+    // segment can be dropped cleanly in 2-way mode without touching the
+    // native/rg/N/blind segment formatting (kept byte-identical to 3-way).
+    let mut segments = vec![format!(
+        "native={:.2} {}",
+        capture.native.ratio, capture.native.verdict
+    )];
+    if let Some(isal) = &capture.isal {
+        segments.push(format!("isal={:.2} {}", isal.ratio, isal.verdict));
+    }
+    segments.push(format!("rg={:.0}ms", capture.rg.wall_ms));
+    segments.push(format!("N={} frozen {}", capture.samples, args.date));
+    segments.push(format!(
+        "blind:src={},dist={},lever={}",
+        args.src_sha, capture.distribution, args.lever
+    ));
     let score_line = format!(
-        "SCORE: {arch_os} {t_label} {corpus} | \
-         native={native_ratio:.2} {native_verdict} | \
-         isal={isal_ratio:.2} {isal_verdict} | \
-         rg={rg_wall:.0}ms | \
-         N={samples} frozen {date} | \
-         blind:src={src_sha},dist={dist},lever={lever}",
-        arch_os = args.arch_os,
-        t_label = t_label,
-        corpus = args.corpus,
-        native_ratio = capture.native.ratio,
-        native_verdict = capture.native.verdict,
-        isal_ratio = capture.isal.ratio,
-        isal_verdict = capture.isal.verdict,
-        rg_wall = capture.rg.wall_ms,
-        samples = capture.samples,
-        date = args.date,
-        src_sha = args.src_sha,
-        dist = capture.distribution,
-        lever = args.lever,
+        "SCORE: {} {} {} | {}",
+        args.arch_os,
+        t_label,
+        args.corpus,
+        segments.join(" | ")
     );
 
-    let verdict_prose = match (capture.native.verdict, capture.isal.verdict) {
-        ("PASS", "PASS") => format!(
+    let verdict_prose = match (&capture.isal, capture.native.verdict) {
+        (Some(isal), "PASS") if isal.verdict == "PASS" => format!(
             "Both gzippy-native ({:.2}x) and gzippy-isal ({:.2}x) PASS the 0.99x bar \
              vs rapidgzip-native. Distribution: {}.",
-            capture.native.ratio, capture.isal.ratio, capture.distribution
+            capture.native.ratio, isal.ratio, capture.distribution
         ),
-        ("FAIL", "PASS") => format!(
+        (Some(isal), "FAIL") if isal.verdict == "PASS" => format!(
             "gzippy-isal PASSES ({:.2}x rg) but gzippy-native FAILS ({:.2}x rg). \
              The pure-Rust engine is the binding constraint at this thread count. \
              Distribution: {}.",
-            capture.isal.ratio, capture.native.ratio, capture.distribution
+            isal.ratio, capture.native.ratio, capture.distribution
         ),
-        ("PASS", "FAIL") => format!(
+        (Some(isal), "PASS") => format!(
             "gzippy-native PASSES ({:.2}x rg) but gzippy-isal FAILS ({:.2}x rg). \
              Distribution: {}.",
-            capture.native.ratio, capture.isal.ratio, capture.distribution
+            capture.native.ratio, isal.ratio, capture.distribution
         ),
-        _ => format!(
+        (Some(isal), _) => format!(
             "Both gzippy-native ({:.2}x) and gzippy-isal ({:.2}x) FAIL \
              to reach the 0.99x bar vs rapidgzip-native. Distribution: {}.",
-            capture.native.ratio, capture.isal.ratio, capture.distribution
+            capture.native.ratio, isal.ratio, capture.distribution
+        ),
+        (None, "PASS") => format!(
+            "gzippy-native PASSES ({:.2}x rg) vs rapidgzip-native \
+             (2-way capture — no isal build measured). Distribution: {}.",
+            capture.native.ratio, capture.distribution
+        ),
+        (None, _) => format!(
+            "gzippy-native FAILS to reach the 0.99x bar vs rapidgzip-native ({:.2}x) \
+             (2-way capture — no isal build measured). Distribution: {}.",
+            capture.native.ratio, capture.distribution
         ),
     };
 
     let decomp_pin_short = &args.decomp_pin[..8.min(args.decomp_pin.len())];
+
+    // isal-conditional YAML fragments — empty strings in 2-way mode so the
+    // surrounding template stays a single format! call with no isal fields.
+    let isal_builds_yaml = match &capture.isal {
+        Some(isal) => format!(
+            "\x20\x20gzippy-isal:\n\
+             \x20\x20\x20\x20wall_ms: {:.0}\n\
+             \x20\x20\x20\x20spread_ms: {:.0}\n\
+             \x20\x20\x20\x20sha256: {}\n\
+             \x20\x20\x20\x20ratio: {:.2}\n\
+             \x20\x20\x20\x20verdict: {}\n\
+             \x20\x20\x20\x20flavor: isal\n",
+            isal.wall_ms, isal.spread_ms, isal.sha256_bin, isal.ratio, isal.verdict
+        ),
+        None => String::new(),
+    };
+    let isal_parity_yaml = match &capture.isal {
+        Some(isal) => {
+            let native_vs_isal = if isal.wall_ms > 0.0 {
+                capture.native.wall_ms / isal.wall_ms
+            } else {
+                0.0
+            };
+            format!(
+                "\x20\x20isal_vs_rg: {:.2}\n\x20\x20native_vs_isal: {:.2}\n",
+                isal.ratio, native_vs_isal
+            )
+        }
+        None => String::new(),
+    };
+    let isal_reverify_line = if capture.isal.is_some() {
+        format!(" \\\n\x20\x20--isal {}", args.isal.display())
+    } else {
+        String::new()
+    };
 
     let body = format!(
         "{score_line}\n\
@@ -693,6 +806,7 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
          threads: {threads}\n\
          thread_mask: \"{mask}\"\n\
          corpus: {corpus}\n\
+         capture_mode: {capture_mode}\n\
          corpus_pin:\n\
          \x20\x20path: {corpus_path}\n\
          \x20\x20sha256: {corpus_pin}\n\
@@ -718,17 +832,10 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
          \x20\x20\x20\x20ratio: {native_ratio:.2}\n\
          \x20\x20\x20\x20verdict: {native_verdict}\n\
          \x20\x20\x20\x20flavor: pure-rust-inflate\n\
-         \x20\x20gzippy-isal:\n\
-         \x20\x20\x20\x20wall_ms: {isal_wall:.0}\n\
-         \x20\x20\x20\x20spread_ms: {isal_spread:.0}\n\
-         \x20\x20\x20\x20sha256: {isal_sha}\n\
-         \x20\x20\x20\x20ratio: {isal_ratio:.2}\n\
-         \x20\x20\x20\x20verdict: {isal_verdict}\n\
-         \x20\x20\x20\x20flavor: isal\n\
+         {isal_builds_yaml}\
          parity:\n\
          \x20\x20native_vs_rg: {native_ratio:.2}\n\
-         \x20\x20isal_vs_rg: {isal_ratio:.2}\n\
-         \x20\x20native_vs_isal: {native_vs_isal:.2}\n\
+         {isal_parity_yaml}\
          distribution: {distribution}\n\
          blindspots:\n\
          \x20\x20- \"lever tag is 'none' until trace-based fulcrum decide analysis is run\"\n\
@@ -765,8 +872,7 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
          \x20\x20--corpus-path {corpus_path} \\\n\
          \x20\x20--corpus-pin {corpus_pin} \\\n\
          \x20\x20--decomp-pin {decomp_pin} \\\n\
-         \x20\x20--native {native_path} \\\n\
-         \x20\x20--isal {isal_path} \\\n\
+         \x20\x20--native {native_path}{isal_reverify_line} \\\n\
          \x20\x20--rg {rg_path} \\\n\
          \x20\x20--box {box_name} \\\n\
          \x20\x20--freeze-method \"{freeze_method}\" \\\n\
@@ -783,6 +889,7 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
         box_name = args.box_name,
         threads = args.threads,
         mask = args.mask,
+        capture_mode = capture_mode,
         corpus_path = args.corpus_path.display(),
         corpus_pin = args.corpus_pin,
         decomp_pin = args.decomp_pin,
@@ -797,19 +904,15 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
         native_sha = capture.native.sha256_bin,
         native_ratio = capture.native.ratio,
         native_verdict = capture.native.verdict,
-        isal_wall = capture.isal.wall_ms,
-        isal_spread = capture.isal.spread_ms,
-        isal_sha = capture.isal.sha256_bin,
-        isal_ratio = capture.isal.ratio,
-        isal_verdict = capture.isal.verdict,
-        native_vs_isal = native_vs_isal,
+        isal_builds_yaml = isal_builds_yaml,
+        isal_parity_yaml = isal_parity_yaml,
         distribution = capture.distribution,
         lever = args.lever,
         verdict_prose = verdict_prose,
         measurement_log = capture.measurement_log.trim_end(),
         decomp_pin_short = decomp_pin_short,
         native_path = args.native.display(),
-        isal_path = args.isal.display(),
+        isal_reverify_line = isal_reverify_line,
         rg_path = args.rg.display(),
         src_sha = args.src_sha,
     );
@@ -826,19 +929,36 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
 pub fn comparability_section(args: &ScoreArgs, capture: &CaptureResult) -> String {
     use crate::comparability as cg;
     let cell_id = format!("{}/t{}/{}", args.arch_os, args.threads, args.corpus);
-    let cap = cg::Capture::score_like(
-        &cell_id,
-        &args.src_sha,
-        &args.corpus,
-        &args.arch_os,
-        crate::compare::ThreadCell::Fixed(args.threads),
-        capture.samples,
-        capture.rg.wall_ms,
-        capture.native.wall_ms,
-        capture.isal.wall_ms,
-        capture.native.spread_ms / capture.native.wall_ms.max(1e-9),
-        capture.isal.spread_ms / capture.isal.wall_ms.max(1e-9),
-    );
+    let native_aa_spread = capture.native.spread_ms / capture.native.wall_ms.max(1e-9);
+    let cap = match &capture.isal {
+        Some(isal) => cg::Capture::score_like(
+            &cell_id,
+            &args.src_sha,
+            &args.corpus,
+            &args.arch_os,
+            crate::compare::ThreadCell::Fixed(args.threads),
+            capture.samples,
+            capture.rg.wall_ms,
+            capture.native.wall_ms,
+            isal.wall_ms,
+            native_aa_spread,
+            isal.spread_ms / isal.wall_ms.max(1e-9),
+        ),
+        // 2-way: no isal arm was measured — `gzippy-isal` is present as
+        // ABSENT (same treatment as the unmeasured field tools) so a
+        // "settled" reading is still refused.
+        None => cg::Capture::score_like_2way(
+            &cell_id,
+            &args.src_sha,
+            &args.corpus,
+            &args.arch_os,
+            crate::compare::ThreadCell::Fixed(args.threads),
+            capture.samples,
+            capture.rg.wall_ms,
+            capture.native.wall_ms,
+            native_aa_spread,
+        ),
+    };
     // The "settled" reading of a PASS — gated against the full field-tool roster.
     let settled = cg::evaluate(
         &cap,
@@ -887,11 +1007,17 @@ pub fn run_score(args: &ScoreArgs) -> Result<(), ScoreError> {
     };
     eprintln!("## SCORE-PROVENANCE-FREEZE: OK ({readback_str})");
 
-    // 4. Flavor checks.
+    // 4. Flavor checks. FLAVOR-N always applies. FLAVOR-I only applies in
+    // 3-way mode — 2-way mode never spawns/measures an isal binary, so
+    // `check_flavor_isal` is not invoked at all (not merely skipped-but-run).
     check_flavor_native(&args.native)?;
     eprintln!("## SCORE-PROVENANCE-FLAVOR-N: OK (0 isal_inflate symbols)");
-    check_flavor_isal(&args.isal)?;
-    eprintln!("## SCORE-PROVENANCE-FLAVOR-I: OK (>0 isal_inflate symbols)");
+    if args.is_two_way() {
+        eprintln!("## SCORE-PROVENANCE-FLAVOR-I: SKIPPED (2-way mode, no --isal given)");
+    } else {
+        check_flavor_isal(&args.isal)?;
+        eprintln!("## SCORE-PROVENANCE-FLAVOR-I: OK (>0 isal_inflate symbols)");
+    }
 
     // 5. Wall capture (the measurement).
     let mut capture = run_wall_capture(args)?;
@@ -958,7 +1084,10 @@ pub fn args_from_cli(args: &[String]) -> Result<ScoreArgs, String> {
         corpus_pin: need(args, "--corpus-pin")?.to_string(),
         decomp_pin: need(args, "--decomp-pin")?.to_string(),
         native: PathBuf::from(need(args, "--native")?),
-        isal: PathBuf::from(need(args, "--isal")?),
+        // `--isal` is OPTIONAL: when omitted/empty, `run_score` runs a 2-WAY
+        // capture (native vs rg only) — no isal arm, no FLAVOR-I gate. See
+        // `is_two_way`.
+        isal: flag(args, "--isal").map(PathBuf::from).unwrap_or_default(),
         rg: PathBuf::from(need(args, "--rg")?),
         box_name: flag(args, "--box").unwrap_or("unknown").to_string(),
         freeze_method: flag(args, "--freeze-method").unwrap_or("").to_string(),
@@ -997,7 +1126,8 @@ pub fn usage_score() -> &'static str {
      \x20\x20--corpus-pin <sha256>       # sha256 of the .gz input\n\
      \x20\x20--decomp-pin <sha256>       # sha256 of gunzip output (correctness oracle)\n\
      \x20\x20--native <path>             # gzippy-native binary (pure-rust-inflate)\n\
-     \x20\x20--isal <path>               # gzippy-isal binary (ISA-L on decode path)\n\
+     \x20\x20[--isal <path>]             # gzippy-isal binary (ISA-L on decode path);\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20# omit for a 2-way capture (native vs rg, no FLAVOR-I gate)\n\
      \x20\x20--rg <path>                 # rapidgzip-native ELF (NEVER the pip wheel)\n\
      \x20\x20--box <name>                # e.g. <BENCH_HOST>\n\
      \x20\x20--freeze-method <str>       # e.g. \"<BENCH_ROOT>/bench-lock.sh\"\n\
@@ -1059,19 +1189,27 @@ mod tests {
                 verdict: "FAIL",
                 flavor: "pure-rust-inflate",
             },
-            isal: BuildMeasurement {
+            isal: Some(BuildMeasurement {
                 wall_ms: 249.0,
                 spread_ms: 5.0,
                 sha256_bin: "c".repeat(64),
                 ratio: 0.99,
                 verdict: "PASS",
                 flavor: "isal",
-            },
+            }),
             distribution: "RESOLVED",
             samples: 9,
             measurement_log: "## test log\n## i=1: native=334ms isal=249ms rg=247ms sha=OK\n"
                 .into(),
         }
+    }
+
+    /// Same as [`test_capture`] but 2-WAY (no isal arm measured).
+    fn test_capture_2way() -> CaptureResult {
+        let mut cap = test_capture();
+        cap.isal = None;
+        cap.measurement_log = "## test log\n## i=1: native=334ms rg=247ms sha=OK\n".into();
+        cap
     }
 
     #[test]
@@ -1326,8 +1464,9 @@ mod tests {
         let mut cap = test_capture();
         cap.native.ratio = 0.74;
         cap.native.verdict = "FAIL";
-        cap.isal.ratio = 0.88;
-        cap.isal.verdict = "FAIL";
+        let isal = cap.isal.as_mut().expect("3-way test_capture has isal");
+        isal.ratio = 0.88;
+        isal.verdict = "FAIL";
         let cell = emit_cell(&args, &cap);
         let line1 = cell.lines().next().unwrap();
         assert!(line1.contains("native=0.74 FAIL"), "{line1}");
@@ -1340,11 +1479,175 @@ mod tests {
         let mut cap = test_capture();
         cap.native.ratio = 1.02;
         cap.native.verdict = "PASS";
-        cap.isal.ratio = 1.05;
-        cap.isal.verdict = "PASS";
+        let isal = cap.isal.as_mut().expect("3-way test_capture has isal");
+        isal.ratio = 1.05;
+        isal.verdict = "PASS";
         let cell = emit_cell(&args, &cap);
         let line1 = cell.lines().next().unwrap();
         assert!(line1.contains("native=1.02 PASS"), "{line1}");
         assert!(line1.contains("isal=1.05 PASS"), "{line1}");
+    }
+
+    // ── 2-way mode (native vs rg only, --isal omitted) ─────────────────────────
+
+    #[test]
+    fn two_way_arg_parse_isal_omitted() {
+        let args: Vec<String> = [
+            "--arch-os",
+            "amd-zen2",
+            "--threads",
+            "8",
+            "--mask",
+            "0-7",
+            "--corpus",
+            "storedheavy",
+            "--corpus-path",
+            "/tmp/storedheavy.gz",
+            "--corpus-pin",
+            "aaaa",
+            "--decomp-pin",
+            "bbbb",
+            "--native",
+            "/tmp/gzippy-native",
+            "--rg",
+            "/tmp/rapidgzip",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = args_from_cli(&args).expect("2-way args must parse without --isal");
+        assert!(
+            parsed.isal.as_os_str().is_empty(),
+            "isal path must be empty when --isal is omitted"
+        );
+        assert!(
+            parsed.is_two_way(),
+            "is_two_way() must be true when --isal is omitted"
+        );
+    }
+
+    #[test]
+    fn three_way_arg_parse_isal_present_keeps_3way() {
+        let args: Vec<String> = [
+            "--arch-os",
+            "amd-zen2",
+            "--threads",
+            "8",
+            "--mask",
+            "0-7",
+            "--corpus",
+            "storedheavy",
+            "--corpus-path",
+            "/tmp/storedheavy.gz",
+            "--corpus-pin",
+            "aaaa",
+            "--decomp-pin",
+            "bbbb",
+            "--native",
+            "/tmp/gzippy-native",
+            "--isal",
+            "/tmp/gzippy-isal",
+            "--rg",
+            "/tmp/rapidgzip",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = args_from_cli(&args).expect("3-way args must still parse");
+        assert!(
+            !parsed.is_two_way(),
+            "is_two_way() must be false when --isal is given"
+        );
+        assert_eq!(parsed.isal, PathBuf::from("/tmp/gzippy-isal"));
+    }
+
+    #[test]
+    fn two_way_flavor_i_gate_not_reached_when_isal_empty() {
+        // `run_score` guards the SCORE-PROVENANCE-FLAVOR-I check with exactly
+        // this condition — proves FLAVOR-I is skipped (not invoked-and-ignored)
+        // in 2-way mode.
+        let mut args = test_args();
+        args.isal = PathBuf::new();
+        assert!(args.is_two_way());
+    }
+
+    #[test]
+    fn three_way_flavor_i_gate_reached_when_isal_set() {
+        let args = test_args(); // carries an isal path
+        assert!(!args.is_two_way());
+    }
+
+    #[test]
+    fn flavor_n_still_fires_regardless_of_mode() {
+        // FLAVOR-N is unconditional in both 2-way and 3-way — it does not
+        // depend on is_two_way() at all. A bogus path yields 0 symbols found
+        // (None -> 0), which is the same "pass" behavior in both modes; the
+        // point is the call is never gated by isal presence.
+        let bogus = PathBuf::from("/nonexistent/gzippy-native-binary-for-test");
+        assert!(check_flavor_native(&bogus).is_ok());
+    }
+
+    #[test]
+    fn two_way_capture_native_vs_native_synthetic_reconciles() {
+        // Synthetic A/A: native measured against itself (rg_wall == native_wall)
+        // must reconcile to ratio == 1.0 within spread, PASS the >=0.99 bar,
+        // and the SCORE line must carry no isal segment at all.
+        let mut args = test_args();
+        args.isal = PathBuf::new();
+        let mut cap = test_capture_2way();
+        cap.rg.wall_ms = 250.0;
+        cap.native.wall_ms = 250.0;
+        cap.native.ratio = 1.0;
+        cap.native.verdict = "PASS";
+        cap.native.spread_ms = 3.0; // ~1.2% spread, within the 0.99 bar's slack
+
+        let cell = emit_cell(&args, &cap);
+        let line1 = cell.lines().next().unwrap();
+        assert!(line1.contains("native=1.00 PASS"), "{line1}");
+        assert!(
+            !line1.contains("isal="),
+            "2-way SCORE line must not carry an isal segment: {line1}"
+        );
+        assert!(
+            cell.contains("capture_mode: 2-way"),
+            "yaml must record 2-way capture_mode"
+        );
+        assert!(
+            !cell.contains("gzippy-isal:"),
+            "2-way yaml must not include an isal builds block"
+        );
+    }
+
+    #[test]
+    fn two_way_emit_cell_omits_isal_reverify_flag() {
+        let cell = emit_cell(&test_args(), &test_capture_2way());
+        assert!(
+            !cell.contains("--isal"),
+            "2-way RE-VERIFY command must not pass --isal"
+        );
+    }
+
+    #[test]
+    fn three_way_emit_cell_still_has_isal_fields() {
+        // Regression guard: the 3-way path stays byte-identical in shape.
+        let cell = emit_cell(&test_args(), &test_capture());
+        assert!(
+            cell.contains("gzippy-isal:"),
+            "3-way yaml must still include an isal builds block"
+        );
+        assert!(
+            cell.contains("--isal"),
+            "3-way RE-VERIFY command must still pass --isal"
+        );
+        assert!(cell.contains("capture_mode: 3-way"));
+    }
+
+    #[test]
+    fn two_way_capture_result_carries_no_isal_measurement() {
+        let cap = test_capture_2way();
+        assert!(
+            cap.isal.is_none(),
+            "2-way CaptureResult.isal must be None, not a zeroed BuildMeasurement"
+        );
     }
 }
