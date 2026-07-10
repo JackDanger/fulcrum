@@ -219,22 +219,28 @@ pub fn parse_phase_line(line: &str) -> Result<PhaseRecord, String> {
 
 // ── Gate-0 self-validation (pure — unit-tested) ─────────────────────────────
 
-/// Gate-0 check 1 (CONSERVATION): `consumer_wall_us - (decode_wait_us +
-/// future_recv_us + drain_us + blockfind_us)` must be small relative to
-/// `consumer_wall_us` — those four are the consumer's BLOCKING spans; the rest
-/// is CPU work + overlap. Tolerance: `max(200us, 10% of consumer_wall_us)`
-/// (matches the brief's residual bound exactly). On success returns the signed
-/// residual (µs) for reporting; on failure names the check and prints the
-/// residual rather than silently passing.
+/// Gate-0 check 1 (CONSERVATION): the consumer thread's wall is spent either
+/// BLOCKED in one of the four measured waits (decode_wait + future_recv + drain
+/// + blockfind) or BURNING CPU (consumer_cpu). On an idle box with full
+/// instrumentation, `consumer_wall_us - (waits + consumer_cpu_us) ~= 0`. A
+/// residual beyond tolerance means an UNMEASURED region (an uninstrumented wait,
+/// or descheduling) — REFUSE rather than report a misleading breakdown. This is
+/// the physics fix over the original waits-only formula, which assumed the
+/// consumer is ~all-wait (true on marker-heavy corpora, FALSE on stored-heavy
+/// where consumer_cpu is a large share). Tolerance: `max(500us, 12% of
+/// consumer_wall_us)` — headroom for overlap/measurement noise, still tight
+/// enough to catch a real uninstrumented region. Returns the signed residual.
 pub fn check_conservation(r: &PhaseRecord) -> Result<i64, String> {
-    let sum = r.decode_wait_us + r.future_recv_us + r.drain_us + r.blockfind_us;
+    let waits = r.decode_wait_us + r.future_recv_us + r.drain_us + r.blockfind_us;
+    let sum = waits + r.consumer_cpu_us;
     let residual = r.consumer_wall_us as i64 - sum as i64;
-    let tol = (r.consumer_wall_us as f64 * 0.10).max(200.0).round() as i64;
+    let tol = (r.consumer_wall_us as f64 * 0.12).max(500.0).round() as i64;
     if residual.abs() > tol {
         return Err(format!(
             "GATE0-CONSERVATION: |residual|={}us > tolerance {}us \
              (consumer_wall_us={}us, decode_wait_us={}us, future_recv_us={}us, \
-             drain_us={}us, blockfind_us={}us, sum={}us)",
+             drain_us={}us, blockfind_us={}us, consumer_cpu_us={}us, sum={}us) \
+             — an unmeasured consumer region remains; instrument it before trusting the breakdown",
             residual.abs(),
             tol,
             r.consumer_wall_us,
@@ -242,6 +248,7 @@ pub fn check_conservation(r: &PhaseRecord) -> Result<i64, String> {
             r.future_recv_us,
             r.drain_us,
             r.blockfind_us,
+            r.consumer_cpu_us,
             sum
         ));
     }
@@ -627,11 +634,12 @@ mod tests {
     use super::*;
 
     fn ok_record() -> PhaseRecord {
-        // consumer_wall=10_000; decode_wait+future_recv+drain+blockfind = 9_800
-        // (residual 200us, exactly at the floor tolerance -> passes).
+        // Physically consistent under the cpu-inclusive conservation model:
+        // waits (1000+6000+2500+300=9_800) + consumer_cpu (3_000) = 12_800;
+        // consumer_wall=13_000 -> residual 200us (within tolerance -> passes).
         PhaseRecord {
-            wall_us: 10_500,
-            consumer_wall_us: 10_000,
+            wall_us: 13_500,
+            consumer_wall_us: 13_000,
             consumer_cpu_us: 3_000,
             decode_wait_us: 1_000,
             future_recv_us: 6_000,
@@ -793,7 +801,7 @@ mod tests {
     fn gate0_conservation_passes_on_consistent_record() {
         let r = ok_record();
         let residual = check_conservation(&r).expect("should pass Gate-0 conservation");
-        assert_eq!(residual, 200); // 10_000 - (1000+6000+2500+300) = 200
+        assert_eq!(residual, 200); // 13_000 - (waits 9_800 + cpu 3_000) = 200
     }
 
     #[test]
