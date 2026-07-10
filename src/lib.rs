@@ -78,6 +78,7 @@ pub mod occupancy;
 pub mod optgate;
 pub mod optimality;
 pub mod perturb;
+pub mod phasebreak;
 pub mod pipeline;
 pub mod probe;
 pub mod provenance;

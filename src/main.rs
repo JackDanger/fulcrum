@@ -26,9 +26,9 @@ use fulcrum::ledger::Ledger;
 use fulcrum::{
     abmeasure, audit, bundle, causal, chainlat, compare, compare_cli, consumer, coz, coz_jsonl,
     critpath, cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants,
-    locate, mech, mech_arch, memlife, model, optgate, perturb, provenance, rank, region_hw, report,
-    rg_verbose, scaling, scaling_matrix, schedule, score, scoreboard, spans, sweep, trace, validate,
-    vs, vs_sweep, xtool,
+    locate, mech, mech_arch, memlife, model, optgate, perturb, phasebreak, provenance, rank,
+    region_hw, report, rg_verbose, scaling, scaling_matrix, schedule, score, scoreboard, spans,
+    sweep, trace, validate, vs, vs_sweep, xtool,
 };
 // counterdiff's perf-based command is the fallback whenever the macOS kpc
 // backend (fulcrum::macmeasure) is NOT compiled in — i.e. off macOS, or on
@@ -89,6 +89,9 @@ USAGE:\n\
   fulcrum chainlat --asm gz.s --cmp-asm igzip.s [--path literal-fast]\n\
               CRITICAL-RECURRENCE / CHAIN-LATENCY loop analysis via llvm-mca; compares steady-state\n\
               cycles/iter, critical sequence, and port pressure for one linear decode path slice\n\
+  fulcrum phasebreak --native <gzippy-bin> --corpus <f.gz> [-p T] [-n N] [--taskset <mask>] [--json]\n\
+              runs a --features phase-timing gzippy binary N times, Gate-0 conservation-checks\n\
+              each run's phase JSON, reports per-phase median+spread + the dominant blocking phase\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -3980,6 +3983,36 @@ fn cmd_chainlat(args: &[String]) -> ExitCode {
     }
 }
 
+/// phasebreak: deterministic per-phase parallel-decode wall breakdown.
+/// Mirrors `cmd_chainlat`'s shape (parse → run → render/REFUSE).
+fn cmd_phasebreak(args: &[String]) -> ExitCode {
+    let cfg = match phasebreak::parse_args(args) {
+        Ok(c) => c,
+        Err(e) if e == "HELP" => {
+            println!("{}", phasebreak::HELP);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{e}\n\n{}", phasebreak::HELP);
+            return ExitCode::from(2);
+        }
+    };
+    match phasebreak::run(&cfg) {
+        Ok(report) => {
+            if cfg.json {
+                println!("{}", report.render_json());
+            } else {
+                print!("{}", report.render_table());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[INSTRUMENT REFUSED] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
 fn cmd_ledger(args: &[String]) -> ExitCode {
     let verb = match args.first().map(String::as_str) {
@@ -4254,6 +4287,7 @@ fn main() -> ExitCode {
         "kpcphase" => fulcrum::macmeasure::cmd_kpcphase(rest),
         "excess" => cmd_excess(rest),
         "chainlat" => cmd_chainlat(rest),
+        "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
