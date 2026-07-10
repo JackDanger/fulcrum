@@ -78,6 +78,7 @@ pub mod model;
 pub mod occupancy;
 pub mod optgate;
 pub mod optimality;
+pub mod paired;
 pub mod perturb;
 pub mod phasebreak;
 pub mod pipeline;

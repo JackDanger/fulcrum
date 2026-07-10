@@ -97,6 +97,13 @@ USAGE:\n\
               TTL watchdog + idempotent release with a GLOBAL orphan sweep). `freeze run\n\
               [--ttl-s N] -- CMD...` releases on EVERY exit path; kills the re-CONT/orphan\n\
               bug class. `freeze selftest` is the baked Gate-0 (fake sysfs + real procs)\n\
+  fulcrum paired --a-cmd <tmpl> --b-cmd <tmpl> --corpus <path> [--n 51] [--warmup 2]\n\
+              [--ref-cmd 'gunzip -c {{corpus}}'] [--no-sha] [--out result.json]\n\
+              the ONE interleaved A/B paired-diff runner for ~35 ms /dev/null decode walls\n\
+              (per-round paired Δ cancels common-mode drift; best-of-N is unusable that low).\n\
+              Δ<spread ⇒ TIE (log-ratio CI must EXCLUDE 0). SINK LAW /dev/null both arms +\n\
+              mandatory A/A certificate + byte-exact gate. `paired selftest` is the baked Gate-0.\n\
+              Composes: `fulcrum freeze run -- fulcrum paired ...`\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -4293,6 +4300,7 @@ fn main() -> ExitCode {
         "excess" => cmd_excess(rest),
         "chainlat" => cmd_chainlat(rest),
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
+        "paired" => fulcrum::paired::cmd_paired(rest),
         "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
