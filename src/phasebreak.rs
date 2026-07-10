@@ -64,6 +64,11 @@ pub struct PhasebreakArgs {
     pub n: usize,
     pub taskset: Option<String>,
     pub json: bool,
+    /// Host-side analysis of a JSONL of phase records already collected on a
+    /// guest (matches the fulcrum execution model: walls run on the guest,
+    /// analysis runs host-side). When set, `--native`/`--corpus` are not
+    /// required and no binary is spawned.
+    pub from_file: Option<PathBuf>,
 }
 
 /// Parse `phasebreak`'s CLI args. Returns `Err("HELP")` for `--help`/`-h` (the
@@ -75,6 +80,7 @@ pub fn parse_args(args: &[String]) -> Result<PhasebreakArgs, String> {
     let mut n: usize = 7;
     let mut taskset: Option<String> = None;
     let mut json = false;
+    let mut from_file: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -105,12 +111,30 @@ pub fn parse_args(args: &[String]) -> Result<PhasebreakArgs, String> {
                     .map_err(|_| format!("phasebreak: -n wants an integer, got '{v}'"))?;
             }
             "--taskset" => taskset = Some(next_val!()),
+            "--from-file" => from_file = Some(PathBuf::from(next_val!())),
             "--json" => {
                 json = true;
                 i += 1;
             }
             other => return Err(format!("phasebreak: unknown argument '{other}'")),
         }
+    }
+
+    // Host-side analysis mode: analyze a guest-collected JSONL. --native/--corpus
+    // are not needed (nothing is spawned); they default to placeholders.
+    if let Some(f) = from_file {
+        if threads == 0 {
+            return Err("phasebreak: -p must be >= 1".to_string());
+        }
+        return Ok(PhasebreakArgs {
+            native: native.unwrap_or_else(|| PathBuf::from("<from-file>")),
+            corpus: corpus.unwrap_or_else(|| PathBuf::from("<from-file>")),
+            threads,
+            n,
+            taskset,
+            json,
+            from_file: Some(f),
+        });
     }
 
     let native = native.ok_or_else(|| "phasebreak: --native is required".to_string())?;
@@ -128,6 +152,7 @@ pub fn parse_args(args: &[String]) -> Result<PhasebreakArgs, String> {
         n,
         taskset,
         json,
+        from_file: None,
     })
 }
 
@@ -515,6 +540,47 @@ impl Report {
 /// the warmup) aborts the WHOLE run with `Err` — no partial or
 /// silently-degraded report is ever returned.
 pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
+    // Host-side analysis of a guest-collected JSONL: parse every non-empty
+    // line, drop the first as warmup (matching the spawn path), Gate-0-validate
+    // the rest. Same conservation/trap gates as the spawn path — the collection
+    // just happened on another host.
+    if let Some(f) = &args.from_file {
+        let content = std::fs::read_to_string(f)
+            .map_err(|e| format!("phasebreak: cannot read --from-file {} ({e})", f.display()))?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() < 2 {
+            return Err(format!(
+                "phasebreak: --from-file {} has {} record(s); need >= 2 (line 1 is dropped as warmup)",
+                f.display(),
+                lines.len()
+            ));
+        }
+        let mut records: Vec<PhaseRecord> = Vec::with_capacity(lines.len() - 1);
+        let mut warnings: Vec<String> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let record = parse_phase_line(line)
+                .map_err(|e| format!("phasebreak: --from-file line {}: {e}", idx + 1))?;
+            if idx == 0 {
+                continue; // warmup
+            }
+            gate0_validate(&record).map_err(|e| {
+                format!(
+                    "phasebreak: --from-file line {} REFUSED (Gate-0 failed): {e}",
+                    idx + 1
+                )
+            })?;
+            if let Some(w) = check_inert_oracle_trap(&record) {
+                warnings.push(format!("line {}: {w}", idx + 1));
+            }
+            records.push(record);
+        }
+        let threads = records
+            .first()
+            .map(|r| r.threads as usize)
+            .unwrap_or(args.threads);
+        return Ok(build_report(threads, &records, warnings));
+    }
+
     if !args.native.exists() {
         return Err(format!(
             "phasebreak: --native binary does not exist: {}",
@@ -655,6 +721,7 @@ mod tests {
             n: 7,
             taskset: None,
             json: false,
+            from_file: None,
         };
         let (prog, argv) = build_argv(&a);
         assert_eq!(prog, "/bin/gzippy");
@@ -670,6 +737,7 @@ mod tests {
             n: 7,
             taskset: Some("0-3".to_string()),
             json: false,
+            from_file: None,
         };
         let (prog, argv) = build_argv(&a);
         assert_eq!(prog, "taskset");
