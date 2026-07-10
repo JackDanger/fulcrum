@@ -92,6 +92,11 @@ USAGE:\n\
   fulcrum phasebreak --native <gzippy-bin> --corpus <f.gz> [-p T] [-n N] [--taskset <mask>] [--json]\n\
               runs a --features phase-timing gzippy binary N times, Gate-0 conservation-checks\n\
               each run's phase JSON, reports per-phase median+spread + the dominant blocking phase\n\
+  fulcrum freeze acquire|release|run|status|selftest   the ONE managed box-freeze lifecycle\n\
+              (boost=0 + governor=performance + SIGSTOP tenants supervisor-first + detached\n\
+              TTL watchdog + idempotent release with a GLOBAL orphan sweep). `freeze run\n\
+              [--ttl-s N] -- CMD...` releases on EVERY exit path; kills the re-CONT/orphan\n\
+              bug class. `freeze selftest` is the baked Gate-0 (fake sysfs + real procs)\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -4287,6 +4292,7 @@ fn main() -> ExitCode {
         "kpcphase" => fulcrum::macmeasure::cmd_kpcphase(rest),
         "excess" => cmd_excess(rest),
         "chainlat" => cmd_chainlat(rest),
+        "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
