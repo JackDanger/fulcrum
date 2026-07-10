@@ -301,9 +301,17 @@ pub fn build_argv(args: &PhasebreakArgs) -> (String, Vec<String>) {
     }
 }
 
-/// Run the native binary once with a fresh `GZIPPY_PHASE_OUT` tmpfile, parse
-/// the one phasebreak line it wrote, and Gate-0-validate it. `run_idx` is used
-/// only to make the tmpfile name unique and to label errors.
+/// Run the native binary once with a fresh `GZIPPY_PHASE_OUT` tmpfile and
+/// parse the one phasebreak line it wrote. Does NOT Gate-0-validate — run 0
+/// (warmup, always spawned+parsed so a totally-inert binary is still caught,
+/// but then discarded) legitimately fails the CONSERVATION check on a cold
+/// process/mmap/page-cache start: `consumer_wall_ns` is anchored before
+/// `block_finder`/`window_map`/`thread_pool` construction, so first-run
+/// cold-start cost lands in `consumer_wall_us` without landing in any of the
+/// four phase atomics — a real (not broken) accounting gap that only the
+/// discarded warmup sample should ever see. [`run`] applies [`gate0_validate`]
+/// to the RETAINED (non-warmup) records only. `run_idx` is used only to make
+/// the tmpfile name unique and to label errors.
 fn run_once(args: &PhasebreakArgs, run_idx: usize) -> Result<PhaseRecord, String> {
     let tmp = std::env::temp_dir().join(format!(
         "fulcrum-phasebreak-{}-{}-{run_idx}.jsonl",
@@ -353,10 +361,7 @@ fn run_once(args: &PhasebreakArgs, run_idx: usize) -> Result<PhaseRecord, String
                  may not be built with --features phase-timing"
             )
         })?;
-    let record = parse_phase_line(line)?;
-    gate0_validate(&record)
-        .map_err(|e| format!("phasebreak: run {run_idx} REFUSED (Gate-0 failed): {e}"))?;
-    Ok(record)
+    parse_phase_line(line)
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
@@ -501,10 +506,14 @@ impl Report {
 
 // ── Top-level run ────────────────────────────────────────────────────────────
 
-/// Run `phasebreak`: spawn the native binary N times (dropping run 0 as
-/// warmup), Gate-0-validate every run, and build the report. Any Gate-0
-/// failure or spawn/parse error aborts the WHOLE run with `Err` — no partial
-/// or silently-degraded report is ever returned.
+/// Run `phasebreak`: spawn the native binary N times, drop run 0 (warmup)
+/// UNGATED (it still must spawn + parse successfully — that catches a
+/// completely inert/broken binary — but is not conservation-checked; see
+/// [`run_once`]'s doc for why a cold first run legitimately fails Gate-0),
+/// Gate-0-validate every RETAINED run, and build the report. Any Gate-0
+/// failure (on a retained run) or spawn/parse error (on ANY run, including
+/// the warmup) aborts the WHOLE run with `Err` — no partial or
+/// silently-degraded report is ever returned.
 pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
     if !args.native.exists() {
         return Err(format!(
@@ -523,13 +532,16 @@ pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
     let mut warnings: Vec<String> = Vec::new();
     for i in 0..args.n {
         let record = run_once(args, i)?;
+        if i == 0 {
+            // Warmup — spawned + parsed (so a totally inert/broken binary is
+            // still caught) but NOT Gate-0-validated and dropped from the
+            // report; see run_once's doc.
+            continue;
+        }
+        gate0_validate(&record)
+            .map_err(|e| format!("phasebreak: run {i} REFUSED (Gate-0 failed): {e}"))?;
         if let Some(w) = check_inert_oracle_trap(&record) {
             warnings.push(format!("run {i}: {w}"));
-        }
-        if i == 0 {
-            // Warmup — measured (so a spawn/Gate-0 failure on run 0 still
-            // aborts loudly) but dropped from the report.
-            continue;
         }
         records.push(record);
     }
