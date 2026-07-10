@@ -9,7 +9,13 @@
 //! 4. Asserts gzippy-native has 0 `isal_inflate` symbols (pure-Rust build).
 //! 5. Asserts gzippy-isal has >0 `isal_inflate` symbols (ISA-L build).
 //! 6. Runs the SCHEMA-conformant 3-way interleaved wall capture:
-//!    SINK LAW (regular-file sinks), best-of-N, sha-verify every run.
+//!    SINK LAW (`/dev/null` — timing NEVER touches a regular-file sink; a file
+//!    sink dilutes/flips the ratio by timing the write, not the decode — see
+//!    `SCORE-SINK-DEVNULL`), best-of-N.
+//!    Correctness is verified SEPARATELY and untimed via `correctness_run`
+//!    (stdout piped through a streaming SHA-256, >=3x per binary per cell) —
+//!    decoupling "how fast" from "was it right" so neither measurement
+//!    contaminates the other.
 //! 7. Emits the `score/<arch-os>/t<N>/<corpus>.md` cell file.
 //!
 //! Named invariants (abort with the invariant name in the error):
@@ -18,9 +24,10 @@
 //!   `SCORE-PROVENANCE-FREEZE`       readable thawed governor or no_turbo
 //!   `SCORE-PROVENANCE-FLAVOR-N`     gzippy-native has ISA-L inflate symbols
 //!   `SCORE-PROVENANCE-FLAVOR-I`     gzippy-isal has 0 ISA-L inflate symbols
-//!   `SCORE-SHA-VERIFY`              run output sha != decomp-pin (Rule 4 — wrong bytes is a loss)
+//!   `SCORE-SINK-DEVNULL`            the timing sink is not the `/dev/null` char device
+//!   `SCORE-SHA-VERIFY`              correctness_run output sha != decomp-pin (Rule 4 — wrong bytes is a loss)
 
-use crate::compare::hex32;
+use crate::compare::{hex32, sha256_reader};
 use crate::provenance::count_isal_inflate_symbols;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -119,7 +126,9 @@ pub enum ScoreError {
     ProvenanceFlavorN { symbols: usize },
     /// `SCORE-PROVENANCE-FLAVOR-I`: gzippy-isal has 0 ISA-L inflate symbols.
     ProvenanceFlavorI,
-    /// `SCORE-SHA-VERIFY`: run output sha != decomp-pin (Rule 4).
+    /// `SCORE-SINK-DEVNULL`: the timing sink is not the `/dev/null` char device.
+    SinkNotDevnull { path: String, detail: String },
+    /// `SCORE-SHA-VERIFY`: correctness_run output sha != decomp-pin (Rule 4).
     ShaVerify {
         binary: String,
         iteration: usize,
@@ -139,6 +148,7 @@ impl ScoreError {
             ScoreError::ProvenanceFreeze { .. } => "SCORE-PROVENANCE-FREEZE",
             ScoreError::ProvenanceFlavorN { .. } => "SCORE-PROVENANCE-FLAVOR-N",
             ScoreError::ProvenanceFlavorI => "SCORE-PROVENANCE-FLAVOR-I",
+            ScoreError::SinkNotDevnull { .. } => "SCORE-SINK-DEVNULL",
             ScoreError::ShaVerify { .. } => "SCORE-SHA-VERIFY",
             ScoreError::Internal(_) => "SCORE-INTERNAL",
         }
@@ -177,6 +187,13 @@ impl std::fmt::Display for ScoreError {
                  — not an ISA-L build. Rebuild with default features.",
                 self.invariant_name()
             ),
+            ScoreError::SinkNotDevnull { path, detail } => write!(
+                f,
+                "{}: sink {path} is not the /dev/null char device ({detail}) — \
+                 a regular-file sink penalizes the faster arm and manufactures \
+                 phantom sign-flips (project sink law). Refusing to time.",
+                self.invariant_name()
+            ),
             ScoreError::ShaVerify {
                 binary,
                 iteration,
@@ -184,7 +201,7 @@ impl std::fmt::Display for ScoreError {
                 expected,
             } => write!(
                 f,
-                "{}: {binary} output sha mismatch at iteration {iteration} \
+                "{}: {binary} correctness_run output sha mismatch at rep {iteration} \
                  (got {got}, expected {expected}) — wrong bytes is a loss (Rule 4). Cell VOID.",
                 self.invariant_name()
             ),
@@ -404,44 +421,53 @@ pub fn read_freeze_state() -> (String, String) {
     (gov, turbo)
 }
 
-// ─── Inner timed run (SINK LAW enforced) ──────────────────────────────────────
+// ─── Inner timed run (SINK LAW enforced: /dev/null, NEVER a regular file) ─────
 
-/// Run one decompression, redirecting stdout to a regular-file sink.
+/// `SCORE-SINK-DEVNULL` — assert `path` is the `/dev/null` char device, not a
+/// regular file (or anything else). Pure/testable without spawning a process.
 ///
-/// Command: `taskset -c <mask> <binary> <args...>` (stdout → sink).
-/// Returns `(wall_ms, output_sha256_hex)`.
+/// This is the sink-law gate: a regular-file sink times the OUTPUT WRITE in
+/// addition to the decode, which dilutes (and can flip) the true decode-only
+/// ratio between two binaries with different write patterns. `/dev/null`
+/// discards writes at the kernel level with (to first order) zero marginal
+/// cost per byte, so both arms are timed on decode alone.
+pub fn check_sink_is_devnull(path: &Path) -> Result<(), ScoreError> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = std::fs::metadata(path).map_err(|e| ScoreError::SinkNotDevnull {
+        path: path.display().to_string(),
+        detail: format!("stat failed: {e}"),
+    })?;
+    if meta.file_type().is_char_device() {
+        Ok(())
+    } else {
+        Err(ScoreError::SinkNotDevnull {
+            path: path.display().to_string(),
+            detail: "not a char device".to_string(),
+        })
+    }
+}
+
+/// Run one decompression, timing ONLY the decode. Stdout is sunk to
+/// `/dev/null` (`Stdio::null()`, which on Unix opens `/dev/null`) — never a
+/// regular file. Returns `wall_ms`.
 ///
-/// The sink is created fresh each call (removes any prior node so a planted
-/// FIFO/symlink cannot survive); the SINK LAW assertion that it is a plain
-/// regular file happens here.
+/// Command: `taskset -c <mask> <binary> <args...>` (stdout → `/dev/null`).
+///
+/// Correctness is NOT checked here — see [`correctness_run`] /
+/// [`verify_correctness`], which run the SAME command untimed with stdout
+/// piped through a streaming SHA-256 instead. Splitting the two means a slow
+/// correctness pass (piping + hashing) never contaminates the timed wall, and
+/// a fast/incorrect run never lets bad output through unnoticed.
 fn timed_run(
-    sink: &Path,
     mask: &str,
     binary: &Path,
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
     log: &mut String,
-) -> Result<(f64, String), ScoreError> {
-    // SINK LAW: remove prior node, create as plain file, assert it is regular.
-    let _ = std::fs::remove_file(sink);
-    let sink_file = std::fs::File::create(sink)
-        .map_err(|e| ScoreError::Internal(format!("create sink {}: {e}", sink.display())))?;
-    {
-        // Assert regular file (not symlink / FIFO).
-        let meta = sink_file
-            .metadata()
-            .map_err(|e| ScoreError::Internal(format!("stat sink {}: {e}", sink.display())))?;
-        if !meta.is_file() {
-            return Err(ScoreError::Internal(format!(
-                "sink {} is not a regular file (SINK LAW violation)",
-                sink.display()
-            )));
-        }
-    }
-
+) -> Result<f64, ScoreError> {
     let mut cmd = Command::new("taskset");
     cmd.arg("-c").arg(mask).arg(binary).args(extra_args);
-    cmd.stdout(sink_file);
+    cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -461,31 +487,113 @@ fn timed_run(
         ));
     }
 
-    let out_sha = sha256_file_hex(sink)
-        .map_err(|e| ScoreError::Internal(format!("sha256 sink {}: {e}", sink.display())))?;
-    Ok((wall_ms, out_sha))
+    Ok(wall_ms)
+}
+
+// ─── Correctness run (SEPARATE, UNTIMED — never shares a code path with timing) ─
+
+/// Run one decompression with stdout PIPED (never `/dev/null`, never a file)
+/// through a streaming SHA-256 hasher. Untimed — no `Instant` anywhere in
+/// this function. Returns the lowercase hex digest of stdout.
+///
+/// Command: `taskset -c <mask> <binary> <args...>` (stdout → pipe → hasher).
+fn correctness_run(
+    mask: &str,
+    binary: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, ScoreError> {
+    let mut cmd = Command::new("taskset");
+    cmd.arg("-c").arg(mask).arg(binary).args(extra_args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ScoreError::Internal(format!("spawn {}: {e}", binary.display())))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ScoreError::Internal(format!(
+            "{}: no stdout pipe (correctness_run)",
+            binary.display()
+        ))
+    })?;
+    let digest = sha256_reader(stdout)
+        .map_err(|e| ScoreError::Internal(format!("hash stdout of {}: {e}", binary.display())))?;
+    let status = child
+        .wait()
+        .map_err(|e| ScoreError::Internal(format!("wait {}: {e}", binary.display())))?;
+    if !status.success() {
+        return Err(ScoreError::Internal(format!(
+            "{} exited {:?} during correctness_run",
+            binary.display(),
+            status
+        )));
+    }
+    Ok(hex32(&digest))
+}
+
+/// Number of untimed correctness reps run per binary per cell. >=3 to catch
+/// intermittent parallel-decode corruption that a single per-run check could
+/// miss (the thing per-iteration file-sink sha-verify used to catch, before
+/// the sink itself was the bug).
+pub const CORRECTNESS_REPS: usize = 3;
+
+/// Run [`correctness_run`] `reps` times for one binary and assert every
+/// output sha == `decomp_pin`. Fires `SCORE-SHA-VERIFY` (Rule 4) on the first
+/// mismatch — the cell is VOID, exactly as a mismatch in the old per-iteration
+/// timed-sha-verify used to void it.
+fn verify_correctness(
+    label: &str,
+    mask: &str,
+    binary: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+    decomp_pin: &str,
+    reps: usize,
+    log: &mut String,
+) -> Result<(), ScoreError> {
+    for k in 1..=reps {
+        let got = correctness_run(mask, binary, extra_args, extra_env)?;
+        if got.trim() != decomp_pin.trim() {
+            return Err(ScoreError::ShaVerify {
+                binary: label.to_string(),
+                iteration: k,
+                got,
+                expected: decomp_pin.to_string(),
+            });
+        }
+        log.push_str(&format!("## correctness {label} rep={k}/{reps}: sha=OK\n"));
+    }
+    Ok(())
 }
 
 // ─── 3-way / 2-way interleaved wall capture ────────────────────────────────────
 
 /// Run the interleaved wall capture — 3-way (native / isal / rg) when
 /// `args.isal` is set, 2-way (native / rg) when it is not
-/// ([`ScoreArgs::is_two_way`]) — best-of-N, sha-verify every run against
-/// `args.decomp_pin`.
+/// ([`ScoreArgs::is_two_way`]).
 ///
-/// In 2-way mode the isal binary is never spawned/measured (not merely
-/// dropped from the report): no `timed_run` call is made for it, and its sha
-/// is excluded from the per-iteration verify set.
+/// Two DECOUPLED passes, in this order:
+///   1. **Correctness** ([`verify_correctness`], untimed, [`CORRECTNESS_REPS`]
+///      reps per binary): stdout piped through a streaming SHA-256, compared
+///      to `args.decomp_pin`. Any mismatch fires `SCORE-SHA-VERIFY` and the
+///      cell is VOID before a single timed sample is taken.
+///   2. **Timing** ([`timed_run`], best-of-N, `/dev/null` sink — SINK LAW):
+///      N+1 interleaved iterations (i=0 is warmup, dropped); every arm times
+///      the SAME sink so neither is penalized for its output volume/pattern.
 ///
-/// The warmup iteration (i = 0) is dropped. Each real iteration sha-verifies
-/// every measured output; any mismatch fires `SCORE-SHA-VERIFY`.
+/// In 2-way mode the isal binary is never spawned/measured in EITHER pass
+/// (not merely dropped from the report).
 pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
     let two_way = args.is_two_way();
     let mut log = String::new();
-    let tmpdir = std::env::temp_dir();
-    let sink_native = tmpdir.join("fulcrum_score_sink_native.bin");
-    let sink_isal = tmpdir.join("fulcrum_score_sink_isal.bin");
-    let sink_rg = tmpdir.join("fulcrum_score_sink_rg.bin");
+
+    // SINK LAW gate (SCORE-SINK-DEVNULL): fail loud, before spawning anything,
+    // if this host's /dev/null is not the char device we expect.
+    check_sink_is_devnull(Path::new("/dev/null"))?;
 
     let t_str = args.threads.to_string();
     let corpus_str = args.corpus_path.to_str().unwrap_or("");
@@ -494,7 +602,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
     let gzippy_env: [(&str, &str); 1] = [("GZIPPY_FORCE_PARALLEL_SM", "1")];
 
     log.push_str(&format!(
-        "## fulcrum score — {}-way interleaved capture (N={}, mask={})\n",
+        "## fulcrum score — {}-way interleaved capture (N={}, mask={}, sink=/dev/null)\n",
         if two_way { 2 } else { 3 },
         args.samples,
         args.mask
@@ -518,14 +626,51 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         ));
     }
 
+    // ── Pass 1: correctness (untimed, decoupled from the wall) ────────────
+    log.push_str(&format!(
+        "## correctness pass: {CORRECTNESS_REPS} reps/binary, piped+hashed, untimed\n"
+    ));
+    verify_correctness(
+        "native",
+        &args.mask,
+        &args.native,
+        &gzippy_args,
+        &gzippy_env,
+        &args.decomp_pin,
+        CORRECTNESS_REPS,
+        &mut log,
+    )?;
+    if !two_way {
+        verify_correctness(
+            "isal",
+            &args.mask,
+            &args.isal,
+            &gzippy_args,
+            &gzippy_env,
+            &args.decomp_pin,
+            CORRECTNESS_REPS,
+            &mut log,
+        )?;
+    }
+    verify_correctness(
+        "rg",
+        &args.mask,
+        &args.rg,
+        &rg_args,
+        &[],
+        &args.decomp_pin,
+        CORRECTNESS_REPS,
+        &mut log,
+    )?;
+
+    // ── Pass 2: timing (best-of-N interleaved, /dev/null sink) ────────────
     let mut native_walls: Vec<f64> = Vec::with_capacity(args.samples);
     let mut isal_walls: Vec<f64> = Vec::with_capacity(args.samples);
     let mut rg_walls: Vec<f64> = Vec::with_capacity(args.samples);
 
     // N+1 iterations: i=0 is warmup (dropped), i=1..=N are measurements.
     for i in 0..=(args.samples) {
-        let (nw, nsha) = timed_run(
-            &sink_native,
+        let nw = timed_run(
             &args.mask,
             &args.native,
             &gzippy_args,
@@ -533,11 +678,10 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             &mut log,
         )?;
         // 2-way: no isal arm is spawned at all.
-        let isal_run = if two_way {
+        let iw = if two_way {
             None
         } else {
             Some(timed_run(
-                &sink_isal,
                 &args.mask,
                 &args.isal,
                 &gzippy_args,
@@ -545,11 +689,11 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
                 &mut log,
             )?)
         };
-        let (rw, rsha) = timed_run(&sink_rg, &args.mask, &args.rg, &rg_args, &[], &mut log)?;
+        let rw = timed_run(&args.mask, &args.rg, &rg_args, &[], &mut log)?;
 
         if i == 0 {
-            match &isal_run {
-                Some((iw, _)) => log.push_str(&format!(
+            match iw {
+                Some(iw) => log.push_str(&format!(
                     "## warmup (dropped): native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms\n"
                 )),
                 None => log.push_str(&format!(
@@ -559,44 +703,20 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             continue;
         }
 
-        // sha-verify every measured output against the decompressed-corpus pin.
-        let mut checks: Vec<(&str, &String)> = vec![("native", &nsha), ("rg", &rsha)];
-        if let Some((_, isha)) = &isal_run {
-            checks.push(("isal", isha));
-        }
-        for (label, sha) in checks {
-            if sha.trim() != args.decomp_pin.trim() {
-                let _ = std::fs::remove_file(&sink_native);
-                let _ = std::fs::remove_file(&sink_isal);
-                let _ = std::fs::remove_file(&sink_rg);
-                return Err(ScoreError::ShaVerify {
-                    binary: label.to_string(),
-                    iteration: i,
-                    got: sha.clone(),
-                    expected: args.decomp_pin.clone(),
-                });
-            }
-        }
-
         native_walls.push(nw);
         rg_walls.push(rw);
-        match &isal_run {
-            Some((iw, _)) => {
-                isal_walls.push(*iw);
+        match iw {
+            Some(iw) => {
+                isal_walls.push(iw);
                 log.push_str(&format!(
-                    "## i={i}: native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms sha=OK\n"
+                    "## i={i}: native={nw:.0}ms isal={iw:.0}ms rg={rw:.0}ms\n"
                 ));
             }
             None => {
-                log.push_str(&format!("## i={i}: native={nw:.0}ms rg={rw:.0}ms sha=OK\n"));
+                log.push_str(&format!("## i={i}: native={nw:.0}ms rg={rw:.0}ms\n"));
             }
         }
     }
-
-    // Clean up sinks.
-    let _ = std::fs::remove_file(&sink_native);
-    let _ = std::fs::remove_file(&sink_isal);
-    let _ = std::fs::remove_file(&sink_rg);
 
     // Best = minimum wall; spread = max - min.
     let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1648,6 +1768,143 @@ mod tests {
         assert!(
             cap.isal.is_none(),
             "2-way CaptureResult.isal must be None, not a zeroed BuildMeasurement"
+        );
+    }
+
+    // ── SINK LAW: /dev/null, never a regular file (2026-07 fix) ───────────────
+
+    #[test]
+    fn devnull_sink_is_char_device() {
+        // The gate `run_wall_capture` calls before spawning anything: /dev/null
+        // must be a char device on this host. Pure, no subprocess.
+        assert!(check_sink_is_devnull(Path::new("/dev/null")).is_ok());
+    }
+
+    #[test]
+    fn sink_law_rejects_a_regular_file() {
+        // A regular-file "sink" (the OLD behavior) must be REJECTED by the same
+        // gate that accepts /dev/null — this is the direct regression guard
+        // for the bug this fix addresses (file sink dilutes/flips the ratio).
+        let tmp = std::env::temp_dir().join("fulcrum_score_sink_law_test_regular_file_marker.bin");
+        std::fs::write(&tmp, b"not /dev/null").expect("write test fixture");
+        let result = check_sink_is_devnull(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            matches!(result, Err(ScoreError::SinkNotDevnull { .. })),
+            "a regular file must be rejected as a sink, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().invariant_name(), "SCORE-SINK-DEVNULL");
+    }
+
+    #[test]
+    fn correctness_reps_is_at_least_three() {
+        // >=3 reps/binary/cell — catches intermittent parallel-decode
+        // corruption that a single untimed check could miss.
+        assert!(CORRECTNESS_REPS >= 3);
+    }
+
+    /// `taskset` is Linux-only (util-linux); these end-to-end tests spawn a
+    /// real subprocess through it, so they self-skip (not fail) on hosts
+    /// without it (e.g. macOS dev boxes) rather than making `cargo test`
+    /// host-dependent. On the Linux bench boxes (where `fulcrum score`
+    /// actually runs) they execute for real.
+    fn taskset_available() -> bool {
+        Command::new("taskset")
+            .arg("-c")
+            .arg("0")
+            .arg("true")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn timed_run_end_to_end_uses_devnull_sink_not_a_file() {
+        if !taskset_available() {
+            eprintln!(
+                "SKIP timed_run_end_to_end_uses_devnull_sink_not_a_file: no taskset on this host"
+            );
+            return;
+        }
+        let mut log = String::new();
+        // /bin/echo writes a known payload to stdout; timed_run must succeed
+        // with the sink target NEVER a regular file. If timed_run regressed
+        // to creating a file sink under $TMPDIR, a parallel test run would
+        // race on it; this test's mere success alongside
+        // `sink_law_rejects_a_regular_file` running concurrently is itself
+        // part of the guard, but the direct assertion is: it succeeds and
+        // returns a plausible non-negative wall with zero stdout captured
+        // anywhere (nothing to assert on stdout — that's the point of
+        // /dev/null).
+        let wall = timed_run(
+            "0",
+            Path::new("/bin/echo"),
+            &["hello-devnull-sink-test"],
+            &[],
+            &mut log,
+        );
+        assert!(wall.is_ok(), "timed_run must succeed: {wall:?}");
+        assert!(wall.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn correctness_run_refuses_a_deliberately_wrong_hash() {
+        if !taskset_available() {
+            eprintln!(
+                "SKIP correctness_run_refuses_a_deliberately_wrong_hash: no taskset on this host"
+            );
+            return;
+        }
+        let mut log = String::new();
+        // `verify_correctness` is the enforcement layer atop `correctness_run`
+        // (which only computes a hash) — deliberately mismatch the pin and
+        // assert the SHA-VERIFY invariant fires on the first rep.
+        let wrong_pin = "0".repeat(64);
+        let result = verify_correctness(
+            "echo-selftest",
+            "0",
+            Path::new("/bin/echo"),
+            &["known-content-for-hash-mismatch-selftest"],
+            &[],
+            &wrong_pin,
+            1,
+            &mut log,
+        );
+        assert!(
+            matches!(result, Err(ScoreError::ShaVerify { .. })),
+            "expected ShaVerify on a deliberately-wrong pin, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().invariant_name(), "SCORE-SHA-VERIFY");
+    }
+
+    #[test]
+    fn correctness_run_accepts_a_matching_hash() {
+        if !taskset_available() {
+            eprintln!("SKIP correctness_run_accepts_a_matching_hash: no taskset on this host");
+            return;
+        }
+        let mut log = String::new();
+        let payload = "known-content-for-hash-match-selftest";
+        // sha256("known-content-for-hash-match-selftest\n") — /bin/echo appends \n.
+        let expected = {
+            let digest =
+                sha256_reader(std::io::Cursor::new(format!("{payload}\n"))).expect("hash fixture");
+            hex32(&digest)
+        };
+        let result = verify_correctness(
+            "echo-selftest",
+            "0",
+            Path::new("/bin/echo"),
+            &[payload],
+            &[],
+            &expected,
+            CORRECTNESS_REPS,
+            &mut log,
+        );
+        assert!(result.is_ok(), "expected match to pass, got {result:?}");
+        assert!(
+            log.matches("sha=OK").count() >= CORRECTNESS_REPS,
+            "expected {CORRECTNESS_REPS} sha=OK log lines, got: {log}"
         );
     }
 }
