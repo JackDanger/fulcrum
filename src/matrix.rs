@@ -179,6 +179,102 @@ pub fn expand_threads(template: &str, threads: u32) -> String {
     template.replace("{threads}", &threads.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Per-cell CPU pinning — the rg-reference-DRIFT fix (advisor-flagged confound)
+// ---------------------------------------------------------------------------
+//
+// WHY (bug post-mortem, 2026-07-10). A matrix is a SCOREBOARD: every cell's A/B
+// must run on the SAME fixed cores, exactly like a `fulcrum paired` run pinned
+// with `taskset -c <mask>`. Before this fix `matrix` did NOT pin — it handed the
+// bare {threads}-expanded command straight to `run_paired`, so the OS was free to
+// migrate each cell's arms across cores. The COMPARATOR (rg) reference then
+// DRIFTED cell-to-cell (measured 29→40 ms) and manufactured SIGN-FLIPS: a phantom
+// silesia LOSS on code silesia never executes, and storedheavy cells that flipped
+// LOSS↔WIN unpinned-vs-pinned. The storedheavy segmented ship had to DISCARD the
+// matrix and re-run with pinned `paired`. The fix makes matrix pin each cell's
+// paired run to a fixed core-set — BOTH arms identically — so the common-mode
+// (the reference) is shared and cancels in the per-round paired Δ (the
+// feedback_paired_diff_scoreboard invariant), instead of drifting between arms.
+//
+// Pinning is applied by PREPENDING `taskset -c <mask> ` to each timed arm's
+// command (the same mechanism a hand-pinned `fulcrum paired` uses — `run_paired`
+// runs the arm through `sh -c`, so a `taskset` prefix Just Works and the byte /
+// A-A / timed passes all inherit it). The reference decode (untimed correctness)
+// is deliberately NOT pinned — it never enters the wall, so it cannot drift it.
+
+/// Per-cell CPU pinning for the two TIMED arms. Default (CLI) is `PerThread` on
+/// Linux — the canonical `0-(T-1)` mask (`T=1 → "0"`) shared by BOTH arms every
+/// cell. macOS has no `taskset`, so the CLI selects `None` there (and the pure
+/// library default is `None` for back-compat, so unit tests never shell out to a
+/// missing `taskset`). `Tmpl` carries a custom mask template (`{Tm1}`/`{T}`
+/// substituted, mirroring `scoreboard`'s `mask_tmpl`) for an independent-P-core
+/// pool or a uniform pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pin {
+    /// No pinning (macOS / explicit `--no-pin`). The pre-fix drift-prone behavior.
+    None,
+    /// `taskset -c 0-(T-1)` per cell (canonical per-T mask; `T=1 → "0"`).
+    PerThread,
+    /// Custom mask template with `{Tm1}`/`{T}` substituted per cell.
+    Tmpl(String),
+}
+
+impl Pin {
+    /// The `taskset -c` mask string for a thread count (no `taskset -c` prefix),
+    /// or `None` when pinning is disabled. `PerThread`: `"0"` at T=1 else
+    /// `"0-(T-1)"`.
+    pub fn mask(&self, threads: u32) -> Option<String> {
+        match self {
+            Pin::None => Option::None,
+            Pin::PerThread => Some(if threads <= 1 {
+                "0".to_string()
+            } else {
+                format!("0-{}", threads - 1)
+            }),
+            Pin::Tmpl(t) => Some(
+                t.replace("{Tm1}", &threads.saturating_sub(1).to_string())
+                    .replace("{T}", &threads.to_string()),
+            ),
+        }
+    }
+
+    /// The command PREFIX (`"taskset -c <mask> "` or `""`) for a thread count.
+    pub fn prefix(&self, threads: u32) -> String {
+        match self.mask(threads) {
+            Some(m) => format!("taskset -c {m} "),
+            Option::None => String::new(),
+        }
+    }
+
+    /// Prepend the pin prefix to a fully `{threads}`-expanded command (the
+    /// `{corpus}` token, if any, survives for `run_paired` to substitute).
+    pub fn apply(&self, cmd: &str, threads: u32) -> String {
+        format!("{}{}", self.prefix(threads), cmd)
+    }
+
+    /// Provenance string banked in the manifest/method (so a scoreboard records
+    /// HOW it was pinned — an unpinned surface must never masquerade as pinned).
+    pub fn provenance(&self) -> String {
+        match self {
+            Pin::None => "pin=none".to_string(),
+            Pin::PerThread => "pin=taskset-per-thread(0-(T-1))".to_string(),
+            Pin::Tmpl(t) => format!("pin=taskset-tmpl({t})"),
+        }
+    }
+}
+
+/// Build the `(a_cmd, b_cmd)` a cell hands to `run_paired`: substitute
+/// `{threads}` in each template, then apply the SAME pin prefix to BOTH arms.
+/// Exposed (pure, no subprocess/`taskset` needed) so the pin plumbing —
+/// specifically that both arms receive the identical mask — is unit-testable on
+/// any box, however many cores.
+pub fn cell_cmds(a_tmpl: &str, b_tmpl: &str, threads: u32, pin: &Pin) -> (String, String) {
+    (
+        pin.apply(&expand_threads(a_tmpl, threads), threads),
+        pin.apply(&expand_threads(b_tmpl, threads), threads),
+    )
+}
+
 /// Enumerate the (corpus, thread) cells in row-major (corpus-outer) order — the
 /// order the grid renders and the JSON banks. Used by `--dry-run` too.
 pub fn plan_cells(corpora: &[PathBuf], threads: &[u32]) -> Vec<(PathBuf, u32)> {
@@ -231,6 +327,12 @@ pub struct RunManifest {
     /// artifact reproduces byte-for-byte from its inputs.
     pub timestamp: String,
     pub method: String,
+    /// How each cell's timed arms were CPU-pinned (`Pin::provenance()`), e.g.
+    /// `pin=taskset-per-thread(0-(T-1))`. A scoreboard must record this so an
+    /// UNPINNED (drift-prone) surface can never masquerade as pinned. Defaulted
+    /// for back-compat with pre-pin banked artifacts.
+    #[serde(default)]
+    pub pin: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -384,11 +486,10 @@ pub fn run_matrix(
 }
 
 /// Run the full corpus×T sweep, optionally freezing the box PER CELL via `gate`.
-/// Per cell: substitute `{threads}`, `gate.enter()` (freeze), delegate to
-/// [`run_paired`], then `gate.exit()` (release) on EVERY path. Fail-soft: a cell
-/// error — INCLUDING a freeze-acquire failure — becomes a VOID cell and the
-/// sweep goes on. When `gate` is `Some`, the banked method records
-/// `freeze-per-cell` for provenance.
+/// UNPINNED (`Pin::None`) — the pure back-compat entry the unit tests use (they
+/// must never shell out to a `taskset` that may be absent, e.g. on macOS). The
+/// scoreboard CLI calls [`run_matrix_gated_pinned`] with `Pin::PerThread` so the
+/// production surface is always pinned.
 #[allow(clippy::too_many_arguments)]
 pub fn run_matrix_gated(
     a_cmd_tmpl: &str,
@@ -404,6 +505,39 @@ pub fn run_matrix_gated(
     box_name: &str,
     sha_pins: &[String],
     timestamp: &str,
+    gate: Option<&mut dyn CellGate>,
+) -> MatrixResult {
+    run_matrix_gated_pinned(
+        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpora, threads, n, warmup, sink, do_sha, ours,
+        box_name, sha_pins, timestamp, &Pin::None, gate,
+    )
+}
+
+/// Run the full corpus×T sweep, PINNING each cell's timed arms to a fixed core
+/// set (`pin`) and optionally freezing the box PER CELL via `gate`. THIS is the
+/// scoreboard core (the rg-reference-drift fix): per cell it builds the SAME
+/// `taskset`-prefixed command for BOTH arms via [`cell_cmds`], `gate.enter()`
+/// (freeze), delegates to [`run_paired`], then `gate.exit()` (release) on EVERY
+/// path. Fail-soft: a cell error — INCLUDING a freeze-acquire failure — becomes a
+/// VOID cell and the sweep goes on. The banked method/manifest records the pin
+/// provenance (and `freeze-per-cell` when `gate` is `Some`). Pinning composes
+/// with freeze-each: the freeze wraps the cell, the pin prefixes the command.
+#[allow(clippy::too_many_arguments)]
+pub fn run_matrix_gated_pinned(
+    a_cmd_tmpl: &str,
+    b_cmd_tmpl: &str,
+    ref_cmd_tmpl: &str,
+    corpora: &[PathBuf],
+    threads: &[u32],
+    n: usize,
+    warmup: usize,
+    sink: &Path,
+    do_sha: bool,
+    ours: Arm,
+    box_name: &str,
+    sha_pins: &[String],
+    timestamp: &str,
+    pin: &Pin,
     mut gate: Option<&mut dyn CellGate>,
 ) -> MatrixResult {
     let freeze_each = gate.is_some();
@@ -426,8 +560,10 @@ pub fn run_matrix_gated(
                 continue;
             }
         }
-        let a_t = expand_threads(a_cmd_tmpl, t);
-        let b_t = expand_threads(b_cmd_tmpl, t);
+        // PIN each cell's timed arms to the SAME fixed core-set (both arms
+        // identical — that is what cancels the rg-reference drift). The untimed
+        // reference decode is NOT pinned (it never enters the wall).
+        let (a_t, b_t) = cell_cmds(a_cmd_tmpl, b_cmd_tmpl, t, pin);
         let ref_t = expand_threads(ref_cmd_tmpl, t);
         let result = run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha);
         // Release THIS cell's freeze on EVERY path, before recording the result.
@@ -460,11 +596,11 @@ pub fn run_matrix_gated(
     }
 
     let summary = MatrixResult::summarize(&cells);
-    let method = if freeze_each {
-        format!("{METHOD};freeze-per-cell(acquire+release+watchdog-per-cell)")
-    } else {
-        METHOD.to_string()
-    };
+    let pin_prov = pin.provenance();
+    let mut method = format!("{METHOD};{pin_prov}");
+    if freeze_each {
+        method.push_str(";freeze-per-cell(acquire+release+watchdog-per-cell)");
+    }
     let manifest = RunManifest {
         a_cmd: a_cmd_tmpl.to_string(),
         b_cmd: b_cmd_tmpl.to_string(),
@@ -478,6 +614,7 @@ pub fn run_matrix_gated(
         sha_pins: sha_pins.to_vec(),
         timestamp: timestamp.to_string(),
         method,
+        pin: pin_prov,
     };
     MatrixResult { manifest, cells, summary }
 }
@@ -495,8 +632,13 @@ fn basename(p: &str) -> &str {
 pub fn render_grid(r: &MatrixResult) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "fulcrum matrix  ours={}  n={}  warmup={}  box={}  ts={}\n",
-        r.manifest.ours, r.manifest.n, r.manifest.warmup, r.manifest.box_name, r.manifest.timestamp
+        "fulcrum matrix  ours={}  n={}  warmup={}  box={}  ts={}  {}\n",
+        r.manifest.ours,
+        r.manifest.n,
+        r.manifest.warmup,
+        r.manifest.box_name,
+        r.manifest.timestamp,
+        if r.manifest.pin.is_empty() { "pin=?" } else { &r.manifest.pin },
     ));
     out.push_str(&format!("  a(ours-if-a)= {}\n", r.manifest.a_cmd));
     out.push_str(&format!("  b(ours-if-b)= {}\n", r.manifest.b_cmd));
@@ -977,6 +1119,111 @@ pub fn selftest() -> ExitCode {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // -- PIN: the rg-reference-DRIFT fix (advisor-flagged confound) -----------
+    // A matrix is a scoreboard; every cell's timed arms MUST run on the SAME
+    // fixed cores, both arms identically, exactly like a hand-pinned `fulcrum
+    // paired`. Unpinned, the rg comparator reference drifted cell-to-cell
+    // (29→40 ms) and manufactured sign-flips (phantom silesia LOSS; storedheavy
+    // LOSS↔WIN). These checks pin the fix WITHOUT a many-core box / real taskset:
+    // the mask convention, the both-arms-identical plumbing, the pinned==hand-
+    // pinned-paired equivalence, the stable classification, and the provenance.
+    {
+        // (a) canonical per-T mask convention: T=1→"0", else "0-(T-1)".
+        check("pin: PerThread mask T1 == 0", Pin::PerThread.mask(1).as_deref() == Some("0"));
+        check("pin: PerThread mask T4 == 0-3", Pin::PerThread.mask(4).as_deref() == Some("0-3"));
+        check("pin: PerThread mask T16 == 0-15", Pin::PerThread.mask(16).as_deref() == Some("0-15"));
+        check("pin: None mask is None", Pin::None.mask(8).is_none());
+        check(
+            "pin: Tmpl substitutes {Tm1}/{T}",
+            Pin::Tmpl("2-{Tm1},{T}".into()).mask(4).as_deref() == Some("2-3,4"),
+        );
+        check(
+            "pin: PerThread prefix is taskset -c <mask>",
+            Pin::PerThread.prefix(4) == "taskset -c 0-3 " && Pin::None.prefix(4).is_empty(),
+        );
+
+        // (b) PLUMBING: cell_cmds pins BOTH arms to the SAME mask (this is what
+        //     cancels the reference drift), without needing many cores/taskset.
+        let (pa, pb) = cell_cmds(
+            "gzippy -d -c -p {threads} {corpus}",
+            "rapidgzip -d -c -P {threads} {corpus}",
+            8,
+            &Pin::PerThread,
+        );
+        check(
+            "pin: cell_cmds prefixes BOTH arms with the identical mask",
+            pa == "taskset -c 0-7 gzippy -d -c -p 8 {corpus}"
+                && pb == "taskset -c 0-7 rapidgzip -d -c -P 8 {corpus}",
+        );
+
+        // (c) REGRESSION: matrix's pinned per-cell command == the command a hand-
+        //     pinned `fulcrum paired` would run, for every T. Identical mask on
+        //     both arms every cell ⇒ no reference drift ⇒ no manufactured flip.
+        let a_tmpl = "gzippy -d -c -p {threads} {corpus}";
+        let b_tmpl = "rapidgzip -d -c -P {threads} {corpus}";
+        let equal_all_t = [1u32, 2, 4, 8, 16].iter().all(|&t| {
+            let (a, b) = cell_cmds(a_tmpl, b_tmpl, t, &Pin::PerThread);
+            let mask = Pin::PerThread.mask(t).unwrap();
+            a == format!("taskset -c {mask} {}", expand_threads(a_tmpl, t))
+                && b == format!("taskset -c {mask} {}", expand_threads(b_tmpl, t))
+        });
+        check("pin: matrix cell command == hand-pinned paired (all T)", equal_all_t);
+
+        // (d) CLASSIFICATION is STABLE under pinning: a fixed synthetic paired
+        //     log-ratio vector (CI excludes 0, hi<0 ⇒ RESOLVED-b-slower) classifies
+        //     the SAME as pinned paired — WIN for ours=a, flipping to LOSS for
+        //     ours=b — with NO drift-induced sign flip.
+        let lr = [-0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11];
+        let verdict = crate::paired::ab_verdict(&crate::paired::ci95(&lr));
+        check("pin: fixed vector → paired RESOLVED-b-slower", verdict == "RESOLVED-b-slower");
+        check(
+            "pin: pinned matrix classify == paired verdict (ours=a → WIN)",
+            classify("OK", verdict, Arm::A) == CellClass::Win,
+        );
+        check(
+            "pin: orientation flip stable (ours=b → LOSS)",
+            classify("OK", verdict, Arm::B) == CellClass::Loss,
+        );
+
+        // (e) PROVENANCE: a pinned run banks its pin in method + manifest; the
+        //     back-compat ungated entry banks pin=none (never masquerades pinned).
+        let corpora = vec![PathBuf::from("/tmp/cA.gz")];
+        let threads = vec![1u32];
+        let pinned = run_matrix_gated_pinned(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, None,
+        );
+        check(
+            "pin: pinned manifest records taskset-per-thread provenance",
+            pinned.manifest.pin == "pin=taskset-per-thread(0-(T-1))"
+                && pinned.manifest.method.contains("pin=taskset-per-thread"),
+        );
+        let unpinned = run_matrix(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z",
+        );
+        check("pin: ungated entry banks pin=none", unpinned.manifest.pin == "pin=none");
+
+        // (f) COMPOSES with freeze-each: pin + a per-cell gate both fire; the
+        //     banked method carries BOTH provenances (pin prefixes the command,
+        //     freeze wraps the cell — orthogonal).
+        struct NopGate;
+        impl CellGate for NopGate {
+            fn enter(&mut self, _c: &Path, _t: u32) -> Result<(), String> { Ok(()) }
+            fn exit(&mut self, _c: &Path, _t: u32) {}
+        }
+        let mut g = NopGate;
+        let both = run_matrix_gated_pinned(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, Some(&mut g),
+        );
+        check(
+            "pin: composes with freeze-each (method carries pin AND freeze-per-cell)",
+            both.manifest.method.contains("pin=taskset-per-thread")
+                && both.manifest.method.contains("freeze-per-cell"),
+        );
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -1081,6 +1328,7 @@ fn usage() -> ExitCode {
          \x20                [--n 51] [--warmup 2] [--ours a|b] [--ref-cmd 'gunzip -c {{corpus}}']\n\
          \x20                [--sink /dev/null] [--no-sha] [--box NAME] [--sha-pin K:V ...]\n\
          \x20                [--timestamp STR] [--out matrix.json] [--dry-run]\n\
+         \x20                [--no-pin | --pin <mask-tmpl>]   (default: taskset -c 0-(T-1) per cell)\n\
          \x20                [--freeze-each [--freeze-procs 'llama-swap,llama-server']\n\
          \x20                               [--freeze-ttl-s 600] [--freeze-state PATH]\n\
          \x20                               [--freeze-sysfs-root /] [--freeze-force-stale]]\n\
@@ -1089,6 +1337,13 @@ fn usage() -> ExitCode {
          \n\
          Templates substitute {{threads}} then {{corpus}}. --a-cmd is the SUBJECT (ours by\n\
          default); --ours b scores the comparator instead.\n\
+         \n\
+         PIN (default ON — a scoreboard must not drift): each cell's TWO timed arms are pinned\n\
+         to the SAME fixed cores (`taskset -c 0-(T-1)`), exactly like a hand-pinned `fulcrum\n\
+         paired`. Both arms identical ⇒ the comparator (rg) reference is common-mode and\n\
+         cancels in the paired Δ — it cannot drift cell-to-cell and manufacture sign-flips.\n\
+         `--no-pin` disables; `--pin <tmpl>` supplies a custom mask ({{Tm1}}/{{T}} substituted).\n\
+         macOS has no taskset ⇒ pinning is forced OFF there.\n\
          \n\
          FREEZE-PER-CELL (--freeze-each): the matrix acquires/releases its OWN short-TTL\n\
          freeze around EACH cell, so no whole-grid watchdog can expire mid-run and thaw the\n\
@@ -1185,6 +1440,22 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         .unwrap_or_else(now_epoch_string);
     let dry_run = cli_has(args, "--dry-run");
 
+    // -- PIN (the rg-reference-drift fix). A scoreboard must NOT drift: pin every
+    //    cell's timed arms to a fixed core-set, BOTH arms identically, exactly as
+    //    a hand-pinned `fulcrum paired` does. DEFAULT ON — canonical per-T mask
+    //    `taskset -c 0-(T-1)`. `--no-pin` opts out; `--pin <tmpl>` supplies a
+    //    custom mask template (`{Tm1}`/`{T}` substituted). macOS has no taskset,
+    //    so pinning is forced OFF there (the matrix only certifies on the boxes).
+    let pin = if cli_has(args, "--no-pin") {
+        Pin::None
+    } else if let Some(tmpl) = cli_flag(args, "--pin") {
+        Pin::Tmpl(tmpl.to_string())
+    } else if std::env::consts::OS == "macos" {
+        Pin::None
+    } else {
+        Pin::PerThread
+    };
+
     // -- FREEZE-PER-CELL (the TTL-contamination fix). `--freeze-each` makes the
     //    matrix acquire/release its own SHORT-TTL freeze around EACH cell, so
     //    there is no whole-grid watchdog to expire mid-run. Use INSTEAD OF the
@@ -1212,14 +1483,15 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
     if dry_run {
         let cells = plan_cells(&corpora, &threads);
         println!(
-            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} ours={} box={} freeze_each={}",
+            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} ours={} box={} freeze_each={} {}",
             cells.len(),
             corpora.len(),
             threads.len(),
             n,
             ours.token(),
             box_name,
-            freeze_each
+            freeze_each,
+            pin.provenance(),
         );
         if freeze_each {
             println!(
@@ -1229,14 +1501,16 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         }
         println!("  a-cmd: {a_cmd}");
         println!("  b-cmd: {b_cmd}");
-        println!("  ref-cmd: {ref_cmd}");
+        println!("  ref-cmd: {ref_cmd}  (untimed correctness gate — NOT pinned)");
         for (c, t) in &cells {
+            // Show the ACTUAL pinned commands the cell will run (both arms same mask).
+            let (a_run, b_run) = cell_cmds(&a_cmd, &b_cmd, *t, &pin);
             println!(
                 "  plan cell: corpus={} threads={} -> a='{}' b='{}'",
                 c.display(),
                 t,
-                expand_threads(&a_cmd, *t),
-                expand_threads(&b_cmd, *t),
+                a_run,
+                b_run,
             );
         }
         return ExitCode::SUCCESS;
@@ -1275,9 +1549,9 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         None
     };
 
-    let r = run_matrix_gated(
+    let r = run_matrix_gated_pinned(
         &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
-        &sha_pins, &timestamp,
+        &sha_pins, &timestamp, &pin,
         gate.as_mut().map(|g| g as &mut dyn CellGate),
     );
 
@@ -1337,6 +1611,98 @@ mod tests {
             expand_threads("gz -p {threads} {corpus}", 8),
             "gz -p 8 {corpus}"
         );
+    }
+
+    // ---- PIN: the rg-reference-drift fix (advisor-flagged confound) ----------
+
+    #[test]
+    fn pin_mask_per_thread_convention() {
+        // canonical per-T mask: T=1→"0", else "0-(T-1)".
+        assert_eq!(Pin::PerThread.mask(1).as_deref(), Some("0"));
+        assert_eq!(Pin::PerThread.mask(2).as_deref(), Some("0-1"));
+        assert_eq!(Pin::PerThread.mask(4).as_deref(), Some("0-3"));
+        assert_eq!(Pin::PerThread.mask(16).as_deref(), Some("0-15"));
+        assert!(Pin::None.mask(8).is_none());
+        assert_eq!(Pin::Tmpl("2-{Tm1},{T}".into()).mask(4).as_deref(), Some("2-3,4"));
+    }
+
+    #[test]
+    fn pin_prefix_and_apply() {
+        assert_eq!(Pin::PerThread.prefix(4), "taskset -c 0-3 ");
+        assert_eq!(Pin::None.prefix(4), "");
+        assert_eq!(
+            Pin::PerThread.apply("gzippy -d -c {corpus}", 8),
+            "taskset -c 0-7 gzippy -d -c {corpus}"
+        );
+        // None is a no-op (the pre-fix behavior, kept for macОS/unit tests).
+        assert_eq!(Pin::None.apply("gzippy {corpus}", 8), "gzippy {corpus}");
+    }
+
+    #[test]
+    fn cell_cmds_pins_both_arms_with_identical_mask() {
+        // The PLUMBING that cancels the drift: BOTH arms get the SAME taskset
+        // mask (no many-core box / real taskset needed to assert this).
+        let (a, b) = cell_cmds(
+            "gzippy -d -c -p {threads} {corpus}",
+            "rapidgzip -d -c -P {threads} {corpus}",
+            8,
+            &Pin::PerThread,
+        );
+        assert_eq!(a, "taskset -c 0-7 gzippy -d -c -p 8 {corpus}");
+        assert_eq!(b, "taskset -c 0-7 rapidgzip -d -c -P 8 {corpus}");
+        // Unpinned back-compat leaves the command untouched.
+        let (a0, b0) = cell_cmds("a {threads}", "b {threads}", 4, &Pin::None);
+        assert_eq!((a0.as_str(), b0.as_str()), ("a 4", "b 4"));
+    }
+
+    #[test]
+    fn pinned_matrix_command_equals_hand_pinned_paired_all_t() {
+        // REGRESSION: matrix's pinned per-cell command == what a hand-pinned
+        // `fulcrum paired` would run, for every T. Identical mask on both arms
+        // every cell ⇒ no reference drift ⇒ no manufactured sign flip.
+        let a_tmpl = "gzippy -d -c -p {threads} {corpus}";
+        let b_tmpl = "rapidgzip -d -c -P {threads} {corpus}";
+        for &t in &[1u32, 2, 4, 8, 16] {
+            let (a, b) = cell_cmds(a_tmpl, b_tmpl, t, &Pin::PerThread);
+            let mask = Pin::PerThread.mask(t).unwrap();
+            assert_eq!(a, format!("taskset -c {mask} {}", expand_threads(a_tmpl, t)));
+            assert_eq!(b, format!("taskset -c {mask} {}", expand_threads(b_tmpl, t)));
+        }
+    }
+
+    #[test]
+    fn pinned_classification_equals_paired_classification_on_fixed_vector() {
+        // On a FIXED synthetic paired log-ratio vector (CI excludes 0, hi<0 ⇒
+        // RESOLVED-b-slower), matrix's classification agrees with the pinned
+        // paired verdict — WIN for ours=a, LOSS for ours=b — deterministically,
+        // with NO drift-induced sign flip.
+        let lr = [-0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11];
+        let verdict = crate::paired::ab_verdict(&crate::paired::ci95(&lr));
+        assert_eq!(verdict, "RESOLVED-b-slower");
+        assert_eq!(classify("OK", verdict, Arm::A), CellClass::Win);
+        assert_eq!(classify("OK", verdict, Arm::B), CellClass::Loss);
+    }
+
+    #[test]
+    fn pinned_run_records_provenance_and_composes_with_freeze() {
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32];
+        let pinned = run_matrix_gated_pinned(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts", &Pin::PerThread, None,
+        );
+        assert_eq!(pinned.manifest.pin, "pin=taskset-per-thread(0-(T-1))");
+        assert!(pinned.manifest.method.contains("pin=taskset-per-thread"));
+
+        // pin composes with freeze-each (orthogonal: pin the command, freeze the cell).
+        let mut g = RecGate { enters: vec![], exits: vec![], fail_on: None };
+        let both = run_matrix_gated_pinned(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts", &Pin::PerThread, Some(&mut g),
+        );
+        assert!(both.manifest.method.contains("pin=taskset-per-thread"));
+        assert!(both.manifest.method.contains("freeze-per-cell"));
+        assert_eq!(g.enters.len(), 1);
     }
 
     #[test]
@@ -1521,7 +1887,11 @@ mod tests {
             "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
             true, Arm::A, "t", &[], "ts",
         );
-        assert_eq!(r.manifest.method, METHOD);
+        // Back-compat entry is UNPINNED: method is METHOD + the pin provenance
+        // (pin=none), and carries no freeze-per-cell marker.
+        assert!(r.manifest.method.starts_with(METHOD));
+        assert!(r.manifest.method.contains("pin=none"));
+        assert_eq!(r.manifest.pin, "pin=none");
         assert!(!r.manifest.method.contains("freeze-per-cell"));
     }
 
