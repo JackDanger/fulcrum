@@ -57,9 +57,14 @@ USAGE:\n\
   fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
   fulcrum comparability --capture cap.json [--capture ...] --claim subject-specific|settled|law\n\
               [--subject id --contrast id --counter name] [--field-tools a,b,c] [--statement \"...\"]\n\
+  fulcrum score --gzippy-native <bin> --comparator <bin[:argtmpl]> --corpus <path>\n\
+              --threads <T> [--n 51] [--out <path|json>]\n\
+              THE paired-backed scoreboard — delegates timing to `fulcrum paired`\n\
+              (interleaved paired-Δ + log-ratio CI95; Δ<spread ⇒ TIE) + COMPARATOR-native\n\
+              + FLAVOR-N provenance + byte-exact gate. `score selftest` is the Gate-0.\n\
   fulcrum score --arch-os <arch-os> --threads <N> --mask <cpu-mask> --corpus <name>\n\
               --corpus-path <path> --corpus-pin <sha256> --decomp-pin <sha256>\n\
-              --native <path> --isal <path> --rg <path>\n\
+              --native <path> --isal <path> --rg <path>   [LEGACY best-of-N cell emitter]\n\
               --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
               [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
   fulcrum scoreboard run       --spec <spec.json> [--dry-run]\n\
@@ -4312,20 +4317,31 @@ fn main() -> ExitCode {
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
         "invariants" => cmd_invariants(rest),
-        "score" => match score::args_from_cli(rest) {
-            Ok(a) => {
-                if let Err(e) = score::run_score(&a) {
-                    eprintln!("fulcrum score: {e}");
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
+        "score" => {
+            // `selftest` and the paired-backed form (`--gzippy-native`) route to
+            // the paired engine; the legacy best-of-N form (`--native/--isal/--rg`)
+            // is preserved for the deployed 2-way workflow.
+            if rest.first().map(|s| s.as_str()) == Some("selftest") {
+                score::selftest()
+            } else if rest.iter().any(|a| a == "--gzippy-native") {
+                score::cmd_score_paired(rest)
+            } else {
+                match score::args_from_cli(rest) {
+                    Ok(a) => {
+                        if let Err(e) = score::run_score(&a) {
+                            eprintln!("fulcrum score: {e}");
+                            ExitCode::FAILURE
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
+                        ExitCode::from(2)
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
-                ExitCode::from(2)
-            }
-        },
+        }
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "help" | "--help" | "-h" => {
             usage();

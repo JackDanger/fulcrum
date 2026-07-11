@@ -28,9 +28,11 @@
 //!   `SCORE-SHA-VERIFY`              correctness_run output sha != decomp-pin (Rule 4 — wrong bytes is a loss)
 
 use crate::compare::{hex32, sha256_reader};
+use crate::paired::{run_paired, PairedResult};
 use crate::provenance::count_isal_inflate_symbols;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -312,14 +314,23 @@ pub fn check_freeze_readback(
     Ok(())
 }
 
+/// `SCORE-PROVENANCE-FLAVOR-N` — pure verdict on an already-counted symbol total.
+///
+/// Split out from [`check_flavor_native`] so the gate itself is testable without
+/// a real binary (the box-free `selftest` fabricates a symbol count and asserts
+/// this fires); the symbol *counting* is separately tested in `provenance.rs`.
+pub fn flavor_n_verdict(symbols: usize) -> Result<(), ScoreError> {
+    if symbols > 0 {
+        Err(ScoreError::ProvenanceFlavorN { symbols })
+    } else {
+        Ok(())
+    }
+}
+
 /// `SCORE-PROVENANCE-FLAVOR-N` — gzippy-native must have 0 `isal_inflate` symbols.
 pub fn check_flavor_native(binary: &Path) -> Result<(), ScoreError> {
     let (count, _) = count_isal_inflate_symbols(binary);
-    let n = count.unwrap_or(0);
-    if n > 0 {
-        return Err(ScoreError::ProvenanceFlavorN { symbols: n });
-    }
-    Ok(())
+    flavor_n_verdict(count.unwrap_or(0))
 }
 
 /// `SCORE-PROVENANCE-FLAVOR-I` — gzippy-isal must have >0 `isal_inflate` symbols.
@@ -1262,6 +1273,577 @@ pub fn usage_score() -> &'static str {
      Aborts with a named SCORE-PROVENANCE-* error on any invariant violation."
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// PAIRED-BACKED SCORE (Task #5 / roadmap #5) — the named scoreboard now delegates
+// its TIMING to the `fulcrum paired` engine (`crate::paired::run_paired`) instead
+// of the best-of-N loop above, which is unusable at the ~35 ms /dev/null decode
+// walls the campaign lives at (a min-filter latches onto one lucky sample and
+// manufactures phantom sign-flips). The paired engine gives per-round paired-Δ +
+// log-ratio CI95 + RESOLVED/NOISY (Δ<spread ⇒ TIE) + a mandatory A/A certificate.
+//
+// This wrapper adds NOTHING to the statistics (it calls the shared `paired`
+// functions) — it contributes only the PROVENANCE the paired engine does not do
+// on its own: SCORE-PROVENANCE-COMPARATOR (comparator is a native ELF, not a
+// python wheel), SCORE-PROVENANCE-FLAVOR-N (gzippy-native is a pure-Rust build),
+// plus the greppable `SCORE:` line, the machine `SCORE=OK|VOID|FAIL` line, and the
+// bankable JSON. The byte-exact gate + SINK LAW live inside `run_paired`.
+//
+// `--comparator <bin[:argtmpl]>` generalizes the old hard-wired rapidgzip arm to
+// any decoder (libdeflate-gunzip / igzip / minigzip). The legacy best-of-N CLI
+// (`--native/--isal/--rg/--corpus-path/...`, dispatched when `--gzippy-native` is
+// ABSENT) is UNTOUCHED, so the deployed 2-way workflow keeps working.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Inputs to the paired-backed `fulcrum score` (the new spec).
+#[derive(Debug, Clone)]
+pub struct ScorePairedArgs {
+    /// e.g. `"intel-x86_64"` (informational; default `"unknown"`).
+    pub arch_os: String,
+    /// Corpus display name (default: the corpus file stem).
+    pub corpus_name: String,
+    /// Absolute path to the `.gz` corpus file (the timed input, `{corpus}`).
+    pub corpus_path: PathBuf,
+    /// Subject: the gzippy-native binary (pure-Rust build; FLAVOR-N gated).
+    pub gzippy_native: PathBuf,
+    /// Comparator spec: `"<bin>"` or `"<bin>:<argtmpl>"` (argtmpl may carry
+    /// `{corpus}` / `{threads}`). Default rapidgzip-native semantics.
+    pub comparator_spec: String,
+    /// Thread count for this cell (substituted as `{threads}`).
+    pub threads: usize,
+    /// Recorded interleaved rounds (default 51 — usable at ~35 ms walls).
+    pub n: usize,
+    /// Unrecorded warmup rounds (default 2).
+    pub warmup: usize,
+    /// Byte-exact reference decode template (default `gunzip -c {corpus}`).
+    pub ref_cmd_tmpl: String,
+    /// Timing sink — SINK LAW: MUST be `/dev/null` (default).
+    pub sink: PathBuf,
+    /// Git short-sha of the source (provenance stamp; default `"unknown"`).
+    pub src_sha: String,
+    /// Measurement date (default: today).
+    pub date: String,
+    /// `--out`: `Some("json")`/`Some("-")` prints JSON to stdout; `Some(path)`
+    /// writes the JSON there; `None` emits only the SCORE lines.
+    pub out: Option<String>,
+    /// Run the untimed byte-exact sha gate (default true; `--no-sha` disables).
+    pub do_sha: bool,
+}
+
+impl Default for ScorePairedArgs {
+    fn default() -> Self {
+        ScorePairedArgs {
+            arch_os: "unknown".into(),
+            corpus_name: String::new(),
+            corpus_path: PathBuf::new(),
+            gzippy_native: PathBuf::new(),
+            comparator_spec: String::new(),
+            threads: 1,
+            n: 51,
+            warmup: 2,
+            ref_cmd_tmpl: "gunzip -c {corpus}".into(),
+            sink: PathBuf::from("/dev/null"),
+            src_sha: "unknown".into(),
+            date: String::new(),
+            out: None,
+            do_sha: true,
+        }
+    }
+}
+
+/// The bankable result of a paired-backed score run: the full `paired` result
+/// plus the provenance this wrapper adds. Serializes to the paired schema + a
+/// provenance envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScorePairedResult {
+    /// `"OK" | "VOID" | "FAIL"` — mirrors the paired status.
+    pub score_status: String,
+    /// `"WIN" | "LOSS" | "TIE" | "VOID" | "FAIL"` — oriented for the subject.
+    pub class: String,
+    pub arch_os: String,
+    pub corpus: String,
+    pub threads: usize,
+    /// The parsed comparator binary (for the COMPARATOR provenance line).
+    pub comparator_bin: String,
+    /// `--version` wall of the comparator (the native-ELF provenance witness).
+    pub comparator_version_ms: f64,
+    /// `isal_inflate` symbol count in the subject (0 ⇒ pure-Rust, FLAVOR-N OK).
+    pub flavor_n_symbols: usize,
+    pub src_sha: String,
+    pub date: String,
+    /// Provenance-annotated method string.
+    pub method: String,
+    /// The full paired-diff result (stats, verdict, A/A cert, byte-exact gate).
+    pub paired: PairedResult,
+}
+
+/// Shell-single-quote a path so it survives `sh -c` with spaces/specials.
+fn shquote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Build the SUBJECT (gzippy-native) command template with `{threads}` resolved
+/// and `{corpus}` left for `paired` to substitute. Forces the parallel-SM engine.
+pub fn build_subject_cmd(bin: &Path, threads: usize) -> String {
+    format!(
+        "GZIPPY_FORCE_PARALLEL_SM=1 {} -d -c -p {} {{corpus}}",
+        shquote(bin),
+        threads
+    )
+}
+
+/// Default arg template for a comparator when `--comparator` carries no
+/// `:argtmpl`. rapidgzip needs `-P <threads>`; everything else is gunzip-shaped.
+fn default_comparator_args(bin: &str) -> String {
+    let base = Path::new(bin)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if base.contains("rapidgzip") || base == "rg" {
+        "-d -c -f -P {threads} {corpus}".to_string()
+    } else {
+        "-d -c {corpus}".to_string()
+    }
+}
+
+/// Parse a `--comparator <bin[:argtmpl]>` spec into `(bin, cmd_template)` with
+/// `{threads}` resolved and `{corpus}` left intact for `paired`. An explicit
+/// `:argtmpl` wins; otherwise a decoder-appropriate default is chosen.
+pub fn build_comparator_cmd(spec: &str, threads: usize) -> (String, String) {
+    let (bin, argtmpl) = match spec.split_once(':') {
+        Some((b, a)) => (b.to_string(), a.to_string()),
+        None => (spec.to_string(), default_comparator_args(spec)),
+    };
+    let argtmpl = argtmpl.replace("{threads}", &threads.to_string());
+    let cmd = format!("{} {}", shquote(Path::new(&bin)), argtmpl);
+    (bin, cmd)
+}
+
+/// Oriented WIN/LOSS/TIE class for the subject from a paired result.
+/// ratio = A/B = subject/comparator, so `RESOLVED-b-slower` ⇒ subject faster ⇒ WIN.
+pub fn classify(pr: &PairedResult) -> &'static str {
+    match pr.status.as_str() {
+        "FAIL" => "FAIL",
+        "VOID" => "VOID",
+        _ => match pr.verdict.as_str() {
+            "RESOLVED-b-slower" => "WIN",
+            "RESOLVED-a-slower" => "LOSS",
+            _ => "TIE",
+        },
+    }
+}
+
+impl ScorePairedResult {
+    /// The greppable line-1 `SCORE:` string (continuity with the legacy cell).
+    pub fn score_line(&self) -> String {
+        format!(
+            "SCORE: {} t{} {} | native={:.3} {} | ours={:.1}ms comparator={:.1}ms | \
+             N={} logratio_ci=[{:.4},{:.4}] | verdict={} method=paired",
+            self.arch_os,
+            self.threads,
+            self.corpus,
+            self.paired.ratio,
+            self.class,
+            self.paired.a_median,
+            self.paired.b_median,
+            self.paired.n,
+            self.paired.logratio_ci[0],
+            self.paired.logratio_ci[1],
+            self.paired.verdict,
+        )
+    }
+
+    /// The machine one-liner other tooling greps for.
+    pub fn machine_line(&self) -> String {
+        format!(
+            "SCORE={} class={} ratio={:.4} verdict={} n={} logratio_ci=[{:.4},{:.4}] \
+             a_median={:.3} b_median={:.3} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] \
+             aa_bias={:.4} sha_ok={} flavor_n={} comparator_ms={:.1} method=\"{}\"",
+            self.score_status,
+            self.class,
+            self.paired.ratio,
+            self.paired.verdict,
+            self.paired.n,
+            self.paired.logratio_ci[0],
+            self.paired.logratio_ci[1],
+            self.paired.a_median,
+            self.paired.b_median,
+            self.paired.sign_kn,
+            self.paired.spread,
+            self.paired.aa_ratio_ci[0],
+            self.paired.aa_ratio_ci[1],
+            self.paired.aa_bias,
+            self.paired.sha_ok,
+            self.flavor_n_symbols,
+            self.comparator_version_ms,
+            self.method,
+        )
+    }
+}
+
+/// Run a paired-backed score: PROVENANCE gates → delegate TIMING to `run_paired`
+/// → wrap with the provenance envelope. The SINK LAW, byte-exact gate, A/A
+/// certificate, and all statistics live inside `run_paired` (shared, not
+/// re-implemented). Aborts with a named `ScoreError` only on a provenance
+/// violation or a hard subprocess/sink error; a NOISY/VOID/FAIL *verdict* is a
+/// successful run that returns `Ok` with the status carried in the result.
+pub fn run_score_paired(a: &ScorePairedArgs) -> Result<ScorePairedResult, ScoreError> {
+    // -- corpus must exist (STRIKE-5-equivalent existence check).
+    if !a.corpus_path.exists() {
+        return Err(ScoreError::Internal(format!(
+            "corpus {} does not exist",
+            a.corpus_path.display()
+        )));
+    }
+
+    // -- SCORE-PROVENANCE-FLAVOR-N: subject is a pure-Rust build (0 isal syms).
+    let (flavor_count, _tool) = count_isal_inflate_symbols(&a.gzippy_native);
+    let flavor_n = flavor_count.unwrap_or(0);
+    flavor_n_verdict(flavor_n)?;
+
+    // -- Parse the comparator + SCORE-PROVENANCE-COMPARATOR (native ELF, <50ms).
+    let (comp_bin, b_cmd_tmpl) = build_comparator_cmd(&a.comparator_spec, a.threads);
+    let ver_ms = measure_version_wall(Path::new(&comp_bin));
+    check_comparator_native(ver_ms)?;
+
+    // -- Subject command (parallel-SM forced).
+    let a_cmd_tmpl = build_subject_cmd(&a.gzippy_native, a.threads);
+
+    // -- Delegate ALL timing to the paired engine (SINK LAW + byte-exact gate +
+    //    A/A certificate + interleaved paired-Δ CI95 are enforced inside).
+    let pr = run_paired(
+        &a_cmd_tmpl,
+        &b_cmd_tmpl,
+        &a.ref_cmd_tmpl,
+        &a.corpus_path,
+        a.n,
+        a.warmup,
+        &a.sink,
+        a.do_sha,
+    )
+    .map_err(ScoreError::Internal)?;
+
+    let class = classify(&pr).to_string();
+    let method = format!(
+        "fulcrum-score-v2:paired-backed;provenance=comparator-native(<50ms)+flavor-n(0-isal)\
+         +byte-exact(vs-ref)+sink-law;delegated={}",
+        pr.method
+    );
+
+    Ok(ScorePairedResult {
+        score_status: pr.status.clone(),
+        class,
+        arch_os: a.arch_os.clone(),
+        corpus: a.corpus_name.clone(),
+        threads: a.threads,
+        comparator_bin: comp_bin,
+        comparator_version_ms: ver_ms,
+        flavor_n_symbols: flavor_n,
+        src_sha: a.src_sha.clone(),
+        date: a.date.clone(),
+        method,
+        paired: pr,
+    })
+}
+
+/// Parse the paired-backed `fulcrum score` CLI (the `--gzippy-native` form).
+pub fn paired_args_from_cli(args: &[String]) -> Result<ScorePairedArgs, String> {
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+    }
+    fn need<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
+        flag(args, name).ok_or_else(|| format!("fulcrum score: missing required arg {name}"))
+    }
+
+    let gzippy_native = PathBuf::from(need(args, "--gzippy-native")?);
+    let corpus_path = PathBuf::from(need(args, "--corpus")?);
+    // Comparator: `--comparator` wins; `--rg` is a back-compat alias; else error.
+    let comparator_spec = flag(args, "--comparator")
+        .or_else(|| flag(args, "--rg"))
+        .ok_or_else(|| {
+            "fulcrum score: missing --comparator <bin[:argtmpl]> (or legacy --rg <bin>)".to_string()
+        })?
+        .to_string();
+    let threads: usize = flag(args, "--threads")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|e| format!("--threads: {e}"))?
+        .unwrap_or(1);
+    let n: usize = flag(args, "--n")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|e| format!("--n: {e}"))?
+        .unwrap_or(51);
+    if n < 7 {
+        return Err(format!("--n {n} < 7 (significance gate needs N>=7)"));
+    }
+    let warmup: usize = flag(args, "--warmup")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|e| format!("--warmup: {e}"))?
+        .unwrap_or(2);
+    let corpus_name = flag(args, "--corpus-name")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            corpus_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "corpus".into())
+        });
+
+    Ok(ScorePairedArgs {
+        arch_os: flag(args, "--arch-os").unwrap_or("unknown").to_string(),
+        corpus_name,
+        corpus_path,
+        gzippy_native,
+        comparator_spec,
+        threads,
+        n,
+        warmup,
+        ref_cmd_tmpl: flag(args, "--ref-cmd")
+            .unwrap_or("gunzip -c {corpus}")
+            .to_string(),
+        sink: PathBuf::from(flag(args, "--sink").unwrap_or("/dev/null")),
+        src_sha: flag(args, "--src-sha").unwrap_or("unknown").to_string(),
+        date: flag(args, "--date")
+            .map(String::from)
+            .unwrap_or_else(today_iso),
+        out: flag(args, "--out").map(String::from),
+        do_sha: !args.iter().any(|a| a == "--no-sha"),
+    })
+}
+
+/// CLI entry for the paired-backed score form. Emits the `SCORE:` line + the
+/// machine `SCORE=...` line to stdout and (optionally) bankable JSON.
+pub fn cmd_score_paired(args: &[String]) -> ExitCode {
+    let a = match paired_args_from_cli(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}\n\nUsage:\n{}", usage_score_paired());
+            return ExitCode::from(2);
+        }
+    };
+    match run_score_paired(&a) {
+        Ok(r) => {
+            println!("{}", r.score_line());
+            println!("{}", r.machine_line());
+            if let Some(out) = &a.out {
+                match serde_json::to_string_pretty(&r) {
+                    Ok(js) => {
+                        if out == "json" || out == "-" {
+                            println!("{js}");
+                        } else if let Err(e) = std::fs::write(out, &js) {
+                            eprintln!("fulcrum score: WARN could not write --out {out}: {e}");
+                        } else {
+                            eprintln!("fulcrum score: wrote {out}");
+                        }
+                    }
+                    Err(e) => eprintln!("fulcrum score: WARN serialize: {e}"),
+                }
+            }
+            if r.score_status == "OK" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE // VOID (A/A bias) / FAIL (byte mismatch)
+            }
+        }
+        Err(e) => {
+            // Provenance / hard error: still emit a greppable machine line.
+            println!(
+                "SCORE=FAIL {} verdict=provenance method=\"fulcrum-score-v2\"",
+                e.invariant_name()
+            );
+            eprintln!("fulcrum score: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub fn usage_score_paired() -> &'static str {
+    "fulcrum score \\\n\
+     \x20\x20--gzippy-native <bin>       # SUBJECT: pure-Rust gzippy (FLAVOR-N gated)\n\
+     \x20\x20--comparator <bin[:argtmpl]># COMPARATOR (native ELF); default rg args if no :argtmpl\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20# e.g. libdeflate-gunzip:'-d -c {corpus}', igzip, minigzip\n\
+     \x20\x20--corpus <path>             # abs path to the .gz input ({corpus})\n\
+     \x20\x20--threads <T>               # thread count ({threads}); default 1\n\
+     \x20\x20[--n 51]                    # interleaved paired rounds (>=7); default 51\n\
+     \x20\x20[--warmup 2] [--ref-cmd 'gunzip -c {corpus}'] [--no-sha] [--sink /dev/null]\n\
+     \x20\x20[--arch-os <s>] [--corpus-name <s>] [--src-sha <sha7>] [--date <YYYY-MM-DD>]\n\
+     \x20\x20[--out <path|json>]         # bankable JSON to a file, or 'json' to stdout\n\
+     \x20\x20selftest                    # Gate-0: fake/trivial cmds, no box needed\n\
+     \n\
+     Delegates TIMING to `fulcrum paired` (interleaved paired-Δ + log-ratio CI95;\n\
+     Δ<spread ⇒ TIE); adds COMPARATOR-native + FLAVOR-N provenance + byte-exact gate\n\
+     + SINK LAW. Emits the SCORE: line, SCORE=OK|VOID|FAIL machine line, and JSON.\n\
+     Composes: fulcrum freeze run -- fulcrum score --gzippy-native ... --comparator ..."
+}
+
+// ─── Paired-backed selftest — Gate-0 baked in (fake/trivial cmds, no box) ──────
+
+/// `fulcrum score selftest` — box-free Gate-0 for the paired-backed path.
+/// Proves: the delegated CI math matches `paired`; provenance gates (FLAVOR-N,
+/// COMPARATOR-native, SINK LAW) fire; and the paired engine's A/A certificate,
+/// known-slower detection, and byte-exact FAIL flow correctly into the SCORE
+/// classes (WIN/TIE/FAIL, OK/VOID/FAIL). Runs the same trivial commands as
+/// `paired selftest` (sleep/printf/true), so no gzippy/rg binary is needed.
+pub fn selftest() -> ExitCode {
+    use crate::paired::{ci95, run_paired};
+    let pass = std::cell::Cell::new(0u32);
+    let fail = std::cell::Cell::new(0u32);
+    let check = |name: &str, ok: bool| {
+        if ok {
+            pass.set(pass.get() + 1);
+            println!("  PASS {name}");
+        } else {
+            fail.set(fail.get() + 1);
+            println!("  FAIL {name}");
+        }
+    };
+
+    let devnull = PathBuf::from("/dev/null");
+    let corpus = PathBuf::from("/dev/null"); // unused by the trivial commands
+    let (n, warmup) = (9usize, 1usize);
+
+    // 1. FLAVOR-N provenance gate still fires (fabricated symbol count → error).
+    check(
+        "FLAVOR-N gates a fake binary with isal symbols",
+        matches!(
+            flavor_n_verdict(3),
+            Err(ScoreError::ProvenanceFlavorN { symbols: 3 })
+        ),
+    );
+    check(
+        "FLAVOR-N passes a 0-symbol pure-Rust build",
+        flavor_n_verdict(0).is_ok(),
+    );
+
+    // 2. COMPARATOR-native provenance gate (python-wheel-slow → error).
+    check(
+        "COMPARATOR gates a >=50ms --version (wheel)",
+        check_comparator_native(120.0).is_err(),
+    );
+    check(
+        "COMPARATOR passes a native-ELF --version",
+        check_comparator_native(4.0).is_ok(),
+    );
+
+    // 3. SINK LAW (file sink rejected; /dev/null accepted).
+    let tmpfile =
+        std::env::temp_dir().join(format!("fulcrum-score-st-sink-{}", std::process::id()));
+    let _ = std::fs::write(&tmpfile, b"x");
+    check(
+        "SINK LAW rejects a regular-file sink",
+        check_sink_is_devnull(&tmpfile).is_err(),
+    );
+    check(
+        "SINK LAW accepts /dev/null",
+        check_sink_is_devnull(&devnull).is_ok(),
+    );
+    let _ = std::fs::remove_file(&tmpfile);
+
+    // 4. Delegated CI math matches `paired` on the fixed regression vector.
+    let lr = [
+        -0.02, 0.01, -0.015, 0.005, -0.03, 0.0, -0.01, 0.02, -0.005, 0.015, -0.025,
+    ];
+    let c = ci95(&lr);
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    check(
+        "delegated ci95 matches paired/aa_ci.py on fixed vector",
+        near(c.mean, -0.005) && near(c.lo, -0.015621573244) && near(c.hi, 0.005621573244),
+    );
+
+    // 5. Comparator-spec parsing: rg default args vs explicit :argtmpl.
+    let (rg_bin, rg_cmd) = build_comparator_cmd("/x/rapidgzip-native", 8);
+    check(
+        "comparator default rg args carry -P {threads} and {corpus}",
+        rg_bin == "/x/rapidgzip-native" && rg_cmd.contains("-P 8") && rg_cmd.contains("{corpus}"),
+    );
+    let (ld_bin, ld_cmd) = build_comparator_cmd("/x/libdeflate-gunzip:-d -c {corpus}", 8);
+    check(
+        "comparator explicit :argtmpl is honored verbatim",
+        ld_bin == "/x/libdeflate-gunzip"
+            && ld_cmd.contains("-d -c {corpus}")
+            && !ld_cmd.contains("-P"),
+    );
+
+    // 6. A/A certificate brackets 1.0 via the delegated engine ⇒ TIE class.
+    match run_paired(
+        "sleep 0.02",
+        "sleep 0.02",
+        "true",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
+    ) {
+        Ok(r) => {
+            check(
+                "A/A certificate brackets 1.0",
+                r.aa_ratio_ci[0] <= 1.0 && 1.0 <= r.aa_ratio_ci[1],
+            );
+            check("A/A: paired status OK", r.status == "OK");
+            check("A/A: score class TIE (self-vs-self)", classify(&r) == "TIE");
+        }
+        Err(e) => check(&format!("A/A run ({e})"), false),
+    }
+
+    // 7. Known-slower comparator ⇒ RESOLVED right sign ⇒ WIN class.
+    match run_paired(
+        "sleep 0.02",
+        "sleep 0.05",
+        "true",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
+    ) {
+        Ok(r) => {
+            check(
+                "slower-comparator: verdict RESOLVED-b-slower",
+                r.verdict == "RESOLVED-b-slower",
+            );
+            check("slower-comparator: ratio<1 (subject faster)", r.ratio < 1.0);
+            check("slower-comparator: score class WIN", classify(&r) == "WIN");
+        }
+        Err(e) => check(&format!("slower-comparator run ({e})"), false),
+    }
+
+    // 8. Byte-exact mismatch ⇒ FAIL status ⇒ FAIL class.
+    match run_paired(
+        "printf AAA",
+        "printf BBB",
+        "printf AAA",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
+    ) {
+        Ok(r) => {
+            check("sha-mismatch: sha_ok false", !r.sha_ok);
+            check("sha-mismatch: paired status FAIL", r.status == "FAIL");
+            check("sha-mismatch: score class FAIL", classify(&r) == "FAIL");
+        }
+        Err(e) => check(&format!("sha-mismatch run ({e})"), false),
+    }
+
+    println!(
+        "SELFTEST={} pass={} fail={}",
+        if fail.get() == 0 { "PASS" } else { "FAIL" },
+        pass.get(),
+        fail.get()
+    );
+    if fail.get() == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 // ─── Unit tests (pure, no binary execution) ───────────────────────────────────
 
 #[cfg(test)]
@@ -1875,6 +2457,258 @@ mod tests {
             "expected ShaVerify on a deliberately-wrong pin, got {result:?}"
         );
         assert_eq!(result.unwrap_err().invariant_name(), "SCORE-SHA-VERIFY");
+    }
+
+    // ── Paired-backed score (Task #5) ──────────────────────────────────────────
+
+    #[test]
+    fn flavor_n_verdict_gate_fires_and_passes() {
+        assert!(matches!(
+            flavor_n_verdict(1),
+            Err(ScoreError::ProvenanceFlavorN { symbols: 1 })
+        ));
+        assert!(matches!(
+            flavor_n_verdict(4),
+            Err(ScoreError::ProvenanceFlavorN { symbols: 4 })
+        ));
+        assert!(flavor_n_verdict(0).is_ok());
+        assert_eq!(
+            flavor_n_verdict(2).unwrap_err().invariant_name(),
+            "SCORE-PROVENANCE-FLAVOR-N"
+        );
+    }
+
+    #[test]
+    fn comparator_spec_default_rg_args() {
+        let (bin, cmd) = build_comparator_cmd("/opt/oracle_c/rapidgzip-native", 8);
+        assert_eq!(bin, "/opt/oracle_c/rapidgzip-native");
+        assert!(
+            cmd.contains("-P 8"),
+            "rg default must carry -P <threads>: {cmd}"
+        );
+        assert!(
+            cmd.contains("{corpus}"),
+            "must leave {{corpus}} for paired: {cmd}"
+        );
+        assert!(
+            cmd.contains("'/opt/oracle_c/rapidgzip-native'"),
+            "bin must be shquoted: {cmd}"
+        );
+    }
+
+    #[test]
+    fn comparator_spec_explicit_argtmpl_honored() {
+        let (bin, cmd) = build_comparator_cmd("/usr/bin/libdeflate-gunzip:-d -c {corpus}", 4);
+        assert_eq!(bin, "/usr/bin/libdeflate-gunzip");
+        assert!(
+            cmd.contains("-d -c {corpus}"),
+            "explicit argtmpl verbatim: {cmd}"
+        );
+        assert!(
+            !cmd.contains("-P"),
+            "non-rg comparator must not get -P: {cmd}"
+        );
+    }
+
+    #[test]
+    fn comparator_spec_threads_substituted_not_corpus() {
+        let (_bin, cmd) = build_comparator_cmd("rapidgzip:-P {threads} -d -c {corpus}", 16);
+        assert!(
+            cmd.contains("-P 16"),
+            "{{threads}} must be substituted: {cmd}"
+        );
+        assert!(
+            cmd.contains("{corpus}"),
+            "{{corpus}} must NOT be substituted here: {cmd}"
+        );
+    }
+
+    #[test]
+    fn subject_cmd_forces_parallel_sm_and_leaves_corpus() {
+        let cmd = build_subject_cmd(Path::new("/b/gzippy-native"), 8);
+        assert!(
+            cmd.starts_with("GZIPPY_FORCE_PARALLEL_SM=1 "),
+            "env must lead: {cmd}"
+        );
+        assert!(cmd.contains("-p 8"), "thread count in -p: {cmd}");
+        assert!(
+            cmd.contains("{corpus}"),
+            "{{corpus}} left for paired: {cmd}"
+        );
+        assert!(cmd.contains("'/b/gzippy-native'"), "bin shquoted: {cmd}");
+    }
+
+    #[test]
+    fn classify_maps_verdicts_to_win_loss_tie() {
+        let mut pr = PairedResult {
+            status: "OK".into(),
+            verdict: "RESOLVED-b-slower".into(),
+            method: String::new(),
+            corpus: String::new(),
+            a_cmd: String::new(),
+            b_cmd: String::new(),
+            n: 9,
+            a_median: 1.0,
+            b_median: 2.0,
+            delta_median_ms: -1.0,
+            delta_ci95: [-1.1, -0.9],
+            logratio_ci: [-0.8, -0.6],
+            ratio: 0.5,
+            sign_kn: "9/9".into(),
+            sign_k: 9,
+            spread: 0.01,
+            aa_ratio_ci: [0.99, 1.01],
+            aa_bias: 0.001,
+            sha_ok: true,
+            ref_sha: String::new(),
+            a_sha: String::new(),
+            b_sha: String::new(),
+        };
+        assert_eq!(classify(&pr), "WIN");
+        pr.verdict = "RESOLVED-a-slower".into();
+        assert_eq!(classify(&pr), "LOSS");
+        pr.verdict = "NOISY".into();
+        assert_eq!(classify(&pr), "TIE");
+        pr.status = "VOID".into();
+        assert_eq!(classify(&pr), "VOID");
+        pr.status = "FAIL".into();
+        assert_eq!(classify(&pr), "FAIL");
+    }
+
+    #[test]
+    fn paired_args_parse_new_spec() {
+        let args: Vec<String> = [
+            "--gzippy-native",
+            "/b/gzippy-native",
+            "--comparator",
+            "/b/rapidgzip-native",
+            "--corpus",
+            "/root/silesia.tar.gz",
+            "--threads",
+            "8",
+            "--n",
+            "51",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let a = paired_args_from_cli(&args).expect("new-spec args must parse");
+        assert_eq!(a.gzippy_native, PathBuf::from("/b/gzippy-native"));
+        assert_eq!(a.comparator_spec, "/b/rapidgzip-native");
+        assert_eq!(a.corpus_path, PathBuf::from("/root/silesia.tar.gz"));
+        assert_eq!(a.threads, 8);
+        assert_eq!(a.n, 51);
+        assert_eq!(a.corpus_name, "silesia.tar.gz"); // derived from stem
+        assert!(a.do_sha);
+    }
+
+    #[test]
+    fn paired_args_rg_is_backcompat_comparator_alias() {
+        let args: Vec<String> = [
+            "--gzippy-native",
+            "/b/gzippy-native",
+            "--rg",
+            "/b/rapidgzip-native",
+            "--corpus",
+            "/root/x.gz",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let a = paired_args_from_cli(&args).expect("--rg must alias --comparator");
+        assert_eq!(a.comparator_spec, "/b/rapidgzip-native");
+    }
+
+    #[test]
+    fn paired_args_reject_small_n() {
+        let args: Vec<String> = [
+            "--gzippy-native",
+            "/b/n",
+            "--comparator",
+            "/b/rg",
+            "--corpus",
+            "/root/x.gz",
+            "--n",
+            "3",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(paired_args_from_cli(&args).is_err(), "n<7 must be rejected");
+    }
+
+    #[test]
+    fn paired_args_missing_comparator_errors() {
+        let args: Vec<String> = ["--gzippy-native", "/b/n", "--corpus", "/root/x.gz"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            paired_args_from_cli(&args).is_err(),
+            "missing comparator must error"
+        );
+    }
+
+    #[test]
+    fn score_paired_result_lines_are_greppable() {
+        let pr = PairedResult {
+            status: "OK".into(),
+            verdict: "RESOLVED-b-slower".into(),
+            method: "fulcrum-paired-v1:...".into(),
+            corpus: "silesia".into(),
+            a_cmd: String::new(),
+            b_cmd: String::new(),
+            n: 51,
+            a_median: 33.2,
+            b_median: 41.7,
+            delta_median_ms: -8.5,
+            delta_ci95: [-9.0, -8.0],
+            logratio_ci: [-0.25, -0.19],
+            ratio: 0.796,
+            sign_kn: "50/51".into(),
+            sign_k: 50,
+            spread: 0.03,
+            aa_ratio_ci: [0.995, 1.004],
+            aa_bias: 0.002,
+            sha_ok: true,
+            ref_sha: String::new(),
+            a_sha: String::new(),
+            b_sha: String::new(),
+        };
+        let r = ScorePairedResult {
+            score_status: "OK".into(),
+            class: classify(&pr).to_string(),
+            arch_os: "amd-zen2".into(),
+            corpus: "silesia".into(),
+            threads: 8,
+            comparator_bin: "/b/rapidgzip-native".into(),
+            comparator_version_ms: 5.0,
+            flavor_n_symbols: 0,
+            src_sha: "abc1234".into(),
+            date: "2026-07-10".into(),
+            method: "fulcrum-score-v2:paired-backed;...".into(),
+            paired: pr,
+        };
+        let sl = r.score_line();
+        assert!(sl.starts_with("SCORE: amd-zen2 t8 silesia |"), "{sl}");
+        assert!(sl.contains("native=0.796 WIN"), "{sl}");
+        assert!(sl.contains("method=paired"), "{sl}");
+        let ml = r.machine_line();
+        assert!(ml.starts_with("SCORE=OK class=WIN"), "{ml}");
+        assert!(ml.contains("flavor_n=0"), "{ml}");
+        assert!(ml.contains("verdict=RESOLVED-b-slower"), "{ml}");
+        // bankable JSON carries the paired schema + provenance envelope
+        let js = serde_json::to_string(&r).unwrap();
+        for f in [
+            "score_status",
+            "class",
+            "flavor_n_symbols",
+            "comparator_bin",
+            "logratio_ci",
+            "aa_ratio_ci",
+        ] {
+            assert!(js.contains(f), "JSON missing {f}: {js}");
+        }
     }
 
     #[test]
