@@ -51,7 +51,7 @@
 //! a file sink is rejected, and the CI math is regression-pinned against
 //! aa_ci.py on a fixed sample vector.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
@@ -332,7 +332,7 @@ pub fn ab_verdict(lr_ci: &Ci) -> &'static str {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairedResult {
     pub status: String,
     pub verdict: String,

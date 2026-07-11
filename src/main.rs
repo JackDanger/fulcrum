@@ -104,6 +104,12 @@ USAGE:\n\
               Δ<spread ⇒ TIE (log-ratio CI must EXCLUDE 0). SINK LAW /dev/null both arms +\n\
               mandatory A/A certificate + byte-exact gate. `paired selftest` is the baked Gate-0.\n\
               Composes: `fulcrum freeze run -- fulcrum paired ...`\n\
+  fulcrum matrix --a-cmd <tmpl> --b-cmd <tmpl> --corpora a.gz,b.gz --threads 1,4,8,16\n\
+              [--n 51] [--ours a|b] [--box NAME] [--sha-pin K:V ...] [--out matrix.json] [--dry-run]\n\
+              the corpus×T LOSS-SURFACE sweep — drives `paired` per cell and AUTO-BANKS the durable\n\
+              JSON artifact (subsumes breadth_driver.sh; kills the never-banked-N=51-table debt).\n\
+              Fail-soft per cell → MATRIX=OK|PARTIAL. `matrix selftest` is the baked Gate-0.\n\
+              Composes: `fulcrum freeze run -- fulcrum matrix ...`\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -4301,6 +4307,7 @@ fn main() -> ExitCode {
         "chainlat" => cmd_chainlat(rest),
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "paired" => fulcrum::paired::cmd_paired(rest),
+        "matrix" => fulcrum::matrix::cmd_matrix(rest),
         "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),

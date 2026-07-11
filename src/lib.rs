@@ -66,6 +66,7 @@ pub mod invariants;
 pub mod labels;
 pub mod ledger;
 pub mod locate;
+pub mod matrix;
 // macmeasure drives the IN-PROCESS gzippy decode subject, so it only builds
 // when the optional `gzippy` dep is present (`--features in-process-gzippy`).
 #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
