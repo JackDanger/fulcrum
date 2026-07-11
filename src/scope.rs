@@ -54,6 +54,16 @@ pub struct ScopeManifest {
     /// Cells whose only coverage is non-fresh artifacts report STALE.
     #[serde(default)]
     pub require_sha: Option<String>,
+    /// Optional per-corpus alias tokens: goal-corpus token → EXTRA accepted
+    /// substrings, for boxes that recorded the SAME logical corpus under a
+    /// divergent filename (measured, not hypothetical: AMD banks
+    /// `purestored.gz` while Intel banks `pure_stored_100mb.gz`; AMD banks
+    /// `access.log.gz` while Intel/M1 bank `logs_corpus.txt.gz`). A cell
+    /// matches a goal corpus when the corpus token OR any of its aliases is a
+    /// substring of the cell's corpus basename. Empty by default — back-compat,
+    /// and a run with no aliases behaves exactly as before.
+    #[serde(default)]
+    pub corpus_aliases: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +193,14 @@ fn join_cell(
     threads: u32,
 ) -> ScopeCell {
     let comp_lc = comparator.to_ascii_lowercase();
-    let corpus_lc = corpus.to_ascii_lowercase();
+    // Accepted corpus tokens = the goal token PLUS any configured aliases, so a
+    // single goal corpus can join box-specific filenames that diverge
+    // (purestored ↔ pure_stored_100mb, logs ↔ access.log). A cell matches when
+    // ANY accepted token is a substring of its corpus basename.
+    let mut corpus_tokens: Vec<String> = vec![corpus.to_ascii_lowercase()];
+    if let Some(aliases) = manifest.corpus_aliases.get(corpus) {
+        corpus_tokens.extend(aliases.iter().map(|a| a.to_ascii_lowercase()));
+    }
 
     // (cell, fresh, timestamp_key, timestamp) for every banked match.
     let mut matches: Vec<(&MatrixCell, bool, u64, &str)> = Vec::new();
@@ -207,10 +224,8 @@ fn join_cell(
             if cell.threads != threads {
                 continue;
             }
-            if !basename(&cell.corpus)
-                .to_ascii_lowercase()
-                .contains(&corpus_lc)
-            {
+            let bn = basename(&cell.corpus).to_ascii_lowercase();
+            if !corpus_tokens.iter().any(|t| bn.contains(t.as_str())) {
                 continue;
             }
             matches.push((cell, fresh, ts, art.manifest.timestamp.as_str()));
@@ -600,6 +615,7 @@ pub fn selftest() -> ExitCode {
         corpora: vec!["silesia".into(), "storedheavy".into()],
         threads: vec![1, 4],
         require_sha: Some("deadbeef".into()),
+        corpus_aliases: std::collections::BTreeMap::new(),
     };
     // Full goal grid = 2 boxes × 2 comparators × 2 corpora × 2 T = 16 cells.
 
@@ -797,6 +813,63 @@ pub fn selftest() -> ExitCode {
             && r.summary.total == 16
             && r.summary.unmeasured == 0
             && r.summary.stale == 0,
+    );
+
+    // -- corpus aliases: ONE goal corpus, divergent per-box filenames --------
+    // (purestored ↔ pure_stored_100mb) must join WITHOUT the alias swallowing
+    // the distinct storedheavy corpus.
+    let alias_manifest = ScopeManifest {
+        goal: Some("alias".into()),
+        boxes: vec!["solvency".into()],
+        comparators: vec!["rapidgzip".into()],
+        corpora: vec!["purestored".into(), "storedheavy".into()],
+        threads: vec![1],
+        require_sha: None,
+        corpus_aliases: [("purestored".to_string(), vec!["pure_stored".to_string()])]
+            .into_iter()
+            .collect(),
+    };
+    let alias_art = synth_artifact(
+        "solvency",
+        "a",
+        "gzippy",
+        "rapidgzip-native",
+        "epoch:200",
+        &["gz:deadbeef"],
+        &[
+            ("/root/archive/pure_stored_100mb.gz", 1, "WIN", 0.30),
+            ("/root/archive/storedheavy-512M.gz", 1, "LOSS", 1.20),
+        ],
+    );
+    let r = evaluate(&alias_manifest, std::slice::from_ref(&alias_art));
+    check(
+        "alias: goal 'purestored' joins the divergent 'pure_stored_100mb.gz'",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "purestored" && c.threads == 1)
+            .is_some_and(|c| c.status == ScopeStatus::Win),
+    );
+    check(
+        "alias: 'purestored'+alias do NOT swallow the distinct 'storedheavy-512M.gz'",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "storedheavy" && c.threads == 1)
+            .is_some_and(|c| c.status == ScopeStatus::Loss && (c.ratio - 1.20).abs() < 1e-12),
+    );
+    check(
+        "alias: no aliases configured ⇒ identical to plain substring match",
+        {
+            let plain = ScopeManifest {
+                corpus_aliases: std::collections::BTreeMap::new(),
+                ..alias_manifest.clone()
+            };
+            let rp = evaluate(&plain, std::slice::from_ref(&alias_art));
+            // Without the alias, 'purestored' cannot match 'pure_stored_100mb'.
+            rp.cells
+                .iter()
+                .find(|c| c.corpus == "purestored" && c.threads == 1)
+                .is_some_and(|c| c.status == ScopeStatus::Unmeasured)
+        },
     );
 
     // -- empty grid can never be WIN -----------------------------------------

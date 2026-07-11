@@ -1,0 +1,24 @@
+{
+  "goal": "strictly-fastest gzip decompressor per (arch x threads x archive) vs rapidgzip — the FULL cross-arch Gate-3 grid (solvency AMD-Zen2, trainer Intel i7-13700T, m1pro Apple-Silicon) x 12 corpora x T{1,4,8,16}; SCOPE=WIN only when every cell is a measured WIN/TIE. gz_src 9c84b0ee (Intel/M1) vs authoritative HEAD 25863516 (AMD native).",
+  "boxes": ["solvency", "trainer-i7-13700T", "m1pro"],
+  "comparators": ["rapidgzip"],
+  "corpora": [
+    "silesia",
+    "monorepo",
+    "markup",
+    "logs",
+    "nasa",
+    "weights",
+    "movie",
+    "dovi",
+    "photo",
+    "incompressible",
+    "storedheavy",
+    "purestored"
+  ],
+  "threads": [1, 4, 8, 16],
+  "corpus_aliases": {
+    "logs": ["access.log"],
+    "purestored": ["pure_stored"]
+  }
+}
