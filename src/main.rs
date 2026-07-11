@@ -2426,11 +2426,20 @@ fn cmd_coz_jsonl(args: &[String]) -> ExitCode {
 ///   fulcrum sweep capture --spec s.json --out DIR   (run on the perf box)
 ///   fulcrum sweep mine DIR [--config region.json]   (offline, re-runnable)
 fn cmd_sweep(args: &[String]) -> ExitCode {
+    // FACTOR mode (multi-factor lever-boundary characterizer): dispatched when
+    // the caller passes `--cand`/`--selftest` instead of a capture/mine phase.
+    // `fulcrum sweep --cand <bin> --base <bin> --run '...' --corpora ... --threads ...`
+    if args.iter().any(|a| a == "--cand" || a == "--selftest") {
+        return fulcrum::sweep_factor::cmd(args);
+    }
     let Some(phase) = args.first().map(|s| s.as_str()) else {
         eprintln!(
-            "sweep needs a phase: 'capture' or 'mine'\n  \
+            "sweep needs a phase: 'capture', 'mine', or the FACTOR mode (--cand ...)\n  \
              fulcrum sweep capture --spec s.json --out DIR\n  \
-             fulcrum sweep mine DIR [--config region.json]"
+             fulcrum sweep mine DIR [--config region.json]\n  \
+             fulcrum sweep --cand <bin> --base <bin> --run '<tmpl {{bin}} {{threads}} {{corpus}}>' \\\n    \
+               --corpora a.gz,b.gz --threads 2,4,8 [--rg <bin>] [--n 51] [--out sweep.json]\n  \
+             fulcrum sweep --selftest    (Gate-0 separation self-test)"
         );
         return usage();
     };

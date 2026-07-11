@@ -114,6 +114,41 @@ struct RunOpts {
     madvise_detail: bool,
 }
 
+/// Public entry so other subcommands (e.g. `sweep`) can profile a decode
+/// command in-process and mine the resulting [`MemProfile`] (peak RSS,
+/// per-thread busy occupancy) without shelling out to `fulcrum memprofile`.
+/// `strace` is disabled here (it perturbs timing and needs privileges); RSS
+/// timeline + per-thread task-clock occupancy are the signals callers want.
+/// Linux-only; returns an error on other hosts.
+#[allow(unused_variables)]
+pub fn profile_argv(
+    label: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    interval_ms: u64,
+) -> Result<MemProfile, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("memprofile::profile_argv is Linux-only (needs /proc)".to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if argv.is_empty() {
+            return Err("profile_argv: empty argv".to_string());
+        }
+        let opts = RunOpts {
+            label: label.to_string(),
+            argv: argv.to_vec(),
+            env: env.to_vec(),
+            sink: PathBuf::from("/dev/null"),
+            interval_ms,
+            do_strace: false,
+            madvise_detail: false,
+        };
+        profile(&opts)
+    }
+}
+
 // ───────────────────────────── CLI ─────────────────────────────
 
 pub fn cmd_memprofile(args: &[String]) -> ExitCode {

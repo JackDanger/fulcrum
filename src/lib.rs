@@ -102,6 +102,7 @@ pub mod scoreboard;
 pub mod spans;
 pub mod stats;
 pub mod sweep;
+pub mod sweep_factor;
 pub mod trace;
 pub mod validate;
 pub mod verbose_stats;
