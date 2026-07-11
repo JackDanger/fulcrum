@@ -115,6 +115,14 @@ USAGE:\n\
               JSON artifact (subsumes breadth_driver.sh; kills the never-banked-N=51-table debt).\n\
               Fail-soft per cell → MATRIX=OK|PARTIAL. `matrix selftest` is the baked Gate-0.\n\
               Composes: `fulcrum freeze run -- fulcrum matrix ...`\n\
+  fulcrum bisect --bins <l1=p1,l2=p2,...> --run '<tmpl {{bin}} {{threads}} {{corpus}}>'\n\
+              --corpus <path> --threads <T> [--n 51] [--min-effect 0.02] [--out result.json]\n\
+              native-vs-native paired REGRESSOR-HUNT: races each ADJACENT pair of an ordered build\n\
+              chain (oldest→newest) with `fulcrum paired` and NAMES the transition that moved the\n\
+              wall (ratio B/A>1 ⇒ newer slower ⇒ regression; a move needs CI-excludes-0 AND\n\
+              |ratio-1|>=min-effect, else TIE). A/B byte-identity guarded (sha). Thin\n\
+              `--build '<tmpl {{sha}} {{out}}>' --shas a,b,c` builds each sha first. `bisect\n\
+              selftest` is the baked Gate-0. → BISECT=OK|PARTIAL regressors=[...]\n\
   fulcrum scope --manifest scope.json --banked <file-or-dir> [--banked ...] [--require-sha SHA] [--json out.json]\n\
               GOAL-GRID completeness gate — joins banked matrix artifacts onto the FULL\n\
               box×comparator×corpus×T goal grid; every cell is W/T/L/V/STALE/UNMEASURED and the\n\
@@ -4318,6 +4326,7 @@ fn main() -> ExitCode {
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "paired" => fulcrum::paired::cmd_paired(rest),
         "matrix" => fulcrum::matrix::cmd_matrix(rest),
+        "bisect" => fulcrum::bisect::cmd_bisect(rest),
         "scope" => fulcrum::scope::cmd_scope(rest),
         "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),

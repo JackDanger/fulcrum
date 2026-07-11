@@ -38,6 +38,7 @@ pub mod abmeasure;
 pub mod alloc;
 pub mod audit;
 pub mod binloc;
+pub mod bisect;
 pub mod bundle;
 pub mod causal;
 pub mod chainlat;
