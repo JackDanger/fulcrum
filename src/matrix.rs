@@ -43,14 +43,28 @@
 //! timestamp — the timestamp is PASSED IN; the lib never calls the clock, so a
 //! banked artifact is reproducible byte-for-byte from its inputs).
 //!
-//! COMPOSES WITH `fulcrum freeze`:
-//! ```text
-//! fulcrum freeze run --ttl-s 3000 -- \
-//!   fulcrum matrix --a-cmd 'gzippy -d -c -p {threads} {corpus}' \
-//!                  --b-cmd 'rapidgzip -d -c -P {threads} {corpus}' \
-//!                  --corpora /root/silesia.tar.gz,/root/monorepo.tar.gz \
-//!                  --threads 1,4,8,16 --n 51 --out /dev/shm/loss_surface.json
-//! ```
+//! FREEZE — TWO WAYS (2026-07-10 contamination fix):
+//!   * `--freeze-each` (PREFERRED): the matrix freezes PER CELL — a fresh,
+//!     short-TTL `fulcrum freeze` acquire/release around every cell, so no
+//!     whole-grid watchdog exists to expire mid-run. This closes the bug where a
+//!     40-cell grid outran a single `freeze run --ttl-s 2400`, the watchdog
+//!     force-released mid-grid, and the TAIL corpora were measured UNFROZEN
+//!     (turbo) — silently contaminating them (an incompressible T8 cell flipped
+//!     WIN→LOSS from the thaw alone). See [`FreezeEachGate`].
+//!     ```text
+//!     fulcrum matrix --freeze-each \
+//!       --a-cmd 'gzippy -d -c -p {threads} {corpus}' \
+//!       --b-cmd 'rapidgzip -d -c -P {threads} {corpus}' \
+//!       --corpora /root/silesia.gz,/root/incompressible.gz \
+//!       --threads 1,4,8,16 --n 51 --out /dev/shm/loss_surface.json
+//!     ```
+//!   * OUTER `fulcrum freeze run` (manual box): still works, but the whole-grid
+//!     TTL must be sized ABOVE the FULL grid's wall or the tail contaminates —
+//!     which is exactly why `--freeze-each` exists.
+//!     ```text
+//!     fulcrum freeze run --ttl-s 3000 -- \
+//!       fulcrum matrix --a-cmd '…' --b-cmd '…' --corpora … --threads 1,4,8,16
+//!     ```
 //!
 //! Gate-0 self-validation is baked in as `fulcrum matrix selftest` (fake/trivial
 //! commands, no box needed): the classify() truth-table pins a-vs-a→TIE and
@@ -63,6 +77,7 @@
 //! selftest pins a-vs-a semantics at the deterministic classify() layer, not by
 //! asserting a stochastic grid is "always TIE".)
 
+use crate::freeze::AcquireOpts;
 use crate::paired::{run_paired, PairedResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -261,9 +276,91 @@ impl MatrixResult {
 // The sweep (pure — no clock, no argv)
 // ---------------------------------------------------------------------------
 
-/// Run the full corpus×T sweep. Per cell: substitute `{threads}` then delegate
-/// to [`run_paired`] (which substitutes `{corpus}` and does the whole paired
-/// protocol). Fail-soft: a cell error becomes a VOID cell and the sweep goes on.
+// ---------------------------------------------------------------------------
+// Per-cell box gate (the TTL-contamination fix)
+// ---------------------------------------------------------------------------
+//
+// WHY (bug post-mortem, 2026-07-10). `fulcrum matrix` was composed under ONE
+// long `fulcrum freeze run --ttl-s 2400`. A 40-cell × N=51 grid (plus VOID
+// re-runs) EXCEEDED that TTL at base frequency, so the detached watchdog
+// force-RELEASED the box MID-GRID — and the tail corpora (movie / dovi /
+// incompressible, run last) were then measured UNFROZEN (turbo back on),
+// silently contaminating those cells (an incompressible T8 cell flipped
+// WIN→LOSS purely from the thaw). A single whole-grid TTL cannot be sized
+// safely: too short thaws the tail, too long strands the user's tenants.
+//
+// THE FIX — FREEZE PER CELL. The matrix acquires a FRESH, SHORT-TTL freeze
+// immediately BEFORE each cell's walls and releases it immediately AFTER. Every
+// cell is therefore measured under its OWN independent freeze that is bounded to
+// ONE cell's duration — the whole-grid TTL disappears, so there is nothing to
+// expire mid-grid. Each acquire spawns its own per-cell watchdog, so a matrix
+// that dies mid-cell thaws within ONE cell's TTL (never leaving the tenants
+// stranded, never silently continuing unfrozen).
+
+/// A per-cell box gate: `enter` is called immediately BEFORE a cell's paired
+/// walls, `exit` immediately AFTER (on EVERY path, including a cell that
+/// errored). An `enter` failure means the box could NOT be frozen → the cell is
+/// recorded VOID and is NEVER measured unfrozen (the whole point of the fix).
+pub trait CellGate {
+    /// Freeze the box for the cell about to run. `Err` ⇒ VOID this cell.
+    fn enter(&mut self, corpus: &Path, threads: u32) -> Result<(), String>;
+    /// Release the cell's freeze. Idempotent; must not panic.
+    fn exit(&mut self, corpus: &Path, threads: u32);
+}
+
+/// The production per-cell gate: a `fulcrum freeze` acquire/release around each
+/// cell. `acquire` sets boost=0 + governor=performance + SIGSTOPs the tenants
+/// (supervisor-first) and spawns a SHORT-TTL per-cell watchdog; `release`
+/// restores everything and sweeps orphans. A `Drop` net releases on panic /
+/// early-exit (beyond the watchdog's SIGKILL net) — this gate cannot strand a
+/// frozen tenant.
+pub struct FreezeEachGate {
+    opts: AcquireOpts,
+    live: bool,
+}
+
+impl FreezeEachGate {
+    pub fn new(opts: AcquireOpts) -> Self {
+        FreezeEachGate { opts, live: false }
+    }
+}
+
+impl CellGate for FreezeEachGate {
+    fn enter(&mut self, corpus: &Path, threads: u32) -> Result<(), String> {
+        // Defensive: never stack a second freeze on a live one.
+        if self.live {
+            self.exit(corpus, threads);
+        }
+        crate::freeze::acquire(&self.opts)?;
+        self.live = true;
+        Ok(())
+    }
+    fn exit(&mut self, _corpus: &Path, _threads: u32) {
+        if self.live {
+            crate::freeze::release(&self.opts.state_path, &self.opts.patterns, false);
+            self.live = false;
+        }
+    }
+}
+
+impl Drop for FreezeEachGate {
+    fn drop(&mut self) {
+        // Panic / early-exit safety net (the per-cell watchdog covers SIGKILL).
+        if self.live {
+            crate::freeze::release(&self.opts.state_path, &self.opts.patterns, false);
+            self.live = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The sweep (pure — no clock, no argv)
+// ---------------------------------------------------------------------------
+
+/// Run the full corpus×T sweep with NO per-cell gate (the box is either already
+/// frozen out-of-band, or the caller composes under `fulcrum freeze run`). Pure:
+/// no clock, no argv, no process/​sysfs mutation — the property the selftest and
+/// unit tests rely on.
 #[allow(clippy::too_many_arguments)]
 pub fn run_matrix(
     a_cmd_tmpl: &str,
@@ -280,12 +377,64 @@ pub fn run_matrix(
     sha_pins: &[String],
     timestamp: &str,
 ) -> MatrixResult {
+    run_matrix_gated(
+        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpora, threads, n, warmup, sink, do_sha, ours,
+        box_name, sha_pins, timestamp, None,
+    )
+}
+
+/// Run the full corpus×T sweep, optionally freezing the box PER CELL via `gate`.
+/// Per cell: substitute `{threads}`, `gate.enter()` (freeze), delegate to
+/// [`run_paired`], then `gate.exit()` (release) on EVERY path. Fail-soft: a cell
+/// error — INCLUDING a freeze-acquire failure — becomes a VOID cell and the
+/// sweep goes on. When `gate` is `Some`, the banked method records
+/// `freeze-per-cell` for provenance.
+#[allow(clippy::too_many_arguments)]
+pub fn run_matrix_gated(
+    a_cmd_tmpl: &str,
+    b_cmd_tmpl: &str,
+    ref_cmd_tmpl: &str,
+    corpora: &[PathBuf],
+    threads: &[u32],
+    n: usize,
+    warmup: usize,
+    sink: &Path,
+    do_sha: bool,
+    ours: Arm,
+    box_name: &str,
+    sha_pins: &[String],
+    timestamp: &str,
+    mut gate: Option<&mut dyn CellGate>,
+) -> MatrixResult {
+    let freeze_each = gate.is_some();
     let mut cells = Vec::new();
     for (corpus, t) in plan_cells(corpora, threads) {
+        // Per-cell freeze: acquire BEFORE any wall. A freeze failure VOIDs the
+        // cell — it is NEVER measured unfrozen (the contamination this fixes).
+        if let Some(g) = gate.as_deref_mut() {
+            if let Err(e) = g.enter(&corpus, t) {
+                cells.push(MatrixCell {
+                    corpus: corpus.display().to_string(),
+                    threads: t,
+                    class: CellClass::Void.token().to_string(),
+                    ratio: f64::NAN,
+                    paired: None,
+                    error: Some(format!(
+                        "freeze-each acquire FAILED — cell NOT measured (never unfrozen): {e}"
+                    )),
+                });
+                continue;
+            }
+        }
         let a_t = expand_threads(a_cmd_tmpl, t);
         let b_t = expand_threads(b_cmd_tmpl, t);
         let ref_t = expand_threads(ref_cmd_tmpl, t);
-        let cell = match run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha) {
+        let result = run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha);
+        // Release THIS cell's freeze on EVERY path, before recording the result.
+        if let Some(g) = gate.as_deref_mut() {
+            g.exit(&corpus, t);
+        }
+        let cell = match result {
             Ok(r) => {
                 let class = classify(&r.status, &r.verdict, ours);
                 let ratio = oriented_ratio(r.ratio, ours);
@@ -311,6 +460,11 @@ pub fn run_matrix(
     }
 
     let summary = MatrixResult::summarize(&cells);
+    let method = if freeze_each {
+        format!("{METHOD};freeze-per-cell(acquire+release+watchdog-per-cell)")
+    } else {
+        METHOD.to_string()
+    };
     let manifest = RunManifest {
         a_cmd: a_cmd_tmpl.to_string(),
         b_cmd: b_cmd_tmpl.to_string(),
@@ -323,7 +477,7 @@ pub fn run_matrix(
         box_name: box_name.to_string(),
         sha_pins: sha_pins.to_vec(),
         timestamp: timestamp.to_string(),
-        method: METHOD.to_string(),
+        method,
     };
     MatrixResult { manifest, cells, summary }
 }
@@ -621,6 +775,208 @@ pub fn selftest() -> ExitCode {
     ]);
     check("dry-run: matrix --dry-run exits SUCCESS", is_success(dry));
 
+    // -- FREEZE-PER-CELL: orchestration (fake gate; pure, no box) ------------
+    // Pins the control flow the contamination fix rests on: the matrix calls
+    // enter() (freeze) BEFORE and exit() (release) AFTER every cell, strictly
+    // interleaved, and a freeze-acquire failure VOIDs just that cell (fail-soft,
+    // never measured unfrozen). No sysfs/procs needed — the real freeze is
+    // exercised end-to-end below.
+    {
+        struct RecordingGate {
+            log: Vec<String>,
+            fail_on: Option<(String, u32)>,
+        }
+        impl CellGate for RecordingGate {
+            fn enter(&mut self, c: &Path, t: u32) -> Result<(), String> {
+                if self.fail_on.as_ref() == Some(&(c.display().to_string(), t)) {
+                    return Err("injected acquire failure".into());
+                }
+                self.log.push(format!("enter {} {}", c.display(), t));
+                Ok(())
+            }
+            fn exit(&mut self, c: &Path, t: u32) {
+                self.log.push(format!("exit {} {}", c.display(), t));
+            }
+        }
+
+        let mut g = RecordingGate { log: vec![], fail_on: None };
+        let m = run_matrix_gated(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", Some(&mut g),
+        );
+        let enters = g.log.iter().filter(|l| l.starts_with("enter")).count();
+        let exits = g.log.iter().filter(|l| l.starts_with("exit")).count();
+        check("freeze-each: enter fired once per cell", enters == m.cells.len());
+        check("freeze-each: exit fired once per cell (balanced)", exits == enters);
+        check(
+            "freeze-each: strictly interleaved enter,exit,enter,exit…",
+            g.log.chunks(2).all(|w| w.len() == 2 && w[0].starts_with("enter") && w[1].starts_with("exit")),
+        );
+        check(
+            "freeze-each: banked method records freeze-per-cell provenance",
+            m.manifest.method.contains("freeze-per-cell"),
+        );
+        check(
+            "ungated run does NOT claim freeze-per-cell",
+            !run_matrix(
+                "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+                Arm::A, "b", &pins, "ts",
+            )
+            .manifest
+            .method
+            .contains("freeze-per-cell"),
+        );
+
+        // acquire-failure cell → VOID + errored, never measured; sweep continues.
+        let mut gf = RecordingGate {
+            log: vec![],
+            fail_on: Some((corpora[0].display().to_string(), threads[0])),
+        };
+        let mf = run_matrix_gated(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
+            Arm::A, "b", &pins, "ts", Some(&mut gf),
+        );
+        let failed = mf
+            .cells
+            .iter()
+            .find(|c| c.threads == threads[0] && c.corpus == corpora[0].display().to_string());
+        check(
+            "freeze-each: acquire-failure cell is VOID + carries the error",
+            failed
+                .map(|c| {
+                    c.class == "VOID"
+                        && c.paired.is_none()
+                        && c.error.as_deref().map(|e| e.contains("freeze-each acquire FAILED")).unwrap_or(false)
+                })
+                .unwrap_or(false),
+        );
+        check(
+            "freeze-each: fail-soft — every planned cell still recorded",
+            mf.cells.len() == plan_cells(&corpora, &threads).len(),
+        );
+        check(
+            "freeze-each: NO exit for the un-entered (failed) cell",
+            gf.log.iter().filter(|l| l.starts_with("exit")).count() == mf.cells.len() - 1,
+        );
+    }
+
+    // -- FREEZE-PER-CELL: real end-to-end (fake sysfs + a real dummy proc) ----
+    // Proves the box is ACTUALLY frozen at the moment a cell's walls would run
+    // (boost==0 AND the tenant SIGSTOPped), and fully RELEASED afterward (boost
+    // restored, tenant running, state file gone). This is the Gate-0 that makes
+    // the contamination fix trustworthy. Portable (signals + pgrep -f + injected
+    // sysfs) — runs on macOS too, like `fulcrum freeze selftest`.
+    {
+        use std::process::{Command as PCommand, Stdio};
+        let tmp = std::env::temp_dir().join(format!("fulcrum-matrix-frz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cpu = tmp.join("sys/devices/system/cpu");
+        let sysfs_ok = std::fs::create_dir_all(cpu.join("cpufreq")).is_ok()
+            && std::fs::write(cpu.join("cpufreq/boost"), "1\n").is_ok()
+            && (0..2).all(|nn| {
+                let d = cpu.join(format!("cpu{nn}/cpufreq"));
+                std::fs::create_dir_all(&d).is_ok()
+                    && std::fs::write(d.join("scaling_governor"), "schedutil\n").is_ok()
+            });
+        let marker = format!("fulcrum_matrix_frz_{}", std::process::id());
+        // trailing `; :` keeps the marker in argv (sh would exec-optimize it away)
+        let dummy = PCommand::new("sh")
+            .args(["-c", "sleep 120; :", &marker])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        if !sysfs_ok || dummy.is_err() {
+            println!("  NOTE freeze-each e2e skipped (could not build fake sysfs / dummy proc)");
+        } else {
+            let mut dummy = dummy.unwrap();
+            let opts = AcquireOpts {
+                patterns: vec![format!("f:{marker}")],
+                ttl_s: 600,
+                state_path: tmp.join("cell.state.json"),
+                sysfs_root: tmp.to_string_lossy().to_string(),
+                spawn_watchdog: false, // release explicitly in-test; no detached child
+                dry_run: false,
+                force_stale: false,
+            };
+            let state_path = opts.state_path.clone();
+            let sysfs_root = opts.sysfs_root.clone();
+
+            // Wrap the real gate so we can observe the freeze AT cell time.
+            struct AssertFrozenGate {
+                inner: FreezeEachGate,
+                sysfs_root: String,
+                marker: String,
+                saw_boost0: bool,
+                saw_stopped: bool,
+            }
+            impl CellGate for AssertFrozenGate {
+                fn enter(&mut self, c: &Path, t: u32) -> Result<(), String> {
+                    self.inner.enter(c, t)?;
+                    let boost = std::fs::read_to_string(crate::freeze::boost_path(&self.sysfs_root))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    if boost == "0" {
+                        self.saw_boost0 = true;
+                    }
+                    let pids = crate::freeze::pgrep(&format!("f:{}", self.marker));
+                    if !pids.is_empty()
+                        && pids.iter().all(|&p| {
+                            crate::freeze::ps_stat(p)
+                                .map(|s| crate::freeze::stat_is_stopped(&s))
+                                .unwrap_or(false)
+                        })
+                    {
+                        self.saw_stopped = true;
+                    }
+                    Ok(())
+                }
+                fn exit(&mut self, c: &Path, t: u32) {
+                    self.inner.exit(c, t);
+                }
+            }
+
+            let mut ag = AssertFrozenGate {
+                inner: FreezeEachGate::new(opts),
+                sysfs_root: sysfs_root.clone(),
+                marker: marker.clone(),
+                saw_boost0: false,
+                saw_stopped: false,
+            };
+            let one = [PathBuf::from("/tmp/cA.gz")];
+            let one_t = [1u32];
+            let _ = run_matrix_gated(
+                "sleep 0.02", "sleep 0.02", "true", &one, &one_t, n, warmup, &devnull, true,
+                Arm::A, "frz-box", &pins, "ts", Some(&mut ag),
+            );
+            check("freeze-each e2e: box boost==0 AT cell time", ag.saw_boost0);
+            check("freeze-each e2e: tenant SIGSTOPped AT cell time", ag.saw_stopped);
+            // dropping ag runs no release (already exited); assert post-state.
+            drop(ag);
+            check(
+                "freeze-each e2e: boost RESTORED to 1 after the cell",
+                std::fs::read_to_string(crate::freeze::boost_path(&sysfs_root))
+                    .map(|s| s.trim() == "1")
+                    .unwrap_or(false),
+            );
+            check(
+                "freeze-each e2e: tenant RUNNING again after the cell",
+                crate::freeze::pgrep(&format!("f:{marker}"))
+                    .iter()
+                    .all(|&p| crate::freeze::ps_stat(p).map(|s| !crate::freeze::stat_is_stopped(&s)).unwrap_or(true)),
+            );
+            check(
+                "freeze-each e2e: per-cell state file removed (no orphan lock)",
+                !state_path.exists(),
+            );
+            let _ = dummy.kill();
+            let _ = dummy.wait();
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -725,11 +1081,21 @@ fn usage() -> ExitCode {
          \x20                [--n 51] [--warmup 2] [--ours a|b] [--ref-cmd 'gunzip -c {{corpus}}']\n\
          \x20                [--sink /dev/null] [--no-sha] [--box NAME] [--sha-pin K:V ...]\n\
          \x20                [--timestamp STR] [--out matrix.json] [--dry-run]\n\
+         \x20                [--freeze-each [--freeze-procs 'llama-swap,llama-server']\n\
+         \x20                               [--freeze-ttl-s 600] [--freeze-state PATH]\n\
+         \x20                               [--freeze-sysfs-root /] [--freeze-force-stale]]\n\
          \x20 fulcrum matrix --spec cells.json    (JSON: corpora/threads/a_cmd/b_cmd/ref_cmd/ours/n/warmup)\n\
          \x20 fulcrum matrix selftest             Gate-0: fake commands, no box needed\n\
          \n\
          Templates substitute {{threads}} then {{corpus}}. --a-cmd is the SUBJECT (ours by\n\
-         default); --ours b scores the comparator instead. Compose under a freeze:\n\
+         default); --ours b scores the comparator instead.\n\
+         \n\
+         FREEZE-PER-CELL (--freeze-each): the matrix acquires/releases its OWN short-TTL\n\
+         freeze around EACH cell, so no whole-grid watchdog can expire mid-run and thaw the\n\
+         tail corpora (the contamination bug). Use INSTEAD OF wrapping in `freeze run`:\n\
+         \x20 fulcrum matrix --freeze-each --a-cmd ... --b-cmd ... --corpora ... --threads ...\n\
+         Or, for a manually-frozen box, compose under a single freeze (whole-grid TTL — size\n\
+         it above the FULL grid's wall or the tail contaminates):\n\
          \x20 fulcrum freeze run --ttl-s 3000 -- fulcrum matrix --a-cmd ... --b-cmd ... --corpora ...\n\
          \n\
          MACHINE LINE: MATRIX=OK|PARTIAL win=.. tie=.. loss=.. void=.. total=.. ..."
@@ -819,6 +1185,24 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         .unwrap_or_else(now_epoch_string);
     let dry_run = cli_has(args, "--dry-run");
 
+    // -- FREEZE-PER-CELL (the TTL-contamination fix). `--freeze-each` makes the
+    //    matrix acquire/release its own SHORT-TTL freeze around EACH cell, so
+    //    there is no whole-grid watchdog to expire mid-run. Use INSTEAD OF the
+    //    outer `fulcrum freeze run` wrapper (a distinct default state path keeps
+    //    the two from colliding if someone wraps anyway).
+    let freeze_each = cli_has(args, "--freeze-each");
+    let freeze_procs = cli_flag(args, "--freeze-procs")
+        .unwrap_or(crate::freeze::DEFAULT_PROCS)
+        .to_string();
+    let freeze_ttl_s: u64 = cli_flag(args, "--freeze-ttl-s")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let freeze_state = cli_flag(args, "--freeze-state")
+        .unwrap_or("/tmp/fulcrum-freeze.matrix-cell.state.json")
+        .to_string();
+    let freeze_sysfs_root = cli_flag(args, "--freeze-sysfs-root").unwrap_or("/").to_string();
+    let freeze_force_stale = cli_has(args, "--freeze-force-stale");
+
     if n < 7 {
         eprintln!("MATRIX=FAIL n={n} < 7 (significance gate needs N>=7)");
         return ExitCode::FAILURE;
@@ -828,14 +1212,21 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
     if dry_run {
         let cells = plan_cells(&corpora, &threads);
         println!(
-            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} ours={} box={}",
+            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} ours={} box={} freeze_each={}",
             cells.len(),
             corpora.len(),
             threads.len(),
             n,
             ours.token(),
-            box_name
+            box_name,
+            freeze_each
         );
+        if freeze_each {
+            println!(
+                "  freeze-each: procs=[{freeze_procs}] ttl_s={freeze_ttl_s} state={freeze_state} \
+                 (per-cell acquire/release+watchdog; do NOT also wrap in `fulcrum freeze run`)"
+            );
+        }
         println!("  a-cmd: {a_cmd}");
         println!("  b-cmd: {b_cmd}");
         println!("  ref-cmd: {ref_cmd}");
@@ -859,9 +1250,35 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         }
     }
 
-    let r = run_matrix(
+    // Build the per-cell freeze gate if requested (else the sweep is ungated —
+    // the box must be frozen out-of-band or the caller wraps in `freeze run`).
+    let mut gate = if freeze_each {
+        let opts = AcquireOpts {
+            patterns: freeze_procs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            ttl_s: freeze_ttl_s,
+            state_path: PathBuf::from(&freeze_state),
+            sysfs_root: freeze_sysfs_root.clone(),
+            spawn_watchdog: true,
+            dry_run: false,
+            force_stale: freeze_force_stale,
+        };
+        eprintln!(
+            "matrix: FREEZE-PER-CELL on (procs=[{freeze_procs}] ttl_s={freeze_ttl_s}/cell) — \
+             each cell measured under its own short freeze"
+        );
+        Some(FreezeEachGate::new(opts))
+    } else {
+        None
+    };
+
+    let r = run_matrix_gated(
         &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
         &sha_pins, &timestamp,
+        gate.as_mut().map(|g| g as &mut dyn CellGate),
     );
 
     print!("{}", render_grid(&r));
@@ -1037,6 +1454,75 @@ mod tests {
         assert_eq!(rt.manifest.sha_pins, vec!["gz:abc".to_string()]);
         assert_eq!(rt.manifest.timestamp, "ts0");
         assert!(rt.cells[0].paired.is_some());
+    }
+
+    struct RecGate {
+        enters: Vec<(String, u32)>,
+        exits: Vec<(String, u32)>,
+        fail_on: Option<(String, u32)>,
+    }
+    impl CellGate for RecGate {
+        fn enter(&mut self, c: &Path, t: u32) -> Result<(), String> {
+            if self.fail_on.as_ref() == Some(&(c.display().to_string(), t)) {
+                return Err("injected".into());
+            }
+            self.enters.push((c.display().to_string(), t));
+            Ok(())
+        }
+        fn exit(&mut self, c: &Path, t: u32) {
+            self.exits.push((c.display().to_string(), t));
+        }
+    }
+
+    #[test]
+    fn gated_loop_enters_and_exits_every_cell() {
+        let corpora = vec![PathBuf::from("/tmp/a.gz"), PathBuf::from("/tmp/b.gz")];
+        let threads = vec![1u32, 4u32];
+        let mut g = RecGate { enters: vec![], exits: vec![], fail_on: None };
+        let r = run_matrix_gated(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts", Some(&mut g),
+        );
+        assert_eq!(r.cells.len(), 4);
+        assert_eq!(g.enters.len(), 4, "enter once per cell");
+        assert_eq!(g.exits.len(), 4, "exit once per cell");
+        assert_eq!(g.enters, g.exits, "each enter paired with its exit");
+        assert!(r.manifest.method.contains("freeze-per-cell"));
+    }
+
+    #[test]
+    fn gated_loop_acquire_failure_voids_only_that_cell() {
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32, 4u32];
+        let mut g = RecGate {
+            enters: vec![],
+            exits: vec![],
+            fail_on: Some(("/tmp/a.gz".to_string(), 1)),
+        };
+        let r = run_matrix_gated(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts", Some(&mut g),
+        );
+        assert_eq!(r.cells.len(), 2, "fail-soft: both cells recorded");
+        let failed = r.cells.iter().find(|c| c.threads == 1).unwrap();
+        assert_eq!(failed.class, "VOID");
+        assert!(failed.paired.is_none());
+        assert!(failed.error.as_deref().unwrap().contains("freeze-each acquire FAILED"));
+        // only the entered cell (t=4) got an exit
+        assert_eq!(g.enters, vec![("/tmp/a.gz".to_string(), 4u32)]);
+        assert_eq!(g.exits, vec![("/tmp/a.gz".to_string(), 4u32)]);
+    }
+
+    #[test]
+    fn ungated_run_matrix_has_plain_method() {
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32];
+        let r = run_matrix(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts",
+        );
+        assert_eq!(r.manifest.method, METHOD);
+        assert!(!r.manifest.method.contains("freeze-per-cell"));
     }
 
     #[test]
