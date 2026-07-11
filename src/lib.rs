@@ -75,6 +75,7 @@ pub mod macmeasure;
 pub mod mech;
 pub mod mech_arch;
 pub mod memlife;
+pub mod memprofile;
 pub mod microbench;
 pub mod model;
 pub mod occupancy;

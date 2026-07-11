@@ -4263,6 +4263,7 @@ fn main() -> ExitCode {
         "schedule" => cmd_schedule(rest),
         "scaling" => cmd_scaling(rest),
         "memlife" => cmd_memlife(rest),
+        "memprofile" => fulcrum::memprofile::cmd_memprofile(rest),
         "decompose" => cmd_decompose(rest),
         "alloc" => cmd_alloc(rest),
         "model" => cmd_model(rest),
