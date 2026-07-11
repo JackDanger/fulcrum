@@ -441,7 +441,11 @@ impl Evidence {
         if self.subject.as_ref().map_or(true, |t| t.sha256.is_empty()) {
             m.push("subject.sha256".to_string());
         }
-        if self.comparator.as_ref().map_or(true, |t| t.sha256.is_empty()) {
+        if self
+            .comparator
+            .as_ref()
+            .map_or(true, |t| t.sha256.is_empty())
+        {
             m.push("comparator.sha256".to_string());
         }
         match &self.corpus {
@@ -519,16 +523,13 @@ impl Evidence {
 /// THE ONLY constructor of a cell. Missing evidence ⇒ `Refused`. Complete
 /// evidence ⇒ classify into `Verdict` | `Void`. There is no other path.
 pub fn assemble(ev: &Evidence, crit: &Criteria) -> RunCell {
-    let cell = ev
-        .cell
-        .clone()
-        .unwrap_or_else(|| CellId {
-            box_id: ev.box_id.clone().unwrap_or_default(),
-            corpus: String::new(),
-            threads: ev.threads,
-            subject: String::new(),
-            comparator: String::new(),
-        });
+    let cell = ev.cell.clone().unwrap_or_else(|| CellId {
+        box_id: ev.box_id.clone().unwrap_or_default(),
+        corpus: String::new(),
+        threads: ev.threads,
+        subject: String::new(),
+        comparator: String::new(),
+    });
     let prov = ev.provenance();
 
     let missing = ev.missing();
@@ -786,7 +787,11 @@ pub fn paired_significant(n_pos: usize, n_neg: usize, n: usize) -> bool {
 /// normal approximation on the paired mean. (Review disposition #12: fixed
 /// margin, one scale, noise CANNOT make TIE easier — a wider CI fails the test.)
 pub fn tost_equivalent(log_ratios: &[f64], margin_pct: f64) -> bool {
-    let q: Vec<f64> = log_ratios.iter().cloned().filter(|x| x.is_finite()).collect();
+    let q: Vec<f64> = log_ratios
+        .iter()
+        .cloned()
+        .filter(|x| x.is_finite())
+        .collect();
     let n = q.len();
     if n < 3 {
         return false;
@@ -865,7 +870,12 @@ impl Runner for SshRunner {
 /// child (the ssh process, for a box) is killed — the box-side supervisor's own
 /// trap then CONTs any quiesced pids and reaps the measurement pgroup, so the
 /// remote is not orphaned (review disposition #8).
-fn exec_stdin(prog: &str, args: &[String], stdin_data: &str, timeout_s: u64) -> Result<RunOut, String> {
+fn exec_stdin(
+    prog: &str,
+    args: &[String],
+    stdin_data: &str,
+    timeout_s: u64,
+) -> Result<RunOut, String> {
     let mut child = Command::new(prog)
         .args(args)
         .stdin(Stdio::piped())
@@ -1449,7 +1459,14 @@ pub fn measure_cell(
     }
 
     let timeout = bx.quiesce.as_ref().map(|q| q.max_block_s).unwrap_or(300);
-    let script = build_measure_script(&bx.platform, &mask, &corpus.path, &subj_arm, &cmp_arm, spec.n);
+    let script = build_measure_script(
+        &bx.platform,
+        &mask,
+        &corpus.path,
+        &subj_arm,
+        &cmp_arm,
+        spec.n,
+    );
     let run = runner.run(&script, timeout);
 
     // Restore quiesce NOW (before assembling), record the verified result.
@@ -1521,7 +1538,11 @@ pub fn measure_cell(
     // Walls.
     let subj_walls = parsed.reps.get("subject").cloned().unwrap_or_default();
     let cmp_walls = parsed.reps.get("comparator").cloned().unwrap_or_default();
-    let aa_walls = parsed.reps.get("comparator_aa").cloned().unwrap_or_default();
+    let aa_walls = parsed
+        .reps
+        .get("comparator_aa")
+        .cloned()
+        .unwrap_or_default();
 
     if !subj_walls.is_empty() {
         ev.subject_median_ms = Some(median(&subj_walls));
@@ -1628,8 +1649,8 @@ pub fn run_scoreboard(spec: &Spec, dry_run: bool) -> Result<i32, String> {
         recertified: None,
     };
 
-    let json = serde_json::to_string_pretty(&artifact)
-        .map_err(|e| format!("serialize artifact: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&artifact).map_err(|e| format!("serialize artifact: {e}"))?;
     println!("{json}");
 
     // Exit nonzero if any cell is a LOSS or REFUSED (a hole must be loud).
@@ -1686,7 +1707,7 @@ fn evidence_from_cell(cell: &RunCell) -> Option<Evidence> {
             v.comparator_wall_median_ms,
             v.subject_rel_spread,
             v.comparator_rel_spread,
-            v.aa_rel_spread?, // no stored A/A ⇒ cannot recertify ⇒ preserve
+            v.aa_rel_spread?,  // no stored A/A ⇒ cannot recertify ⇒ preserve
             v.paired.clone()?, // no stored reps ⇒ cannot recertify ⇒ preserve
             v.subject_correct.unwrap_or(true),
             v.comparator_correct.unwrap_or(true),
@@ -1931,17 +1952,17 @@ pub fn diff_cli(before_path: &Path, after_path: &Path) -> Result<i32, String> {
         "# before {} (src {}) → after {} (src {})",
         before.timestamp, before.src_sha, after.timestamp, after.src_sha
     );
-    println!("{:<10} {:<24} {:<24} {}", "CLASS", "BEFORE", "AFTER", "CELL");
+    println!(
+        "{:<10} {:<24} {:<24} {}",
+        "CLASS", "BEFORE", "AFTER", "CELL"
+    );
     for r in &rows {
         println!(
             "{:<10} {:<24} {:<24} {}  {}",
             r.class, r.before, r.after, r.key, r.detail
         );
     }
-    println!(
-        "# {} regression/flip cell(s)",
-        regressions
-    );
+    println!("# {} regression/flip cell(s)", regressions);
     Ok(if regressions > 0 { 1 } else { 0 })
 }
 
@@ -1961,11 +1982,7 @@ pub fn render(artifact: &Artifact) -> String {
     for b in &artifact.boxes {
         s.push_str(&format!("\n## {} ({})\n\n", b.id, b.cpu));
         // corpus × T grid, cell = verdict + ratio + criterion.
-        let mut corpora: Vec<String> = b
-            .cells
-            .iter()
-            .map(|c| c.cell().corpus.clone())
-            .collect();
+        let mut corpora: Vec<String> = b.cells.iter().map(|c| c.cell().corpus.clone()).collect();
         corpora.sort();
         corpora.dedup();
         let mut threads: Vec<usize> = b.cells.iter().map(|c| c.cell().threads).collect();
@@ -2131,7 +2148,11 @@ pub fn cmd(args: &[String]) -> i32 {
             }
         }
         "diff" => {
-            let pos: Vec<&str> = rest.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
+            let pos: Vec<&str> = rest
+                .iter()
+                .filter(|a| !a.starts_with("--"))
+                .map(|s| s.as_str())
+                .collect();
             if pos.len() != 2 {
                 eprintln!("scoreboard diff <before.json> <after.json>");
                 return 2;
@@ -2145,7 +2166,11 @@ pub fn cmd(args: &[String]) -> i32 {
             }
         }
         "render" => {
-            let pos: Vec<&str> = rest.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
+            let pos: Vec<&str> = rest
+                .iter()
+                .filter(|a| !a.starts_with("--"))
+                .map(|s| s.as_str())
+                .collect();
             if pos.len() != 1 {
                 eprintln!("scoreboard render <artifact.json>");
                 return 2;
@@ -2162,7 +2187,11 @@ pub fn cmd(args: &[String]) -> i32 {
             }
         }
         "recertify" => {
-            let pos: Vec<&str> = rest.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
+            let pos: Vec<&str> = rest
+                .iter()
+                .filter(|a| !a.starts_with("--"))
+                .map(|s| s.as_str())
+                .collect();
             if pos.len() != 1 {
                 eprintln!("scoreboard recertify <artifact.json>");
                 return 2;
@@ -2173,7 +2202,10 @@ pub fn cmd(args: &[String]) -> i32 {
                     if let Some(p) = &recert.recertified {
                         eprintln!(
                             "[recertify] aa_win_mult={} recertified={} preserved={} flips={}",
-                            p.aa_win_mult, p.cells_recertified, p.cells_preserved, p.flips.len()
+                            p.aa_win_mult,
+                            p.cells_recertified,
+                            p.cells_preserved,
+                            p.flips.len()
                         );
                         for f in &p.flips {
                             eprintln!("[recertify] FLIP {f}");

@@ -177,7 +177,10 @@ fn categorize_amd_events() {
         categorize("ic_fetch_stall.ic_stall_back_pressure"),
         Category::FrontendFetch
     );
-    assert_eq!(categorize("de_dis_uop_queue_empty_di0"), Category::FrontendFetch);
+    assert_eq!(
+        categorize("de_dis_uop_queue_empty_di0"),
+        Category::FrontendFetch
+    );
     assert_eq!(
         categorize("de_dis_dispatch_token_stalls1.int_phy_reg_file_token_stall"),
         Category::BackendDispatchRegister
@@ -185,7 +188,10 @@ fn categorize_amd_events() {
     assert_eq!(categorize("branch-misses"), Category::BadSpeculation);
     assert_eq!(categorize("L1-dcache-load-misses"), Category::CacheMemory);
     assert_eq!(categorize("dTLB-load-misses"), Category::CacheMemory);
-    assert_eq!(categorize("l2_cache_req_stat.ls_rd_blk_c"), Category::CacheMemory);
+    assert_eq!(
+        categorize("l2_cache_req_stat.ls_rd_blk_c"),
+        Category::CacheMemory
+    );
     assert_eq!(categorize("instructions"), Category::Neutral);
     assert!(Category::FrontendFetch.is_cycle_stall());
     assert!(Category::BackendDispatchRegister.is_cycle_stall());
@@ -283,15 +289,17 @@ fn batches_for_always_appends_user_fault_batch() {
         let bs = batches_for(vendor);
         let last = bs.last().expect("at least one batch");
         assert_eq!(last.name, "E_user_faults");
-        for ev in ["instructions:u", "cycles:u", "page-faults", "minor-faults", "major-faults"] {
+        for ev in [
+            "instructions:u",
+            "cycles:u",
+            "page-faults",
+            "minor-faults",
+            "major-faults",
+        ] {
             assert!(last.events.contains(&s(ev)), "missing {ev} for {vendor:?}");
         }
         // hardware (PMU) part is only 4 — the rest are software, no multiplexing.
-        let hw = last
-            .events
-            .iter()
-            .filter(|e| !e.contains("faults"))
-            .count();
+        let hw = last.events.iter().filter(|e| !e.contains("faults")).count();
         assert_eq!(hw, 4, "more than 4 PMU counters would multiplex");
     }
 }
@@ -314,23 +322,28 @@ fn user_kernel_split_decode_wins_overhead_faults() {
     assert!(uk.user_cyc_ratio < 1.0, "gz user-mode fewer cycles");
     assert!(uk.user_ipc_ratio > 1.0, "gz user-mode higher IPC");
     assert!((uk.page_faults_ratio - 1.738).abs() < 1e-9);
-    assert!(uk.subj_kernel_share > uk.comp_kernel_share, "gz more kernel share");
-    assert!(uk.verdict.contains("DECODE: gz user-mode is FASTER"), "{}", uk.verdict);
+    assert!(
+        uk.subj_kernel_share > uk.comp_kernel_share,
+        "gz more kernel share"
+    );
+    assert!(
+        uk.verdict.contains("DECODE: gz user-mode is FASTER"),
+        "{}",
+        uk.verdict
+    );
     assert!(uk.verdict.contains("FAULTS MORE"), "{}", uk.verdict);
 }
 
 #[test]
 fn user_kernel_split_self_test_catches_violations() {
     // cycles:u > cycles (impossible) → self-test fail.
-    let bad_cyc = compute_user_kernel_split(
-        1.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-    );
+    let bad_cyc =
+        compute_user_kernel_split(1.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
     assert!(!bad_cyc.subj_user_le_total);
     assert!(!bad_cyc.self_test_pass);
     // zero faults → self-test fail.
-    let bad_faults = compute_user_kernel_split(
-        1.0, 0.9, 1.0, 0.9, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    );
+    let bad_faults =
+        compute_user_kernel_split(1.0, 0.9, 1.0, 0.9, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     assert!(!bad_faults.faults_nonzero);
     assert!(!bad_faults.self_test_pass);
 }

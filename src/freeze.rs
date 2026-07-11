@@ -309,7 +309,10 @@ pub fn verify_frozen(procs: &[ProcSave]) -> Result<Vec<i32>, String> {
         match ps_stat(p.pid) {
             Some(st) if stat_is_stopped(&st) => {}
             Some(_) => revived.push(p.pid),
-            None => eprintln!("freeze: WARN pid {} ({}) exited while frozen", p.pid, p.comm),
+            None => eprintln!(
+                "freeze: WARN pid {} ({}) exited while frozen",
+                p.pid, p.comm
+            ),
         }
     }
     if revived.is_empty() {
@@ -350,7 +353,11 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
             eprintln!("freeze: WARN pattern '{pat}' matched no process (boost/governor freeze still applies)");
         }
         for pid in pids {
-            procs.push(ProcSave { pid, comm: comm_of(pid), pattern: pat.clone() });
+            procs.push(ProcSave {
+                pid,
+                comm: comm_of(pid),
+                pattern: pat.clone(),
+            });
         }
     }
 
@@ -366,7 +373,10 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
     let governors: Vec<GovSave> = governor_paths(&opts.sysfs_root)
         .into_iter()
         .filter_map(|p| {
-            read_trim(&p).map(|orig| GovSave { path: p.to_string_lossy().to_string(), orig })
+            read_trim(&p).map(|orig| GovSave {
+                path: p.to_string_lossy().to_string(),
+                orig,
+            })
         })
         .collect();
 
@@ -398,7 +408,10 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
         }
     }
     if !gov_fail.is_empty() {
-        eprintln!("freeze: WARN could not set performance governor on {} cpus (permissions?)", gov_fail.len());
+        eprintln!(
+            "freeze: WARN could not set performance governor on {} cpus (permissions?)",
+            gov_fail.len()
+        );
     }
     if let Some(orig) = &boost_orig {
         if orig != "0" && fs::write(&bpath, "0").is_err() {
@@ -438,7 +451,9 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
         acquired_at_unix: now_unix(),
         ttl_s: opts.ttl_s,
         sysfs_root: opts.sysfs_root.clone(),
-        boost_path: boost_orig.as_ref().map(|_| bpath.to_string_lossy().to_string()),
+        boost_path: boost_orig
+            .as_ref()
+            .map(|_| bpath.to_string_lossy().to_string()),
         boost_orig,
         governors,
         procs,
@@ -459,7 +474,9 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
                 let body = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
                 let _ = fs::write(&opts.state_path, &body);
             }
-            Err(e) => eprintln!("freeze: WARN could not spawn watchdog: {e} — release relies on the caller"),
+            Err(e) => eprintln!(
+                "freeze: WARN could not spawn watchdog: {e} — release relies on the caller"
+            ),
         }
     }
 
@@ -485,7 +502,10 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
         boost_now,
         gov_now,
         state.procs.len(),
-        state.watchdog_pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into()),
+        state
+            .watchdog_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".into()),
         state.ttl_s,
         opts.state_path.display(),
         state.method_string()
@@ -564,7 +584,8 @@ pub fn release(
                 rep.boost_restored = Some(true);
             } else {
                 rep.boost_restored = Some(false);
-                rep.errors.push(format!("boost NOT restored to {orig} at {bp}"));
+                rep.errors
+                    .push(format!("boost NOT restored to {orig} at {bp}"));
             }
         }
         for g in &st.governors {
@@ -576,7 +597,8 @@ pub fn release(
             }
         }
         if rep.governors_failed > 0 {
-            rep.errors.push(format!("{} governors NOT restored", rep.governors_failed));
+            rep.errors
+                .push(format!("{} governors NOT restored", rep.governors_failed));
         }
 
         // -- CONT in REVERSE order (children first, supervisor last)
@@ -638,7 +660,8 @@ pub fn release(
         std::thread::sleep(Duration::from_millis(SETTLE_MS));
         for &pid in &rep.orphans_swept {
             if ps_stat(pid).map(|s| stat_is_stopped(&s)).unwrap_or(false) {
-                rep.errors.push(format!("orphan pid {pid} still stopped after sweep CONT"));
+                rep.errors
+                    .push(format!("orphan pid {pid} still stopped after sweep CONT"));
             }
         }
     }
@@ -728,7 +751,9 @@ pub fn run_under_freeze(opts: &AcquireOpts, cmd_argv: &[String]) -> ExitCode {
         Ok(st) => {
             let code = st.code().unwrap_or(1);
             if !rep.ok() {
-                eprintln!("freeze run: command exited {code} but RESTORE=FAIL — treat the box as suspect");
+                eprintln!(
+                    "freeze run: command exited {code} but RESTORE=FAIL — treat the box as suspect"
+                );
                 return ExitCode::FAILURE;
             }
             ExitCode::from(code.clamp(0, 255) as u8)
@@ -931,7 +956,9 @@ pub fn selftest() -> ExitCode {
     check(
         "re-CONT hole: enforcement re-stopped the revived pid",
         matches!(&enforced, Ok(revived) if revived.contains(&victim))
-            && ps_stat(victim).map(|s| stat_is_stopped(&s)).unwrap_or(false),
+            && ps_stat(victim)
+                .map(|s| stat_is_stopped(&s))
+                .unwrap_or(false),
     );
 
     // 4. release restores everything + reports
@@ -970,7 +997,11 @@ pub fn selftest() -> ExitCode {
 
     // 6. watchdog end-to-end: acquire with a 2s TTL, DON'T release, watch it
     //    auto-release (this is the SIGKILLed-driver guarantee)
-    let wd_opts = AcquireOpts { ttl_s: 2, spawn_watchdog: true, ..opts.clone() };
+    let wd_opts = AcquireOpts {
+        ttl_s: 2,
+        spawn_watchdog: true,
+        ..opts.clone()
+    };
     match acquire(&wd_opts) {
         Ok(st2) => {
             check("watchdog: spawned", st2.watchdog_pid.is_some());
@@ -1027,7 +1058,11 @@ fn cli_has(args: &[String], name: &str) -> bool {
 fn parse_common(args: &[String]) -> AcquireOpts {
     let mut o = AcquireOpts::default();
     if let Some(p) = cli_flag(args, "--procs") {
-        o.patterns = p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        o.patterns = p
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     if let Some(t) = cli_flag(args, "--ttl-s").and_then(|v| v.parse().ok()) {
         o.ttl_s = t;
@@ -1129,7 +1164,8 @@ mod tests {
     use super::*;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fulcrum-freeze-test-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("fulcrum-freeze-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -1144,8 +1180,15 @@ mod tests {
             sysfs_root: "/".into(),
             boost_path: Some("/sys/devices/system/cpu/cpufreq/boost".into()),
             boost_orig: Some("1".into()),
-            governors: vec![GovSave { path: "/x".into(), orig: "schedutil".into() }],
-            procs: vec![ProcSave { pid: 7, comm: "llama-swap".into(), pattern: "llama-swap".into() }],
+            governors: vec![GovSave {
+                path: "/x".into(),
+                orig: "schedutil".into(),
+            }],
+            procs: vec![ProcSave {
+                pid: 7,
+                comm: "llama-swap".into(),
+                pattern: "llama-swap".into(),
+            }],
             watchdog_pid: Some(99),
             patterns: vec!["llama-swap".into(), "llama-server".into()],
         };
@@ -1194,7 +1237,9 @@ mod tests {
         assert_eq!(read_trim(&boost_path(&root)).as_deref(), Some("1"));
         let govs = governor_paths(&root);
         assert_eq!(govs.len(), 4);
-        assert!(govs.iter().all(|p| read_trim(p).as_deref() == Some("schedutil")));
+        assert!(govs
+            .iter()
+            .all(|p| read_trim(p).as_deref() == Some("schedutil")));
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1213,7 +1258,11 @@ mod tests {
             boost_path: None,
             boost_orig: None,
             governors: vec![],
-            procs: vec![ProcSave { pid: 1, comm: "init".into(), pattern: "init".into() }],
+            procs: vec![ProcSave {
+                pid: 1,
+                comm: "init".into(),
+                pattern: "init".into(),
+            }],
             watchdog_pid: None,
             patterns: vec![],
         };
@@ -1269,11 +1318,17 @@ mod tests {
         let st = acquire(&opts).expect("acquire");
         assert_eq!(st.procs.len(), 1);
         assert!(stat_is_stopped(&ps_stat(st.procs[0].pid).unwrap()));
-        assert_eq!(read_trim(&boost_path(&opts.sysfs_root)).as_deref(), Some("0"));
+        assert_eq!(
+            read_trim(&boost_path(&opts.sysfs_root)).as_deref(),
+            Some("0")
+        );
         // release restores everything and removes state
         let rep = release(&opts.state_path, &[], false);
         assert!(rep.ok(), "release errors: {:?}", rep.errors);
-        assert_eq!(read_trim(&boost_path(&opts.sysfs_root)).as_deref(), Some("1"));
+        assert_eq!(
+            read_trim(&boost_path(&opts.sysfs_root)).as_deref(),
+            Some("1")
+        );
         assert!(!opts.state_path.exists());
         assert!(!stat_is_stopped(&ps_stat(st.procs[0].pid).unwrap()));
         let _ = child.kill();
@@ -1299,7 +1354,11 @@ mod tests {
         assert!(stat_is_stopped(&ps_stat(pid).unwrap()));
         // release with NO state file must still sweep it
         let rep = release(&d.join("nonexistent.json"), &[format!("f:{marker}")], false);
-        assert!(rep.orphans_swept.contains(&pid), "swept: {:?}", rep.orphans_swept);
+        assert!(
+            rep.orphans_swept.contains(&pid),
+            "swept: {:?}",
+            rep.orphans_swept
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert!(!stat_is_stopped(&ps_stat(pid).unwrap()));
         let _ = child.kill();

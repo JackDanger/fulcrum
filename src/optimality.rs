@@ -240,11 +240,7 @@ fn loop_spec_from_asm(label: &str, path: &str, asm: &PathBuf) -> LoopSpec {
     }
 }
 
-fn chainlat_cfg(
-    m: &Manifest,
-    primary: LoopSpec,
-    comparator: LoopSpec,
-) -> ChainlatConfig {
+fn chainlat_cfg(m: &Manifest, primary: LoopSpec, comparator: LoopSpec) -> ChainlatConfig {
     ChainlatConfig {
         primary,
         comparator,
@@ -275,10 +271,7 @@ fn model_slice(
     let spec = loop_spec_from_asm(label, label, asm);
     let cfg = chainlat_cfg(m, spec.clone(), spec);
     let report = chainlat::run(&cfg)?;
-    Ok((
-        report.primary.cycles_per_iter,
-        report.primary.port_pressure,
-    ))
+    Ok((report.primary.cycles_per_iter, report.primary.port_pressure))
 }
 
 fn build_rec_ledger(m: &Manifest, warnings: &mut Vec<String>) -> Vec<RecLedgerRow> {
@@ -363,10 +356,7 @@ fn pressure_map(pp: &[PortPressure]) -> BTreeMap<String, f64> {
     m
 }
 
-fn build_port_ledger(
-    m: &Manifest,
-    warnings: &mut Vec<String>,
-) -> (Vec<PortLedgerRow>, String) {
+fn build_port_ledger(m: &Manifest, warnings: &mut Vec<String>) -> (Vec<PortLedgerRow>, String) {
     let Some(ports) = &m.ports else {
         return (
             Vec::new(),
@@ -564,8 +554,8 @@ pub fn run_self_cal(script: &str, arch: Arch, spec: Option<&CompletenessSpec>) -
 
     // (c) A/A determinism: same input → identical attribution.
     let again = summarize_script(script, arch, "gz");
-    let aa_deterministic = counts_map(&again) == base_counts
-        && again.classified_samples == base.classified_samples;
+    let aa_deterministic =
+        counts_map(&again) == base_counts && again.classified_samples == base.classified_samples;
     if !aa_deterministic {
         notes.push("A/A FAIL: attribution not deterministic on identical input".to_string());
     }
@@ -577,7 +567,11 @@ pub fn run_self_cal(script: &str, arch: Arch, spec: Option<&CompletenessSpec>) -
     let end_to_end_note = format!(
         "{} distinct attributed symbols ({}; ≥2 ⇒ capture spans beyond the inner loop)",
         distinct_symbols,
-        if end_to_end_ok { "OK" } else { "SUSPECT: inner-loop-only?" }
+        if end_to_end_ok {
+            "OK"
+        } else {
+            "SUSPECT: inner-loop-only?"
+        }
     );
     if !end_to_end_ok {
         notes.push(
@@ -727,7 +721,12 @@ fn maybe_perf_script(text: &str, path: &PathBuf) -> Result<String, String> {
         .arg(path)
         .args(["-F", "ip,sym,insn"])
         .output()
-        .map_err(|e| format!("{}: not a perf-script and `perf script` failed: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "{}: not a perf-script and `perf script` failed: {e}",
+                path.display()
+            )
+        })?;
     if !out.status.success() {
         return Err(format!(
             "{}: not a perf-script (no `insn:`) and `perf script` failed: {}",
@@ -746,15 +745,15 @@ fn maybe_perf_script(text: &str, path: &PathBuf) -> Result<String, String> {
 /// emitted across multiple symbols so the §7d end-to-end check is meaningful.
 /// (opcode bytes, symbol)
 const FIXTURE_INSNS: &[(&[u8], &str)] = &[
-    (&[0x8b, 0x06], "decode_clean_into_contig"),          // mov (%rsi),%eax  scalar-load
-    (&[0x88, 0x07], "decode_clean_into_contig"),          // mov %al,(%rdi)   scalar-store
-    (&[0x48, 0x01, 0xd8], "decode_clean_into_contig"),    // add %rbx,%rax    alu
-    (&[0x48, 0x8d, 0x04, 0x11], "run_contig"),            // lea (%rcx,%rdx),%rax  lea
-    (&[0x48, 0xc1, 0xe0, 0x03], "run_contig"),            // shl $3,%rax      shift
-    (&[0x75, 0x02], "run_contig"),                        // jne .+2         branch-cond
-    (&[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0xc1], "crc_fold"),  // crc32 %rcx,%rax crc/pclmul
-    (&[0xc5, 0xfa, 0x6f, 0x06], "apply_window"),          // vmovdqu (%rsi),%xmm0 vector-load
-    (&[0xc5, 0xfa, 0x7f, 0x07], "apply_window"),          // vmovdqu %xmm0,(%rdi) vector-store
+    (&[0x8b, 0x06], "decode_clean_into_contig"), // mov (%rsi),%eax  scalar-load
+    (&[0x88, 0x07], "decode_clean_into_contig"), // mov %al,(%rdi)   scalar-store
+    (&[0x48, 0x01, 0xd8], "decode_clean_into_contig"), // add %rbx,%rax    alu
+    (&[0x48, 0x8d, 0x04, 0x11], "run_contig"),   // lea (%rcx,%rdx),%rax  lea
+    (&[0x48, 0xc1, 0xe0, 0x03], "run_contig"),   // shl $3,%rax      shift
+    (&[0x75, 0x02], "run_contig"),               // jne .+2         branch-cond
+    (&[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0xc1], "crc_fold"), // crc32 %rcx,%rax crc/pclmul
+    (&[0xc5, 0xfa, 0x6f, 0x06], "apply_window"), // vmovdqu (%rsi),%xmm0 vector-load
+    (&[0xc5, 0xfa, 0x7f, 0x07], "apply_window"), // vmovdqu %xmm0,(%rdi) vector-store
 ];
 
 pub fn gen_fixture() -> String {
@@ -795,7 +794,11 @@ pub fn render_self_cal(sc: &SelfCal) -> String {
         "(a) INSTR-DISJOINT SPINE : Σ buckets = {} , classified = {} → {}\n",
         sc.spine_sum,
         sc.spine_classified,
-        if sc.spine_disjoint { "PASS (disjoint)" } else { "FAIL" }
+        if sc.spine_disjoint {
+            "PASS (disjoint)"
+        } else {
+            "FAIL"
+        }
     ));
     out.push_str(&format!("    {}\n", sc.closure_note));
     out.push_str("(b) PERTURBATION CALIBRATION (inject 2× per op → only that bucket grows):\n");
@@ -810,7 +813,11 @@ pub fn render_self_cal(sc: &SelfCal) -> String {
             r.baseline,
             r.op_after,
             r.expected_op_after,
-            if r.other_buckets_unchanged { "yes" } else { "NO" },
+            if r.other_buckets_unchanged {
+                "yes"
+            } else {
+                "NO"
+            },
             if r.total_grew_exactly { "yes" } else { "NO" },
             if r.passed { "PASS" } else { "FAIL" },
             if r.leaked_into.is_empty() {
@@ -822,13 +829,20 @@ pub fn render_self_cal(sc: &SelfCal) -> String {
     }
     out.push_str(&format!(
         "    perturbation calibration: {}\n",
-        if sc.perturb_passed { "PASS — attribution is disjoint, no cross-contamination" } else { "FAIL" }
+        if sc.perturb_passed {
+            "PASS — attribution is disjoint, no cross-contamination"
+        } else {
+            "FAIL"
+        }
     ));
     out.push_str(&format!(
         "(c) A/A DETERMINISM      : {}\n",
         if sc.aa_deterministic { "PASS" } else { "FAIL" }
     ));
-    out.push_str(&format!("(d) END-TO-END COVERAGE  : {}\n", sc.end_to_end_note));
+    out.push_str(&format!(
+        "(d) END-TO-END COVERAGE  : {}\n",
+        sc.end_to_end_note
+    ));
     out.push('\n');
     out.push_str(&format!(
         "SELF-CAL VERDICT: {}\n",
@@ -895,7 +909,11 @@ pub fn render(r: &OptimalityReport) -> String {
         "R", "chain", "gz", "best", "best-tool", "tag", "winner"
     ));
     for row in &r.rec_ledger {
-        let tag = if row.wall_owed { "wall-owed" } else { "closable" };
+        let tag = if row.wall_owed {
+            "wall-owed"
+        } else {
+            "closable"
+        };
         let winner = match row.gz_dominates {
             Some(true) => "gz ≤ best",
             Some(false) => "OPPORTUNITY",
@@ -928,8 +946,12 @@ pub fn render(r: &OptimalityReport) -> String {
     out.push('\n');
 
     // port ledger
-    out.push_str("PORT LEDGER (PRESS = uops/iter per port, joint over the in-context loop, §5/§6)\n");
-    out.push_str("------------------------------------------------------------------------------\n");
+    out.push_str(
+        "PORT LEDGER (PRESS = uops/iter per port, joint over the in-context loop, §5/§6)\n",
+    );
+    out.push_str(
+        "------------------------------------------------------------------------------\n",
+    );
     if r.port_ledger.is_empty() {
         out.push_str(&format!("{}\n", r.port_note));
     } else {
@@ -944,7 +966,11 @@ pub fn render(r: &OptimalityReport) -> String {
                 p.gz,
                 fmt_opt(p.best),
                 p.best_tool.clone().unwrap_or_else(|| "-".to_string()),
-                if p.gz_dominates { "gz ≤ best" } else { "OPPORTUNITY" }
+                if p.gz_dominates {
+                    "gz ≤ best"
+                } else {
+                    "OPPORTUNITY"
+                }
             ));
         }
     }
@@ -952,7 +978,9 @@ pub fn render(r: &OptimalityReport) -> String {
 
     // wall-owed
     if !r.wall_owed_items.is_empty() {
-        out.push_str("WALL-OWED (§9 — model says dominant, NOT bankable without quiet-window wall):\n");
+        out.push_str(
+            "WALL-OWED (§9 — model says dominant, NOT bankable without quiet-window wall):\n",
+        );
         for w in &r.wall_owed_items {
             out.push_str(&format!("  • {w}\n"));
         }

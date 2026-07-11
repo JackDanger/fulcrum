@@ -29,7 +29,10 @@ fn parse_threads_rejects_zero_and_garbage() {
 #[test]
 fn render_tmpl_substitutes_thread_count() {
     assert_eq!(render_tmpl("-d -c -p{T}", 4), vec!["-d", "-c", "-p4"]);
-    assert_eq!(render_tmpl("-d -c -P {T}", 16), vec!["-d", "-c", "-P", "16"]);
+    assert_eq!(
+        render_tmpl("-d -c -P {T}", 16),
+        vec!["-d", "-c", "-P", "16"]
+    );
     // no placeholder → verbatim
     assert_eq!(render_tmpl("-d -c", 2), vec!["-d", "-c"]);
 }
@@ -202,8 +205,16 @@ fn sv(xs: &[&str]) -> Vec<String> {
 #[test]
 fn parse_args_minimal_ok() {
     let a = sv(&[
-        "--box", "trainer", "--gz", "/b/gz", "--rg", "/b/rg", "--corpus", "/c/silesia.gz",
-        "--oracle-sha", "deadbeef",
+        "--box",
+        "trainer",
+        "--gz",
+        "/b/gz",
+        "--rg",
+        "/b/rg",
+        "--corpus",
+        "/c/silesia.gz",
+        "--oracle-sha",
+        "deadbeef",
     ]);
     let cfg = parse_args(&a).unwrap();
     assert_eq!(cfg.box_host, "trainer");
@@ -216,15 +227,37 @@ fn parse_args_minimal_ok() {
     assert_eq!(cfg.threads, vec![1, 2, 3, 4, 5, 6, 7, 8, 12, 16]);
     assert_eq!(cfg.gz_tmpl, "-d -c -p{T}");
     assert_eq!(cfg.rg_tmpl, "-d -c -P {T}");
-    assert_eq!(cfg.gz_env, vec![("GZIPPY_FORCE_PARALLEL_SM".to_string(), "1".to_string())]);
+    assert_eq!(
+        cfg.gz_env,
+        vec![("GZIPPY_FORCE_PARALLEL_SM".to_string(), "1".to_string())]
+    );
 }
 
 #[test]
 fn parse_args_overrides() {
     let a = sv(&[
-        "--box", "solvency", "--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "sha",
-        "--threads", "1,2,4", "--n", "21", "--gz-tmpl", "-d -c -p {T}", "--rg-tmpl", "-d -o /dev/null -P {T}",
-        "--gz-env", "GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_X=2", "--out", "/tmp/out.json",
+        "--box",
+        "solvency",
+        "--gz",
+        "g",
+        "--rg",
+        "r",
+        "--corpus",
+        "c",
+        "--oracle-sha",
+        "sha",
+        "--threads",
+        "1,2,4",
+        "--n",
+        "21",
+        "--gz-tmpl",
+        "-d -c -p {T}",
+        "--rg-tmpl",
+        "-d -o /dev/null -P {T}",
+        "--gz-env",
+        "GZIPPY_FORCE_PARALLEL_SM=1 GZIPPY_X=2",
+        "--out",
+        "/tmp/out.json",
     ]);
     let cfg = parse_args(&a).unwrap();
     assert_eq!(cfg.threads, vec![1, 2, 4]);
@@ -238,18 +271,57 @@ fn parse_args_overrides() {
 #[test]
 fn parse_args_requires_all_mandatory() {
     // missing --box
-    assert!(parse_args(&sv(&["--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "s"])).is_err());
+    assert!(parse_args(&sv(&[
+        "--gz",
+        "g",
+        "--rg",
+        "r",
+        "--corpus",
+        "c",
+        "--oracle-sha",
+        "s"
+    ]))
+    .is_err());
     // missing --oracle-sha
-    assert!(parse_args(&sv(&["--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c"])).is_err());
+    assert!(parse_args(&sv(&[
+        "--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c"
+    ]))
+    .is_err());
     // unknown arg
-    assert!(parse_args(&sv(&["--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "s", "--bogus"])).is_err());
+    assert!(parse_args(&sv(&[
+        "--box",
+        "b",
+        "--gz",
+        "g",
+        "--rg",
+        "r",
+        "--corpus",
+        "c",
+        "--oracle-sha",
+        "s",
+        "--bogus"
+    ]))
+    .is_err());
     // help sentinel
     assert_eq!(parse_args(&sv(&["--help"])).unwrap_err(), "HELP");
 }
 
 #[test]
 fn parse_args_n_zero_rejected() {
-    let a = sv(&["--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "s", "--n", "0"]);
+    let a = sv(&[
+        "--box",
+        "b",
+        "--gz",
+        "g",
+        "--rg",
+        "r",
+        "--corpus",
+        "c",
+        "--oracle-sha",
+        "s",
+        "--n",
+        "0",
+    ]);
     assert!(parse_args(&a).is_err());
 }
 
@@ -293,7 +365,10 @@ fn count_status_tallies_certified_and_void() {
     ];
     assert_eq!(count_status(&statuses), (3, 2));
     // all certified
-    assert_eq!(count_status(&[CellStatus::Certified, CellStatus::Certified]), (2, 0));
+    assert_eq!(
+        count_status(&[CellStatus::Certified, CellStatus::Certified]),
+        (2, 0)
+    );
     // all void
     assert_eq!(count_status(&[CellStatus::Void]), (0, 1));
     // empty
@@ -355,7 +430,16 @@ fn parse_load_1min_rejects_garbage() {
 #[test]
 fn parse_args_retry_default_and_override() {
     let base = sv(&[
-        "--box", "b", "--gz", "g", "--rg", "r", "--corpus", "c", "--oracle-sha", "s",
+        "--box",
+        "b",
+        "--gz",
+        "g",
+        "--rg",
+        "r",
+        "--corpus",
+        "c",
+        "--oracle-sha",
+        "s",
     ]);
     assert_eq!(parse_args(&base).unwrap().retry, 2); // default
     let mut a = base.clone();

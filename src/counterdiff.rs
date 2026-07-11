@@ -82,7 +82,9 @@ impl Category {
 pub fn categorize(event: &str) -> Category {
     let e = event;
     // Frontend-fetch: IC fetch stalls + uop-queue starvation.
-    if e.starts_with("ic_fetch_stall") || e.contains("uop_queue_empty") || e.contains("frontend_bound")
+    if e.starts_with("ic_fetch_stall")
+        || e.contains("uop_queue_empty")
+        || e.contains("frontend_bound")
     {
         return Category::FrontendFetch;
     }
@@ -168,7 +170,10 @@ pub fn split_args(s: &str) -> Vec<String> {
 
 pub fn parse_env(s: &str) -> Vec<(String, String)> {
     s.split_whitespace()
-        .filter_map(|tok| tok.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .filter_map(|tok| {
+            tok.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
         .collect()
 }
 
@@ -365,7 +370,16 @@ fn b(name: &str, events: &[&str]) -> Batch {
 /// The AMD Zen2 batch set — the events proven on this box by `/root/ipc_measure.sh`.
 pub fn amd_batches() -> Vec<Batch> {
     vec![
-        b("A_ipc", &["instructions", "cycles", "branches", "branch-misses", "task-clock"]),
+        b(
+            "A_ipc",
+            &[
+                "instructions",
+                "cycles",
+                "branches",
+                "branch-misses",
+                "task-clock",
+            ],
+        ),
         b(
             "B_cache",
             &[
@@ -408,7 +422,16 @@ pub fn amd_batches() -> Vec<Batch> {
 /// `topdown.*` slot events on a real Intel box.)
 pub fn intel_batches() -> Vec<Batch> {
     vec![
-        b("A_ipc", &["instructions", "cycles", "branches", "branch-misses", "task-clock"]),
+        b(
+            "A_ipc",
+            &[
+                "instructions",
+                "cycles",
+                "branches",
+                "branch-misses",
+                "task-clock",
+            ],
+        ),
         b(
             "B_cache",
             &[
@@ -472,7 +495,13 @@ pub fn batches_for(vendor: Vendor) -> Vec<Batch> {
         // Unknown: the universal IPC batch only.
         Vendor::Unknown => vec![b(
             "A_ipc",
-            &["instructions", "cycles", "branches", "branch-misses", "task-clock"],
+            &[
+                "instructions",
+                "cycles",
+                "branches",
+                "branch-misses",
+                "task-clock",
+            ],
         )],
     };
     // The user/kernel + page-fault split is arch-independent — always measured.
@@ -530,7 +559,8 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
     let mut threads_set = false;
     let mut i = 0;
     let need = |i: usize, name: &str| -> Result<&String, String> {
-        args.get(i + 1).ok_or_else(|| format!("{name} requires a value"))
+        args.get(i + 1)
+            .ok_or_else(|| format!("{name} requires a value"))
     };
     while i < args.len() {
         match args[i].as_str() {
@@ -554,10 +584,9 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
             }
             "--comparator-label" => {
                 let lbl = need(i, "--comparator-label")?.clone();
-                let last = cfg
-                    .comparators
-                    .last_mut()
-                    .ok_or_else(|| "--comparator-label must follow a --comparator-cmd".to_string())?;
+                let last = cfg.comparators.last_mut().ok_or_else(|| {
+                    "--comparator-label must follow a --comparator-cmd".to_string()
+                })?;
                 last.label = lbl;
                 i += 2;
             }
@@ -650,7 +679,11 @@ pub fn assemble_rows(
         };
         let subj_pb = median(sv);
         let comp_pb = median(cv);
-        let ratio = if comp_pb != 0.0 { subj_pb / comp_pb } else { f64::NAN };
+        let ratio = if comp_pb != 0.0 {
+            subj_pb / comp_pb
+        } else {
+            f64::NAN
+        };
         let delta = subj_pb - comp_pb;
         // A/A noise floor: max of the subject-arm spread, the AA-arm spread, and
         // the subject-vs-AA median deviation (all relative).
@@ -719,11 +752,7 @@ pub fn rank_verdict(rows: &[CounterRow]) -> Option<Verdict> {
             .partial_cmp(&a.delta_per_byte)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let top: &CounterRow = stalls
-        .iter()
-        .copied()
-        .find(|r| !r.tie)
-        .unwrap_or(stalls[0]);
+    let top: &CounterRow = stalls.iter().copied().find(|r| !r.tie).unwrap_or(stalls[0]);
     let dom = categorize(&top.event);
     // Secondary: the leading counter of the RUNNER-UP category — the highest
     // per-byte excess among non-tie stalls whose category differs from the
@@ -954,7 +983,9 @@ pub fn detect_arch() -> String {
 /// an absolute/relative existing path.
 fn check_comparator_binary(cmd: &[String]) -> Result<(), String> {
     check_thread_flag(cmd)?;
-    let bin = cmd.first().ok_or_else(|| "comparator argv is empty".to_string())?;
+    let bin = cmd
+        .first()
+        .ok_or_else(|| "comparator argv is empty".to_string())?;
     let path = resolve_bin(bin)?;
     let meta = std::fs::metadata(&path)
         .map_err(|e| format!("cannot stat comparator '{}': {e}", path.display()))?;
@@ -999,7 +1030,9 @@ fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    Err(format!("comparator binary '{bin}' not found (not a path, not on PATH)"))
+    Err(format!(
+        "comparator binary '{bin}' not found (not a path, not on PATH)"
+    ))
 }
 
 /// Run the trusted oracle once → (reference_sha, output byte count).
@@ -1015,7 +1048,10 @@ fn run_oracle(oracle_cmd: &[String], corpus: &str) -> Result<(String, f64), Stri
         .output()
         .map_err(|e| format!("cannot spawn oracle '{prog}': {e}"))?;
     if !out.status.success() {
-        return Err(format!("oracle '{prog}' exited {:?} on {corpus}", out.status.code()));
+        return Err(format!(
+            "oracle '{prog}' exited {:?} on {corpus}",
+            out.status.code()
+        ));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len() as f64))
 }
@@ -1039,7 +1075,10 @@ fn run_arm_sha(
         .output()
         .map_err(|e| format!("cannot spawn arm '{bin}': {e}"))?;
     if !out.status.success() {
-        return Err(format!("arm '{bin}' exited {:?} on {corpus}", out.status.code()));
+        return Err(format!(
+            "arm '{bin}' exited {:?} on {corpus}",
+            out.status.code()
+        ));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len()))
 }
@@ -1151,18 +1190,18 @@ fn run_cell(
     let subj_full: Vec<String> = std::iter::once(cfg.subject_bin.clone())
         .chain(gz_args.iter().cloned())
         .collect();
-    let (subj_sha, subj_bytes) =
-        run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus)?;
+    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus)?;
     if subj_sha != reference_sha {
         return Err(format!(
             "SHA MISMATCH subject vs oracle on {corpus} T{thread}: {subj_sha} != {reference_sha}"
         ));
     }
     if subj_bytes == 0 {
-        return Err(format!("subject produced 0 bytes on {corpus} T{thread} (empty-output trap)"));
+        return Err(format!(
+            "subject produced 0 bytes on {corpus} T{thread} (empty-output trap)"
+        ));
     }
-    let (comp_sha, comp_bytes) =
-        run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus)?;
+    let (comp_sha, comp_bytes) = run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus)?;
     if comp_bytes == 0 {
         return Err(format!(
             "comparator '{}' produced 0 bytes on {corpus} T{thread} (empty-output / bad-argv trap)",
@@ -1182,8 +1221,13 @@ fn run_cell(
     let mut aa_map: EvMap = EvMap::new();
 
     for batch in batches {
-        let subj_argv =
-            build_perf_argv(&batch.events, &cfg.mask, &cfg.common_env, &subj_full, corpus);
+        let subj_argv = build_perf_argv(
+            &batch.events,
+            &cfg.mask,
+            &cfg.common_env,
+            &subj_full,
+            corpus,
+        );
         let comp_argv = build_perf_argv(&batch.events, &cfg.mask, &[], &comp_cmd, corpus);
         for _ in 0..cfg.n {
             // INTERLEAVED in the same rep: subject, comparator, subjectAA.
@@ -1209,14 +1253,30 @@ fn run_cell(
     let comp_instr = med_of(&comp_map, "instructions");
     let subj_cyc = med_of(&subj_map, "cycles");
     let comp_cyc = med_of(&comp_map, "cycles");
-    let subj_ipc = if subj_cyc != 0.0 { subj_instr / subj_cyc } else { 0.0 };
-    let comp_ipc = if comp_cyc != 0.0 { comp_instr / comp_cyc } else { 0.0 };
+    let subj_ipc = if subj_cyc != 0.0 {
+        subj_instr / subj_cyc
+    } else {
+        0.0
+    };
+    let comp_ipc = if comp_cyc != 0.0 {
+        comp_instr / comp_cyc
+    } else {
+        0.0
+    };
     let subj_br = med_of(&subj_map, "branches");
     let comp_br = med_of(&comp_map, "branches");
     let subj_brm = med_of(&subj_map, "branch-misses");
     let comp_brm = med_of(&comp_map, "branch-misses");
-    let subj_brmr = if subj_br != 0.0 { subj_brm / subj_br } else { 0.0 };
-    let comp_brmr = if comp_br != 0.0 { comp_brm / comp_br } else { 0.0 };
+    let subj_brmr = if subj_br != 0.0 {
+        subj_brm / subj_br
+    } else {
+        0.0
+    };
+    let comp_brmr = if comp_br != 0.0 {
+        comp_brm / comp_br
+    } else {
+        0.0
+    };
 
     // User/kernel + page-fault split (the decode-vs-overhead lens).
     let user_kernel = compute_user_kernel_split(
@@ -1251,14 +1311,30 @@ fn run_cell(
         comparator_ipc: comp_ipc,
         subject_instr_per_byte: subj_instr,
         comparator_instr_per_byte: comp_instr,
-        instr_ratio: if comp_instr != 0.0 { subj_instr / comp_instr } else { f64::NAN },
-        ipc_ratio: if comp_ipc != 0.0 { subj_ipc / comp_ipc } else { f64::NAN },
+        instr_ratio: if comp_instr != 0.0 {
+            subj_instr / comp_instr
+        } else {
+            f64::NAN
+        },
+        ipc_ratio: if comp_ipc != 0.0 {
+            subj_ipc / comp_ipc
+        } else {
+            f64::NAN
+        },
         subject_cyc_per_byte: subj_cyc,
         comparator_cyc_per_byte: comp_cyc,
-        cyc_ratio: if comp_cyc != 0.0 { subj_cyc / comp_cyc } else { f64::NAN },
+        cyc_ratio: if comp_cyc != 0.0 {
+            subj_cyc / comp_cyc
+        } else {
+            f64::NAN
+        },
         branch_miss_rate_subj: subj_brmr,
         branch_miss_rate_comp: comp_brmr,
-        branch_miss_rate_ratio: if comp_brmr != 0.0 { subj_brmr / comp_brmr } else { f64::NAN },
+        branch_miss_rate_ratio: if comp_brmr != 0.0 {
+            subj_brmr / comp_brmr
+        } else {
+            f64::NAN
+        },
         user_kernel,
         rows,
         verdict,
@@ -1340,7 +1416,10 @@ fn render_cell(a: &CellArtifact) {
     );
     println!("SPLIT VERDICT: {}", uk.verdict);
     if !a.dropped_events.is_empty() {
-        println!("DROPPED (unsupported on this box): {}", a.dropped_events.join(", "));
+        println!(
+            "DROPPED (unsupported on this box): {}",
+            a.dropped_events.join(", ")
+        );
     }
     if !a.zero_events.is_empty() {
         println!("ZERO (excluded from verdict): {}", a.zero_events.join(", "));
@@ -1396,7 +1475,11 @@ fn render_cell(a: &CellArtifact) {
                 "VERDICT: {}-bound (IPC gz/comp {:.4}{})",
                 v.dominant.to_uppercase(),
                 a.ipc_ratio,
-                if a.ipc_ratio < 1.0 { ", gz lower → more stalls" } else { "" },
+                if a.ipc_ratio < 1.0 {
+                    ", gz lower → more stalls"
+                } else {
+                    ""
+                },
             );
         }
         None => {
@@ -1439,7 +1522,11 @@ fn out_path_for(out: &Option<String>, corpus: &str, thread: usize, label: &str) 
         }
         None => {
             let shm = PathBuf::from("/dev/shm");
-            let dir = if shm.is_dir() { shm } else { std::env::temp_dir() };
+            let dir = if shm.is_dir() {
+                shm
+            } else {
+                std::env::temp_dir()
+            };
             dir.join(filename)
         }
     }
@@ -1492,7 +1579,10 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
                 kept.push(ev.clone());
             }
         }
-        if kept.iter().any(|e| e != "instructions" && e != "cycles" && e != "task-clock") {
+        if kept
+            .iter()
+            .any(|e| e != "instructions" && e != "cycles" && e != "task-clock")
+        {
             batches.push(Batch {
                 name: batch.name.clone(),
                 events: kept,
@@ -1509,7 +1599,9 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
         }
     }
     if batches.is_empty() {
-        return Err("no supported event batches (perf cannot count instructions/cycles?)".to_string());
+        return Err(
+            "no supported event batches (perf cannot count instructions/cycles?)".to_string(),
+        );
     }
     if !dropped.is_empty() {
         eprintln!("# DROPPED unsupported events: {}", dropped.join(", "));
@@ -1525,7 +1617,14 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
         for &thread in &cfg.threads {
             for comp in &cfg.comparators {
                 let art = run_cell(
-                    &cfg, corpus, thread, comp, &batches, &reference_sha, bytes, &dropped,
+                    &cfg,
+                    corpus,
+                    thread,
+                    comp,
+                    &batches,
+                    &reference_sha,
+                    bytes,
+                    &dropped,
                 )?;
                 render_cell(&art);
                 let path = out_path_for(&cfg.out, corpus, thread, &comp.label);

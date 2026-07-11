@@ -77,19 +77,46 @@ fn refusal_fires_on_each_missing_field() {
 
     // Removing any one required field must yield REFUSED with that field named.
     let cases: Vec<(&str, Box<dyn Fn(&mut Evidence)>)> = vec![
-        ("subject.sha256", Box::new(|e: &mut Evidence| e.subject.as_mut().unwrap().sha256.clear())),
-        ("comparator.sha256", Box::new(|e: &mut Evidence| e.comparator.as_mut().unwrap().sha256.clear())),
-        ("corpus.pin_sha256", Box::new(|e: &mut Evidence| e.corpus.as_mut().unwrap().pin_sha256.clear())),
-        ("corpus.decompressed_sha256", Box::new(|e: &mut Evidence| e.corpus.as_mut().unwrap().decompressed_sha256.clear())),
+        (
+            "subject.sha256",
+            Box::new(|e: &mut Evidence| e.subject.as_mut().unwrap().sha256.clear()),
+        ),
+        (
+            "comparator.sha256",
+            Box::new(|e: &mut Evidence| e.comparator.as_mut().unwrap().sha256.clear()),
+        ),
+        (
+            "corpus.pin_sha256",
+            Box::new(|e: &mut Evidence| e.corpus.as_mut().unwrap().pin_sha256.clear()),
+        ),
+        (
+            "corpus.decompressed_sha256",
+            Box::new(|e: &mut Evidence| e.corpus.as_mut().unwrap().decompressed_sha256.clear()),
+        ),
         ("box.cpu", Box::new(|e: &mut Evidence| e.box_cpu = None)),
-        ("box.run_queue_samples", Box::new(|e: &mut Evidence| e.run_queue_samples.clear())),
-        ("src_sha", Box::new(|e: &mut Evidence| e.src_sha = Some(String::new()))),
+        (
+            "box.run_queue_samples",
+            Box::new(|e: &mut Evidence| e.run_queue_samples.clear()),
+        ),
+        (
+            "src_sha",
+            Box::new(|e: &mut Evidence| e.src_sha = Some(String::new())),
+        ),
         ("timestamp", Box::new(|e: &mut Evidence| e.timestamp = None)),
         ("mask", Box::new(|e: &mut Evidence| e.mask = None)),
-        ("subject.wall_median_ms", Box::new(|e: &mut Evidence| e.subject_median_ms = None)),
-        ("aa.spread", Box::new(|e: &mut Evidence| e.aa_rel_spread = None)),
+        (
+            "subject.wall_median_ms",
+            Box::new(|e: &mut Evidence| e.subject_median_ms = None),
+        ),
+        (
+            "aa.spread",
+            Box::new(|e: &mut Evidence| e.aa_rel_spread = None),
+        ),
         ("paired", Box::new(|e: &mut Evidence| e.paired = None)),
-        ("subject.correctness", Box::new(|e: &mut Evidence| e.subject_correct = None)),
+        (
+            "subject.correctness",
+            Box::new(|e: &mut Evidence| e.subject_correct = None),
+        ),
     ];
     for (field, mutate) in cases {
         let mut ev = full_evidence();
@@ -282,7 +309,10 @@ fn mm_large_deficit_certifies_loss_at_k1_5() {
     }
     // Sanity: at the OLD k=3.0 the same cell VOIDs (11.4%<17.9%<22.8%),
     // proving the calibration is what flips it.
-    let strict = Criteria { aa_win_mult: 3.0, ..Criteria::default() };
+    let strict = Criteria {
+        aa_win_mult: 3.0,
+        ..Criteria::default()
+    };
     match assemble(&ev, &strict) {
         RunCell::Void(_) => {}
         other => panic!("expected VOID at k=3.0 (pre-calibration), got {other:?}"),
@@ -332,7 +362,10 @@ fn recertify_flips_k3_void_to_loss_at_k1_5() {
         p_value: 0.0,
         log_ratios: vec![(82.1f64 / 100.0).ln(); 15],
     });
-    let strict = Criteria { aa_win_mult: 3.0, ..Criteria::default() };
+    let strict = Criteria {
+        aa_win_mult: 3.0,
+        ..Criteria::default()
+    };
     let voided = assemble(&ev, &strict);
     match &voided {
         RunCell::Void(v) => {
@@ -414,7 +447,9 @@ fn tost_math_direct() {
     let off: Vec<f64> = (0..30).map(|_| 0.03).collect();
     assert!(!tost_equivalent(&off, 1.0));
     // Wide noise ⇒ CI too wide ⇒ NOT equivalent (noise can't buy a TIE).
-    let wide: Vec<f64> = (0..30).map(|i| if i % 2 == 0 { 0.05 } else { -0.05 }).collect();
+    let wide: Vec<f64> = (0..30)
+        .map(|i| if i % 2 == 0 { 0.05 } else { -0.05 })
+        .collect();
     assert!(!tost_equivalent(&wide, 1.0));
 }
 
@@ -522,23 +557,49 @@ fn spec_rejects_bad_pin_and_empty_grid() {
 
 #[test]
 fn measure_script_has_dev_null_and_rotates() {
-    let subj = ArmCmd { label: "subject".into(), bin: "/gz".into(), argv: "-d -c".into(), env: vec![] };
-    let cmp = ArmCmd { label: "comparator".into(), bin: "/rg".into(), argv: "-d -c".into(), env: vec![] };
+    let subj = ArmCmd {
+        label: "subject".into(),
+        bin: "/gz".into(),
+        argv: "-d -c".into(),
+        env: vec![],
+    };
+    let cmp = ArmCmd {
+        label: "comparator".into(),
+        bin: "/rg".into(),
+        argv: "-d -c".into(),
+        env: vec![],
+    };
     let s = build_measure_script("linux", "0-7", "/s.gz", &subj, &cmp, 6);
-    assert!(s.contains(">/dev/null"), "timed reps must sink to /dev/null");
+    assert!(
+        s.contains(">/dev/null"),
+        "timed reps must sink to /dev/null"
+    );
     assert!(s.contains("CORR subject"));
     assert!(s.contains("comparator_aa"), "must run an A/A arm");
     // /proc/uptime is FORBIDDEN: centisecond resolution quantizes sub-200ms
     // walls (2026-07-06 defect). Linux must use a nanosecond clock.
-    assert!(!s.contains("/proc/uptime"), "10ms-resolution clock is forbidden");
+    assert!(
+        !s.contains("/proc/uptime"),
+        "10ms-resolution clock is forbidden"
+    );
     assert!(s.contains("date +%s%N"), "linux nanosecond clock");
     assert!(s.contains("taskset -c 0-7"));
 }
 
 #[test]
 fn macos_script_uses_monotonic_and_no_taskset() {
-    let subj = ArmCmd { label: "subject".into(), bin: "/gz".into(), argv: "-d -c".into(), env: vec![] };
-    let cmp = ArmCmd { label: "comparator".into(), bin: "/gzip".into(), argv: "-d -c".into(), env: vec![] };
+    let subj = ArmCmd {
+        label: "subject".into(),
+        bin: "/gz".into(),
+        argv: "-d -c".into(),
+        env: vec![],
+    };
+    let cmp = ArmCmd {
+        label: "comparator".into(),
+        bin: "/gzip".into(),
+        argv: "-d -c".into(),
+        env: vec![],
+    };
     let s = build_measure_script("macos", "0-3", "/s.gz", &subj, &cmp, 3);
     assert!(s.contains("time.monotonic_ns"));
     assert!(!s.contains("taskset"), "no taskset on macos");
@@ -589,8 +650,15 @@ fn local_smoke_runs_full_orchestration() {
         criteria: Criteria::default(),
         boxes: vec![BoxSpec {
             id: "local".into(),
-            exec: ExecSpec { local: true, ssh: None },
-            platform: if cfg!(target_os = "macos") { "macos".into() } else { "linux".into() },
+            exec: ExecSpec {
+                local: true,
+                ssh: None,
+            },
+            platform: if cfg!(target_os = "macos") {
+                "macos".into()
+            } else {
+                "linux".into()
+            },
             cpu: String::new(),
             quiesce: None,
             subject: ToolSpec {
@@ -633,7 +701,10 @@ fn local_smoke_runs_full_orchestration() {
 
     // Must NOT be REFUSED — every evidence field was captured through the real loop.
     match &cell {
-        RunCell::Refused(r) => panic!("smoke cell REFUSED (loop failed to capture): {:?}", r.missing),
+        RunCell::Refused(r) => panic!(
+            "smoke cell REFUSED (loop failed to capture): {:?}",
+            r.missing
+        ),
         RunCell::Verdict(v) => {
             // gzip vs gzip on the same input ⇒ correct bytes both arms; a decisive
             // WIN/LOSS between identical tools is implausible — expect TIE, else VOID.

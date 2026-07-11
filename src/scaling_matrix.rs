@@ -166,7 +166,10 @@ error / refused instrument (Gate-0 b/c/d/e failure).";
 /// Split a `"K=V K=V"` env string into pairs (first `=` splits; no-`=` ignored).
 pub fn parse_env(s: &str) -> Vec<(String, String)> {
     s.split_whitespace()
-        .filter_map(|tok| tok.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .filter_map(|tok| {
+            tok.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
         .collect()
 }
 
@@ -487,7 +490,8 @@ pub fn parse_args(args: &[String]) -> Result<ScalingConfig, String> {
     let mut cfg = ScalingConfig::default();
     let mut i = 0;
     let need = |i: usize, name: &str| -> Result<&String, String> {
-        args.get(i + 1).ok_or_else(|| format!("{name} requires a value"))
+        args.get(i + 1)
+            .ok_or_else(|| format!("{name} requires a value"))
     };
     while i < args.len() {
         match args[i].as_str() {
@@ -572,12 +576,18 @@ pub fn parse_args(args: &[String]) -> Result<ScalingConfig, String> {
 
 /// sha256 of a file's BYTES (the binary fingerprint, Gate-0 e).
 fn sha_of_file(path: &str) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read '{path}' for fingerprint: {e}"))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read '{path}' for fingerprint: {e}"))?;
     Ok(hex32(&sha256(&bytes)))
 }
 
 /// Decode once with stdout CAPTURED, return the output sha256 (the sha-gate).
-fn sha_of_decode(bin: &str, args: &[String], env: &[(String, String)], corpus: &str) -> Result<String, String> {
+fn sha_of_decode(
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+    corpus: &str,
+) -> Result<String, String> {
     let mut c = Command::new(bin);
     for (k, v) in env {
         c.env(k, v);
@@ -590,13 +600,21 @@ fn sha_of_decode(bin: &str, args: &[String], env: &[(String, String)], corpus: &
         .output()
         .map_err(|e| format!("cannot spawn '{bin}': {e}"))?;
     if !out.status.success() {
-        return Err(format!("'{bin}' exited {:?} on {corpus}", out.status.code()));
+        return Err(format!(
+            "'{bin}' exited {:?} on {corpus}",
+            out.status.code()
+        ));
     }
     Ok(hex32(&sha256(&out.stdout)))
 }
 
 /// Run gz once with `GZIPPY_DEBUG=1`, capture stderr for the path assertion.
-fn gz_debug_stderr(bin: &str, args: &[String], env: &[(String, String)], corpus: &str) -> Result<String, String> {
+fn gz_debug_stderr(
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+    corpus: &str,
+) -> Result<String, String> {
     let mut c = Command::new(bin);
     for (k, v) in env {
         c.env(k, v);
@@ -614,14 +632,24 @@ fn gz_debug_stderr(bin: &str, args: &[String], env: &[(String, String)], corpus:
 
 /// One WALL sample: decode `bin args... corpus` to /dev/null, timing the whole
 /// process. Returns wall in MILLISECONDS. SINK-LAW: stdout is always /dev/null.
-fn wall_once(bin: &str, args: &[String], env: &[(String, String)], corpus: &str) -> Result<f64, String> {
+fn wall_once(
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+    corpus: &str,
+) -> Result<f64, String> {
     let mut c = Command::new(bin);
     for (k, v) in env {
         c.env(k, v);
     }
-    c.args(args).arg(corpus).stdout(Stdio::null()).stderr(Stdio::null());
+    c.args(args)
+        .arg(corpus)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let t0 = Instant::now();
-    let status = c.status().map_err(|e| format!("cannot spawn '{bin}': {e}"))?;
+    let status = c
+        .status()
+        .map_err(|e| format!("cannot spawn '{bin}': {e}"))?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if !status.success() {
         return Err(format!("'{bin}' exited {:?} on {corpus}", status.code()));
@@ -684,10 +712,18 @@ fn measure_cell(cfg: &ScalingConfig, t: usize, retries: usize) -> Result<Cell, S
         rg_median_ms: rg_med,
         gz_rel_spread: rel_spread(&gz_s),
         rg_rel_spread: rg_sp,
-        ratio: if rg_med > 0.0 { gz_med / rg_med } else { f64::NAN },
+        ratio: if rg_med > 0.0 {
+            gz_med / rg_med
+        } else {
+            f64::NAN
+        },
         spread,
         verdict: classify(gz_med, rg_med, spread),
-        self_ratio: if rg_aa_med > 0.0 { rg_med / rg_aa_med } else { f64::NAN },
+        self_ratio: if rg_aa_med > 0.0 {
+            rg_med / rg_aa_med
+        } else {
+            f64::NAN
+        },
         self_consistent: self_ok,
         status: cell_status(self_ok),
         retries_used: retries,
@@ -699,7 +735,10 @@ fn measure_cell(cfg: &ScalingConfig, t: usize, retries: usize) -> Result<Cell, S
 /// failure (caller maps `Err` → exit 2). This is the reconnect-validated layer.
 pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
     eprintln!("== fulcrum scaling — COMPETITIVE THREAD-SCALING MATRIX ==");
-    eprintln!("   box={}  corpus={}  n={}", cfg.box_host, cfg.corpus, cfg.n);
+    eprintln!(
+        "   box={}  corpus={}  n={}",
+        cfg.box_host, cfg.corpus, cfg.n
+    );
 
     // ── Gate-0(e): binary fingerprints (recorded + printed) ────────────────
     let gz_sha256 = sha_of_file(&cfg.gz_bin)?;
@@ -713,7 +752,10 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
     let gz_sha = sha_of_decode(&cfg.gz_bin, &t1_gz, &cfg.gz_env, &cfg.corpus)?;
     let rg_sha = sha_of_decode(&cfg.rg_bin, &t1_rg, &[], &cfg.corpus)?;
     check_sha(&gz_sha, &rg_sha, &cfg.oracle_sha)?;
-    eprintln!("   Gate-0(b) OK: gz+rg decode == oracle {}", cfg.oracle_sha.to_lowercase());
+    eprintln!(
+        "   Gate-0(b) OK: gz+rg decode == oracle {}",
+        cfg.oracle_sha.to_lowercase()
+    );
 
     // ── Gate-0(c): sink-law (structural; both /dev/null) ───────────────────
     check_sink(SINK, SINK)?;
@@ -726,7 +768,9 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
 
     // ── Load state PRE (informational — the run is load-immune, never gated) ─
     let load_pre = capture_load();
-    eprintln!("   load PRE: {load_pre}   (informational — measurement is LOAD-IMMUNE, not gated on idle)");
+    eprintln!(
+        "   load PRE: {load_pre}   (informational — measurement is LOAD-IMMUNE, not gated on idle)"
+    );
 
     // ── Per-T interleaved measurement + Gate-0(a) self-1.0 (LOAD-IMMUNITY
     //    CERTIFICATE) at each T. A VOID(load-noise) cell is auto-retried up to
@@ -749,7 +793,11 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
             cell.status.label(),
             cell.self_ratio,
             cell.ratio,
-            if cell.status.is_certified() { cell.verdict.label() } else { "(no verdict — re-measure)" },
+            if cell.status.is_certified() {
+                cell.verdict.label()
+            } else {
+                "(no verdict — re-measure)"
+            },
         );
         cells.push(cell);
     }
@@ -792,7 +840,11 @@ pub fn run(cfg: &ScalingConfig) -> Result<bool, String> {
         report.certified_cells,
         report.certified_cells + report.void_cells,
         report.void_cells,
-        if report.void_cells > 0 { " — VOID cells need re-measure" } else { "" },
+        if report.void_cells > 0 {
+            " — VOID cells need re-measure"
+        } else {
+            ""
+        },
         report.load_pre,
         report.load_post,
     );
@@ -845,7 +897,11 @@ pub fn print_table(box_host: &str, corpus: &str, cells: &[Cell]) {
     );
     for c in cells {
         let delta = (1.0 - c.ratio).abs();
-        let cell_label = if c.status.is_certified() { c.verdict.label() } else { "VOID" };
+        let cell_label = if c.status.is_certified() {
+            c.verdict.label()
+        } else {
+            "VOID"
+        };
         println!(
             "  {:>4}  {:>11.2}  {:>11.2}  {:>8.4}  {:>+9.4}  {:>7.4}  {:>7.4}  {:>6}{}",
             c.threads,

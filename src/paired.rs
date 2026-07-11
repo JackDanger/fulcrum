@@ -159,11 +159,19 @@ pub fn ci95(xs: &[f64]) -> Ci {
     let m = mean(xs);
     let n = xs.len();
     if n < 2 {
-        return Ci { mean: m, lo: m, hi: m };
+        return Ci {
+            mean: m,
+            lo: m,
+            hi: m,
+        };
     }
     let se = pstdev(xs) / (n as f64).sqrt();
     let h = tcrit(n) * se;
-    Ci { mean: m, lo: m - h, hi: m + h }
+    Ci {
+        mean: m,
+        lo: m - h,
+        hi: m + h,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +189,8 @@ pub fn expand(template: &str, corpus: &Path) -> String {
 /// carries its own Gate-0.
 pub fn sink_is_devnull(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("sink {} stat failed: {e}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("sink {} stat failed: {e}", path.display()))?;
     if meta.file_type().is_char_device() {
         Ok(())
     } else {
@@ -252,7 +260,11 @@ pub struct PairedSamples {
 impl PairedSamples {
     /// Per-round paired difference a-b (ms). Positive ⇒ A slower.
     pub fn deltas(&self) -> Vec<f64> {
-        self.a_ms.iter().zip(&self.b_ms).map(|(a, b)| a - b).collect()
+        self.a_ms
+            .iter()
+            .zip(&self.b_ms)
+            .map(|(a, b)| a - b)
+            .collect()
     }
     /// Per-round log-ratio ln(a/b). >0 ⇒ A slower.
     pub fn log_ratios(&self) -> Vec<f64> {
@@ -511,10 +523,7 @@ pub fn selftest() -> ExitCode {
     ];
     let c = ci95(&lr);
     let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
-    check(
-        "ci95 matches aa_ci.py (mean)",
-        near(c.mean, -0.005),
-    );
+    check("ci95 matches aa_ci.py (mean)", near(c.mean, -0.005));
     check(
         "ci95 matches aa_ci.py (lo/hi)",
         near(c.lo, -0.015621573244) && near(c.hi, 0.005621573244),
@@ -525,12 +534,22 @@ pub fn selftest() -> ExitCode {
             && near(c.lo.exp(), 0.984499810640)
             && near(c.hi.exp(), 1.005637403938),
     );
-    check("ci95 pstdev matches aa_ci.py", near(pstdev(&lr), 0.015811388301));
-    check("tcrit(11)==2.228 (df=10)", (tcrit(11) - 2.228).abs() < 1e-12);
-    check("tcrit(51)==2.009 (df=50, the ~n=51 anchor)", (tcrit(51) - 2.009).abs() < 1e-12);
+    check(
+        "ci95 pstdev matches aa_ci.py",
+        near(pstdev(&lr), 0.015811388301),
+    );
+    check(
+        "tcrit(11)==2.228 (df=10)",
+        (tcrit(11) - 2.228).abs() < 1e-12,
+    );
+    check(
+        "tcrit(51)==2.009 (df=50, the ~n=51 anchor)",
+        (tcrit(51) - 2.009).abs() < 1e-12,
+    );
 
     // 2. file sink rejected (SINK LAW)
-    let tmpfile = std::env::temp_dir().join(format!("fulcrum-paired-st-sink-{}", std::process::id()));
+    let tmpfile =
+        std::env::temp_dir().join(format!("fulcrum-paired-st-sink-{}", std::process::id()));
     let _ = std::fs::write(&tmpfile, b"x");
     check("file-sink rejected", sink_is_devnull(&tmpfile).is_err());
     check("/dev/null sink accepted", sink_is_devnull(&devnull).is_ok());
@@ -539,7 +558,14 @@ pub fn selftest() -> ExitCode {
     // 3. A/A certificate brackets 1.0 (same trivial command both slots).
     //    `sleep 0.02` produces no stdout, so the byte-exact ref is `true` (empty).
     match run_paired(
-        "sleep 0.02", "sleep 0.02", "true", &corpus, n, warmup, &devnull, true,
+        "sleep 0.02",
+        "sleep 0.02",
+        "true",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
     ) {
         Ok(r) => {
             check("A/A: sha_ok (both arms empty == ref)", r.sha_ok);
@@ -559,7 +585,14 @@ pub fn selftest() -> ExitCode {
     // 4. known-slower B detected RESOLVED-b-slower with the right sign.
     //    a=sleep 0.02, b=sleep 0.05 ⇒ ratio a/b ≈ 0.4 ⇒ B is slower.
     match run_paired(
-        "sleep 0.02", "sleep 0.05", "true", &corpus, n, warmup, &devnull, true,
+        "sleep 0.02",
+        "sleep 0.05",
+        "true",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
     ) {
         Ok(r) => {
             check("slower-B: status OK", r.status == "OK");
@@ -572,14 +605,24 @@ pub fn selftest() -> ExitCode {
                 "slower-B: logratio CI excludes 0 (hi<0)",
                 r.logratio_ci[1] < 0.0,
             );
-            check("slower-B: delta_median_ms < 0 (A-B negative)", r.delta_median_ms < 0.0);
+            check(
+                "slower-B: delta_median_ms < 0 (A-B negative)",
+                r.delta_median_ms < 0.0,
+            );
         }
         Err(e) => check(&format!("slower-B run ({e})"), false),
     }
 
     // 5. sha-mismatch arm → PAIRED=FAIL. a=AAA (==ref), b=BBB (!=ref).
     match run_paired(
-        "printf AAA", "printf BBB", "printf AAA", &corpus, n, warmup, &devnull, true,
+        "printf AAA",
+        "printf BBB",
+        "printf AAA",
+        &corpus,
+        n,
+        warmup,
+        &devnull,
+        true,
     ) {
         Ok(r) => {
             check("sha-mismatch: sha_ok false", !r.sha_ok);
@@ -654,8 +697,12 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
     ) else {
         return usage();
     };
-    let n: usize = cli_flag(args, "--n").and_then(|v| v.parse().ok()).unwrap_or(51);
-    let warmup: usize = cli_flag(args, "--warmup").and_then(|v| v.parse().ok()).unwrap_or(2);
+    let n: usize = cli_flag(args, "--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(51);
+    let warmup: usize = cli_flag(args, "--warmup")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let sink = PathBuf::from(cli_flag(args, "--sink").unwrap_or("/dev/null"));
     let ref_cmd = cli_flag(args, "--ref-cmd").unwrap_or("gunzip -c {corpus}");
     let do_sha = !cli_has(args, "--no-sha");
@@ -666,11 +713,23 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if !corpus_path.exists() {
-        eprintln!("PAIRED=FAIL corpus {} does not exist", corpus_path.display());
+        eprintln!(
+            "PAIRED=FAIL corpus {} does not exist",
+            corpus_path.display()
+        );
         return ExitCode::FAILURE;
     }
 
-    match run_paired(a_cmd, b_cmd, ref_cmd, &corpus_path, n, warmup, &sink, do_sha) {
+    match run_paired(
+        a_cmd,
+        b_cmd,
+        ref_cmd,
+        &corpus_path,
+        n,
+        warmup,
+        &sink,
+        do_sha,
+    ) {
         Ok(r) => {
             print_machine_line(&r);
             if let Some(out) = cli_flag(args, "--out") {
@@ -730,7 +789,7 @@ mod tests {
         assert!((tcrit(11) - 2.228).abs() < 1e-12); // df=10
         assert!((tcrit(51) - 2.009).abs() < 1e-12); // df=50 (aa_ci.py anchor)
         assert!((tcrit(8) - 2.228).abs() < 1e-12); // df=7 → first table row df<=10
-        // large n falls back toward 1.96
+                                                   // large n falls back toward 1.96
         assert!((tcrit(1000) - 1.96).abs() < 1e-12);
     }
 
@@ -743,17 +802,40 @@ mod tests {
     #[test]
     fn verdict_direction_from_logratio_ci() {
         // CI entirely below 0 ⇒ A/B<1 ⇒ B slower
-        assert_eq!(ab_verdict(&Ci { mean: -0.69, lo: -0.70, hi: -0.68 }), "RESOLVED-b-slower");
+        assert_eq!(
+            ab_verdict(&Ci {
+                mean: -0.69,
+                lo: -0.70,
+                hi: -0.68
+            }),
+            "RESOLVED-b-slower"
+        );
         // CI entirely above 0 ⇒ A slower
-        assert_eq!(ab_verdict(&Ci { mean: 0.69, lo: 0.68, hi: 0.70 }), "RESOLVED-a-slower");
+        assert_eq!(
+            ab_verdict(&Ci {
+                mean: 0.69,
+                lo: 0.68,
+                hi: 0.70
+            }),
+            "RESOLVED-a-slower"
+        );
         // brackets 0 ⇒ NOISY/TIE
-        assert_eq!(ab_verdict(&Ci { mean: 0.0, lo: -0.1, hi: 0.1 }), "NOISY");
+        assert_eq!(
+            ab_verdict(&Ci {
+                mean: 0.0,
+                lo: -0.1,
+                hi: 0.1
+            }),
+            "NOISY"
+        );
     }
 
     #[test]
     fn known_slower_b_vector_resolves_b_slower() {
         // from paired_ci_ref.py V2: tight negative log-ratios ⇒ excludes 0, hi<0
-        let lr2 = [-0.69, -0.70, -0.68, -0.71, -0.69, -0.70, -0.69, -0.68, -0.70];
+        let lr2 = [
+            -0.69, -0.70, -0.68, -0.71, -0.69, -0.70, -0.69, -0.68, -0.70,
+        ];
         let c = ci95(&lr2);
         assert!(!c.brackets_zero());
         assert!(c.hi < 0.0);
@@ -769,7 +851,8 @@ mod tests {
     #[test]
     fn sink_law_rejects_regular_file_accepts_devnull() {
         assert!(sink_is_devnull(Path::new("/dev/null")).is_ok());
-        let f = std::env::temp_dir().join(format!("fulcrum-paired-sinktest-{}", std::process::id()));
+        let f =
+            std::env::temp_dir().join(format!("fulcrum-paired-sinktest-{}", std::process::id()));
         std::fs::write(&f, b"x").unwrap();
         assert!(sink_is_devnull(&f).is_err());
         let _ = std::fs::remove_file(&f);
@@ -787,8 +870,14 @@ mod tests {
     #[test]
     fn aa_certificate_brackets_one_on_identical_commands() {
         let r = run_paired(
-            "sleep 0.02", "sleep 0.02", "true", Path::new("/dev/null"), 9, 1,
-            Path::new("/dev/null"), true,
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            Path::new("/dev/null"),
+            9,
+            1,
+            Path::new("/dev/null"),
+            true,
         )
         .unwrap();
         assert!(r.sha_ok, "empty-vs-empty vs empty ref should match");
@@ -804,8 +893,14 @@ mod tests {
     #[test]
     fn known_slower_b_end_to_end_resolves_b_slower() {
         let r = run_paired(
-            "sleep 0.02", "sleep 0.05", "true", Path::new("/dev/null"), 9, 1,
-            Path::new("/dev/null"), true,
+            "sleep 0.02",
+            "sleep 0.05",
+            "true",
+            Path::new("/dev/null"),
+            9,
+            1,
+            Path::new("/dev/null"),
+            true,
         )
         .unwrap();
         assert_eq!(r.status, "OK");
@@ -817,8 +912,14 @@ mod tests {
     #[test]
     fn sha_mismatch_arm_fails() {
         let r = run_paired(
-            "printf AAA", "printf BBB", "printf AAA", Path::new("/dev/null"), 7, 1,
-            Path::new("/dev/null"), true,
+            "printf AAA",
+            "printf BBB",
+            "printf AAA",
+            Path::new("/dev/null"),
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
         )
         .unwrap();
         assert!(!r.sha_ok);
@@ -829,15 +930,31 @@ mod tests {
     #[test]
     fn result_serializes_to_json_with_aa_ci_fields() {
         let r = run_paired(
-            "true", "true", "true", Path::new("/dev/null"), 7, 1,
-            Path::new("/dev/null"), true,
+            "true",
+            "true",
+            "true",
+            Path::new("/dev/null"),
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
         )
         .unwrap();
         let js = serde_json::to_string(&r).unwrap();
         // schema mirrors aa_ci.py's fields
         for f in [
-            "a_median", "b_median", "delta_median_ms", "delta_ci95", "logratio_ci",
-            "\"n\"", "sign_kn", "spread", "verdict", "aa_ratio_ci", "sha_ok", "method",
+            "a_median",
+            "b_median",
+            "delta_median_ms",
+            "delta_ci95",
+            "logratio_ci",
+            "\"n\"",
+            "sign_kn",
+            "spread",
+            "verdict",
+            "aa_ratio_ci",
+            "sha_ok",
+            "method",
         ] {
             assert!(js.contains(f), "JSON missing field {f}: {js}");
         }

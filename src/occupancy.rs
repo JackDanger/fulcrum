@@ -133,7 +133,10 @@ fn detect_consumer_tid(spans: &[Span]) -> Option<u64> {
             *by_tid.entry(s.tid).or_default() += s.dur;
         }
     }
-    by_tid.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(t, _)| t)
+    by_tid
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(t, _)| t)
 }
 
 fn is_decode(name: &str) -> bool {
@@ -174,8 +177,14 @@ pub fn analyze(events: &[Event]) -> OccReport {
         if tspans.is_empty() {
             continue;
         }
-        let first = tspans.iter().map(|s| s.ts_start).fold(f64::INFINITY, f64::min);
-        let last = tspans.iter().map(|s| s.ts_end).fold(f64::NEG_INFINITY, f64::max);
+        let first = tspans
+            .iter()
+            .map(|s| s.ts_start)
+            .fold(f64::INFINITY, f64::min);
+        let last = tspans
+            .iter()
+            .map(|s| s.ts_end)
+            .fold(f64::NEG_INFINITY, f64::max);
         let window = last - first;
 
         let mut decode = 0.0;
@@ -227,8 +236,14 @@ pub fn analyze(events: &[Event]) -> OccReport {
     let (decode_wall_us, peak_concurrency) = if run_intervals.is_empty() {
         (0.0, 0)
     } else {
-        let min_s = run_intervals.iter().map(|i| i.0).fold(f64::INFINITY, f64::min);
-        let max_e = run_intervals.iter().map(|i| i.1).fold(f64::NEG_INFINITY, f64::max);
+        let min_s = run_intervals
+            .iter()
+            .map(|i| i.0)
+            .fold(f64::INFINITY, f64::min);
+        let max_e = run_intervals
+            .iter()
+            .map(|i| i.1)
+            .fold(f64::NEG_INFINITY, f64::max);
         let mut pts: Vec<(f64, i32)> = Vec::with_capacity(run_intervals.len() * 2);
         for (s, e) in &run_intervals {
             pts.push((*s, 1));
@@ -281,7 +296,9 @@ pub fn print_report(path: &str, r: &OccReport) {
         "wall            : {}   workers {}   consumer tid {}   decode-wall {}",
         fmt_us(r.wall_us),
         r.n_workers,
-        r.consumer_tid.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+        r.consumer_tid
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".into()),
         fmt_us(r.decode_wall_us),
     );
 
@@ -289,7 +306,11 @@ pub fn print_report(path: &str, r: &OccReport) {
     let busy_frac = r.mean_busy_workers / n;
     println!(
         "\n  >>> MEAN BUSY WORKERS = {:.2} / {}  ({:.1}% occupancy)   peak concurrency = {} / {}",
-        r.mean_busy_workers, r.n_workers, 100.0 * busy_frac, r.peak_concurrency, r.n_workers,
+        r.mean_busy_workers,
+        r.n_workers,
+        100.0 * busy_frac,
+        r.peak_concurrency,
+        r.n_workers,
     );
     println!(
         "      total DECODE = {}   total BLOCKED-on-dependency (nested wait in run_task) = {} ({:.2}% of decode)",
@@ -298,7 +319,9 @@ pub fn print_report(path: &str, r: &OccReport) {
         100.0 * r.total_blocked_dep_us / r.total_decode_us.max(1.0),
     );
 
-    println!("\n  per-worker (decode + idle == window; blocked-dep is a re-attribution of decode):");
+    println!(
+        "\n  per-worker (decode + idle == window; blocked-dep is a re-attribution of decode):"
+    );
     println!(
         "  {:>6}  {:>9}  {:>9} {:>6}  {:>9} {:>6}  {:>9} {:>6}  {:>6}  {:>5}",
         "tid", "window", "DECODE", "%", "IDLE", "%", "BLK-dep", "%", "tasks", "recon",
@@ -322,8 +345,14 @@ pub fn print_report(path: &str, r: &OccReport) {
     // VERDICT — discriminate the cap class.
     let occ = 100.0 * busy_frac;
     let blocked_share = 100.0 * r.total_blocked_dep_us / r.total_decode_us.max(1.0);
-    println!("\n  GATE-0 conservation (per worker decode+idle==window): {}",
-        if r.all_reconciled { "PASS (all workers reconcile within 1µs)" } else { "FAIL — pairing unsound, numbers suspect" });
+    println!(
+        "\n  GATE-0 conservation (per worker decode+idle==window): {}",
+        if r.all_reconciled {
+            "PASS (all workers reconcile within 1µs)"
+        } else {
+            "FAIL — pairing unsound, numbers suspect"
+        }
+    );
     let verdict = if blocked_share >= 5.0 {
         "WINDOW-DEPENDENCY: workers hold tasks but block on a nested dependency (port window prefetch / out-of-order resolve)"
     } else if occ >= 85.0 {
@@ -394,10 +423,7 @@ mod tests {
     fn two_workers_decode_and_idle_reconcile() {
         // Consumer tid 1 runs `drive`. Worker tid 2: run_task [0,40], pick [40,100].
         // Worker tid 3: pick [0,30], run_task [30,100].
-        let mut events = vec![
-            ev("drive", "B", 0.0, 1),
-            ev("drive", "E", 100.0, 1),
-        ];
+        let mut events = vec![ev("drive", "B", 0.0, 1), ev("drive", "E", 100.0, 1)];
         // worker 2
         events.push(ev("pool.run_task", "B", 0.0, 2));
         events.push(ev("pool.run_task", "E", 40.0, 2));

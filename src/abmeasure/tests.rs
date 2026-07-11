@@ -59,7 +59,10 @@ fn wall_summary_paired_ratio_and_vs_rg() {
     assert!(s.contains("4+/0-/0="), "sign test wrong: {s}");
     assert!(s.contains("after/base 0.9"), "paired ratio wrong: {s}");
     // base/rg ≈ 1.0526, after/rg ≈ 0.947.
-    assert!(s.contains("after/rg 0.94") || s.contains("after/rg 0.95"), "after/rg wrong: {s}");
+    assert!(
+        s.contains("after/rg 0.94") || s.contains("after/rg 0.95"),
+        "after/rg wrong: {s}"
+    );
 }
 
 #[test]
@@ -68,7 +71,10 @@ fn wall_summary_suppressed_on_missing_wall() {
     let base = vec![1.0, 0.0];
     let after = vec![0.9, 0.9];
     let rg = vec![0.95, 0.95];
-    assert_eq!(super::render_wall_summary("c.gz", &base, &after, &rg, "rg"), "");
+    assert_eq!(
+        super::render_wall_summary("c.gz", &base, &after, &rg, "rg"),
+        ""
+    );
 }
 
 // ── parse_env ───────────────────────────────────────────────────────────────

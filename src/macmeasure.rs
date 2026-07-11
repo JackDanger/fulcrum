@@ -1223,12 +1223,26 @@ pub fn cmd_kpcphase(args: &[String]) -> ExitCode {
     // Correctness (same sink, sha == oracle) for BOTH arms.
     let gz_len = run_gz(&data, &mut buf);
     let gz_sha = sha256_hex(&buf[..gz_len]);
-    g0!(gz_len == out_len, "gz output length {gz_len} == oracle {out_len}");
-    g0!(gz_sha == oracle, "gz output sha == oracle [{}…]", &gz_sha[..12]);
+    g0!(
+        gz_len == out_len,
+        "gz output length {gz_len} == oracle {out_len}"
+    );
+    g0!(
+        gz_sha == oracle,
+        "gz output sha == oracle [{}…]",
+        &gz_sha[..12]
+    );
     let ld_len = critpath_libdeflate::gzip_decode(&data, &mut buf);
     let ld_sha = sha256_hex(&buf[..ld_len]);
-    g0!(ld_len == out_len, "ld output length {ld_len} == oracle {out_len}");
-    g0!(ld_sha == oracle, "ld output sha == oracle [{}…]", &ld_sha[..12]);
+    g0!(
+        ld_len == out_len,
+        "ld output length {ld_len} == oracle {out_len}"
+    );
+    g0!(
+        ld_sha == oracle,
+        "ld output sha == oracle [{}…]",
+        &ld_sha[..12]
+    );
 
     let pmu = match Pmu::new() {
         Ok(p) => p,
@@ -1263,18 +1277,19 @@ pub fn cmd_kpcphase(args: &[String]) -> ExitCode {
         after.wrapping_sub(before)
     };
     // One armed decode → (per-phase acc, per-phase fires, switches, whole_armed).
-    let phase_run = |buf: &mut [u8], arm: char| -> ([u64; phase::NPHASE], [u64; phase::NPHASE], u64, u64) {
-        let before = sess.read_at(&pmu, 0);
-        unsafe { phase::arm(&pmu as *const Pmu, &sess as *const Session) };
-        if arm == 'g' {
-            run_gz(&data, buf);
-        } else {
-            critpath_libdeflate::gzip_decode(&data, buf);
-        }
-        let (acc, fires, switches) = unsafe { phase::disarm() };
-        let after = sess.read_at(&pmu, 0);
-        (acc, fires, switches, after.wrapping_sub(before))
-    };
+    let phase_run =
+        |buf: &mut [u8], arm: char| -> ([u64; phase::NPHASE], [u64; phase::NPHASE], u64, u64) {
+            let before = sess.read_at(&pmu, 0);
+            unsafe { phase::arm(&pmu as *const Pmu, &sess as *const Session) };
+            if arm == 'g' {
+                run_gz(&data, buf);
+            } else {
+                critpath_libdeflate::gzip_decode(&data, buf);
+            }
+            let (acc, fires, switches) = unsafe { phase::disarm() };
+            let after = sess.read_at(&pmu, 0);
+            (acc, fires, switches, after.wrapping_sub(before))
+        };
 
     // warmup (uncounted)
     let _ = whole_off(&mut buf, 'g');
@@ -1318,7 +1333,11 @@ pub fn cmd_kpcphase(args: &[String]) -> ExitCode {
         let cons_pct = 100.0 * (sum_phase - whole_armed_m).abs() / whole_armed_m;
         // Tax-adjusted phases: subtract per-switch tax weighted by each phase's
         // segment count (fires[p]); tax is ~uniform per switch.
-        let tax_per_switch = if switches > 0 { tax / switches as f64 } else { 0.0 };
+        let tax_per_switch = if switches > 0 {
+            tax / switches as f64
+        } else {
+            0.0
+        };
         let phase_adj: [f64; phase::NPHASE] =
             std::array::from_fn(|p| (phase_m[p] - fires[p] as f64 * tax_per_switch).max(0.0));
         ArmResult {
@@ -1398,10 +1417,13 @@ pub fn cmd_kpcphase(args: &[String]) -> ExitCode {
         );
     }
     let total_diff: f64 = diff.iter().sum();
-    println!("{:<10} {:>12.1} {:>12.1} {:>14.1}", "TOTAL",
+    println!(
+        "{:<10} {:>12.1} {:>12.1} {:>14.1}",
+        "TOTAL",
         m(gz.phase_adj.iter().sum::<f64>()),
         m(ld.phase_adj.iter().sum::<f64>()),
-        m(total_diff));
+        m(total_diff)
+    );
     // Largest like-for-like surplus.
     let (mut top_p, mut top_v) = (0usize, f64::MIN);
     for p in 0..phase::NPHASE {
@@ -2121,13 +2143,7 @@ fn decode_devnull(arm: &Arm, corpus: &str) -> Result<f64, String> {
 /// in-process calibration traverses the SAME code path (same iteration count),
 /// so the calibrated instr% actually describes the wall arm. Returns `None` if
 /// the subprocess failed or printed no parseable `fires=` line.
-fn subprocess_fires(
-    gz_bin: &str,
-    corpus: &str,
-    mode: &str,
-    dose: u64,
-    stride: u64,
-) -> Option<u64> {
+fn subprocess_fires(gz_bin: &str, corpus: &str, mode: &str, dose: u64, stride: u64) -> Option<u64> {
     let devnull = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/null")
@@ -2587,7 +2603,7 @@ pub fn cmd_vs_wall(args: &[String]) -> ExitCode {
         key: "gz".into(),
         bin: gz_bin.clone(),
         decode_args: vec!["-d".into(), "-c".into(), format!("-p{threads}")],
-            env: Vec::new(),
+        env: Vec::new(),
     };
     let refarm = Arm {
         key: "ref".into(),
@@ -3254,7 +3270,7 @@ pub fn cmd_wall(args: &[String]) -> ExitCode {
         key: "gz".into(),
         bin: gz_bin.clone(),
         decode_args: vec!["-d".into(), "-c".into(), format!("-p{threads}")],
-            env: Vec::new(),
+        env: Vec::new(),
     });
     arms.push(Arm {
         key: "ld".into(),
@@ -5303,7 +5319,11 @@ fn insnattr_bucket(name: &str) -> &'static str {
     if has("crc") || has("Crc") || has("CRC") {
         return "crc";
     }
-    if has("copy_match") || has("simd_copy") || has("apply_window") || has("memcpy") || has("memmove")
+    if has("copy_match")
+        || has("simd_copy")
+        || has("apply_window")
+        || has("memcpy")
+        || has("memmove")
     {
         return "copy";
     }
@@ -5348,8 +5368,12 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let corpus = flag(args, "--corpus").unwrap_or(DEFAULT_CORPUS).to_string();
-    let secs: f64 = flag(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(8.0);
-    let topn: usize = flag(args, "--top").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let secs: f64 = flag(args, "--secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8.0);
+    let topn: usize = flag(args, "--top")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let artifact = flag(args, "--artifact").map(|s| s.to_string());
 
     if !Path::new("/usr/bin/sample").exists() {
@@ -5364,7 +5388,10 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     println!("corpus={corpus} threads=1 sample_secs={secs} bin={self_exe}");
     let gz_commit = option_env!("GZIPPY_COMMIT").unwrap_or("(set GZIPPY_COMMIT at build)");
     let corpus_sha = file_sha256(&corpus).unwrap_or_else(|_| "?".into());
-    println!("gz_commit={gz_commit} corpus_sha256={}", &corpus_sha[..corpus_sha.len().min(16)]);
+    println!(
+        "gz_commit={gz_commit} corpus_sha256={}",
+        &corpus_sha[..corpus_sha.len().min(16)]
+    );
 
     println!("-- Gate-0 self-validation (BLOCKING) --");
     let mut g0_ok = true;
@@ -5394,9 +5421,15 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     {
         let mut buf = vec![0u8; out_len + 4096];
         let gz_len = run_gz(&data, &mut buf);
-        g0!(sha256_hex(&buf[..gz_len]) == oracle, "gz decode sha == gzip -dc oracle");
+        g0!(
+            sha256_hex(&buf[..gz_len]) == oracle,
+            "gz decode sha == gzip -dc oracle"
+        );
         let ld_len = run_ld(&data, &mut buf);
-        g0!(sha256_hex(&buf[..ld_len]) == oracle, "ld decode sha == oracle (comparator solvent)");
+        g0!(
+            sha256_hex(&buf[..ld_len]) == oracle,
+            "ld decode sha == oracle (comparator solvent)"
+        );
     }
 
     // (c) kpc whole-program retired total + cycles, median of N, gz and ld.
@@ -5447,14 +5480,21 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     let ld_instr = median(&li);
     let ld_cyc = median(&lc);
     let gi_spread = if gz_instr > 0.0 {
-        100.0 * (gi.iter().cloned().fold(f64::MIN, f64::max)
-            - gi.iter().cloned().fold(f64::MAX, f64::min))
+        100.0
+            * (gi.iter().cloned().fold(f64::MIN, f64::max)
+                - gi.iter().cloned().fold(f64::MAX, f64::min))
             / gz_instr
     } else {
         999.0
     };
-    g0!(gz_instr > 0.0 && ld_instr > 0.0, "non-zero retired both arms (gz={gz_instr:.0} ld={ld_instr:.0})");
-    g0!(gi_spread < 5.0, "gz retired-instr A/A spread {gi_spread:.2}% < 5% (kpc stable)");
+    g0!(
+        gz_instr > 0.0 && ld_instr > 0.0,
+        "non-zero retired both arms (gz={gz_instr:.0} ld={ld_instr:.0})"
+    );
+    g0!(
+        gi_spread < 5.0,
+        "gz retired-instr A/A spread {gi_spread:.2}% < 5% (kpc stable)"
+    );
     let gz_ipc = if gz_cyc > 0.0 { gz_instr / gz_cyc } else { 0.0 };
     let ld_ipc = if ld_cyc > 0.0 { ld_instr / ld_cyc } else { 0.0 };
 
@@ -5483,13 +5523,24 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     let gz_total_s: u64 = gz_counts.values().sum();
     let gz_total_s2: u64 = gz_counts2.values().sum();
     let ld_total_s: u64 = ld_counts.values().sum();
-    g0!(gz_total_s > 1000, "gz sample non-inert ({gz_total_s} leaf samples)");
-    g0!(ld_total_s > 1000, "ld sample non-inert ({ld_total_s} leaf samples)");
+    g0!(
+        gz_total_s > 1000,
+        "gz sample non-inert ({gz_total_s} leaf samples)"
+    );
+    g0!(
+        ld_total_s > 1000,
+        "ld sample non-inert ({ld_total_s} leaf samples)"
+    );
 
     // decode-dominated: gzippy code share of gz symbolized samples.
     let gz_user_s: u64 = gz_counts
         .iter()
-        .filter(|(k, _)| gz_names.get(*k).map(|s| insnattr_is_gzippy(s)).unwrap_or(false))
+        .filter(|(k, _)| {
+            gz_names
+                .get(*k)
+                .map(|s| insnattr_is_gzippy(s))
+                .unwrap_or(false)
+        })
         .map(|(_, &c)| c)
         .sum();
     let gz_user_share = if gz_total_s > 0 {
@@ -5497,13 +5548,25 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     } else {
         0.0
     };
-    g0!(gz_user_share > 0.5, "decode-dominated: gzippy code = {:.1}% of gz symbolized samples", 100.0 * gz_user_share);
+    g0!(
+        gz_user_share > 0.5,
+        "decode-dominated: gzippy code = {:.1}% of gz symbolized samples",
+        100.0 * gz_user_share
+    );
     let ld_user_s: u64 = ld_counts
         .iter()
-        .filter(|(k, _)| ld_names.get(*k).map(|s| insnattr_is_libdeflate(s)).unwrap_or(false))
+        .filter(|(k, _)| {
+            ld_names
+                .get(*k)
+                .map(|s| insnattr_is_libdeflate(s))
+                .unwrap_or(false)
+        })
         .map(|(_, &c)| c)
         .sum();
-    g0!(ld_user_s > 0, "libdeflate decode symbol sampled ({ld_user_s} samples)");
+    g0!(
+        ld_user_s > 0,
+        "libdeflate decode symbol sampled ({ld_user_s} samples)"
+    );
 
     // A/A distribution stability: top gz key's share across the two passes.
     let top_key = gz_counts
@@ -5514,7 +5577,10 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     let sh1 = *gz_counts.get(&top_key).unwrap_or(&0) as f64 / gz_total_s.max(1) as f64;
     let sh2 = *gz_counts2.get(&top_key).unwrap_or(&0) as f64 / gz_total_s2.max(1) as f64;
     let aa_pp = 100.0 * (sh1 - sh2).abs();
-    g0!(aa_pp < 3.0, "top-symbol share A/A-stable (Δ={aa_pp:.2}pp < 3pp)");
+    g0!(
+        aa_pp < 3.0,
+        "top-symbol share A/A-stable (Δ={aa_pp:.2}pp < 3pp)"
+    );
 
     if !g0_ok {
         eprintln!("insnattr: Gate-0 FAILED — attribution suppressed.");
@@ -5543,11 +5609,13 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
     let ld_attr = attribute(&ld_counts, &ld_names, ld_total_s, ld_instr);
 
     // Phase roll-up (gz).
-    let mut gz_phase: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();
+    let mut gz_phase: std::collections::BTreeMap<&'static str, f64> =
+        std::collections::BTreeMap::new();
     for (_k, name, retired, _s) in &gz_attr {
         *gz_phase.entry(insnattr_bucket(name)).or_insert(0.0) += retired;
     }
-    let mut ld_phase: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();
+    let mut ld_phase: std::collections::BTreeMap<&'static str, f64> =
+        std::collections::BTreeMap::new();
     for (_k, name, retired, _s) in &ld_attr {
         *ld_phase.entry(insnattr_bucket(name)).or_insert(0.0) += retired;
     }
@@ -5568,12 +5636,26 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
         gz_instr / ld_instr.max(1.0),
         surplus / o
     );
-    println!("  IPC similarity (time->retired bias bound): gz/ld IPC ratio = {:.3}", gz_ipc / ld_ipc.max(1e-9));
+    println!(
+        "  IPC similarity (time->retired bias bound): gz/ld IPC ratio = {:.3}",
+        gz_ipc / ld_ipc.max(1e-9)
+    );
 
     println!("\n-- gz TOP {topn} SYMBOLS by attributed retired instructions --");
     for (_k, name, retired, share) in gz_attr.iter().take(topn) {
-        let short = name.rsplit("::").take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("::");
-        let disp = if short.is_empty() { name.clone() } else { short };
+        let short = name
+            .rsplit("::")
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("::");
+        let disp = if short.is_empty() {
+            name.clone()
+        } else {
+            short
+        };
         println!(
             "  {:>6.2}%  {:>12.0}  [{}]  {}",
             100.0 * share,
@@ -5585,11 +5667,23 @@ pub fn cmd_insnattr(args: &[String]) -> ExitCode {
 
     println!("\n-- gz DECODE-PHASE roll-up (retired instructions) --");
     for (phase, r) in &gz_phase {
-        println!("  {:<14} {:>12.0}  {:>6.2}%  ({:.3} instr/B)", phase, r, 100.0 * r / gz_instr, r / o);
+        println!(
+            "  {:<14} {:>12.0}  {:>6.2}%  ({:.3} instr/B)",
+            phase,
+            r,
+            100.0 * r / gz_instr,
+            r / o
+        );
     }
     println!("\n-- ld DECODE-PHASE roll-up (retired instructions) --");
     for (phase, r) in &ld_phase {
-        println!("  {:<14} {:>12.0}  {:>6.2}%  ({:.3} instr/B)", phase, r, 100.0 * r / ld_instr, r / o);
+        println!(
+            "  {:<14} {:>12.0}  {:>6.2}%  ({:.3} instr/B)",
+            phase,
+            r,
+            100.0 * r / ld_instr,
+            r / o
+        );
     }
 
     // Reconciliation against the x86 nomination.
@@ -5696,9 +5790,18 @@ mod insnattr_tests {
 
     #[test]
     fn bucket_lut_build_symbols() {
-        assert_eq!(insnattr_bucket("gzippy::...::DistTable::rebuild::h0"), "lut_build");
-        assert_eq!(insnattr_bucket("gzippy::...::LitLenTable::build::h1"), "lut_build");
-        assert_eq!(insnattr_bucket("gzippy::...::ensure_dist_table::h2"), "lut_build");
+        assert_eq!(
+            insnattr_bucket("gzippy::...::DistTable::rebuild::h0"),
+            "lut_build"
+        );
+        assert_eq!(
+            insnattr_bucket("gzippy::...::LitLenTable::build::h1"),
+            "lut_build"
+        );
+        assert_eq!(
+            insnattr_bucket("gzippy::...::ensure_dist_table::h2"),
+            "lut_build"
+        );
         assert_eq!(insnattr_bucket("gzippy::...::read_header::h3"), "lut_build");
     }
 
@@ -5749,8 +5852,14 @@ mod insnattr_tests {
 
     #[test]
     fn bucket_table_build_huffcode_helpers() {
-        assert_eq!(insnattr_bucket("gzippy::..::make_inflate_huff_code_lit_len::h0"), "lut_build");
-        assert_eq!(insnattr_bucket("gzippy::..::set_and_expand_lit_len_huffcode::h1"), "lut_build");
+        assert_eq!(
+            insnattr_bucket("gzippy::..::make_inflate_huff_code_lit_len::h0"),
+            "lut_build"
+        );
+        assert_eq!(
+            insnattr_bucket("gzippy::..::set_and_expand_lit_len_huffcode::h1"),
+            "lut_build"
+        );
     }
 }
 
@@ -5865,45 +5974,103 @@ trait CritSubject {
 
 struct GzSubject;
 impl CritSubject for GzSubject {
-    fn name(&self) -> &'static str { "gzippy (pure-Rust)" }
-    fn n_regions(&self) -> usize { gzippy::critpath_rt::N_REGIONS }
-    fn region_names(&self) -> &'static [&'static str] { &gzippy::critpath_rt::REGION_NAMES }
-    fn set_enabled(&self, on: bool) { gzippy::critpath_rt::set_enabled(on) }
-    fn select(&self, r: Option<usize>) { gzippy::critpath_rt::select(r) }
-    fn set_dose(&self, d: u64) { gzippy::critpath_rt::set_dose(d) }
-    fn reset_counters(&self) { gzippy::critpath_rt::reset_counters() }
-    fn snapshot(&self) -> (Vec<u64>, Vec<u64>, u64) { gzippy::critpath_rt::snapshot() }
-    fn cntvct(&self) -> u64 { gzippy::critpath_rt::cntvct() }
-    fn cntfrq(&self) -> u64 { gzippy::critpath_rt::cntfrq() }
-    fn inject(&self, n: u64) -> u64 { gzippy::critpath_rt::inject(n) }
-    fn calib_serial(&self, iters: u64) -> u64 { gzippy::critpath_rt::calib_serial(iters) }
+    fn name(&self) -> &'static str {
+        "gzippy (pure-Rust)"
+    }
+    fn n_regions(&self) -> usize {
+        gzippy::critpath_rt::N_REGIONS
+    }
+    fn region_names(&self) -> &'static [&'static str] {
+        &gzippy::critpath_rt::REGION_NAMES
+    }
+    fn set_enabled(&self, on: bool) {
+        gzippy::critpath_rt::set_enabled(on)
+    }
+    fn select(&self, r: Option<usize>) {
+        gzippy::critpath_rt::select(r)
+    }
+    fn set_dose(&self, d: u64) {
+        gzippy::critpath_rt::set_dose(d)
+    }
+    fn reset_counters(&self) {
+        gzippy::critpath_rt::reset_counters()
+    }
+    fn snapshot(&self) -> (Vec<u64>, Vec<u64>, u64) {
+        gzippy::critpath_rt::snapshot()
+    }
+    fn cntvct(&self) -> u64 {
+        gzippy::critpath_rt::cntvct()
+    }
+    fn cntfrq(&self) -> u64 {
+        gzippy::critpath_rt::cntfrq()
+    }
+    fn inject(&self, n: u64) -> u64 {
+        gzippy::critpath_rt::inject(n)
+    }
+    fn calib_serial(&self, iters: u64) -> u64 {
+        gzippy::critpath_rt::calib_serial(iters)
+    }
     fn calib_overlapped(&self, iters: u64, buf: &[u64]) -> u64 {
         gzippy::critpath_rt::calib_overlapped(iters, buf)
     }
-    fn calib_empty(&self, iters: u64) -> u64 { gzippy::critpath_rt::calib_empty(iters) }
-    fn make_chase_buf(&self, n: usize) -> Vec<u64> { gzippy::critpath_rt::make_chase_buf(n) }
-    fn decode(&self, data: &[u8], buf: &mut [u8]) -> usize { run_gz(data, buf) }
+    fn calib_empty(&self, iters: u64) -> u64 {
+        gzippy::critpath_rt::calib_empty(iters)
+    }
+    fn make_chase_buf(&self, n: usize) -> Vec<u64> {
+        gzippy::critpath_rt::make_chase_buf(n)
+    }
+    fn decode(&self, data: &[u8], buf: &mut [u8]) -> usize {
+        run_gz(data, buf)
+    }
 }
 
 struct LdSubject;
 impl CritSubject for LdSubject {
-    fn name(&self) -> &'static str { "libdeflate 1.25 (C, instrumented)" }
-    fn n_regions(&self) -> usize { critpath_libdeflate::N_REGIONS }
-    fn region_names(&self) -> &'static [&'static str] { &critpath_libdeflate::REGION_NAMES }
-    fn set_enabled(&self, on: bool) { critpath_libdeflate::set_enabled(on) }
-    fn select(&self, r: Option<usize>) { critpath_libdeflate::select(r) }
-    fn set_dose(&self, d: u64) { critpath_libdeflate::set_dose(d) }
-    fn reset_counters(&self) { critpath_libdeflate::reset_counters() }
-    fn snapshot(&self) -> (Vec<u64>, Vec<u64>, u64) { critpath_libdeflate::snapshot() }
-    fn cntvct(&self) -> u64 { critpath_libdeflate::cntvct() }
-    fn cntfrq(&self) -> u64 { critpath_libdeflate::cntfrq() }
-    fn inject(&self, n: u64) -> u64 { critpath_libdeflate::inject(n) }
-    fn calib_serial(&self, iters: u64) -> u64 { critpath_libdeflate::calib_serial(iters) }
+    fn name(&self) -> &'static str {
+        "libdeflate 1.25 (C, instrumented)"
+    }
+    fn n_regions(&self) -> usize {
+        critpath_libdeflate::N_REGIONS
+    }
+    fn region_names(&self) -> &'static [&'static str] {
+        &critpath_libdeflate::REGION_NAMES
+    }
+    fn set_enabled(&self, on: bool) {
+        critpath_libdeflate::set_enabled(on)
+    }
+    fn select(&self, r: Option<usize>) {
+        critpath_libdeflate::select(r)
+    }
+    fn set_dose(&self, d: u64) {
+        critpath_libdeflate::set_dose(d)
+    }
+    fn reset_counters(&self) {
+        critpath_libdeflate::reset_counters()
+    }
+    fn snapshot(&self) -> (Vec<u64>, Vec<u64>, u64) {
+        critpath_libdeflate::snapshot()
+    }
+    fn cntvct(&self) -> u64 {
+        critpath_libdeflate::cntvct()
+    }
+    fn cntfrq(&self) -> u64 {
+        critpath_libdeflate::cntfrq()
+    }
+    fn inject(&self, n: u64) -> u64 {
+        critpath_libdeflate::inject(n)
+    }
+    fn calib_serial(&self, iters: u64) -> u64 {
+        critpath_libdeflate::calib_serial(iters)
+    }
     fn calib_overlapped(&self, iters: u64, buf: &[u64]) -> u64 {
         critpath_libdeflate::calib_overlapped(iters, buf)
     }
-    fn calib_empty(&self, iters: u64) -> u64 { critpath_libdeflate::calib_empty(iters) }
-    fn make_chase_buf(&self, n: usize) -> Vec<u64> { critpath_libdeflate::make_chase_buf(n) }
+    fn calib_empty(&self, iters: u64) -> u64 {
+        critpath_libdeflate::calib_empty(iters)
+    }
+    fn make_chase_buf(&self, n: usize) -> Vec<u64> {
+        critpath_libdeflate::make_chase_buf(n)
+    }
     fn decode(&self, data: &[u8], buf: &mut [u8]) -> usize {
         critpath_libdeflate::gzip_decode(data, buf)
     }
@@ -6294,7 +6461,10 @@ fn run_critpath_core(subj: &dyn CritSubject, args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    println!("\n== Per-region wall-causal localization (corpus={corpus}, subject={}, T1, M1) ==", subj.name());
+    println!(
+        "\n== Per-region wall-causal localization (corpus={corpus}, subject={}, T1, M1) ==",
+        subj.name()
+    );
     println!(
         "wall(instrumented)={:.0} ticks ({:.3} ms)  spread={:.2}%  A/A floor={:.2}%",
         wall_med,
@@ -6570,7 +6740,9 @@ fn parse_assay_levels(s: &str) -> Result<Vec<AssayLevel>, String> {
             "delay" => "delay",
             _ => "indep",
         };
-        let dose: u64 = parts[1].parse().map_err(|_| format!("bad dose in '{tok}'"))?;
+        let dose: u64 = parts[1]
+            .parse()
+            .map_err(|_| format!("bad dose in '{tok}'"))?;
         let stride: u64 = parts[2]
             .parse::<u64>()
             .map_err(|_| format!("bad stride in '{tok}'"))?
@@ -6763,14 +6935,15 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
     // a SINGLE run scopes the count to that one decode — the prior assay summed
     // `fires()` over warm+cal_n runs (≈12×), manufacturing a phantom "12× path
     // divergence". This is the per-run truth.
-    let inproc_fires = |buf: &mut [u8], mode: gzippy::assay_tax::Mode, dose: u64, stride: u64| -> u64 {
-        gzippy::assay_tax::configure(mode, dose, stride);
-        gzippy::assay_tax::reset_fires();
-        run_gz(&data, buf);
-        let f = gzippy::assay_tax::fires();
-        gzippy::assay_tax::configure(gzippy::assay_tax::Mode::Off, 0, 1);
-        f
-    };
+    let inproc_fires =
+        |buf: &mut [u8], mode: gzippy::assay_tax::Mode, dose: u64, stride: u64| -> u64 {
+            gzippy::assay_tax::configure(mode, dose, stride);
+            gzippy::assay_tax::reset_fires();
+            run_gz(&data, buf);
+            let f = gzippy::assay_tax::fires();
+            gzippy::assay_tax::configure(gzippy::assay_tax::Mode::Off, 0, 1);
+            f
+        };
 
     // BUG-1 GATE-0 — CALIBRATION PATH == WALL PATH (BLOCKING). The instr% is
     // calibrated in-process; the wall is measured on the subprocess CLI `-p1`
@@ -6808,13 +6981,20 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
         100.0 * (median(&on) / median(&off) - 1.0)
     };
     let mono_doses = [1u64, 2, 4, 8];
-    let mono_pct: Vec<f64> = mono_doses.iter().map(|&d| mono_instr(&mut buf, d)).collect();
+    let mono_pct: Vec<f64> = mono_doses
+        .iter()
+        .map(|&d| mono_instr(&mut buf, d))
+        .collect();
     let monotonic = mono_pct.windows(2).all(|w| w[1] > w[0] + 0.05) && mono_pct[0] > 0.0;
     g0!(
         monotonic,
         "monotonic dose response (dep,stride=1): doses {:?} -> instr% {}",
         mono_doses,
-        mono_pct.iter().map(|p| format!("{p:+.3}")).collect::<Vec<_>>().join(", ")
+        mono_pct
+            .iter()
+            .map(|p| format!("{p:+.3}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let ghz0 = probe_ghz(&pmu, &sess);
@@ -6848,9 +7028,7 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
                 chosen.push(d);
             }
         }
-        println!(
-            "\n  MDE level selection (closest to +0.5/+1/+2% standalone): doses {chosen:?}"
-        );
+        println!("\n  MDE level selection (closest to +0.5/+1/+2% standalone): doses {chosen:?}");
         mde_pick_json = Some(serde_json::json!({
             "target_half_pct_dose": d_half,
             "target_one_pct_dose": d_one,
@@ -6875,7 +7053,15 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
     let mut json_levels: Vec<serde_json::Value> = Vec::new();
     println!(
         "\n{:<20} {:>10} {:>10} {:>12} {:>10} {:>9} {:>9} {:>9} {:<14}",
-        "level", "instr%", "fires/M", "wall_eff%", "taxcost%", "spread%", "AAfloor%", "gated", "verdict"
+        "level",
+        "instr%",
+        "fires/M",
+        "wall_eff%",
+        "taxcost%",
+        "spread%",
+        "AAfloor%",
+        "gated",
+        "verdict"
     );
 
     for lv in &levels {
@@ -7035,7 +7221,11 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
                 }
             }
         }
-        let noise = if noises.is_empty() { f64::NAN } else { median(&noises) };
+        let noise = if noises.is_empty() {
+            f64::NAN
+        } else {
+            median(&noises)
+        };
         if pts.len() < 2 {
             return (f64::NAN, pts, noise, f64::NAN);
         }
@@ -7045,7 +7235,11 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
         let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
         let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
         let denom = n * sxx - sx * sx;
-        let slope = if denom.abs() < 1e-12 { f64::NAN } else { (n * sxy - sx * sy) / denom };
+        let slope = if denom.abs() < 1e-12 {
+            f64::NAN
+        } else {
+            (n * sxy - sx * sy) / denom
+        };
         let span = pts.iter().map(|p| p.0).fold(f64::MIN, f64::max)
             - pts.iter().map(|p| p.0).fold(f64::MAX, f64::min);
         (slope, pts, noise, span)
@@ -7098,7 +7292,8 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
     let a_beats_b = (swing_a - swing_b) > noise;
     let a_beats_c = (swing_a - swing_c) > noise;
     let a_above_noise = swing_a.abs() > noise;
-    let recurrence_verdict = if !slope_a.is_finite() || !slope_b.is_finite() || !slope_c.is_finite() {
+    let recurrence_verdict = if !slope_a.is_finite() || !slope_b.is_finite() || !slope_c.is_finite()
+    {
         "INSUFFICIENT_DATA"
     } else if a_beats_b && a_beats_c && a_above_noise {
         "CONFIRMED_recurrence_latency_bound"
@@ -7120,7 +7315,13 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
     );
     println!(
         "  A>>B: {} ({:+.4} > {:.4})   A>>C: {} ({:+.4} > {:.4})   A>noise: {}",
-        a_beats_b, swing_a - swing_b, noise, a_beats_c, swing_a - swing_c, noise, a_above_noise
+        a_beats_b,
+        swing_a - swing_b,
+        noise,
+        a_beats_c,
+        swing_a - swing_c,
+        noise,
+        a_above_noise
     );
     println!("  VERDICT: {recurrence_verdict}");
 
@@ -7154,7 +7355,10 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
                 continue;
             }
             let g = lvl.get("gated").and_then(|x| x.as_bool()).unwrap_or(false);
-            let tc = lvl.get("tax_cost_pct").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+            let tc = lvl
+                .get("tax_cost_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::NAN);
             let verdict = lvl
                 .get("verdict")
                 .and_then(|x| x.as_str())
@@ -7172,7 +7376,10 @@ pub fn cmd_assay(args: &[String]) -> ExitCode {
             .fold(f64::INFINITY, f64::min);
         println!("\n== MDE VERDICT (positive-control known-wall-delay) ==");
         for (tc, g, v) in &all_pts {
-            println!("  delay tax_cost={tc:+.3}%  gated={}  ({v})", if *g { "YES" } else { "no" });
+            println!(
+                "  delay tax_cost={tc:+.3}%  gated={}  ({v})",
+                if *g { "YES" } else { "no" }
+            );
         }
         if mde.is_finite() {
             println!("  HARNESS MDE on this M1 ≈ {mde:.3}% (smallest KNOWN wall dose resolved above the A/A floor at N≥{cal_n})");

@@ -82,9 +82,9 @@ fn is_simd_x86(m: &str) -> bool {
     const SIMD_EXACT: [&str; 40] = [
         "pxor", "por", "pand", "pandn", "paddb", "paddw", "paddd", "paddq", "psubb", "psubw",
         "psubd", "psubq", "pmullw", "pmulld", "pmulhw", "pavgb", "pminub", "pmaxub", "pminsw",
-        "pmaxsw", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "palignr",
-        "pshufb", "ptest", "pextrb", "pextrd", "pinsrb", "pinsrd", "movd", "movss", "movsd", "addps",
-        "mulps",
+        "pmaxsw", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad",
+        "palignr", "pshufb", "ptest", "pextrb", "pextrd", "pinsrb", "pinsrd", "movd", "movss",
+        "movsd", "addps", "mulps",
     ];
     SIMD_EXACT.contains(&m)
 }
@@ -167,18 +167,57 @@ fn classify_core(m: &str, ops: &str) -> &'static str {
     // jne, jg, jle, jae, jb, jp, js, jo, jnz, jecxz, ...).
     if matches!(
         m,
-        "jmp" | "call" | "ret" | "retq" | "leave" | "loop" | "loope" | "loopne" | "syscall"
-            | "int" | "int3" | "ud2" | "hlt"
+        "jmp"
+            | "call"
+            | "ret"
+            | "retq"
+            | "leave"
+            | "loop"
+            | "loope"
+            | "loopne"
+            | "syscall"
+            | "int"
+            | "int3"
+            | "ud2"
+            | "hlt"
     ) || (m.starts_with('j') && m.len() <= 5)
     {
         return "branch";
     }
     if matches!(
         m,
-        "shl" | "shr" | "sar" | "sal" | "rol" | "ror" | "rcl" | "rcr" | "shld" | "shrd" | "bt"
-            | "bts" | "btr" | "btc" | "bsr" | "bsf" | "popcnt" | "lzcnt" | "tzcnt" | "bzhi" | "pext"
-            | "pdep" | "bextr" | "andn" | "blsi" | "blsr" | "blsmsk" | "bswap" | "rorx" | "sarx"
-            | "shlx" | "shrx"
+        "shl"
+            | "shr"
+            | "sar"
+            | "sal"
+            | "rol"
+            | "ror"
+            | "rcl"
+            | "rcr"
+            | "shld"
+            | "shrd"
+            | "bt"
+            | "bts"
+            | "btr"
+            | "btc"
+            | "bsr"
+            | "bsf"
+            | "popcnt"
+            | "lzcnt"
+            | "tzcnt"
+            | "bzhi"
+            | "pext"
+            | "pdep"
+            | "bextr"
+            | "andn"
+            | "blsi"
+            | "blsr"
+            | "blsmsk"
+            | "bswap"
+            | "rorx"
+            | "sarx"
+            | "shlx"
+            | "shrx"
     ) {
         return "shift/bitfield";
     }
@@ -187,8 +226,24 @@ fn classify_core(m: &str, ops: &str) -> &'static str {
     }
     if matches!(
         m,
-        "add" | "sub" | "imul" | "mul" | "idiv" | "div" | "inc" | "dec" | "neg" | "adc" | "sbb"
-            | "xadd" | "cdqe" | "cqo" | "cdq" | "cwde" | "cltq" | "cqto"
+        "add"
+            | "sub"
+            | "imul"
+            | "mul"
+            | "idiv"
+            | "div"
+            | "inc"
+            | "dec"
+            | "neg"
+            | "adc"
+            | "sbb"
+            | "xadd"
+            | "cdqe"
+            | "cqo"
+            | "cdq"
+            | "cwde"
+            | "cltq"
+            | "cqto"
     ) {
         return "arith";
     }
@@ -245,8 +300,20 @@ fn perf_record(
     // No `--call-graph` (default records none; this perf rejects value `none`).
     let st = Command::new("perf")
         .args([
-            "record", "-F", &freq.to_string(), "-e", event, "-o", &data, "--", "taskset", "-c",
-            &cpu.to_string(), "sh", "-c", &inner,
+            "record",
+            "-F",
+            &freq.to_string(),
+            "-e",
+            event,
+            "-o",
+            &data,
+            "--",
+            "taskset",
+            "-c",
+            &cpu.to_string(),
+            "sh",
+            "-c",
+            &inner,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -259,7 +326,9 @@ fn perf_record(
 }
 
 fn shell_quote(s: &str) -> String {
-    if s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'.' | b'_' | b'-')) {
+    if s.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'.' | b'_' | b'-'))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -269,7 +338,18 @@ fn shell_quote(s: &str) -> String {
 /// `perf report -F sample,dso` → total sample count + per-DSO sample count.
 fn report_totals(data: &str) -> Result<(u64, BTreeMap<String, u64>), String> {
     let out = Command::new("perf")
-        .args(["report", "-i", data, "--stdio", "-g", "none", "-F", "sample,dso", "--percent-limit", "0"])
+        .args([
+            "report",
+            "-i",
+            data,
+            "--stdio",
+            "-g",
+            "none",
+            "-F",
+            "sample,dso",
+            "--percent-limit",
+            "0",
+        ])
         .output()
         .map_err(|e| format!("spawn perf report: {e}"))?;
     if !out.status.success() {
@@ -331,7 +411,15 @@ fn parse_annotate_insn(line: &str) -> Option<(f64, String, String)> {
         }
     }
     let ops = toks.collect::<Vec<_>>().join(" ");
-    let ops = ops.split('#').next().unwrap_or("").split("//").next().unwrap_or("").trim().to_string();
+    let ops = ops
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .split("//")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     Some((pct, mnem.to_string(), ops))
 }
 
@@ -339,7 +427,9 @@ fn parse_annotate_insn(line: &str) -> Option<(f64, String, String)> {
 /// sample-weight units, total resolved weight). Each symbol block header
 /// `Disassembly of <dso> for <ev> (<N> samples, ...)` sets N + dso; each
 /// instruction line contributes N*pct/100 to that dso's class.
-fn annotate_class_hist(data: &str) -> Result<(BTreeMap<String, BTreeMap<String, f64>>, f64), String> {
+fn annotate_class_hist(
+    data: &str,
+) -> Result<(BTreeMap<String, BTreeMap<String, f64>>, f64), String> {
     let out = Command::new("perf")
         .args(["annotate", "-i", data, "--stdio", "--percent-limit", "0"])
         .output()
@@ -400,7 +490,6 @@ fn flatten_hist(per_dso: &BTreeMap<String, BTreeMap<String, f64>>) -> BTreeMap<S
     }
     h
 }
-
 
 fn shares(hist: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
     let tot: f64 = hist.values().sum();
@@ -492,7 +581,16 @@ fn discrimination_shares(
         "--secs".to_string(),
         "3".to_string(),
     ];
-    let data = perf_record(self_exe, &args, "", 1, freq, cpu, event, &format!("disc_{mode}"))?;
+    let data = perf_record(
+        self_exe,
+        &args,
+        "",
+        1,
+        freq,
+        cpu,
+        event,
+        &format!("disc_{mode}"),
+    )?;
     let res = annotate_class_hist(&data);
     let _ = std::fs::remove_file(&data);
     let (per_dso, _resolved) = res?;
@@ -537,18 +635,23 @@ fn run_arm_sha(bin: &str, args: &[String], corpus: &str) -> Result<String, Strin
 fn assert_native_elf(path: &str) -> Result<(), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
     if meta.len() < 1024 {
-        return Err(format!("'{path}' is {}B (<1KiB) — a wrapper/shim, not a native decoder", meta.len()));
+        return Err(format!(
+            "'{path}' is {}B (<1KiB) — a wrapper/shim, not a native decoder",
+            meta.len()
+        ));
     }
     let mut head = [0u8; 4];
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    f.read_exact(&mut head).map_err(|e| format!("read {path}: {e}"))?;
+    f.read_exact(&mut head)
+        .map_err(|e| format!("read {path}: {e}"))?;
     if head != [0x7f, b'E', b'L', b'F'] {
-        return Err(format!("'{path}' is not an ELF (magic {head:02x?}) — refusing a script/shim comparator"));
+        return Err(format!(
+            "'{path}' is not an ELF (magic {head:02x?}) — refusing a script/shim comparator"
+        ));
     }
     Ok(())
 }
-
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -587,7 +690,9 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
     // Internal kernel child (Gate-0(d) discrimination).
     if let Some(i) = args.iter().position(|a| a == "--_kernel-child") {
         let mode = args.get(i + 1).map(|s| s.as_str()).unwrap_or("kalu");
-        let secs: f64 = flag(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(3.0);
+        let secs: f64 = flag(args, "--secs")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3.0);
         return kernel_child(mode, secs);
     }
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
@@ -626,22 +731,37 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
-    let iters: usize = flag(args, "--iters").and_then(|s| s.parse().ok()).unwrap_or(30);
-    let freq: u32 = flag(args, "--freq").and_then(|s| s.parse().ok()).unwrap_or(4000);
-    let cpu: usize = flag(args, "--cpu").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let iters: usize = flag(args, "--iters")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let freq: u32 = flag(args, "--freq")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000);
+    let cpu: usize = flag(args, "--cpu")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     // user-mode retired-instruction sampling event. On hybrid Intel (P+E) the
     // bare `instructions:u` works, but `cpu_core/instructions/u` can be forced.
-    let event = flag(args, "--event").unwrap_or("instructions:u").to_string();
+    let event = flag(args, "--event")
+        .unwrap_or("instructions:u")
+        .to_string();
     let surplus_ratio: Option<f64> = flag(args, "--surplus-ratio").and_then(|s| s.parse().ok());
     let artifact = flag(args, "--artifact").map(|s| s.to_string());
 
     // perf present?
-    if Command::new("perf").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+    if Command::new("perf")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
         eprintln!("classhist: `perf` not available");
         return ExitCode::from(2);
     }
 
-    println!("== fulcrum classhist (Linux/x86-64) — execution-weighted instruction-class histogram ==");
+    println!(
+        "== fulcrum classhist (Linux/x86-64) — execution-weighted instruction-class histogram =="
+    );
     println!("subject={subject} comparator={comparator} corpus={corpus}");
     println!("subject_args={subj_args:?} comparator_args={comp_args:?} iters={iters} freq={freq} cpu={cpu}");
 
@@ -685,23 +805,44 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
         if sha_ok { "PASS" } else { "FAIL" }
     );
     if !sha_ok {
-        eprintln!("Gate-0 FAIL: arm sha != oracle (subj_ok={} comp_ok={}) oracle={}", subj_sha==oracle, comp_sha==oracle, &oracle[..12]);
+        eprintln!(
+            "Gate-0 FAIL: arm sha != oracle (subj_ok={} comp_ok={}) oracle={}",
+            subj_sha == oracle,
+            comp_sha == oracle,
+            &oracle[..12]
+        );
         return ExitCode::from(2);
     }
 
-    let self_exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let self_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     // (d) DISCRIMINATION on this box.
     let disc_load = match discrimination_shares(&self_exe, "kload", freq, cpu, &event) {
-        Ok(s) => s, Err(e) => { eprintln!("Gate-0 FAIL (discrimination kload): {e}"); return ExitCode::from(2); }
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Gate-0 FAIL (discrimination kload): {e}");
+            return ExitCode::from(2);
+        }
     };
     let disc_alu = match discrimination_shares(&self_exe, "kalu", freq, cpu, &event) {
-        Ok(s) => s, Err(e) => { eprintln!("Gate-0 FAIL (discrimination kalu): {e}"); return ExitCode::from(2); }
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Gate-0 FAIL (discrimination kalu): {e}");
+            return ExitCode::from(2);
+        }
     };
     let load_share_loadk = *disc_load.get("load").unwrap_or(&0.0);
     let load_share_aluk = *disc_alu.get("load").unwrap_or(&0.0);
-    let compute_aluk = ["arith","logic","shift/bitfield"].iter().map(|c| *disc_alu.get(*c).unwrap_or(&0.0)).sum::<f64>();
-    let compute_loadk = ["arith","logic","shift/bitfield"].iter().map(|c| *disc_load.get(*c).unwrap_or(&0.0)).sum::<f64>();
+    let compute_aluk = ["arith", "logic", "shift/bitfield"]
+        .iter()
+        .map(|c| *disc_alu.get(*c).unwrap_or(&0.0))
+        .sum::<f64>();
+    let compute_loadk = ["arith", "logic", "shift/bitfield"]
+        .iter()
+        .map(|c| *disc_load.get(*c).unwrap_or(&0.0))
+        .sum::<f64>();
     let disc_ok = load_share_loadk > load_share_aluk && compute_aluk > compute_loadk;
     println!(
         "  (d) discrimination: kload.load={load_share_loadk:.1}% > kalu.load={load_share_aluk:.1}% AND kalu.compute={compute_aluk:.1}% > kload.compute={compute_loadk:.1}% [{}]",
@@ -715,14 +856,18 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
     // Subject sample pass #1 + #2 (A/A stability), comparator pass. Each: one
     // perf record, then `perf report` (totals/coverage) + `perf annotate`
     // (per-instruction class histogram) on the SAME data file.
-    let arm = |bin: &str, a: &[String], tag: &str| -> Result<(BTreeMap<String, f64>, u64, f64, Vec<(String, u64)>), String> {
+    let arm = |bin: &str,
+               a: &[String],
+               tag: &str|
+     -> Result<(BTreeMap<String, f64>, u64, f64, Vec<(String, u64)>), String> {
         let data = perf_record(bin, a, &corpus, iters, freq, cpu, &event, tag)?;
         let totals = report_totals(&data);
         let hist = annotate_class_hist(&data);
         let _ = std::fs::remove_file(&data);
         let (total, per_dso_total) = totals?;
         let (per_dso_hist, resolved) = hist?;
-        let resolved_dsos: std::collections::BTreeSet<String> = per_dso_hist.keys().cloned().collect();
+        let resolved_dsos: std::collections::BTreeSet<String> =
+            per_dso_hist.keys().cloned().collect();
         // unresolved-by-DSO = report DSOs with no annotate coverage.
         let mut unres: Vec<(String, u64)> = per_dso_total
             .iter()
@@ -734,14 +879,28 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
         Ok((flatten_hist(&per_dso_hist), total, resolved, unres))
     };
 
-    let (subj_h1, subj_total1, subj_res1, subj_unres_dso) = match arm(&subject, &subj_args, "subj1") {
-        Ok(v) => v, Err(e) => { eprintln!("Gate-0 FAIL (subject perf#1): {e}"); return ExitCode::from(2); }
+    let (subj_h1, subj_total1, subj_res1, subj_unres_dso) = match arm(&subject, &subj_args, "subj1")
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Gate-0 FAIL (subject perf#1): {e}");
+            return ExitCode::from(2);
+        }
     };
     let (subj_h2, _t2, _r2, _u2) = match arm(&subject, &subj_args, "subj2") {
-        Ok(v) => v, Err(e) => { eprintln!("Gate-0 FAIL (subject perf#2): {e}"); return ExitCode::from(2); }
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Gate-0 FAIL (subject perf#2): {e}");
+            return ExitCode::from(2);
+        }
     };
-    let (comp_h, comp_total, comp_res, comp_unres_dso) = match arm(&comparator, &comp_args, "comp") {
-        Ok(v) => v, Err(e) => { eprintln!("Gate-0 FAIL (comparator perf): {e}"); return ExitCode::from(2); }
+    let (comp_h, comp_total, comp_res, comp_unres_dso) = match arm(&comparator, &comp_args, "comp")
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Gate-0 FAIL (comparator perf): {e}");
+            return ExitCode::from(2);
+        }
     };
 
     let subj_s1 = shares(&subj_h1);
@@ -751,8 +910,16 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
     // (b) non-inert + coverage floor.
     let subj_total_samp = subj_total1;
     let comp_total_samp = comp_total;
-    let subj_cov = if subj_total_samp > 0 { subj_res1 / subj_total_samp as f64 } else { 0.0 };
-    let comp_cov = if comp_total_samp > 0 { comp_res / comp_total_samp as f64 } else { 0.0 };
+    let subj_cov = if subj_total_samp > 0 {
+        subj_res1 / subj_total_samp as f64
+    } else {
+        0.0
+    };
+    let comp_cov = if comp_total_samp > 0 {
+        comp_res / comp_total_samp as f64
+    } else {
+        0.0
+    };
     let inert_floor = 2000u64;
     let cov_floor = 0.80;
     let noninert = subj_total_samp >= inert_floor && comp_total_samp >= inert_floor;
@@ -778,23 +945,38 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
     let mut aa_drift = 0.0f64;
     for c in CLASSES {
         let d = (subj_s1.get(c).unwrap_or(&0.0) - subj_s2.get(c).unwrap_or(&0.0)).abs();
-        if d > aa_drift { aa_drift = d; }
+        if d > aa_drift {
+            aa_drift = d;
+        }
     }
     let aa_ok = aa_drift <= aa_tol;
-    println!("  (c) A/A subject split max per-class drift = {aa_drift:.2}pp [tol {aa_tol}pp] [{}]", if aa_ok { "PASS" } else { "FAIL" });
+    println!(
+        "  (c) A/A subject split max per-class drift = {aa_drift:.2}pp [tol {aa_tol}pp] [{}]",
+        if aa_ok { "PASS" } else { "FAIL" }
+    );
     if !aa_ok {
-        eprintln!("Gate-0 FAIL: A/A unstable ({aa_drift:.2}pp > {aa_tol}pp) — increase --iters/--freq");
+        eprintln!(
+            "Gate-0 FAIL: A/A unstable ({aa_drift:.2}pp > {aa_tol}pp) — increase --iters/--freq"
+        );
         return ExitCode::from(2);
     }
 
     // (e) provenance.
     let corpus_sha = file_sha(&corpus).unwrap_or_else(|_| "?".into());
-    println!("  (e) provenance: subject_sha={} comparator_sha={} corpus_sha={}", &subj_sha[..12.min(subj_sha.len())], &comp_sha[..12.min(comp_sha.len())], &corpus_sha[..12.min(corpus_sha.len())]);
+    println!(
+        "  (e) provenance: subject_sha={} comparator_sha={} corpus_sha={}",
+        &subj_sha[..12.min(subj_sha.len())],
+        &comp_sha[..12.min(comp_sha.len())],
+        &corpus_sha[..12.min(corpus_sha.len())]
+    );
     println!("  ALL GATE-0 PASS");
 
     // ── Report ───────────────────────────────────────────────────────────────
     println!("\n-- per-class execution-weighted shares (subject vs comparator) --");
-    println!("  {:<16} {:>10} {:>10} {:>10}", "class", "subject%", "comparator%", "delta(pp)");
+    println!(
+        "  {:<16} {:>10} {:>10} {:>10}",
+        "class", "subject%", "comparator%", "delta(pp)"
+    );
     let mut deltas: Vec<(String, f64)> = Vec::new();
     for c in CLASSES {
         let s = *subj_s1.get(c).unwrap_or(&0.0);
@@ -807,7 +989,10 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
     if let Some(ratio) = surplus_ratio {
         let surplus_frac = ratio - 1.0;
         println!("\n-- absolute per-class instruction-surplus attribution (counterdiff ratio={ratio:.3}) --");
-        println!("  subject emits {ratio:.3}x comparator instr/byte; the (ratio-1)={:.3} surplus,", surplus_frac);
+        println!(
+            "  subject emits {ratio:.3}x comparator instr/byte; the (ratio-1)={:.3} surplus,",
+            surplus_frac
+        );
         println!("  apportioned by where SUBJECT spends instructions MINUS where comparator does:");
         // surplus per class (in 'comparator instr/byte' units, normalized): subj_share*ratio - comp_share, * total.
         // Report the per-class contribution to the surplus as: subj%*ratio - comp%, renormalized to sum=surplus%.
@@ -819,16 +1004,30 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
             contrib.push((c.to_string(), s * ratio - cm));
         }
         let tot_surplus: f64 = contrib.iter().map(|(_, v)| v).sum(); // == ratio - 1
-        println!("  {:<16} {:>14} {:>14}", "class", "surplus(frac/B)", "%of total surplus");
+        println!(
+            "  {:<16} {:>14} {:>14}",
+            "class", "surplus(frac/B)", "%of total surplus"
+        );
         let mut sorted = contrib.clone();
         sorted.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
         for (c, v) in &sorted {
-            let pct = if tot_surplus.abs() > 1e-9 { 100.0 * v / tot_surplus } else { 0.0 };
+            let pct = if tot_surplus.abs() > 1e-9 {
+                100.0 * v / tot_surplus
+            } else {
+                0.0
+            };
             println!("  {:<16} {:>+14.4} {:>+13.1}%", c, v, pct);
         }
         // Verdict.
-        let top = sorted.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-        let top_pct = if tot_surplus.abs() > 1e-9 { 100.0 * top.1 / tot_surplus } else { 0.0 };
+        let top = sorted
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        let top_pct = if tot_surplus.abs() > 1e-9 {
+            100.0 * top.1 / tot_surplus
+        } else {
+            0.0
+        };
         println!("\n-- VERDICT --");
         if top_pct >= 40.0 {
             println!("  CONCENTRATED: class '{}' owns {:.0}% of the instr surplus (>=40%) — a recoverable cluster.", top.0, top_pct);
@@ -836,27 +1035,53 @@ pub fn cmd_classhist(args: &[String]) -> ExitCode {
             println!("  DISTRIBUTED: top class '{}' owns only {:.0}% of the surplus (<40%) — no concentrated cluster.", top.0, top_pct);
         }
     } else {
-        println!("\n(no --surplus-ratio given: reporting SHAPE only. Run `fulcrum counterdiff` for the");
-        println!(" instr/B ratio, then re-run with --surplus-ratio R for the absolute surplus verdict.)");
+        println!(
+            "\n(no --surplus-ratio given: reporting SHAPE only. Run `fulcrum counterdiff` for the"
+        );
+        println!(
+            " instr/B ratio, then re-run with --surplus-ratio R for the absolute surplus verdict.)"
+        );
     }
 
     if let Some(path) = artifact {
         let mut j = String::new();
         j.push_str("{\n");
-        j.push_str(&format!("  \"subject\": \"{}\",\n  \"comparator\": \"{}\",\n  \"corpus\": \"{}\",\n", subject, comparator, corpus));
+        j.push_str(&format!(
+            "  \"subject\": \"{}\",\n  \"comparator\": \"{}\",\n  \"corpus\": \"{}\",\n",
+            subject, comparator, corpus
+        ));
         j.push_str(&format!("  \"subject_sha\": \"{}\",\n  \"comparator_sha\": \"{}\",\n  \"corpus_sha\": \"{}\",\n", subj_sha, comp_sha, corpus_sha));
-        j.push_str(&format!("  \"iters\": {iters}, \"freq\": {freq}, \"cpu\": {cpu},\n"));
+        j.push_str(&format!(
+            "  \"iters\": {iters}, \"freq\": {freq}, \"cpu\": {cpu},\n"
+        ));
         j.push_str(&format!("  \"subject_samples\": {subj_total_samp}, \"comparator_samples\": {comp_total_samp},\n"));
         j.push_str(&format!("  \"subject_coverage\": {:.4}, \"comparator_coverage\": {:.4}, \"aa_drift_pp\": {:.4},\n", subj_cov, comp_cov, aa_drift));
         let class_json = |s: &BTreeMap<String, f64>| -> String {
-            CLASSES.iter().map(|c| format!("\"{}\": {:.3}", c, s.get(*c).unwrap_or(&0.0))).collect::<Vec<_>>().join(", ")
+            CLASSES
+                .iter()
+                .map(|c| format!("\"{}\": {:.3}", c, s.get(*c).unwrap_or(&0.0)))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        j.push_str(&format!("  \"subject_shares_pct\": {{{}}},\n", class_json(&subj_s1)));
-        j.push_str(&format!("  \"comparator_shares_pct\": {{{}}},\n", class_json(&comp_s)));
+        j.push_str(&format!(
+            "  \"subject_shares_pct\": {{{}}},\n",
+            class_json(&subj_s1)
+        ));
+        j.push_str(&format!(
+            "  \"comparator_shares_pct\": {{{}}},\n",
+            class_json(&comp_s)
+        ));
         if let Some(ratio) = surplus_ratio {
             j.push_str(&format!("  \"surplus_ratio\": {:.4},\n", ratio));
         }
-        j.push_str(&format!("  \"_\": \"deltas: {}\"\n", deltas.iter().map(|(c,d)| format!("{c}={d:+.1}")).collect::<Vec<_>>().join(" ")));
+        j.push_str(&format!(
+            "  \"_\": \"deltas: {}\"\n",
+            deltas
+                .iter()
+                .map(|(c, d)| format!("{c}={d:+.1}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
         j.push_str("}\n");
         if let Err(e) = std::fs::write(&path, j) {
             eprintln!("classhist: failed to write artifact {path}: {e}");
@@ -893,8 +1118,14 @@ mod tests {
         assert_eq!(classify_insn_x86("shl", "$0x3,%rax"), "shift/bitfield");
         assert_eq!(classify_insn_x86("shr", "%cl,%rax"), "shift/bitfield");
         assert_eq!(classify_insn_x86("sar", "$0x1,%rax"), "shift/bitfield");
-        assert_eq!(classify_insn_x86("shlx", "%rax,%rbx,%rcx"), "shift/bitfield");
-        assert_eq!(classify_insn_x86("pext", "%rax,%rbx,%rcx"), "shift/bitfield");
+        assert_eq!(
+            classify_insn_x86("shlx", "%rax,%rbx,%rcx"),
+            "shift/bitfield"
+        );
+        assert_eq!(
+            classify_insn_x86("pext", "%rax,%rbx,%rcx"),
+            "shift/bitfield"
+        );
         assert_eq!(classify_insn_x86("cmp", "%rax,%rbx"), "compare/select");
         assert_eq!(classify_insn_x86("cmpq", "$0x0,%rax"), "compare/select");
         assert_eq!(classify_insn_x86("test", "%rax,%rax"), "compare/select");
@@ -918,8 +1149,14 @@ mod tests {
     #[test]
     fn split_operands_depth() {
         assert_eq!(split_operands("%rax,%rbx"), vec!["%rax", "%rbx"]);
-        assert_eq!(split_operands("(%rax,%rbx,4),%rcx"), vec!["(%rax,%rbx,4)", "%rcx"]);
-        assert_eq!(split_operands("%rcx,0x10(%rax,%rbx,8)"), vec!["%rcx", "0x10(%rax,%rbx,8)"]);
+        assert_eq!(
+            split_operands("(%rax,%rbx,4),%rcx"),
+            vec!["(%rax,%rbx,4)", "%rcx"]
+        );
+        assert_eq!(
+            split_operands("%rcx,0x10(%rax,%rbx,8)"),
+            vec!["%rcx", "0x10(%rax,%rbx,8)"]
+        );
     }
 
     #[test]
@@ -931,7 +1168,8 @@ mod tests {
         let (p, m, o) = parse_annotate_insn("   12.34 :   c62b0:\tadd    $0x1,%rax").unwrap();
         assert!((p - 12.34).abs() < 1e-9);
         assert_eq!(classify_insn_x86(&m, &o), "arith");
-        let (_, m, o) = parse_annotate_insn("    1.20 :   1004:\tmov    (%rdi,%rsi,4),%rax").unwrap();
+        let (_, m, o) =
+            parse_annotate_insn("    1.20 :   1004:\tmov    (%rdi,%rsi,4),%rax").unwrap();
         assert_eq!(classify_insn_x86(&m, &o), "load");
         let (_, m, _o) = parse_annotate_insn("    0.50 :   100b:\tjne    1000 <foo>").unwrap();
         assert_eq!(m, "jne");

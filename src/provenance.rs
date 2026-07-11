@@ -2403,7 +2403,8 @@ mod gate_tests {
         assert_eq!(absent.verdict, CheckVerdict::Void);
         assert!(absent.reason.contains("absent"));
         // A/A=1.043 beyond 1% spread VOIDs (wrong artifact: wheel-vs-ELF startup tax)
-        let aa_off = check_comparator_present(Some(true), Some(1.043), Some(1.0), "<BENCH_ROOT>/rg.whl");
+        let aa_off =
+            check_comparator_present(Some(true), Some(1.043), Some(1.0), "<BENCH_ROOT>/rg.whl");
         assert_eq!(aa_off.verdict, CheckVerdict::Void);
         assert!(aa_off.reason.contains("A/A"));
         // control: present + A/A within spread => OK

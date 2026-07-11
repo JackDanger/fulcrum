@@ -451,8 +451,16 @@ pub fn render_wall_summary(
         }
     }
     let ratio_med = median_of(&ratios);
-    let after_over_rg = if rg_med > 0.0 { after_med / rg_med } else { f64::NAN };
-    let base_over_rg = if rg_med > 0.0 { base_med / rg_med } else { f64::NAN };
+    let after_over_rg = if rg_med > 0.0 {
+        after_med / rg_med
+    } else {
+        f64::NAN
+    };
+    let base_over_rg = if rg_med > 0.0 {
+        base_med / rg_med
+    } else {
+        f64::NAN
+    };
     let delta_pct = (1.0 - ratio_med) * 100.0; // + = after faster
 
     format!(
