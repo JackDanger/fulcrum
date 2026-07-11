@@ -94,6 +94,7 @@ pub mod runner;
 pub mod scaling;
 pub mod scaling_matrix;
 pub mod schedule;
+pub mod scope;
 pub mod score;
 pub mod scoreboard;
 pub mod spans;

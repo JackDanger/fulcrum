@@ -115,6 +115,11 @@ USAGE:\n\
               JSON artifact (subsumes breadth_driver.sh; kills the never-banked-N=51-table debt).\n\
               Fail-soft per cell → MATRIX=OK|PARTIAL. `matrix selftest` is the baked Gate-0.\n\
               Composes: `fulcrum freeze run -- fulcrum matrix ...`\n\
+  fulcrum scope --manifest scope.json --banked <file-or-dir> [--banked ...] [--require-sha SHA] [--json out.json]\n\
+              GOAL-GRID completeness gate — joins banked matrix artifacts onto the FULL\n\
+              box×comparator×corpus×T goal grid; every cell is W/T/L/V/STALE/UNMEASURED and the\n\
+              exit code is the gate (SUCCESS only on SCOPE=WIN). The board can no longer silently\n\
+              shrink to one comparator/box. `scope selftest` is the baked Gate-0.\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
@@ -4313,6 +4318,7 @@ fn main() -> ExitCode {
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "paired" => fulcrum::paired::cmd_paired(rest),
         "matrix" => fulcrum::matrix::cmd_matrix(rest),
+        "scope" => fulcrum::scope::cmd_scope(rest),
         "phasebreak" => cmd_phasebreak(rest),
         "optimality" => cmd_optimality(rest),
         "ledger" => cmd_ledger(rest),
