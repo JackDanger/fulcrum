@@ -4274,6 +4274,7 @@ fn main() -> ExitCode {
         "memlife" => cmd_memlife(rest),
         "memprofile" => fulcrum::memprofile::cmd_memprofile(rest),
         "decompose" => cmd_decompose(rest),
+        "dispatchgap" => fulcrum::dispatchgap::cmd_dispatchgap(rest),
         "alloc" => cmd_alloc(rest),
         "model" => cmd_model(rest),
         "vs" => cmd_vs(rest),
