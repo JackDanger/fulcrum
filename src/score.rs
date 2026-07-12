@@ -387,6 +387,66 @@ pub fn compute_distribution(samples: &[f64]) -> &'static str {
     "NOISY"
 }
 
+// ─── Paired-difference verdict (replaces best-of-N min-fold — SCORE-PAIRED) ───
+//
+// WHY (2026-07-12): the best-of-N `min`-fold verdict (`ratio = best_rg /
+// best_native`) manufactured WRONG-SIGN false-PASSes when the arms had unequal
+// variance — a single lucky low native sample beat rg's tight min while native
+// was PAIRED-slower every round. CONFIRMED on storedheavy-512M-T4: best-of-N
+// said `native=1.05 PASS` (gz faster) while the interleaved paired-Δ with an A/A
+// control said gz ~5% SLOWER (replicated 3×). The verdict now delegates to the
+// same `crate::paired` stats the campaign trusts: log-ratio 95% CI must EXCLUDE 0
+// to resolve, and a native-vs-native A/A control must bracket 1.0 or the cell is
+// VOID. best/spread survive as printed DIAGNOSTICS only.
+
+/// Score-oriented paired verdict for one arm vs the comparator, from the
+/// INTERLEAVED wall vectors — `a_walls[i]` (subject: native/isal) and
+/// `b_walls[i]` (comparator: rg) were captured in the SAME round `i`, so they are
+/// already paired. Reuses `crate::paired`'s log-ratio CI + [`ab_verdict`] verbatim.
+///
+/// Returns `(score_ratio, verdict, logratio_ci)`:
+///   * `score_ratio` = comparator/subject point estimate = `exp(-mean ln(a/b))`
+///     (>=1 ⇒ subject at-or-faster) — continuous with the legacy `ratio` field so
+///     the SCORE line / yaml keep the same >=0.99 orientation.
+///   * `verdict` ∈ {`"PASS"`,`"FAIL"`,`"TIE"`}: CI of `ln(a/b)` clear <0 ⇒ subject
+///     faster ⇒ PASS; clear >0 ⇒ subject slower ⇒ FAIL; brackets 0 ⇒ TIE
+///     (Δ < spread — never a win).
+///   * `logratio_ci` = the CI on `ln(subject/comparator)` (the readout).
+pub fn paired_arm_verdict(
+    a_walls: &[f64],
+    b_walls: &[f64],
+) -> (f64, &'static str, crate::paired::Ci) {
+    use crate::paired::{ab_verdict, ci95, PairedSamples};
+    let ps = PairedSamples {
+        a_ms: a_walls.to_vec(),
+        b_ms: b_walls.to_vec(),
+    };
+    let lr_ci = ci95(&ps.log_ratios());
+    let verdict = match ab_verdict(&lr_ci) {
+        "RESOLVED-b-slower" => "PASS", // comparator slower ⇒ subject faster
+        "RESOLVED-a-slower" => "FAIL", // subject slower
+        _ => "TIE",                    // brackets 0 ⇒ Δ < spread
+    };
+    let score_ratio = (-lr_ci.mean).exp();
+    (score_ratio, verdict, lr_ci)
+}
+
+/// A/A harness-symmetry control: the SAME binary in both slots must paired-tie
+/// (log-ratio CI brackets 0 ⇒ ratio CI brackets 1.0). Returns `(void, bias)` —
+/// `void=true` ⇒ the harness shows a slot/variance bias against a binary compared
+/// with ITSELF, so every A/B number in this cell is noise-dominated and the arm
+/// verdict is VOID (mirrors `paired`'s mandatory A/A certificate). `bias` =
+/// `|exp(mean ln(a1/a2)) - 1|`.
+pub fn aa_control_void(a1: &[f64], a2: &[f64]) -> (bool, f64) {
+    use crate::paired::{ci95, PairedSamples};
+    let ps = PairedSamples {
+        a_ms: a1.to_vec(),
+        b_ms: a2.to_vec(),
+    };
+    let lr_ci = ci95(&ps.log_ratios());
+    (!lr_ci.brackets_zero(), (lr_ci.mean.exp() - 1.0).abs())
+}
+
 // ─── File hashing (streaming — no full-load for large sinks) ─────────────────
 
 /// SHA-256 of a file, streaming in 64 KiB chunks (no memory blowup for large files).
@@ -581,6 +641,41 @@ fn verify_correctness(
     Ok(())
 }
 
+// ─── A/A control capture (harness-symmetry pass, SINK LAW /dev/null) ──────────
+
+/// Capture an A/A control: the SAME binary timed twice per round (fixed order,
+/// mirroring the fixed-order A/B main loop so any slot bias baked into the A/B
+/// pairs shows up here too), `samples`+1 rounds (round 0 is a dropped warmup).
+/// Returns the two paired wall vectors. Uses the SINK-LAW `/dev/null`
+/// [`timed_run`]. Fed to [`aa_control_void`]: if the same binary does not
+/// paired-tie against itself, the cell is VOID (noise-dominated), not a PASS.
+fn capture_aa_control(
+    mask: &str,
+    binary: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+    samples: usize,
+    label: &str,
+    log: &mut String,
+) -> Result<(Vec<f64>, Vec<f64>), ScoreError> {
+    let mut s1 = Vec::with_capacity(samples);
+    let mut s2 = Vec::with_capacity(samples);
+    for i in 0..=samples {
+        let a = timed_run(mask, binary, extra_args, extra_env, log)?;
+        let b = timed_run(mask, binary, extra_args, extra_env, log)?;
+        if i == 0 {
+            continue; // warmup round dropped
+        }
+        s1.push(a);
+        s2.push(b);
+    }
+    log.push_str(&format!(
+        "## A/A {label}: {} paired rounds captured (same binary both slots)\n",
+        s1.len()
+    ));
+    Ok((s1, s2))
+}
+
 // ─── 3-way / 2-way interleaved wall capture ────────────────────────────────────
 
 /// Run the interleaved wall capture — 3-way (native / isal / rg) when
@@ -592,9 +687,14 @@ fn verify_correctness(
 ///      reps per binary): stdout piped through a streaming SHA-256, compared
 ///      to `args.decomp_pin`. Any mismatch fires `SCORE-SHA-VERIFY` and the
 ///      cell is VOID before a single timed sample is taken.
-///   2. **Timing** ([`timed_run`], best-of-N, `/dev/null` sink — SINK LAW):
-///      N+1 interleaved iterations (i=0 is warmup, dropped); every arm times
-///      the SAME sink so neither is penalized for its output volume/pattern.
+///   2. **Timing** ([`timed_run`], `/dev/null` sink — SINK LAW): N+1 interleaved
+///      iterations (i=0 is warmup, dropped); every arm times the SAME sink so
+///      neither is penalized for its output volume/pattern. The VERDICT is the
+///      PAIRED-difference of the per-round `(subject, rg)` walls ([`paired_arm_verdict`]
+///      — log-ratio 95% CI must exclude 0), NOT the best-of-N `min`-fold (which
+///      manufactured wrong-sign PASSes under unequal variance; see the SCORE-PAIRED
+///      note). A native-vs-native A/A control pass ([`capture_aa_control`]) then
+///      VOIDs the cell if the harness is not slot-symmetric.
 ///
 /// In 2-way mode the isal binary is never spawned/measured in EITHER pass
 /// (not merely dropped from the report).
@@ -674,7 +774,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         &mut log,
     )?;
 
-    // ── Pass 2: timing (best-of-N interleaved, /dev/null sink) ────────────
+    // ── Pass 2: timing (interleaved paired-diff, /dev/null sink) ──────────
     let mut native_walls: Vec<f64> = Vec::with_capacity(args.samples);
     let mut isal_walls: Vec<f64> = Vec::with_capacity(args.samples);
     let mut rg_walls: Vec<f64> = Vec::with_capacity(args.samples);
@@ -729,7 +829,38 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         }
     }
 
-    // Best = minimum wall; spread = max - min.
+    // ── Pass 2b: A/A harness-symmetry control (SCORE-PAIRED VOID gate) ─────
+    // The same binary in both slots MUST paired-tie against itself; if it does
+    // not, the harness has a slot/variance bias and every A/B number here is
+    // noise-dominated ⇒ the arm verdict is VOID, never a PASS.
+    log.push_str("## A/A control pass (harness symmetry; same binary both slots)\n");
+    let (naa1, naa2) = capture_aa_control(
+        &args.mask,
+        &args.native,
+        &gzippy_args,
+        &gzippy_env,
+        args.samples,
+        "native",
+        &mut log,
+    )?;
+    let (native_aa_void, native_aa_bias) = aa_control_void(&naa1, &naa2);
+    let (isal_aa_void, isal_aa_bias) = if two_way {
+        (false, 0.0)
+    } else {
+        let (iaa1, iaa2) = capture_aa_control(
+            &args.mask,
+            &args.isal,
+            &gzippy_args,
+            &gzippy_env,
+            args.samples,
+            "isal",
+            &mut log,
+        )?;
+        aa_control_void(&iaa1, &iaa2)
+    };
+
+    // Diagnostics only (NOT the verdict): best = min wall, spread = range,
+    // median = the paired-consistent point wall.
     let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let worst_native = native_walls
         .iter()
@@ -737,14 +868,17 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         .fold(f64::NEG_INFINITY, f64::max);
     let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let worst_rg = rg_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let native_med = crate::paired::median(&native_walls);
+    let rg_med = crate::paired::median(&rg_walls);
 
-    // ratio = rg_wall / build_wall (>= 0.99 = PASS).
-    let ratio_native = if best_native > 0.0 {
-        best_rg / best_native
-    } else {
-        0.0
-    };
-    let verdict_native: &'static str = if ratio_native >= 0.99 { "PASS" } else { "FAIL" };
+    // ── VERDICT: PAIRED-difference, NOT best-of-N min-fold (SCORE-PAIRED) ──
+    // ratio = comparator/subject point (>=0.99 = PASS, same orientation as the
+    // legacy field); verdict from the log-ratio CI; A/A bias overrides to VOID.
+    let (ratio_native, mut verdict_native, native_lr) =
+        paired_arm_verdict(&native_walls, &rg_walls);
+    if native_aa_void {
+        verdict_native = "VOID";
+    }
 
     let distribution = compute_distribution(&native_walls);
 
@@ -757,15 +891,23 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
     } else {
         let best_isal = isal_walls.iter().cloned().fold(f64::INFINITY, f64::min);
         let worst_isal = isal_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let ratio_isal = if best_isal > 0.0 {
-            best_rg / best_isal
-        } else {
-            0.0
-        };
-        let verdict_isal: &'static str = if ratio_isal >= 0.99 { "PASS" } else { "FAIL" };
+        let isal_med = crate::paired::median(&isal_walls);
+        let (ratio_isal, mut verdict_isal, isal_lr) =
+            paired_arm_verdict(&isal_walls, &rg_walls);
+        if isal_aa_void {
+            verdict_isal = "VOID";
+        }
         let isal_sha = sha256_file_hex(&args.isal).unwrap_or_else(|_| "unknown".into());
+        log.push_str(&format!(
+            "## isal:   median={isal_med:.0}ms best={best_isal:.0}ms spread={:.0}ms | \
+             ratio(rg/isal)={ratio_isal:.3} ln(isal/rg)_ci95=[{:.4},{:.4}] {verdict_isal} \
+             (A/A bias={isal_aa_bias:.4} void={isal_aa_void})\n",
+            worst_isal - best_isal,
+            isal_lr.lo,
+            isal_lr.hi,
+        ));
         Some(BuildMeasurement {
-            wall_ms: best_isal,
+            wall_ms: isal_med,
             spread_ms: worst_isal - best_isal,
             sha256_bin: isal_sha,
             ratio: ratio_isal,
@@ -774,27 +916,22 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         })
     };
 
-    let isal_result_line = match &isal_measurement {
-        Some(m) => format!(
-            "## isal:   best={:.0}ms spread={:.0}ms ratio={:.2} {}\n",
-            m.wall_ms, m.spread_ms, m.ratio, m.verdict
-        ),
-        None => String::new(),
-    };
-
     log.push_str(&format!(
-        "## RESULTS\n\
-         ## native: best={best_native:.0}ms spread={:.0}ms ratio={ratio_native:.2} {verdict_native}\n\
-         {isal_result_line}\
-         ## rg:     best={best_rg:.0}ms spread={:.0}ms ratio=1.00 COMPARATOR\n\
+        "## RESULTS (paired-difference verdict — best-of-N min-fold is a DIAGNOSTIC only)\n\
+         ## native: median={native_med:.0}ms best={best_native:.0}ms spread={:.0}ms | \
+         ratio(rg/native)={ratio_native:.3} ln(native/rg)_ci95=[{:.4},{:.4}] {verdict_native} \
+         (A/A bias={native_aa_bias:.4} void={native_aa_void})\n\
+         ## rg:     median={rg_med:.0}ms best={best_rg:.0}ms spread={:.0}ms ratio=1.00 COMPARATOR\n\
          ## distribution: {distribution}\n",
         worst_native - best_native,
+        native_lr.lo,
+        native_lr.hi,
         worst_rg - best_rg,
     ));
 
     Ok(CaptureResult {
         rg: BuildMeasurement {
-            wall_ms: best_rg,
+            wall_ms: rg_med,
             spread_ms: worst_rg - best_rg,
             sha256_bin: rg_sha,
             ratio: 1.0,
@@ -802,7 +939,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
             flavor: "native-elf",
         },
         native: BuildMeasurement {
-            wall_ms: best_native,
+            wall_ms: native_med,
             spread_ms: worst_native - best_native,
             sha256_bin: native_sha,
             ratio: ratio_native,
@@ -855,37 +992,29 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
         segments.join(" | ")
     );
 
-    let verdict_prose = match (&capture.isal, capture.native.verdict) {
-        (Some(isal), "PASS") if isal.verdict == "PASS" => format!(
-            "Both gzippy-native ({:.2}x) and gzippy-isal ({:.2}x) PASS the 0.99x bar \
-             vs rapidgzip-native. Distribution: {}.",
-            capture.native.ratio, isal.ratio, capture.distribution
+    // Per-arm prose — token-aware so PASS / FAIL / TIE / VOID each read
+    // honestly (a VOID/TIE must NEVER be worded as a PASS or a plain FAIL).
+    // The verdict comes from the paired log-ratio CI (SCORE-PAIRED), not a
+    // best-of-N min-fold, so the ratio is the comparator/subject point estimate.
+    fn arm_phrase(name: &str, ratio: f64, verdict: &str) -> String {
+        match verdict {
+            "PASS" => format!("{name} PASSES the 0.99x bar ({ratio:.2}x rg — paired CI clear of parity)"),
+            "FAIL" => format!("{name} FAILS the 0.99x bar ({ratio:.2}x rg — paired CI shows it slower)"),
+            "TIE" => format!("{name} TIES rg within noise ({ratio:.2}x — paired CI brackets parity, Δ<spread)"),
+            "VOID" => format!("{name} is VOID ({ratio:.2}x — A/A harness bias; cell noise-dominated, NOT a pass)"),
+            other => format!("{name} {other} ({ratio:.2}x rg)"),
+        }
+    }
+    let native_phrase = arm_phrase("gzippy-native", capture.native.ratio, capture.native.verdict);
+    let verdict_prose = match &capture.isal {
+        Some(isal) => format!(
+            "{native_phrase}. {}. Distribution: {}.",
+            arm_phrase("gzippy-isal", isal.ratio, isal.verdict),
+            capture.distribution
         ),
-        (Some(isal), "FAIL") if isal.verdict == "PASS" => format!(
-            "gzippy-isal PASSES ({:.2}x rg) but gzippy-native FAILS ({:.2}x rg). \
-             The pure-Rust engine is the binding constraint at this thread count. \
-             Distribution: {}.",
-            isal.ratio, capture.native.ratio, capture.distribution
-        ),
-        (Some(isal), "PASS") => format!(
-            "gzippy-native PASSES ({:.2}x rg) but gzippy-isal FAILS ({:.2}x rg). \
-             Distribution: {}.",
-            capture.native.ratio, isal.ratio, capture.distribution
-        ),
-        (Some(isal), _) => format!(
-            "Both gzippy-native ({:.2}x) and gzippy-isal ({:.2}x) FAIL \
-             to reach the 0.99x bar vs rapidgzip-native. Distribution: {}.",
-            capture.native.ratio, isal.ratio, capture.distribution
-        ),
-        (None, "PASS") => format!(
-            "gzippy-native PASSES ({:.2}x rg) vs rapidgzip-native \
-             (2-way capture — no isal build measured). Distribution: {}.",
-            capture.native.ratio, capture.distribution
-        ),
-        (None, _) => format!(
-            "gzippy-native FAILS to reach the 0.99x bar vs rapidgzip-native ({:.2}x) \
-             (2-way capture — no isal build measured). Distribution: {}.",
-            capture.native.ratio, capture.distribution
+        None => format!(
+            "{native_phrase} (2-way capture — no isal build measured). Distribution: {}.",
+            capture.distribution
         ),
     };
 
@@ -1831,6 +1960,34 @@ pub fn selftest() -> ExitCode {
         Err(e) => check(&format!("sha-mismatch run ({e})"), false),
     }
 
+    // 9. SCORE-PAIRED (legacy 3-way/2-way path): the paired-diff verdict must
+    //    FLIP the best-of-N false-PASS on an unequal-variance cell (the
+    //    storedheavy-512M-T4 wrong-sign bug reproduced synthetically). One deep
+    //    native dip (lucky best-of-N min) + a paired-slower body ⇒ paired FAIL.
+    {
+        let native_walls = vec![95.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0];
+        let rg_walls = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+        let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
+        let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
+        let best_of_n_pass = best_rg / best_native >= 0.99;
+        let (_r, verdict, _lr) = paired_arm_verdict(&native_walls, &rg_walls);
+        check(
+            "SCORE-PAIRED: best-of-N (wrongly) PASSes the unequal-variance cell",
+            best_of_n_pass,
+        );
+        check(
+            "SCORE-PAIRED: paired-diff verdict FLIPS it to FAIL (right sign)",
+            verdict == "FAIL",
+        );
+        // A/A control voids a slot-biased harness.
+        let b1 = vec![105.0, 105.0, 106.0, 104.0, 105.0, 105.0, 106.0];
+        let b2 = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+        check(
+            "SCORE-PAIRED: A/A control VOIDs a slot-biased harness",
+            aa_control_void(&b1, &b2).0,
+        );
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -2188,6 +2345,79 @@ mod tests {
         let line1 = cell.lines().next().unwrap();
         assert!(line1.contains("native=1.02 PASS"), "{line1}");
         assert!(line1.contains("isal=1.05 PASS"), "{line1}");
+    }
+
+    // ── SCORE-PAIRED: paired-diff verdict replaces best-of-N min-fold ──────────
+
+    /// The exact bug this fix exists to kill: an unequal-variance cell where a
+    /// single lucky low native sample (the min) beats rg's tight min — so the
+    /// best-of-N `min`-fold verdict says PASS (native "faster") — while native
+    /// is PAIRED-slower every other round, so the paired log-ratio CI resolves
+    /// FAIL. This synthetic vector reproduces storedheavy-512M-T4's wrong sign.
+    #[test]
+    fn paired_verdict_flips_best_of_n_false_pass_on_unequal_variance() {
+        // round 0: one deep native dip (the lucky best-of-N min); rounds 1..8:
+        // native consistently ~12% slower than a tight rg.
+        let native_walls = vec![95.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0];
+        let rg_walls = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+
+        // BEST-OF-N (the OLD verdict) would PASS: min_rg/min_native = 100/95 = 1.05 >= 0.99.
+        let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
+        let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
+        let best_of_n_ratio = best_rg / best_native;
+        assert!(
+            best_of_n_ratio >= 0.99,
+            "precondition: best-of-N must (wrongly) PASS, got {best_of_n_ratio:.3}"
+        );
+
+        // PAIRED (the NEW verdict) must FAIL — native is paired-slower.
+        let (ratio, verdict, lr) = paired_arm_verdict(&native_walls, &rg_walls);
+        assert_eq!(
+            verdict, "FAIL",
+            "paired verdict must FAIL (native slower), got {verdict} ratio={ratio:.3} ci=[{:.4},{:.4}]",
+            lr.lo, lr.hi
+        );
+        assert!(
+            ratio < 0.99,
+            "score ratio (rg/native) must be <0.99 for a paired FAIL, got {ratio:.3}"
+        );
+        // ln(native/rg) CI must exclude 0 on the SLOWER side (lo > 0).
+        assert!(lr.lo > 0.0, "log-ratio CI must be clear of 0 (native slower): [{:.4},{:.4}]", lr.lo, lr.hi);
+    }
+
+    #[test]
+    fn paired_verdict_pass_when_subject_paired_faster() {
+        // native tightly ~10% faster than rg every round ⇒ PASS.
+        let native = vec![90.0, 91.0, 89.0, 90.0, 91.0, 89.0, 90.0];
+        let rg = vec![100.0, 101.0, 99.0, 100.0, 101.0, 99.0, 100.0];
+        let (ratio, verdict, _lr) = paired_arm_verdict(&native, &rg);
+        assert_eq!(verdict, "PASS", "ratio={ratio:.3}");
+        assert!(ratio > 1.0, "rg/native ratio must exceed 1.0: {ratio:.3}");
+    }
+
+    #[test]
+    fn paired_verdict_tie_when_ci_brackets_parity() {
+        // interleaved noise around parity ⇒ CI brackets 0 ⇒ TIE, never a win.
+        let native = vec![100.0, 101.0, 99.0, 100.5, 99.5, 100.0, 101.0, 99.0, 100.0];
+        let rg = vec![100.0, 99.0, 101.0, 99.5, 100.5, 100.0, 99.0, 101.0, 100.0];
+        let (_ratio, verdict, _lr) = paired_arm_verdict(&native, &rg);
+        assert_eq!(verdict, "TIE");
+    }
+
+    #[test]
+    fn aa_control_voids_a_biased_harness_and_passes_a_symmetric_one() {
+        // Symmetric A/A: same-binary walls tie ⇒ NOT void.
+        let a1 = vec![100.0, 101.0, 99.0, 100.0, 101.0, 99.0, 100.0];
+        let a2 = vec![100.0, 99.0, 101.0, 100.0, 99.0, 101.0, 100.0];
+        let (void, bias) = aa_control_void(&a1, &a2);
+        assert!(!void, "symmetric A/A must not VOID (bias={bias:.4})");
+
+        // Biased A/A: slot-1 systematically ~5% slower than slot-2 ⇒ VOID.
+        let b1 = vec![105.0, 105.0, 106.0, 104.0, 105.0, 105.0, 106.0];
+        let b2 = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+        let (void2, bias2) = aa_control_void(&b1, &b2);
+        assert!(void2, "biased A/A must VOID (bias={bias2:.4})");
+        assert!(bias2 > 0.02, "reported A/A bias must be material: {bias2:.4}");
     }
 
     // ── 2-way mode (native vs rg only, --isal omitted) ─────────────────────────
