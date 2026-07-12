@@ -39,7 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memprofile;
 use crate::paired;
@@ -49,6 +49,15 @@ use crate::paired;
 /// RSS is flagged a COST when the candidate's peak exceeds the base by at least
 /// this fraction (5%). Below it the memory tradeoff is in the noise.
 const RSS_COST_PCT: f64 = 5.0;
+
+/// Overfit guard: a "clean separator" whose MINORITY class (the smaller of the
+/// two outcome classes it must isolate) has at most this many cells is NOT
+/// trusted — one coincidental point can manufacture a perfect split. At or below
+/// this support count the verdict is tagged CONFIDENCE=LOW regardless of the
+/// reported accuracy. (This is the exact bug the guard exists to catch: the
+/// deep-prefetch sweep reported worker_busy "accuracy 1.000" resting on ONE
+/// regress cell of 33 — later falsified by hand-measuring more points.)
+const MIN_SUPPORT: usize = 3;
 
 /// Nominal compressed bytes per decode chunk — the proxy denominator for the
 /// `chunk_count` static param (gzippy/rapidgzip target a few-MiB compressed
@@ -238,7 +247,7 @@ fn static_params(path: &Path) -> Result<StaticParams, String> {
 
 // ───────────────────────────── row ─────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Win,     // cand faster than base (CI resolved)
     Regress, // cand slower than base (CI resolved)
@@ -254,7 +263,7 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactorRow {
     pub corpus: String,
     pub t: usize,
@@ -458,6 +467,30 @@ fn best_pair(
     best
 }
 
+/// The self-confidence / overfit guard layered on top of a separation verdict.
+/// A separator can be "accuracy 1.000" and still be a coincidence if it rests on
+/// a tiny minority class or a single fragile cell — this quantifies that.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Confidence {
+    /// which outcome class is the minority the separator must isolate.
+    pub minority_label: String,
+    /// number of cells in that minority class (the separator's true support).
+    pub minority_count: usize,
+    pub min_support: usize,
+    /// "HIGH" | "LOW" | "N/A" (degenerate, no boundary).
+    pub level: String,
+    /// leave-one-out stable: no single minority-cell removal collapses the
+    /// separation or flips the chosen split feature.
+    pub robust: bool,
+    /// one-line reason for the robust/not-robust verdict.
+    pub robustness_note: String,
+    /// cells whose individual removal breaks the separator (collapse or flip).
+    pub fragile_cells: Vec<String>,
+    /// when LOW / not-robust: the exact follow-up measurement to run before
+    /// trusting or gating on this separator.
+    pub next_measurement: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FactorVerdict {
     pub label: String, // "win-vs-regress" or "rss-cost"
@@ -471,6 +504,187 @@ pub struct FactorVerdict {
     pub n_factors: usize, // 0 = degenerate, 1 = single suffices, 2 = pair needed
     pub minimal_set: Vec<String>,
     pub summary: String,
+    /// self-confidence / overfit guard (class balance + leave-one-out robustness).
+    pub confidence: Confidence,
+}
+
+/// The pos/neg human labels for a verdict's two classes.
+fn class_labels(verdict_label: &str) -> (&'static str, &'static str) {
+    if verdict_label == "win-vs-regress" {
+        ("WIN", "REGRESS")
+    } else {
+        ("RSS-COST", "no-cost")
+    }
+}
+
+/// Compact per-cell identity for naming a fragile point in a robustness report.
+fn cell_label(r: &FactorRow) -> String {
+    format!("{}:T{}", trunc(&r.corpus, 60), r.t)
+}
+
+/// Rank every single predictor by its best decision-stump split of `labels`.
+/// Deterministic; sorted by accuracy then clean-margin. Shared by the primary
+/// separation and the leave-one-out robustness recompute.
+fn rank_stumps(rows: &[&FactorRow], labels: &[bool]) -> Vec<Stump> {
+    if rows.is_empty() {
+        return vec![];
+    }
+    let names: Vec<&'static str> = predictors(rows[0]).into_iter().map(|(n, _)| n).collect();
+    let cols: Vec<Vec<f64>> = names
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| rows.iter().map(|r| predictors(r)[idx].1).collect())
+        .collect();
+    let mut ranking: Vec<Stump> = names
+        .iter()
+        .enumerate()
+        .map(|(idx, nm)| best_stump(nm, &cols[idx], labels))
+        .collect();
+    ranking.sort_by(|a, b| {
+        b.accuracy
+            .partial_cmp(&a.accuracy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.margin
+                    .partial_cmp(&a.margin)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    ranking
+}
+
+/// The self-confidence / overfit guard: class balance + leave-one-out robustness.
+///
+/// - CLASS BALANCE: the minority class is the separator's real support. At or
+///   below MIN_SUPPORT cells ⇒ CONFIDENCE=LOW (a perfect split may be a fluke).
+/// - LEAVE-ONE-OUT: drop each minority cell in turn and re-fit the single-param
+///   separator. If any removal (a) leaves only one class — the boundary vanished,
+///   it rested entirely on that point — or (b) flips the chosen split feature,
+///   the separator is NOT ROBUST and the offending cell is named.
+/// - NEXT MEASUREMENT: when LOW / not-robust, the exact follow-up to run.
+fn assess_confidence(
+    verdict_label: &str,
+    rows: &[&FactorRow],
+    labels: &[bool],
+    best_single: &Option<Stump>,
+    single_sufficient: bool,
+) -> Confidence {
+    let n = labels.len();
+    let n_true = labels.iter().filter(|b| **b).count();
+    let n_false = n - n_true;
+    let (pos, neg) = class_labels(verdict_label);
+
+    // degenerate: no boundary to be (un)confident about.
+    if n_true == 0 || n_false == 0 {
+        return Confidence {
+            minority_label: String::new(),
+            minority_count: 0,
+            min_support: MIN_SUPPORT,
+            level: "N/A".to_string(),
+            robust: true,
+            robustness_note: "degenerate (one class) — no boundary".to_string(),
+            fragile_cells: vec![],
+            next_measurement: None,
+        };
+    }
+
+    let minority_is_true = n_true <= n_false;
+    let minority_count = n_true.min(n_false);
+    let minority_label = if minority_is_true { pos } else { neg }.to_string();
+    let level = if minority_count <= MIN_SUPPORT { "LOW" } else { "HIGH" }.to_string();
+
+    // ── leave-one-out robustness (only meaningful for a clean single separator) ──
+    let orig_param = best_single
+        .as_ref()
+        .filter(|s| s.clean)
+        .map(|s| s.param.clone());
+    let mut fragile_cells: Vec<String> = Vec::new();
+    let robust;
+    let robustness_note;
+
+    if single_sufficient && orig_param.is_some() {
+        let orig_param = orig_param.unwrap();
+        let minority_idxs: Vec<usize> =
+            (0..n).filter(|&k| labels[k] == minority_is_true).collect();
+        for &m in &minority_idxs {
+            let sub_rows: Vec<&FactorRow> =
+                (0..n).filter(|&k| k != m).map(|k| rows[k]).collect();
+            let sub_labels: Vec<bool> = (0..n).filter(|&k| k != m).map(|k| labels[k]).collect();
+            let st = sub_labels.iter().filter(|b| **b).count();
+            let sf = sub_labels.len() - st;
+            if st == 0 || sf == 0 {
+                // boundary vanished — the split rested entirely on this point.
+                fragile_cells.push(format!(
+                    "{} (removing it leaves only {} cells — boundary vanishes)",
+                    cell_label(rows[m]),
+                    if st == 0 { neg } else { pos }
+                ));
+                continue;
+            }
+            let sub_rank = rank_stumps(&sub_rows, &sub_labels);
+            match sub_rank.first() {
+                Some(s) if s.clean && s.param == orig_param => { /* stable */ }
+                Some(s) if s.clean => fragile_cells.push(format!(
+                    "{} (split feature flips {} → {})",
+                    cell_label(rows[m]),
+                    orig_param,
+                    s.param
+                )),
+                _ => fragile_cells.push(format!(
+                    "{} (clean separation collapses when removed)",
+                    cell_label(rows[m])
+                )),
+            }
+        }
+        robust = fragile_cells.is_empty();
+        robustness_note = if robust {
+            "leave-one-out stable — no single minority-cell removal breaks the separator".to_string()
+        } else {
+            "single-point-dependent — a lone minority cell manufactures the split".to_string()
+        };
+    } else {
+        // no clean single-param separator to stress-test (pair / multi-factor).
+        robust = true;
+        robustness_note =
+            "no clean single-param separator — leave-one-out N/A (pair/multi-factor)".to_string();
+    }
+
+    // NOTE: `robust` (leave-one-out) and `level` (class balance) are INDEPENDENT
+    // axes. A minority of 2-3 can pass LOO yet still be CONFIDENCE=LOW — too few
+    // points to trust a boundary — hence the NEXT-MEASUREMENT line fires on LOW
+    // regardless of the LOO result.
+
+    // ── next measurement (when LOW or not-robust) ──
+    let next_measurement = if level == "LOW" || !fragile_cells.is_empty() {
+        // name the feature+value to vary: prefer the (best) single separator.
+        let (feat, val) = best_single
+            .as_ref()
+            .map(|s| (s.param.clone(), s.threshold))
+            .unwrap_or_else(|| ("the separator feature".to_string(), f64::NAN));
+        let k = (MIN_SUPPORT + 2).saturating_sub(minority_count).max(3);
+        let val_str = if val.is_finite() {
+            format!("{:.4}", val)
+        } else {
+            "the boundary value".to_string()
+        };
+        Some(format!(
+            "gather >= {} more {}-side cells near the boundary (vary {} around {}) before trusting/gating this separator",
+            k, minority_label, feat, val_str
+        ))
+    } else {
+        None
+    };
+
+    Confidence {
+        minority_label,
+        minority_count,
+        min_support: MIN_SUPPORT,
+        level,
+        robust,
+        robustness_note,
+        fragile_cells,
+        next_measurement,
+    }
 }
 
 /// Run the separation analysis for one binary labeling of the rows.
@@ -506,24 +720,11 @@ fn separate(
                 "DEGENERATE: all cells are one class ({} true / {} false) — no boundary to characterize",
                 n_true, n_false
             ),
+            confidence: assess_confidence(label, rows, labels, &None, false),
         };
     }
 
-    let mut ranking: Vec<Stump> = names
-        .iter()
-        .enumerate()
-        .map(|(idx, nm)| best_stump(nm, &cols[idx], labels))
-        .collect();
-    ranking.sort_by(|a, b| {
-        b.accuracy
-            .partial_cmp(&a.accuracy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b.margin
-                    .partial_cmp(&a.margin)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
+    let ranking: Vec<Stump> = rank_stumps(rows, labels);
     let best_single = ranking.first().cloned();
     let single_sufficient = best_single.as_ref().map(|s| s.clean).unwrap_or(false);
 
@@ -567,6 +768,29 @@ fn separate(
         }
     };
 
+    let confidence =
+        assess_confidence(label, rows, labels, &best_single, single_sufficient);
+
+    // Never let a bare "accuracy 1.0" stand un-priced: fold the overfit verdict
+    // into the summary so a downstream reader can't quote the clean split alone.
+    let summary = match confidence.level.as_str() {
+        "LOW" => format!(
+            "{summary} [CONFIDENCE=LOW — overfit-risk: rests on {} {} minority cell(s){}]",
+            confidence.minority_count,
+            confidence.minority_label,
+            if confidence.robust {
+                String::new()
+            } else {
+                "; NOT ROBUST (single-point-dependent)".to_string()
+            }
+        ),
+        "HIGH" if !confidence.robust => format!(
+            "{summary} [CONFIDENCE=HIGH but NOT ROBUST — split feature flips/collapses under leave-one-out]"
+        ),
+        "HIGH" => format!("{summary} [CONFIDENCE=HIGH — robust under leave-one-out]"),
+        _ => summary,
+    };
+
     FactorVerdict {
         label: label.to_string(),
         n_true,
@@ -579,6 +803,7 @@ fn separate(
         n_factors,
         minimal_set,
         summary,
+        confidence,
     }
 }
 
@@ -663,7 +888,126 @@ fn print_verdict(v: &FactorVerdict) {
         );
     }
     println!("  n_factors={}  minimal_set={:?}", v.n_factors, v.minimal_set);
+
+    // ── self-confidence / overfit guard ──
+    let c = &v.confidence;
+    let (pos, neg) = class_labels(&v.label);
+    if v.label == "win-vs-regress" {
+        println!(
+            "  CLASS BALANCE: {} WIN / {} TIE / {} REGRESS",
+            v.n_true, v.excluded_ties, v.n_false
+        );
+    } else {
+        println!("  CLASS BALANCE: {} {} / {} {}", v.n_true, pos, v.n_false, neg);
+    }
+    if c.level == "N/A" {
+        println!("  CONFIDENCE=N/A ({})", c.robustness_note);
+    } else {
+        let plural = if c.minority_count == 1 { "" } else { "s" };
+        println!(
+            "  minority class = {} ({} cell{})",
+            c.minority_label, c.minority_count, plural
+        );
+        if c.level == "LOW" {
+            println!(
+                "  CONFIDENCE=LOW (overfit-risk: separator rests on {} minority cell{}, <= MIN_SUPPORT={})",
+                c.minority_count, plural, c.min_support
+            );
+        } else {
+            println!(
+                "  CONFIDENCE=HIGH (minority class {} > MIN_SUPPORT={})",
+                c.minority_count, c.min_support
+            );
+        }
+        if c.robustness_note.contains("N/A") {
+            println!("  LEAVE-ONE-OUT: N/A — {}", c.robustness_note);
+        } else if c.robust {
+            println!(
+                "  LEAVE-ONE-OUT: ROBUST — {}",
+                c.robustness_note
+            );
+        } else {
+            println!("  LEAVE-ONE-OUT: NOT ROBUST — {}", c.robustness_note);
+            for fc in &c.fragile_cells {
+                println!("      fragile cell: {}", fc);
+            }
+        }
+        if let Some(nm) = &c.next_measurement {
+            println!("  NEXT MEASUREMENT: {}", nm);
+        }
+    }
+
     println!("  => {}", v.summary);
+}
+
+// ───────────────────────────── analysis ─────────────────────────────
+
+/// Run BOTH separation analyses (win-vs-regress, excluding TIEs; and rss-cost)
+/// over a set of captured rows. Pure — no box needed — so a banked sweep JSON
+/// can be RE-CHARACTERIZED (`fulcrum sweep --analyze <json>`) without re-running
+/// the walls. Returns (win_vs_regress, rss_cost).
+pub fn analyze_rows(rows: &[FactorRow]) -> (FactorVerdict, FactorVerdict) {
+    // win-vs-regress: exclude TIE cells.
+    let wr_rows: Vec<&FactorRow> = rows.iter().filter(|r| r.outcome != Outcome::Tie).collect();
+    let ties = rows.len() - wr_rows.len();
+    let mut win_vs_regress = if wr_rows.is_empty() {
+        FactorVerdict {
+            label: "win-vs-regress".to_string(),
+            n_true: 0,
+            n_false: 0,
+            excluded_ties: ties,
+            single_param_ranking: vec![],
+            best_single: None,
+            single_sufficient: false,
+            best_pair: None,
+            n_factors: 0,
+            minimal_set: vec![],
+            summary: "DEGENERATE: every cell is a TIE — the lever moves no wall".to_string(),
+            confidence: Confidence {
+                level: "N/A".to_string(),
+                min_support: MIN_SUPPORT,
+                robust: true,
+                robustness_note: "every cell is a TIE — no boundary".to_string(),
+                ..Default::default()
+            },
+        }
+    } else {
+        let labels: Vec<bool> = wr_rows.iter().map(|r| r.outcome == Outcome::Win).collect();
+        separate("win-vs-regress", &wr_rows, &labels)
+    };
+    win_vs_regress.excluded_ties = ties;
+
+    // rss-cost: all rows, label = cand peak exceeds base by >= RSS_COST_PCT.
+    let rss_rows: Vec<&FactorRow> = rows.iter().collect();
+    let rss_labels: Vec<bool> = rss_rows.iter().map(|r| r.rss_delta_pct >= RSS_COST_PCT).collect();
+    let rss_cost = separate("rss-cost", &rss_rows, &rss_labels);
+
+    (win_vs_regress, rss_cost)
+}
+
+/// Re-characterize a banked sweep JSON (rows already captured) — no box needed.
+/// Deserializes the `rows` array and re-runs the separation + confidence guard,
+/// printing the table and both verdicts. This is how a previously-banked sweep
+/// (e.g. the deep-prefetch one that over-claimed worker_busy accuracy 1.000) is
+/// re-audited under the overfit guard.
+pub fn analyze_json(path: &Path) -> Result<(), String> {
+    let txt = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let rows_val = v
+        .get("rows")
+        .ok_or_else(|| format!("{}: no `rows` array", path.display()))?;
+    let rows: Vec<FactorRow> = serde_json::from_value(rows_val.clone())
+        .map_err(|e| format!("{}: deserialize rows: {e}", path.display()))?;
+    if rows.is_empty() {
+        return Err(format!("{}: rows array is empty", path.display()));
+    }
+    println!("── RE-ANALYSIS of banked sweep: {} ({} rows) ──", path.display(), rows.len());
+    print_table(&rows);
+    let (wvr, rss) = analyze_rows(&rows);
+    print_verdict(&wvr);
+    print_verdict(&rss);
+    Ok(())
 }
 
 // ───────────────────────────── driver ─────────────────────────────
@@ -778,37 +1122,8 @@ pub fn run(cfg: &FactorCfg) -> Result<SweepReport, String> {
         }
     }
 
-    // -- separation analyses --
-    // win-vs-regress: exclude TIE cells.
-    let wr_rows: Vec<&FactorRow> = rows
-        .iter()
-        .filter(|r| r.outcome != Outcome::Tie)
-        .collect();
-    let ties = rows.len() - wr_rows.len();
-    let mut win_vs_regress = if wr_rows.is_empty() {
-        FactorVerdict {
-            label: "win-vs-regress".to_string(),
-            n_true: 0,
-            n_false: 0,
-            excluded_ties: ties,
-            single_param_ranking: vec![],
-            best_single: None,
-            single_sufficient: false,
-            best_pair: None,
-            n_factors: 0,
-            minimal_set: vec![],
-            summary: "DEGENERATE: every cell is a TIE — the lever moves no wall".to_string(),
-        }
-    } else {
-        let labels: Vec<bool> = wr_rows.iter().map(|r| r.outcome == Outcome::Win).collect();
-        separate("win-vs-regress", &wr_rows, &labels)
-    };
-    win_vs_regress.excluded_ties = ties;
-
-    // rss-cost: all rows, label = cand peak exceeds base by >= RSS_COST_PCT.
-    let rss_rows: Vec<&FactorRow> = rows.iter().collect();
-    let rss_labels: Vec<bool> = rss_rows.iter().map(|r| r.rss_delta_pct >= RSS_COST_PCT).collect();
-    let rss_cost = separate("rss-cost", &rss_rows, &rss_labels);
+    // -- separation analyses (win-vs-regress + rss-cost, incl. confidence guard) --
+    let (win_vs_regress, rss_cost) = analyze_rows(&rows);
 
     Ok(SweepReport {
         cand: cfg.cand.clone(),
@@ -846,6 +1161,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let get = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
     };
+    // --analyze <json>: re-characterize a banked sweep (no box, no walls).
+    if let Some(p) = get("--analyze") {
+        return match analyze_json(Path::new(&p)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("sweep --analyze: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let (Some(cand), Some(base), Some(run_tmpl)) =
         (get("--cand"), get("--base"), get("--run"))
     else {
@@ -853,6 +1178,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "usage: fulcrum sweep --cand <bin> --base <bin> --run '<tmpl {{bin}} {{threads}} {{corpus}}>' \\\n\
              \x20 --corpora a.gz,b.gz,... --threads 2,4,8 [--rg <bin>] [--n 51] [--warmup 2] \\\n\
              \x20 [--interval-ms 3] [--out sweep.json]\n\
+             \x20 fulcrum sweep --analyze <sweep.json>   re-characterize a BANKED sweep (no box)\n\
              \x20 fulcrum sweep --selftest       Gate-0 separation self-test (hermetic)\n\
              (the capture/mine thread-scaling sweep is still 'fulcrum sweep capture|mine')"
         );
@@ -957,6 +1283,15 @@ fn synth_row(ratio: f64, worker_busy: f64, win: bool) -> FactorRow {
     }
 }
 
+/// Like `synth_row` but with a distinct cell identity (corpus name + T) so the
+/// leave-one-out robustness report can NAME the fragile cell in the selftest.
+fn synth_row_id(id: &str, t: usize, ratio: f64, worker_busy: f64, win: bool) -> FactorRow {
+    let mut r = synth_row(ratio, worker_busy, win);
+    r.corpus = id.to_string();
+    r.t = t;
+    r
+}
+
 pub fn selftest() -> ExitCode {
     let mut pass = 0u32;
     let mut fail = 0u32;
@@ -1006,6 +1341,13 @@ pub fn selftest() -> ExitCode {
                 .as_ref()
                 .map(|s| s.threshold > 1.5 && s.threshold < 1.7)
                 .unwrap_or(false),
+        );
+        // 4 win / 4 regress ⇒ minority 4 > MIN_SUPPORT(3): HIGH + robust.
+        check("1-factor: CONFIDENCE=HIGH", v.confidence.level == "HIGH");
+        check("1-factor: ROBUST (leave-one-out stable)", v.confidence.robust);
+        check(
+            "1-factor: no NEXT-MEASUREMENT when HIGH+robust",
+            v.confidence.next_measurement.is_none(),
         );
     }
 
@@ -1106,11 +1448,118 @@ pub fn selftest() -> ExitCode {
         check("stored-scan: complete", complete);
     }
 
+    // -- Case G: THE EXACT BUG. A "perfect" separator (worker_busy) resting on
+    //    exactly ONE minority (regress) cell. The guard MUST tag CONFIDENCE=LOW,
+    //    NOT ROBUST (single-point-dependent), name that cell, and recommend more
+    //    points — instead of a bare "accuracy 1.000". (This mirrors the banked
+    //    deep-prefetch sweep: 1 regress cell of 33, worker_busy=1.0.)
+    {
+        let rows_owned = vec![
+            synth_row_id("win-a", 2, 2.0, 0.10, true),
+            synth_row_id("win-b", 4, 2.0, 0.50, true),
+            synth_row_id("win-c", 8, 2.0, 0.70, true),
+            synth_row_id("win-d", 16, 2.0, 0.90, true),
+            synth_row_id("win-e", 2, 2.0, 0.30, true),
+            synth_row_id("regress-x", 2, 2.0, 1.00, false), // the lone minority
+        ];
+        let refs: Vec<&FactorRow> = rows_owned.iter().collect();
+        let labels: Vec<bool> = refs.iter().map(|r| r.outcome == Outcome::Win).collect();
+        let v = separate("win-vs-regress", &refs, &labels);
+        // it DOES find a clean single separator (the over-claim)…
+        check("bug: clean single separator found", v.single_sufficient);
+        // …but the guard must refuse to trust it.
+        check("bug: CONFIDENCE=LOW", v.confidence.level == "LOW");
+        check("bug: minority_count==1", v.confidence.minority_count == 1);
+        check("bug: NOT ROBUST (single-point-dependent)", !v.confidence.robust);
+        check(
+            "bug: names the fragile regress cell",
+            v.confidence.fragile_cells.iter().any(|c| c.contains("regress-x")),
+        );
+        check(
+            "bug: NEXT-MEASUREMENT recommends more points near boundary",
+            v.confidence
+                .next_measurement
+                .as_ref()
+                .map(|m| m.contains("gather") && m.contains("worker_busy"))
+                .unwrap_or(false),
+        );
+        check(
+            "bug: summary is NOT a bare accuracy 1.000 (carries CONFIDENCE=LOW)",
+            v.summary.contains("CONFIDENCE=LOW") && v.summary.contains("overfit"),
+        );
+    }
+
+    // -- Case H: LEAVE-ONE-OUT FEATURE FLIP. ratio cleanly separates the full
+    //    set (minority=4 regress ⇒ CONFIDENCE=HIGH by class balance), but ONE
+    //    regress cell (the "spoiler") is the only thing keeping worker_busy from
+    //    also separating — removing it flips the chosen split feature
+    //    ratio→worker_busy. The guard must report NOT ROBUST and name the spoiler
+    //    even though the class balance is HIGH.
+    {
+        let rows_owned = vec![
+            // 5 wins: ratio>1.6, low busy
+            synth_row_id("w1", 2, 1.7, 0.10, true),
+            synth_row_id("w2", 4, 1.9, 0.15, true),
+            synth_row_id("w3", 8, 2.5, 0.20, true),
+            synth_row_id("w4", 16, 3.1, 0.25, true),
+            synth_row_id("w5", 2, 2.0, 0.22, true),
+            // 4 regress: ratio<1.6, high busy — except the spoiler (low busy)
+            synth_row_id("r1", 2, 1.0, 0.80, false),
+            synth_row_id("r2", 4, 1.1, 0.85, false),
+            synth_row_id("r3", 8, 1.3, 0.90, false),
+            synth_row_id("spoiler", 2, 1.4, 0.12, false),
+        ];
+        let refs: Vec<&FactorRow> = rows_owned.iter().collect();
+        let labels: Vec<bool> = refs.iter().map(|r| r.outcome == Outcome::Win).collect();
+        let v = separate("win-vs-regress", &refs, &labels);
+        check(
+            "flip: original clean separator is ratio",
+            v.best_single.as_ref().map(|s| s.param == "ratio" && s.clean).unwrap_or(false),
+        );
+        check("flip: CONFIDENCE=HIGH (minority=4 > MIN_SUPPORT)", v.confidence.level == "HIGH");
+        check("flip: minority_count==4", v.confidence.minority_count == 4);
+        check("flip: NOT ROBUST", !v.confidence.robust);
+        check(
+            "flip: names the spoiler cell + says feature flips",
+            v.confidence
+                .fragile_cells
+                .iter()
+                .any(|c| c.contains("spoiler") && c.contains("flips")),
+        );
+        check(
+            "flip: ONLY the spoiler is fragile",
+            v.confidence.fragile_cells.len() == 1,
+        );
+        check(
+            "flip: summary carries NOT ROBUST",
+            v.summary.contains("NOT ROBUST"),
+        );
+    }
+
+    // -- Case I: rss-cost degenerate (no cost cell) must report CONFIDENCE=N/A,
+    //    not crash or fabricate a boundary.
+    {
+        let rows_owned = vec![
+            synth_row_id("a", 2, 2.0, 0.5, true),
+            synth_row_id("b", 4, 1.2, 0.5, false),
+        ];
+        let refs: Vec<&FactorRow> = rows_owned.iter().collect();
+        // no row exceeds RSS_COST_PCT ⇒ all-false labeling.
+        let labels: Vec<bool> = refs.iter().map(|r| r.rss_delta_pct >= RSS_COST_PCT).collect();
+        let v = separate("rss-cost", &refs, &labels);
+        check("rss-degenerate: CONFIDENCE=N/A", v.confidence.level == "N/A");
+        check("rss-degenerate: no NEXT-MEASUREMENT", v.confidence.next_measurement.is_none());
+    }
+
+    let total = pass + fail;
     println!("\nSELFTEST sweep(factor): {pass} pass, {fail} fail");
     if fail == 0 {
-        println!("SELFTEST=PASS sweep-factor separation analysis is non-inert + correct on known 1/2-factor boundaries");
+        println!(
+            "SELFTEST=PASS {pass}/{total} sweep-factor separation + overfit-guard: correct on known 1/2-factor boundaries AND flags tiny-minority / single-point-dependent separators (the worker_busy accuracy-1.000 bug)"
+        );
         ExitCode::SUCCESS
     } else {
+        println!("SELFTEST=FAIL {pass}/{total}");
         ExitCode::from(1)
     }
 }

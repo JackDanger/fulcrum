@@ -2429,7 +2429,7 @@ fn cmd_sweep(args: &[String]) -> ExitCode {
     // FACTOR mode (multi-factor lever-boundary characterizer): dispatched when
     // the caller passes `--cand`/`--selftest` instead of a capture/mine phase.
     // `fulcrum sweep --cand <bin> --base <bin> --run '...' --corpora ... --threads ...`
-    if args.iter().any(|a| a == "--cand" || a == "--selftest") {
+    if args.iter().any(|a| a == "--cand" || a == "--selftest" || a == "--analyze") {
         return fulcrum::sweep_factor::cmd(args);
     }
     let Some(phase) = args.first().map(|s| s.as_str()) else {
