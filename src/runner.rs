@@ -2783,7 +2783,10 @@ fn parse_cpu_secs(stderr: &str) -> Option<f64> {
 ///   GNU `time -v` (Linux): `Maximum resident set size (kbytes): N`  — N in KiB.
 ///   BSD `time -l` (macOS): `<N>  maximum resident set size`         — N in BYTES.
 /// Returns `None` when neither line is present (rusage unavailable).
-fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
+///
+/// `pub` so the shared timing core (`crate::paired`) reuses the SAME GNU/BSD
+/// parser instead of re-typing it — one source of truth for the rusage-RSS line.
+pub fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
         let line = line.trim();
         // GNU time -v — value is KiB.

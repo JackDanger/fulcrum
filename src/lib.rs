@@ -62,6 +62,7 @@ pub mod finding;
 pub mod fingerprint;
 pub mod flow;
 pub mod freeze;
+pub mod gate;
 pub mod insn;
 pub mod insn_attr;
 pub mod invariants;

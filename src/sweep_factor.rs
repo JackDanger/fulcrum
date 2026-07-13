@@ -1039,6 +1039,7 @@ pub fn run(cfg: &FactorCfg) -> Result<SweepReport, String> {
                 cfg.warmup,
                 &sink,
                 true,
+                0, // RSS handled separately below via memprofile
             )?;
             // ratio = a/b = cand/base. verdict token → outcome.
             let outcome = if pr.verdict.starts_with("RESOLVED-a-slower") {
@@ -1053,7 +1054,7 @@ pub fn run(cfg: &FactorCfg) -> Result<SweepReport, String> {
             let rg_ratio = if let Some(rg) = &cfg.rg {
                 let rg_tmpl = mk_tmpl(rg, t);
                 match paired::run_paired(
-                    &cand_tmpl, &rg_tmpl, &base_tmpl, corpus, cfg.n, cfg.warmup, &sink, false,
+                    &cand_tmpl, &rg_tmpl, &base_tmpl, corpus, cfg.n, cfg.warmup, &sink, false, 0,
                 ) {
                     Ok(r) => Some(r.ratio),
                     Err(_) => None,

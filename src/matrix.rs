@@ -299,6 +299,14 @@ pub struct MatrixCell {
     pub class: String,
     /// Oriented ratio ours/theirs (`<1` ⇒ ours faster). NaN for a run error.
     pub ratio: f64,
+    /// Peak RSS (MiB) of the A arm (`--a-cmd`, the subject). 0.0 ⇒ not captured.
+    /// Co-captured with the wall by the shared `run_paired`, so a matrix is a
+    /// wall+RSS grid in one call (no separate RSS driver).
+    #[serde(default)]
+    pub a_peak_rss_mb: f64,
+    /// Peak RSS (MiB) of the B arm (`--b-cmd`, the comparator). 0.0 ⇒ not captured.
+    #[serde(default)]
+    pub b_peak_rss_mb: f64,
     /// Full paired result (None only when the cell errored before a verdict).
     #[serde(default)]
     pub paired: Option<PairedResult>,
@@ -333,6 +341,10 @@ pub struct RunManifest {
     /// for back-compat with pre-pin banked artifacts.
     #[serde(default)]
     pub pin: String,
+    /// Peak-RSS reps captured per arm per cell (0 ⇒ RSS off). Defaulted for
+    /// back-compat with pre-RSS banked artifacts.
+    #[serde(default)]
+    pub rss_reps: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -509,7 +521,7 @@ pub fn run_matrix_gated(
 ) -> MatrixResult {
     run_matrix_gated_pinned(
         a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpora, threads, n, warmup, sink, do_sha, ours,
-        box_name, sha_pins, timestamp, &Pin::None, gate,
+        box_name, sha_pins, timestamp, &Pin::None, 0, gate,
     )
 }
 
@@ -538,6 +550,7 @@ pub fn run_matrix_gated_pinned(
     sha_pins: &[String],
     timestamp: &str,
     pin: &Pin,
+    rss_reps: usize,
     mut gate: Option<&mut dyn CellGate>,
 ) -> MatrixResult {
     let freeze_each = gate.is_some();
@@ -552,6 +565,8 @@ pub fn run_matrix_gated_pinned(
                     threads: t,
                     class: CellClass::Void.token().to_string(),
                     ratio: f64::NAN,
+                    a_peak_rss_mb: 0.0,
+                    b_peak_rss_mb: 0.0,
                     paired: None,
                     error: Some(format!(
                         "freeze-each acquire FAILED — cell NOT measured (never unfrozen): {e}"
@@ -565,7 +580,7 @@ pub fn run_matrix_gated_pinned(
         // reference decode is NOT pinned (it never enters the wall).
         let (a_t, b_t) = cell_cmds(a_cmd_tmpl, b_cmd_tmpl, t, pin);
         let ref_t = expand_threads(ref_cmd_tmpl, t);
-        let result = run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha);
+        let result = run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha, rss_reps);
         // Release THIS cell's freeze on EVERY path, before recording the result.
         if let Some(g) = gate.as_deref_mut() {
             g.exit(&corpus, t);
@@ -574,11 +589,16 @@ pub fn run_matrix_gated_pinned(
             Ok(r) => {
                 let class = classify(&r.status, &r.verdict, ours);
                 let ratio = oriented_ratio(r.ratio, ours);
+                // Surface the co-captured peak RSS at the cell level (wall+RSS in
+                // one grid) — the full per-arm detail stays in `paired`.
+                let (a_peak_rss_mb, b_peak_rss_mb) = (r.a_peak_rss_mb, r.b_peak_rss_mb);
                 MatrixCell {
                     corpus: corpus.display().to_string(),
                     threads: t,
                     class: class.token().to_string(),
                     ratio,
+                    a_peak_rss_mb,
+                    b_peak_rss_mb,
                     paired: Some(r),
                     error: None,
                 }
@@ -588,6 +608,8 @@ pub fn run_matrix_gated_pinned(
                 threads: t,
                 class: CellClass::Void.token().to_string(),
                 ratio: f64::NAN,
+                a_peak_rss_mb: 0.0,
+                b_peak_rss_mb: 0.0,
                 paired: None,
                 error: Some(e),
             },
@@ -597,7 +619,7 @@ pub fn run_matrix_gated_pinned(
 
     let summary = MatrixResult::summarize(&cells);
     let pin_prov = pin.provenance();
-    let mut method = format!("{METHOD};{pin_prov}");
+    let mut method = format!("{METHOD};{pin_prov};rss_reps={rss_reps}");
     if freeze_each {
         method.push_str(";freeze-per-cell(acquire+release+watchdog-per-cell)");
     }
@@ -615,6 +637,7 @@ pub fn run_matrix_gated_pinned(
         timestamp: timestamp.to_string(),
         method,
         pin: pin_prov,
+        rss_reps,
     };
     MatrixResult { manifest, cells, summary }
 }
@@ -677,6 +700,42 @@ pub fn render_grid(r: &MatrixResult) -> String {
         }
         out.push('\n');
     }
+    // -- PEAK-RSS grid (the MEMORY half) — only when RSS was captured. Cell =
+    //    "aRSS/bRSS" in MiB (a = subject arm, b = comparator arm), so wall AND
+    //    memory read from ONE `fulcrum matrix` call.
+    let any_rss = r
+        .cells
+        .iter()
+        .any(|c| c.a_peak_rss_mb > 0.0 || c.b_peak_rss_mb > 0.0);
+    if any_rss {
+        out.push_str(&format!(
+            "\npeak-RSS MiB (a/b, a=subject b=comparator; rss_reps={}):\n",
+            r.manifest.rss_reps
+        ));
+        out.push_str(&format!("{:<width$}", "corpus", width = corpus_w + 2));
+        for t in &r.manifest.threads {
+            out.push_str(&format!("{:>14}", format!("T{t}")));
+        }
+        out.push('\n');
+        for c in &r.manifest.corpora {
+            let cb = basename(c);
+            out.push_str(&format!("{:<width$}", cb, width = corpus_w + 2));
+            for t in &r.manifest.threads {
+                let cell = r
+                    .cells
+                    .iter()
+                    .find(|x| basename(&x.corpus) == cb && x.threads == *t);
+                let s = match cell {
+                    Some(cl) if cl.a_peak_rss_mb > 0.0 || cl.b_peak_rss_mb > 0.0 => {
+                        format!("{:.0}/{:.0}", cl.a_peak_rss_mb, cl.b_peak_rss_mb)
+                    }
+                    _ => "--".to_string(),
+                };
+                out.push_str(&format!("{s:>14}"));
+            }
+            out.push('\n');
+        }
+    }
     out.push_str(&format!(
         "summary: WIN={} TIE={} LOSS={} VOID={} total={}  MATRIX={}\n",
         r.summary.win, r.summary.tie, r.summary.loss, r.summary.void, r.summary.total, r.summary.status
@@ -696,7 +755,7 @@ fn class_glyph(token: &str) -> char {
 /// The machine-checkable one-liner other tooling greps for.
 pub fn print_machine_line(r: &MatrixResult) {
     println!(
-        "MATRIX={} win={} tie={} loss={} void={} total={} ours={} n={} corpora={} threads={} method=\"{}\"",
+        "MATRIX={} win={} tie={} loss={} void={} total={} ours={} n={} rss_reps={} corpora={} threads={} method=\"{}\"",
         r.summary.status,
         r.summary.win,
         r.summary.tie,
@@ -705,6 +764,7 @@ pub fn print_machine_line(r: &MatrixResult) {
         r.summary.total,
         r.manifest.ours,
         r.manifest.n,
+        r.manifest.rss_reps,
         r.manifest.corpora.len(),
         r.manifest.threads.len(),
         r.manifest.method,
@@ -1191,7 +1251,7 @@ pub fn selftest() -> ExitCode {
         let threads = vec![1u32];
         let pinned = run_matrix_gated_pinned(
             "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, None,
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, 0, None,
         );
         check(
             "pin: pinned manifest records taskset-per-thread provenance",
@@ -1215,7 +1275,7 @@ pub fn selftest() -> ExitCode {
         let mut g = NopGate;
         let both = run_matrix_gated_pinned(
             "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, Some(&mut g),
+            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, 0, Some(&mut g),
         );
         check(
             "pin: composes with freeze-each (method carries pin AND freeze-per-cell)",
@@ -1326,7 +1386,7 @@ fn usage() -> ExitCode {
          USAGE:\n\
          \x20 fulcrum matrix --a-cmd <tmpl> --b-cmd <tmpl> --corpora a.gz,b.gz --threads 1,4,8,16\n\
          \x20                [--n 51] [--warmup 2] [--ours a|b] [--ref-cmd 'gunzip -c {{corpus}}']\n\
-         \x20                [--sink /dev/null] [--no-sha] [--box NAME] [--sha-pin K:V ...]\n\
+         \x20                [--rss-reps 3] [--sink /dev/null] [--no-sha] [--box NAME] [--sha-pin K:V ...]\n\
          \x20                [--timestamp STR] [--out matrix.json] [--dry-run]\n\
          \x20                [--no-pin | --pin <mask-tmpl>]   (default: taskset -c 0-(T-1) per cell)\n\
          \x20                [--freeze-each [--freeze-procs 'llama-swap,llama-server']\n\
@@ -1425,6 +1485,11 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         .or(spec.ref_cmd.clone())
         .unwrap_or_else(|| "gunzip -c {corpus}".to_string());
     let do_sha = !cli_has(args, "--no-sha");
+    // Peak-RSS reps per arm per cell (co-captured with the wall — wall+RSS in one
+    // grid). Default 3 (RSS on); `--rss-reps 0` disables the memory half.
+    let rss_reps: usize = cli_flag(args, "--rss-reps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let ours_tok = cli_flag(args, "--ours")
         .map(String::from)
         .or(spec.ours.clone())
@@ -1483,11 +1548,12 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
     if dry_run {
         let cells = plan_cells(&corpora, &threads);
         println!(
-            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} ours={} box={} freeze_each={} {}",
+            "MATRIX=DRYRUN cells={} corpora={} threads={} n={} rss_reps={} ours={} box={} freeze_each={} {}",
             cells.len(),
             corpora.len(),
             threads.len(),
             n,
+            rss_reps,
             ours.token(),
             box_name,
             freeze_each,
@@ -1551,7 +1617,7 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
 
     let r = run_matrix_gated_pinned(
         &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
-        &sha_pins, &timestamp, &pin,
+        &sha_pins, &timestamp, &pin, rss_reps,
         gate.as_mut().map(|g| g as &mut dyn CellGate),
     );
 
@@ -1689,7 +1755,7 @@ mod tests {
         let threads = vec![1u32];
         let pinned = run_matrix_gated_pinned(
             "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", &Pin::PerThread, None,
+            true, Arm::A, "t", &[], "ts", &Pin::PerThread, 0, None,
         );
         assert_eq!(pinned.manifest.pin, "pin=taskset-per-thread(0-(T-1))");
         assert!(pinned.manifest.method.contains("pin=taskset-per-thread"));
@@ -1698,7 +1764,7 @@ mod tests {
         let mut g = RecGate { enters: vec![], exits: vec![], fail_on: None };
         let both = run_matrix_gated_pinned(
             "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", &Pin::PerThread, Some(&mut g),
+            true, Arm::A, "t", &[], "ts", &Pin::PerThread, 0, Some(&mut g),
         );
         assert!(both.manifest.method.contains("pin=taskset-per-thread"));
         assert!(both.manifest.method.contains("freeze-per-cell"));
@@ -1896,12 +1962,65 @@ mod tests {
     }
 
     #[test]
+    fn matrix_cell_co_captures_peak_rss() {
+        // A real 1×1 a-vs-a cell with rss_reps>0 must surface a non-inert peak
+        // RSS at the CELL level (wall+RSS in one grid) and record rss_reps in the
+        // manifest. Uses a known ~64 MiB allocation so the floor is unambiguous.
+        // Skips cleanly if /usr/bin/time or python3 is unavailable on the box.
+        if crate::paired::peak_rss_mb_of_arm(
+            "python3 -c 'import sys; b=bytearray(64*1024*1024); sys.exit(0)'",
+        )
+        .is_none()
+        {
+            eprintln!("skip: /usr/bin/time or python3 unavailable");
+            return;
+        }
+        let big = "python3 -c 'import sys; b=bytearray(64*1024*1024); sys.exit(0)'";
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32];
+        let r = run_matrix_gated_pinned(
+            big, big, "true", &corpora, &threads, 7, 1, Path::new("/dev/null"), false, Arm::A,
+            "t", &[], "ts", &Pin::None, 3, None,
+        );
+        assert_eq!(r.manifest.rss_reps, 3);
+        assert!(r.manifest.method.contains("rss_reps=3"));
+        let c = &r.cells[0];
+        assert!(c.a_peak_rss_mb > 10.0, "a rss inert: {}", c.a_peak_rss_mb);
+        assert!(c.b_peak_rss_mb > 10.0, "b rss inert: {}", c.b_peak_rss_mb);
+        // the cell's RSS mirrors the banked paired sub-result
+        let p = c.paired.as_ref().unwrap();
+        assert_eq!(c.a_peak_rss_mb, p.a_peak_rss_mb);
+        assert_eq!(c.b_peak_rss_mb, p.b_peak_rss_mb);
+        // grid renders the peak-RSS section
+        let g = render_grid(&r);
+        assert!(g.contains("peak-RSS MiB"), "grid missing RSS section:\n{g}");
+    }
+
+    #[test]
+    fn ungated_matrix_has_rss_off_by_default() {
+        // The back-compat entry (run_matrix / run_matrix_gated) is RSS-off
+        // (rss_reps=0) so unit tests never shell out to /usr/bin/time; cells carry
+        // 0.0 peak RSS and the grid omits the RSS section.
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32];
+        let r = run_matrix(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts",
+        );
+        assert_eq!(r.manifest.rss_reps, 0);
+        assert!(r.cells.iter().all(|c| c.a_peak_rss_mb == 0.0 && c.b_peak_rss_mb == 0.0));
+        assert!(!render_grid(&r).contains("peak-RSS MiB"));
+    }
+
+    #[test]
     fn summarize_counts_all_classes() {
         let mk = |class: &str| MatrixCell {
             corpus: "c".into(),
             threads: 1,
             class: class.into(),
             ratio: 1.0,
+            a_peak_rss_mb: 0.0,
+            b_peak_rss_mb: 0.0,
             paired: None,
             error: None,
         };

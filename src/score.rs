@@ -1456,6 +1456,8 @@ pub struct ScorePairedArgs {
     pub out: Option<String>,
     /// Run the untimed byte-exact sha gate (default true; `--no-sha` disables).
     pub do_sha: bool,
+    /// Peak-RSS reps per arm (co-captured with the wall; 0 ⇒ RSS off). Default 3.
+    pub rss_reps: usize,
 }
 
 impl Default for ScorePairedArgs {
@@ -1475,6 +1477,7 @@ impl Default for ScorePairedArgs {
             date: String::new(),
             out: None,
             do_sha: true,
+            rss_reps: 3,
         }
     }
 }
@@ -1566,7 +1569,7 @@ impl ScorePairedResult {
     pub fn score_line(&self) -> String {
         format!(
             "SCORE: {} t{} {} | native={:.3} {} | ours={:.1}ms comparator={:.1}ms | \
-             N={} logratio_ci=[{:.4},{:.4}] | verdict={} method=paired",
+             rss={:.0}/{:.0}MiB | N={} logratio_ci=[{:.4},{:.4}] | verdict={} method=paired",
             self.arch_os,
             self.threads,
             self.corpus,
@@ -1574,6 +1577,8 @@ impl ScorePairedResult {
             self.class,
             self.paired.a_median,
             self.paired.b_median,
+            self.paired.a_peak_rss_mb,
+            self.paired.b_peak_rss_mb,
             self.paired.n,
             self.paired.logratio_ci[0],
             self.paired.logratio_ci[1],
@@ -1586,7 +1591,8 @@ impl ScorePairedResult {
         format!(
             "SCORE={} class={} ratio={:.4} verdict={} n={} logratio_ci=[{:.4},{:.4}] \
              a_median={:.3} b_median={:.3} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] \
-             aa_bias={:.4} sha_ok={} flavor_n={} comparator_ms={:.1} method=\"{}\"",
+             aa_bias={:.4} sha_ok={} native_rss_mb={:.1} comparator_rss_mb={:.1} rss_reps={} \
+             flavor_n={} comparator_ms={:.1} method=\"{}\"",
             self.score_status,
             self.class,
             self.paired.ratio,
@@ -1602,6 +1608,9 @@ impl ScorePairedResult {
             self.paired.aa_ratio_ci[1],
             self.paired.aa_bias,
             self.paired.sha_ok,
+            self.paired.a_peak_rss_mb,
+            self.paired.b_peak_rss_mb,
+            self.paired.rss_reps,
             self.flavor_n_symbols,
             self.comparator_version_ms,
             self.method,
@@ -1648,6 +1657,7 @@ pub fn run_score_paired(a: &ScorePairedArgs) -> Result<ScorePairedResult, ScoreE
         a.warmup,
         &a.sink,
         a.do_sha,
+        a.rss_reps,
     )
     .map_err(ScoreError::Internal)?;
 
@@ -1713,6 +1723,11 @@ pub fn paired_args_from_cli(args: &[String]) -> Result<ScorePairedArgs, String> 
         .transpose()
         .map_err(|e| format!("--warmup: {e}"))?
         .unwrap_or(2);
+    let rss_reps: usize = flag(args, "--rss-reps")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|e| format!("--rss-reps: {e}"))?
+        .unwrap_or(3);
     let corpus_name = flag(args, "--corpus-name")
         .map(String::from)
         .unwrap_or_else(|| {
@@ -1741,6 +1756,7 @@ pub fn paired_args_from_cli(args: &[String]) -> Result<ScorePairedArgs, String> 
             .unwrap_or_else(today_iso),
         out: flag(args, "--out").map(String::from),
         do_sha: !args.iter().any(|a| a == "--no-sha"),
+        rss_reps,
     })
 }
 
@@ -1907,6 +1923,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check(
@@ -1929,6 +1946,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check(
@@ -1951,6 +1969,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check("sha-mismatch: sha_ok false", !r.sha_ok);
@@ -2793,6 +2812,11 @@ mod tests {
             ref_sha: String::new(),
             a_sha: String::new(),
             b_sha: String::new(),
+            a_peak_rss_mb: 0.0,
+            b_peak_rss_mb: 0.0,
+            a_peak_rss_spread: 0.0,
+            b_peak_rss_spread: 0.0,
+            rss_reps: 0,
         };
         assert_eq!(classify(&pr), "WIN");
         pr.verdict = "RESOLVED-a-slower".into();
@@ -2904,6 +2928,11 @@ mod tests {
             ref_sha: String::new(),
             a_sha: String::new(),
             b_sha: String::new(),
+            a_peak_rss_mb: 120.0,
+            b_peak_rss_mb: 260.0,
+            a_peak_rss_spread: 1.5,
+            b_peak_rss_spread: 3.0,
+            rss_reps: 3,
         };
         let r = ScorePairedResult {
             score_status: "OK".into(),
@@ -2923,9 +2952,13 @@ mod tests {
         assert!(sl.starts_with("SCORE: amd-zen2 t8 silesia |"), "{sl}");
         assert!(sl.contains("native=0.796 WIN"), "{sl}");
         assert!(sl.contains("method=paired"), "{sl}");
+        assert!(sl.contains("rss=120/260MiB"), "score_line missing RSS: {sl}");
         let ml = r.machine_line();
         assert!(ml.starts_with("SCORE=OK class=WIN"), "{ml}");
         assert!(ml.contains("flavor_n=0"), "{ml}");
+        assert!(ml.contains("native_rss_mb=120.0"), "{ml}");
+        assert!(ml.contains("comparator_rss_mb=260.0"), "{ml}");
+        assert!(ml.contains("rss_reps=3"), "{ml}");
         assert!(ml.contains("verdict=RESOLVED-b-slower"), "{ml}");
         // bankable JSON carries the paired schema + provenance envelope
         let js = serde_json::to_string(&r).unwrap();

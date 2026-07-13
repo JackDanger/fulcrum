@@ -4337,6 +4337,7 @@ fn main() -> ExitCode {
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "paired" => fulcrum::paired::cmd_paired(rest),
         "matrix" => fulcrum::matrix::cmd_matrix(rest),
+        "gate" => fulcrum::gate::cmd_gate(rest),
         "bisect" => fulcrum::bisect::cmd_bisect(rest),
         "scope" => fulcrum::scope::cmd_scope(rest),
         "phasebreak" => cmd_phasebreak(rest),

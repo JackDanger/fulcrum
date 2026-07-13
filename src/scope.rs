@@ -562,6 +562,8 @@ fn synth_artifact(
             threads: *threads,
             class: class.to_string(),
             ratio: *ratio,
+            a_peak_rss_mb: 0.0,
+            b_peak_rss_mb: 0.0,
             paired: None,
             error: None,
         })
@@ -582,6 +584,7 @@ fn synth_artifact(
             timestamp: timestamp.to_string(),
             method: "selftest-synthetic".to_string(),
             pin: "pin=selftest".to_string(),
+            rss_reps: 0,
         },
         cells,
         summary: MatrixSummary {

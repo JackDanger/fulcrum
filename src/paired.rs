@@ -247,6 +247,67 @@ fn timed_arm(cmd: &str) -> Result<f64, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Peak-RSS co-capture (the MEMORY half of the scoreboard)
+// ---------------------------------------------------------------------------
+//
+// WHY A SEPARATE PROBE (not the timed rep). The wall is timed by a bare
+// `Command...status()` with `Stdio::null()` and `Instant` — pristine, no wrapper.
+// Peak RSS needs `/usr/bin/time` rusage, whose fork/exec would ADD to the wall if
+// it wrapped the timed rep. So RSS is measured on its OWN dedicated reps AFTER the
+// A/B walls (mirroring `runner::subject_rss`, which takes RSS from a dedicated
+// probe for exactly this reason). The timed passes never touch `/usr/bin/time`, so
+// the wall verdict is provably un-perturbed by the RSS capture. Both probe reps
+// sink stdout to /dev/null (SINK LAW), like the wall.
+//
+// PORTABLE: Linux `/usr/bin/time -v` (RSS in KiB) and macOS `/usr/bin/time -l`
+// (RSS in bytes) are both parsed by the shared `runner::parse_max_rss_mb`.
+
+/// Capture peak RSS (MiB) of ONE arm via `/usr/bin/time` rusage, stdout→/dev/null.
+///   Linux: `/usr/bin/time -v sh -c "<cmd>"` → `Maximum resident set size (kbytes)`.
+///   macOS: `/usr/bin/time -l sh -c "<cmd>"` → `<bytes> maximum resident set size`.
+/// Returns `None` when `/usr/bin/time` is absent, the arm fails, or the rusage
+/// line can't be parsed — RSS is then reported as NOT captured (0.0), never a
+/// fabricated datum.
+pub fn peak_rss_mb_of_arm(cmd: &str) -> Option<f64> {
+    let mut c = Command::new("/usr/bin/time");
+    if cfg!(target_os = "macos") {
+        c.arg("-l");
+    } else {
+        c.arg("-v");
+    }
+    c.arg("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let out = c.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    crate::runner::parse_max_rss_mb(&stderr)
+}
+
+/// Run `reps` dedicated peak-RSS probes for one arm, returning every captured
+/// value (MiB). A rep that fails to parse rusage is dropped, so the caller can
+/// tell "captured N of reps" from an all-empty (uninstrumentable) result.
+pub fn sample_peak_rss(cmd: &str, reps: usize) -> Vec<f64> {
+    (0..reps).filter_map(|_| peak_rss_mb_of_arm(cmd)).collect()
+}
+
+/// Collapse a set of peak-RSS reps into a (point, spread) pair: the MEDIAN peak
+/// (robust to a one-off spike) and the population stdev (the reproducibility
+/// readout, Gate-0). Empty ⇒ (0.0, 0.0) = "not captured".
+pub fn rss_point_spread(reps: &[f64]) -> (f64, f64) {
+    if reps.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (median(reps), pstdev(reps))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The interleaved paired sampler
 // ---------------------------------------------------------------------------
 
@@ -376,6 +437,24 @@ pub struct PairedResult {
     pub ref_sha: String,
     pub a_sha: String,
     pub b_sha: String,
+    // -- MEMORY half (co-captured alongside the wall; 0.0 ⇒ not captured) -----
+    /// Peak RSS (MiB) of the A (subject) arm — the MEDIAN over `rss_reps`
+    /// dedicated `/usr/bin/time` probes (never the timed rep, so the wall is
+    /// un-perturbed). 0.0 ⇒ RSS not captured (`rss_reps=0` or no `/usr/bin/time`).
+    #[serde(default)]
+    pub a_peak_rss_mb: f64,
+    /// Peak RSS (MiB) of the B (comparator) arm — median over `rss_reps` probes.
+    #[serde(default)]
+    pub b_peak_rss_mb: f64,
+    /// Population stdev of the A arm's peak-RSS reps (reproducibility readout).
+    #[serde(default)]
+    pub a_peak_rss_spread: f64,
+    /// Population stdev of the B arm's peak-RSS reps.
+    #[serde(default)]
+    pub b_peak_rss_spread: f64,
+    /// Peak-RSS reps actually CAPTURED per arm (0 ⇒ RSS off / uninstrumentable).
+    #[serde(default)]
+    pub rss_reps: usize,
 }
 
 /// The full paired run: byte-exact gate → A/A certificate → interleaved A/B.
@@ -390,6 +469,7 @@ pub fn run_paired(
     warmup: usize,
     sink: &Path,
     do_sha: bool,
+    rss_reps: usize,
 ) -> Result<PairedResult, String> {
     // -- SINK LAW (before anything spawns)
     sink_is_devnull(sink)?;
@@ -417,6 +497,20 @@ pub fn run_paired(
 
     // -- main A/B (interleaved, order-alternating)
     let ab = sample_interleaved(&a_cmd, &b_cmd, n, warmup)?;
+
+    // -- MEMORY half: dedicated peak-RSS reps AFTER the walls (never the timed
+    //    rep — the wall stays pristine). Both arms probed the same # of reps.
+    let (a_peak_rss_mb, a_peak_rss_spread, b_peak_rss_mb, b_peak_rss_spread, rss_reps_got) =
+        if rss_reps > 0 {
+            let a_r = sample_peak_rss(&a_cmd, rss_reps);
+            let b_r = sample_peak_rss(&b_cmd, rss_reps);
+            let (am, asp) = rss_point_spread(&a_r);
+            let (bm, bsp) = rss_point_spread(&b_r);
+            (am, asp, bm, bsp, a_r.len().min(b_r.len()))
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0)
+        };
+
     let deltas = ab.deltas();
     let lrs = ab.log_ratios();
     let delta_ci = ci95(&deltas);
@@ -438,7 +532,8 @@ pub fn run_paired(
 
     let method = format!(
         "fulcrum-paired-v1:interleaved-order-alt,devnull-both-arms,paired-logratio-ci95(t-df),\
-         aa-certificate,byte-exact-gate;n={n},warmup={warmup}"
+         aa-certificate,byte-exact-gate,peak-rss-dedicated-probe;n={n},warmup={warmup},\
+         rss_reps={rss_reps_got}"
     );
 
     Ok(PairedResult {
@@ -464,6 +559,11 @@ pub fn run_paired(
         ref_sha,
         a_sha,
         b_sha,
+        a_peak_rss_mb,
+        b_peak_rss_mb,
+        a_peak_rss_spread,
+        b_peak_rss_spread,
+        rss_reps: rss_reps_got,
     })
 }
 
@@ -473,6 +573,7 @@ pub fn print_machine_line(r: &PairedResult) {
         "PAIRED={} verdict={} ratio={:.4} logratio_ci=[{:.4},{:.4}] \
          delta_median_ms={:.3} delta_ci95=[{:.3},{:.3}] a_median={:.3} b_median={:.3} \
          n={} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] aa_bias={:.4} sha_ok={} \
+         a_peak_rss_mb={:.1} b_peak_rss_mb={:.1} rss_reps={} \
          method=\"{}\"",
         r.status,
         r.verdict,
@@ -491,6 +592,9 @@ pub fn print_machine_line(r: &PairedResult) {
         r.aa_ratio_ci[1],
         r.aa_bias,
         r.sha_ok,
+        r.a_peak_rss_mb,
+        r.b_peak_rss_mb,
+        r.rss_reps,
         r.method,
     );
 }
@@ -566,6 +670,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check("A/A: sha_ok (both arms empty == ref)", r.sha_ok);
@@ -593,6 +698,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check("slower-B: status OK", r.status == "OK");
@@ -623,6 +729,7 @@ pub fn selftest() -> ExitCode {
         warmup,
         &devnull,
         true,
+        0,
     ) {
         Ok(r) => {
             check("sha-mismatch: sha_ok false", !r.sha_ok);
@@ -633,6 +740,54 @@ pub fn selftest() -> ExitCode {
             );
         }
         Err(e) => check(&format!("sha-mismatch run ({e})"), false),
+    }
+
+    // 6. PEAK-RSS co-capture (Gate-0 for the MEMORY half). Uses a real subprocess
+    //    that allocates a KNOWN, LARGE buffer so the peak RSS is non-inert (well
+    //    above any interpreter/shell floor) and SANE (not absurd). `/usr/bin/time`
+    //    is on both Linux and macOS; if it is somehow absent the probe returns
+    //    None → rss_reps==0, and we record that as a skip rather than a failure.
+    {
+        // ~64 MiB Python bytearray, held live, then exit — a deterministic peak.
+        let big = "python3 -c 'import sys; b=bytearray(64*1024*1024); sys.exit(0)'";
+        let probe = peak_rss_mb_of_arm(big);
+        match probe {
+            None => println!("  NOTE rss: /usr/bin/time or python3 unavailable — RSS selftest skipped"),
+            Some(one) => {
+                check("rss: single probe is non-inert (>10 MiB for a 64 MiB alloc)", one > 10.0);
+                check("rss: single probe is sane (<4096 MiB)", one < 4096.0);
+
+                // A/A rss self-test: the SAME command in both slots must yield
+                // a_peak_rss ≈ b_peak_rss (the memory analogue of the A/A wall
+                // certificate). rss_reps=3 exercises the point+spread collapse.
+                match run_paired(big, big, "true", &corpus, 7, 1, &devnull, false, 3) {
+                    Ok(r) => {
+                        check("rss: A/A captured reps == 3", r.rss_reps == 3);
+                        check("rss: A/A a_peak non-inert (>10 MiB)", r.a_peak_rss_mb > 10.0);
+                        check("rss: A/A b_peak non-inert (>10 MiB)", r.b_peak_rss_mb > 10.0);
+                        check(
+                            "rss: A/A a_peak ≈ b_peak (same cmd both slots, within 20%)",
+                            (r.a_peak_rss_mb - r.b_peak_rss_mb).abs()
+                                <= 0.20 * r.a_peak_rss_mb.max(r.b_peak_rss_mb),
+                        );
+                        check(
+                            "rss: reproducible — A arm spread < 25% of the peak",
+                            r.a_peak_rss_spread <= 0.25 * r.a_peak_rss_mb.max(1.0),
+                        );
+                    }
+                    Err(e) => check(&format!("rss: A/A run ({e})"), false),
+                }
+
+                // rss_reps=0 ⇒ RSS explicitly OFF (0.0, not a fabricated datum).
+                match run_paired("true", "true", "true", &corpus, 7, 1, &devnull, false, 0) {
+                    Ok(r) => check(
+                        "rss: rss_reps=0 leaves peak RSS at 0.0 (not captured)",
+                        r.a_peak_rss_mb == 0.0 && r.b_peak_rss_mb == 0.0 && r.rss_reps == 0,
+                    ),
+                    Err(e) => check(&format!("rss: off run ({e})"), false),
+                }
+            }
+        }
     }
 
     println!(
@@ -673,7 +828,7 @@ fn usage() -> ExitCode {
          USAGE:\n\
          \x20 fulcrum paired --a-cmd <tmpl> --b-cmd <tmpl> --corpus <path>\n\
          \x20                [--n 51] [--warmup 2] [--sink /dev/null] [--ref-cmd 'gunzip -c {{corpus}}']\n\
-         \x20                [--no-sha] [--out result.json] [--label ...]\n\
+         \x20                [--rss-reps 3] [--no-sha] [--out result.json] [--label ...]\n\
          \x20 fulcrum paired selftest                 Gate-0: fake commands, no box needed\n\
          \n\
          {{corpus}} is substituted in every template. --a-cmd is the SUBJECT, --b-cmd the\n\
@@ -706,6 +861,9 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
     let sink = PathBuf::from(cli_flag(args, "--sink").unwrap_or("/dev/null"));
     let ref_cmd = cli_flag(args, "--ref-cmd").unwrap_or("gunzip -c {corpus}");
     let do_sha = !cli_has(args, "--no-sha");
+    let rss_reps: usize = cli_flag(args, "--rss-reps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let corpus_path = PathBuf::from(corpus);
 
     if n < 7 {
@@ -729,6 +887,7 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
         warmup,
         &sink,
         do_sha,
+        rss_reps,
     ) {
         Ok(r) => {
             print_machine_line(&r);
@@ -861,6 +1020,19 @@ mod tests {
     // ---- end-to-end with real trivial subprocesses (portable, no box) ----
 
     #[test]
+    fn rss_point_spread_median_and_stdev() {
+        // empty ⇒ (0,0) = "not captured".
+        assert_eq!(rss_point_spread(&[]), (0.0, 0.0));
+        // point is the median; spread is the population stdev.
+        let (p, s) = rss_point_spread(&[100.0, 102.0, 101.0]);
+        assert!((p - 101.0).abs() < 1e-9);
+        assert!((s - pstdev(&[100.0, 102.0, 101.0])).abs() < 1e-12);
+        // a lone spike does not move the median away from the cluster.
+        let (p2, _) = rss_point_spread(&[100.0, 101.0, 100.5, 400.0, 100.2]);
+        assert!(p2 < 150.0, "median robust to spike, got {p2}");
+    }
+
+    #[test]
     fn interleaved_sampler_records_n_pairs() {
         let s = sample_interleaved("true", "true", 8, 1).unwrap();
         assert_eq!(s.a_ms.len(), 8);
@@ -878,6 +1050,7 @@ mod tests {
             1,
             Path::new("/dev/null"),
             true,
+            0,
         )
         .unwrap();
         assert!(r.sha_ok, "empty-vs-empty vs empty ref should match");
@@ -901,6 +1074,7 @@ mod tests {
             1,
             Path::new("/dev/null"),
             true,
+            0,
         )
         .unwrap();
         assert_eq!(r.status, "OK");
@@ -920,6 +1094,7 @@ mod tests {
             1,
             Path::new("/dev/null"),
             true,
+            0,
         )
         .unwrap();
         assert!(!r.sha_ok);
@@ -938,6 +1113,7 @@ mod tests {
             1,
             Path::new("/dev/null"),
             true,
+            0,
         )
         .unwrap();
         let js = serde_json::to_string(&r).unwrap();
@@ -954,6 +1130,9 @@ mod tests {
             "verdict",
             "aa_ratio_ci",
             "sha_ok",
+            "a_peak_rss_mb",
+            "b_peak_rss_mb",
+            "rss_reps",
             "method",
         ] {
             assert!(js.contains(f), "JSON missing field {f}: {js}");

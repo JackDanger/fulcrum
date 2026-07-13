@@ -307,7 +307,9 @@ pub fn run_bisect(
         let a_tmpl = pin.apply(&expand_run(run_tmpl, from_path, threads), threads);
         let b_tmpl = pin.apply(&expand_run(run_tmpl, to_path, threads), threads);
         let ref_cmd = expand_run(ref_tmpl, from_path, threads); // {bin} rarely used in ref
-        let t = match run_paired(&a_tmpl, &b_tmpl, &ref_cmd, corpus, n, warmup, sink, do_sha) {
+        // RSS off (0): bisect scores adjacent-commit WALL transitions; the memory
+        // half is not part of a bisect verdict, so we skip the extra RSS probes.
+        let t = match run_paired(&a_tmpl, &b_tmpl, &ref_cmd, corpus, n, warmup, sink, do_sha, 0) {
             Ok(r) => Transition::from_paired(from_lbl, to_lbl, r, do_sha, min_effect),
             Err(e) => Transition::errored(from_lbl, to_lbl, e),
         };
