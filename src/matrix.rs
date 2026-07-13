@@ -219,6 +219,23 @@ pub enum Pin {
     Tmpl(String),
 }
 
+/// True iff `cmd`'s first whitespace-delimited token is a shell env-assignment
+/// (`NAME=value`, where NAME is `[A-Za-z_][A-Za-z0-9_]*`). Used by [`Pin::apply`]
+/// to decide whether the pin prefix must splice in `env` so `taskset` doesn't try
+/// to exec the assignment as a program name.
+fn starts_with_env_assignment(cmd: &str) -> bool {
+    let tok = cmd.trim_start().split_whitespace().next().unwrap_or("");
+    match tok.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            let mut chars = name.chars();
+            let first = chars.next().unwrap();
+            (first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
 impl Pin {
     /// The `taskset -c` mask string for a thread count (no `taskset -c` prefix),
     /// or `None` when pinning is disabled. `PerThread`: `"0"` at T=1 else
@@ -248,8 +265,23 @@ impl Pin {
 
     /// Prepend the pin prefix to a fully `{threads}`-expanded command (the
     /// `{corpus}` token, if any, survives for `run_paired` to substitute).
+    ///
+    /// BUG FIX: `taskset` execs its argument directly (it is NOT a shell), so a
+    /// command that begins with inline `VAR=val` env-assignments — e.g. the
+    /// gzippy subject arm `GZIPPY_FORCE_PARALLEL_SM=1 gzippy …` — makes taskset
+    /// try to exec a program literally named `GZIPPY_FORCE_PARALLEL_SM=1`, which
+    /// fails with exit 127 and VOIDs the cell. Splice `env ` between the taskset
+    /// prefix and the env-prefixed command so the assignments are honored and the
+    /// real binary is exec'd under the pin: `taskset -c <mask> env VAR=val bin …`.
+    /// Only done when a pin is active (`Pin::None` runs through `sh -c`, which
+    /// handles the assignment natively, so no `env` is needed there).
     pub fn apply(&self, cmd: &str, threads: u32) -> String {
-        format!("{}{}", self.prefix(threads), cmd)
+        let prefix = self.prefix(threads);
+        if !prefix.is_empty() && starts_with_env_assignment(cmd) {
+            format!("{prefix}env {cmd}")
+        } else {
+            format!("{prefix}{cmd}")
+        }
     }
 
     /// Provenance string banked in the manifest/method (so a scoreboard records
@@ -1200,6 +1232,32 @@ pub fn selftest() -> ExitCode {
         check(
             "pin: PerThread prefix is taskset -c <mask>",
             Pin::PerThread.prefix(4) == "taskset -c 0-3 " && Pin::None.prefix(4).is_empty(),
+        );
+
+        // (a2) ENV-PREFIX FIX: a subject arm that begins with inline `VAR=val`
+        //      assignments (the gzippy `GZIPPY_FORCE_PARALLEL_SM=1 …` arm) must be
+        //      spliced as `taskset -c <mask> env VAR=val bin …` so taskset execs
+        //      the real binary, not the assignment (pre-fix: exit 127, cell VOID).
+        check(
+            "pin: env-prefixed subject arm gets `env` spliced under taskset",
+            Pin::PerThread.apply("GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 4 {corpus}", 4)
+                == "taskset -c 0-3 env GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c -p 4 {corpus}",
+        );
+        check(
+            "pin: non-env arm is NOT wrapped with env",
+            Pin::PerThread.apply("rapidgzip -d -c -P 4 {corpus}", 4)
+                == "taskset -c 0-3 rapidgzip -d -c -P 4 {corpus}",
+        );
+        check(
+            "pin: None leaves env-prefixed arm to the shell (no `env` splice)",
+            Pin::None.apply("GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c {corpus}", 4)
+                == "GZIPPY_FORCE_PARALLEL_SM=1 gzippy -d -c {corpus}",
+        );
+        check(
+            "pin: env-assignment detector rejects a path with '=' in a later token",
+            !starts_with_env_assignment("/bin/gzippy --flag=1 {corpus}")
+                && starts_with_env_assignment("A_B0=x bin")
+                && !starts_with_env_assignment("1BAD=x bin"),
         );
 
         // (b) PLUMBING: cell_cmds pins BOTH arms to the SAME mask (this is what
