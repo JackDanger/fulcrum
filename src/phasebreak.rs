@@ -42,14 +42,22 @@ FLAGS:
   --help, -h        this help
 
 Runs `[taskset -c <mask>] <native> -d -c -p<T> <corpus> > /dev/null` N times with
-GZIPPY_FORCE_PARALLEL_SM=1 and a fresh GZIPPY_PHASE_OUT tmpfile per run, parses the
-one phasebreak JSON line each run emits, and Gate-0-validates it:
-  1. conservation: consumer_wall_us - (decode_wait+future_recv+drain+blockfind)
-     = residual; |residual| <= max(200, 10% of consumer_wall_us), else REFUSE.
+GZIPPY_FORCE_PARALLEL_SM=1 and a fresh GZIPPY_PHASE_OUT tmpfile per run. Each run's
+emitter writes up to TWO JSON lines — `{\"kind\":\"phasebreak\"}` (consumer-wall
+decomposition) AND `{\"kind\":\"pathaccount\"}` (per-decode-path BYTE conservation).
+This parser KIND-DISPATCHES those lines (it never trusts \"the last line\") and
+Gate-0-validates BOTH:
+  1. phasebreak CONSERVATION (cpu-inclusive): consumer_wall_us
+     - (decode_wait+future_recv+drain+blockfind + consumer_cpu_us) = residual;
+     |residual| <= max(500us, 12% of consumer_wall_us), else REFUSE.
   2. consumer_cpu_us <= consumer_wall_us, else REFUSE.
   3. iters > 0, else REFUSE.
+  4. pathaccount CONSERVATION (EXACT byte count): Σ(six disjoint byte buckets)
+     == total_bytes, else REFUSE at RUNTIME (a decode-output site is unaccounted).
 A record with future_recv_us==0 && iters>0 is flagged SUSPICIOUS (an inert-oracle
-trap check — a marker-heavy multi-chunk corpus MUST show nonzero future_recv).
+trap check — a marker-heavy multi-chunk corpus MUST show nonzero future_recv). The
+report also surfaces the MARKER-MACHINERY byte + ns fractions (share of decoded
+output that went through the u16-marker paths vs the clean contig/stored paths).
 Any Gate-0 REFUSAL aborts the whole run and prints which check failed and why —
 never a silently-passed broken number.
 ";
@@ -463,6 +471,63 @@ pub fn check_pathaccount_conservation(r: &PathAccountRecord) -> Result<i64, Stri
     Ok(residual)
 }
 
+// ── Kind-dispatch (never "the last line") ────────────────────────────────────
+
+/// One parsed emitter line, discriminated by its `"kind"` field. The gzippy
+/// emitter writes BOTH a `phasebreak` and a `pathaccount` line per decode; a
+/// parser that grabbed "the last non-empty line" would silently keep whichever
+/// happened to be emitted last and drop the other. [`parse_line_by_kind`] peeks
+/// the `kind` field and routes to the matching strict parser instead.
+#[derive(Debug, Clone)]
+pub enum PhaseLine {
+    Phase(PhaseRecord),
+    Path(PathAccountRecord),
+}
+
+/// Peek the `"kind"` field of ONE emitter line and route to the matching strict
+/// parser. PURE — unit-tested. A blank line returns `Ok(None)`. An unknown kind
+/// REFUSES (an emitter that adds an un-handled line type must be noticed, not
+/// silently dropped). Accepts the raw `[phase-timing]`/`[pathaccount]` stderr
+/// prefixes and the bare `{...}` file form.
+pub fn parse_line_by_kind(line: &str) -> Result<Option<PhaseLine>, String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    // Strip whichever stderr prefix is present before peeking the JSON.
+    let json_part = t
+        .strip_prefix("[phase-timing] ")
+        .or_else(|| t.strip_prefix("[pathaccount] "))
+        .unwrap_or(t);
+    let v: serde_json::Value = serde_json::from_str(json_part)
+        .map_err(|e| format!("phasebreak: cannot parse phase-timing JSON ({e}): {line:?}"))?;
+    match v.get("kind").and_then(|x| x.as_str()) {
+        Some("phasebreak") => Ok(Some(PhaseLine::Phase(parse_phase_line(line)?))),
+        Some("pathaccount") => Ok(Some(PhaseLine::Path(parse_pathaccount_line(line)?))),
+        other => Err(format!(
+            "phasebreak: unexpected 'kind' field {other:?} (want \"phasebreak\" or \
+             \"pathaccount\"): {line:?}"
+        )),
+    }
+}
+
+/// Kind-dispatch every line of a captured JSONL blob into its two disjoint
+/// streams (phasebreak records, pathaccount records), preserving order. PURE —
+/// unit-tested. NEVER "the last line": both kinds are collected explicitly, in
+/// either interleave order. A malformed / unknown-kind line REFUSES.
+pub fn split_by_kind(content: &str) -> Result<(Vec<PhaseRecord>, Vec<PathAccountRecord>), String> {
+    let mut phases = Vec::new();
+    let mut paths = Vec::new();
+    for line in content.lines() {
+        match parse_line_by_kind(line)? {
+            Some(PhaseLine::Phase(r)) => phases.push(r),
+            Some(PhaseLine::Path(r)) => paths.push(r),
+            None => {}
+        }
+    }
+    Ok((phases, paths))
+}
+
 // ── Subprocess plumbing ──────────────────────────────────────────────────────
 
 /// Build the argv for one phasebreak run:
@@ -498,7 +563,10 @@ pub fn build_argv(args: &PhasebreakArgs) -> (String, Vec<String>) {
 /// discarded warmup sample should ever see. [`run`] applies [`gate0_validate`]
 /// to the RETAINED (non-warmup) records only. `run_idx` is used only to make
 /// the tmpfile name unique and to label errors.
-fn run_once(args: &PhasebreakArgs, run_idx: usize) -> Result<PhaseRecord, String> {
+fn run_once(
+    args: &PhasebreakArgs,
+    run_idx: usize,
+) -> Result<(PhaseRecord, Option<PathAccountRecord>), String> {
     let tmp = std::env::temp_dir().join(format!(
         "fulcrum-phasebreak-{}-{}-{run_idx}.jsonl",
         std::process::id(),
@@ -537,17 +605,20 @@ fn run_once(args: &PhasebreakArgs, run_idx: usize) -> Result<PhaseRecord, String
     })?;
     let _ = std::fs::remove_file(&tmp);
 
-    let line = content
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "phasebreak: run {run_idx}: GZIPPY_PHASE_OUT file was empty — the binary \
-                 may not be built with --features phase-timing"
-            )
-        })?;
-    parse_phase_line(line)
+    // KIND-DISPATCH the emitter lines — never "the last non-empty line". One
+    // decode writes one phasebreak line and (on a build that emits it) one
+    // pathaccount line; grabbing the last line would silently keep only one.
+    let (phases, paths) = split_by_kind(&content)
+        .map_err(|e| format!("phasebreak: run {run_idx}: {e}"))?;
+    let phase = phases.into_iter().next_back().ok_or_else(|| {
+        format!(
+            "phasebreak: run {run_idx}: GZIPPY_PHASE_OUT file had no phasebreak line — the \
+             binary may not be built with --features phase-timing"
+        )
+    })?;
+    // pathaccount is OPTIONAL (older builds emit only phasebreak); when present
+    // the LAST one is this decode's.
+    Ok((phase, paths.into_iter().next_back()))
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
@@ -568,6 +639,17 @@ pub struct Report {
     pub stats: Vec<PhaseStat>,
     pub dominant: String,
     pub warnings: Vec<String>,
+    /// pathaccount records retained (Gate-0 byte-conservation PASSED). 0 ⇒ the
+    /// binary did not emit pathaccount lines (older build).
+    pub n_pathaccount: usize,
+    /// Median share (0.0..=1.0) of decoded output BYTES that went through the
+    /// u16-marker machinery (vs the clean contig / stored paths). `None` ⇒ no
+    /// pathaccount data. Near-0 on literal-heavy data ⇒ marker resolution is not
+    /// the wall lever however many chunks bootstrapped window-absent.
+    pub marker_byte_fraction: Option<f64>,
+    /// Median share of accumulated (instrument-inflated) decode TIME in the
+    /// marker paths. `None` ⇒ no pathaccount data.
+    pub marker_ns_fraction: Option<f64>,
 }
 
 /// Median of a value list. PURE — unit-tested. Empty input returns 0.0 (never
@@ -598,7 +680,12 @@ pub fn spread(v: &[f64]) -> f64 {
 /// Build the per-phase median+spread [`Report`] from validated records (run 0
 /// already dropped by the caller) plus any accumulated suspicion warnings.
 /// PURE — unit-tested.
-pub fn build_report(threads: usize, records: &[PhaseRecord], warnings: Vec<String>) -> Report {
+pub fn build_report(
+    threads: usize,
+    records: &[PhaseRecord],
+    path_records: &[PathAccountRecord],
+    warnings: Vec<String>,
+) -> Report {
     type PhaseAccessor = (&'static str, fn(&PhaseRecord) -> u64);
     let phases: [PhaseAccessor; 6] = [
         ("consumer_wall", |r| r.consumer_wall_us),
@@ -628,12 +715,29 @@ pub fn build_report(threads: usize, records: &[PhaseRecord], warnings: Vec<Strin
         .map(|s| s.name.clone())
         .unwrap_or_default();
 
+    let (marker_byte_fraction, marker_ns_fraction) = if path_records.is_empty() {
+        (None, None)
+    } else {
+        let byte: Vec<f64> = path_records
+            .iter()
+            .map(|r| r.marker_machinery_byte_fraction())
+            .collect();
+        let ns: Vec<f64> = path_records
+            .iter()
+            .map(|r| r.marker_machinery_ns_fraction())
+            .collect();
+        (Some(median(byte)), Some(median(ns)))
+    };
+
     Report {
         threads,
         n_used: records.len(),
         stats,
         dominant,
         warnings,
+        n_pathaccount: path_records.len(),
+        marker_byte_fraction,
+        marker_ns_fraction,
     }
 }
 
@@ -660,6 +764,19 @@ impl Report {
             "verdict: dominant blocking phase = {}\n",
             self.dominant
         ));
+        if let (Some(bf), Some(nf)) = (self.marker_byte_fraction, self.marker_ns_fraction) {
+            s.push_str(&format!(
+                "pathaccount: N={} marker-machinery byte-fraction={:.1}%  ns-fraction={:.1}%  \
+                 (clean contig+stored = the rest)\n",
+                self.n_pathaccount,
+                bf * 100.0,
+                nf * 100.0,
+            ));
+        } else {
+            s.push_str(
+                "pathaccount: (no pathaccount lines — binary predates the emitter or emits phasebreak only)\n",
+            );
+        }
         for w in &self.warnings {
             s.push_str(&format!("warning: {w}\n"));
         }
@@ -684,6 +801,9 @@ impl Report {
             "n": self.n_used,
             "phases": phases,
             "dominant": self.dominant,
+            "n_pathaccount": self.n_pathaccount,
+            "marker_machinery_byte_fraction": self.marker_byte_fraction,
+            "marker_machinery_ns_fraction": self.marker_ns_fraction,
             "warnings": self.warnings,
         })
         .to_string()
@@ -708,38 +828,55 @@ pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
     if let Some(f) = &args.from_file {
         let content = std::fs::read_to_string(f)
             .map_err(|e| format!("phasebreak: cannot read --from-file {} ({e})", f.display()))?;
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() < 2 {
+        // KIND-DISPATCH into the two disjoint streams (never "last line").
+        let (all_phases, all_paths) = split_by_kind(&content)
+            .map_err(|e| format!("phasebreak: --from-file {}: {e}", f.display()))?;
+        if all_phases.len() < 2 {
             return Err(format!(
-                "phasebreak: --from-file {} has {} record(s); need >= 2 (line 1 is dropped as warmup)",
+                "phasebreak: --from-file {} has {} phasebreak record(s); need >= 2 \
+                 (record 1 is dropped as warmup)",
                 f.display(),
-                lines.len()
+                all_phases.len()
             ));
         }
-        let mut records: Vec<PhaseRecord> = Vec::with_capacity(lines.len() - 1);
+        let mut records: Vec<PhaseRecord> = Vec::with_capacity(all_phases.len() - 1);
         let mut warnings: Vec<String> = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            let record = parse_phase_line(line)
-                .map_err(|e| format!("phasebreak: --from-file line {}: {e}", idx + 1))?;
+        for (idx, record) in all_phases.iter().enumerate() {
             if idx == 0 {
                 continue; // warmup
             }
-            gate0_validate(&record).map_err(|e| {
+            gate0_validate(record).map_err(|e| {
                 format!(
-                    "phasebreak: --from-file line {} REFUSED (Gate-0 failed): {e}",
+                    "phasebreak: --from-file phasebreak #{} REFUSED (Gate-0 failed): {e}",
                     idx + 1
                 )
             })?;
-            if let Some(w) = check_inert_oracle_trap(&record) {
-                warnings.push(format!("line {}: {w}", idx + 1));
+            if let Some(w) = check_inert_oracle_trap(record) {
+                warnings.push(format!("phasebreak #{}: {w}", idx + 1));
             }
-            records.push(record);
+            records.push(*record);
+        }
+        // pathaccount byte-conservation is a RUNTIME hard-refuse (drop record 1
+        // as warmup, matching the phasebreak stream). EXACT byte count, so any
+        // nonzero residual is a real miscounted output site.
+        let mut path_records: Vec<PathAccountRecord> = Vec::new();
+        for (idx, pa) in all_paths.iter().enumerate() {
+            if idx == 0 && all_paths.len() > 1 {
+                continue; // warmup (only skip when there's a retained sample left)
+            }
+            check_pathaccount_conservation(pa).map_err(|e| {
+                format!(
+                    "phasebreak: --from-file pathaccount #{} REFUSED (Gate-0 failed): {e}",
+                    idx + 1
+                )
+            })?;
+            path_records.push(*pa);
         }
         let threads = records
             .first()
             .map(|r| r.threads as usize)
             .unwrap_or(args.threads);
-        return Ok(build_report(threads, &records, warnings));
+        return Ok(build_report(threads, &records, &path_records, warnings));
     }
 
     if !args.native.exists() {
@@ -756,9 +893,10 @@ pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
     }
 
     let mut records: Vec<PhaseRecord> = Vec::with_capacity(args.n.saturating_sub(1));
+    let mut path_records: Vec<PathAccountRecord> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for i in 0..args.n {
-        let record = run_once(args, i)?;
+        let (record, path) = run_once(args, i)?;
         if i == 0 {
             // Warmup — spawned + parsed (so a totally inert/broken binary is
             // still caught) but NOT Gate-0-validated and dropped from the
@@ -767,13 +905,21 @@ pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
         }
         gate0_validate(&record)
             .map_err(|e| format!("phasebreak: run {i} REFUSED (Gate-0 failed): {e}"))?;
+        // pathaccount byte-conservation is an EXACT-count RUNTIME hard-refuse
+        // (this is the fix for the hole where the check only ran in #[cfg(test)]).
+        if let Some(pa) = path {
+            check_pathaccount_conservation(&pa).map_err(|e| {
+                format!("phasebreak: run {i} REFUSED (Gate-0 pathaccount byte-conservation): {e}")
+            })?;
+            path_records.push(pa);
+        }
         if let Some(w) = check_inert_oracle_trap(&record) {
             warnings.push(format!("run {i}: {w}"));
         }
         records.push(record);
     }
 
-    Ok(build_report(args.threads, &records, warnings))
+    Ok(build_report(args.threads, &records, &path_records, warnings))
 }
 
 /// Render `HELP` with the leading blank line `chainlat`-style callers expect
@@ -1102,7 +1248,7 @@ mod tests {
                 ..ok_record()
             },
         ];
-        let report = build_report(4, &records, vec![]);
+        let report = build_report(4, &records, &[], vec![]);
         assert_eq!(report.n_used, 2);
         assert_eq!(report.dominant, "future_recv");
         // Sorted desc by median: consumer_wall (aggregate) leads, then future_recv.
@@ -1117,14 +1263,14 @@ mod tests {
 
     #[test]
     fn render_table_contains_verdict_line() {
-        let report = build_report(4, &[ok_record()], vec![]);
+        let report = build_report(4, &[ok_record()], &[], vec![]);
         let table = report.render_table();
         assert!(table.contains("verdict: dominant blocking phase = future_recv"));
     }
 
     #[test]
     fn render_json_round_trips_as_valid_json() {
-        let report = build_report(1, &[ok_record()], vec!["w".to_string()]);
+        let report = build_report(1, &[ok_record()], &[], vec!["w".to_string()]);
         let j = report.render_json();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["kind"], "phasebreak_report");
@@ -1174,5 +1320,92 @@ mod tests {
             "{\"kind\":\"pathaccount\",\"protocol\":2,\"total_bytes\":0}"
         )
         .is_err());
+    }
+
+    // ── P0a: kind-dispatch (never "the last line") ───────────────────────────
+
+    const PHASE_LINE: &str = r#"{"kind":"phasebreak","protocol":1,"wall_us":100,"consumer_wall_us":90,"consumer_cpu_us":30,"decode_wait_us":10,"future_recv_us":50,"drain_us":0,"blockfind_us":0,"finalize_us":2,"iters":3,"threads":4}"#;
+
+    #[test]
+    fn split_by_kind_both_orders_parse_to_the_same_streams() {
+        // phasebreak-then-pathaccount
+        let a = format!("{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n");
+        // pathaccount-then-phasebreak (the ORDER the old "last line" logic would
+        // have silently dropped the phasebreak on)
+        let b = format!("{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n");
+        let (pa, paa) = split_by_kind(&a).unwrap();
+        let (pb, pab) = split_by_kind(&b).unwrap();
+        assert_eq!(pa.len(), 1);
+        assert_eq!(paa.len(), 1);
+        assert_eq!(pb.len(), 1);
+        assert_eq!(pab.len(), 1);
+        // Order-independent: same records recovered either way.
+        assert_eq!(pa[0], pb[0]);
+        assert_eq!(paa[0], pab[0]);
+        assert_eq!(pa[0].future_recv_us, 50);
+        assert_eq!(paa[0].total_bytes, 988_575_557);
+    }
+
+    #[test]
+    fn parse_line_by_kind_refuses_unknown_kind() {
+        assert!(parse_line_by_kind(r#"{"kind":"somethingelse","protocol":1}"#).is_err());
+        assert_eq!(parse_line_by_kind("   ").unwrap().is_none(), true);
+    }
+
+    #[test]
+    fn from_file_planted_byte_miscount_refuses_at_runtime() {
+        // Two full decodes (warmup + one retained). The RETAINED decode's
+        // pathaccount line has a deliberately broken byte count (contig off by
+        // 1000). This must REFUSE at RUNTIME via run() — the exact hole P0a
+        // fixed (the check formerly lived only in #[cfg(test)]).
+        let broken = QWEN_T4_PATHACCOUNT.replace("\"contig_bytes\":956183883", "\"contig_bytes\":956182883");
+        let jsonl = format!(
+            "{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{broken}\n"
+        );
+        let dir = std::env::temp_dir().join(format!("fulcrum-pb-selftest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("phases.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let args = PhasebreakArgs {
+            native: PathBuf::from("<from-file>"),
+            corpus: PathBuf::from("<from-file>"),
+            threads: 4,
+            n: 7,
+            taskset: None,
+            json: false,
+            from_file: Some(path.clone()),
+        };
+        let e = run(&args).expect_err("planted byte-miscount must REFUSE at runtime");
+        assert!(
+            e.contains("GATE0-PATHACCOUNT-CONSERVATION"),
+            "expected pathaccount conservation refusal, got: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_file_conserving_pathaccount_passes_and_surfaces_marker_fraction() {
+        let jsonl = format!(
+            "{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n"
+        );
+        let dir = std::env::temp_dir().join(format!("fulcrum-pb-selftest-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("phases.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        let args = PhasebreakArgs {
+            native: PathBuf::from("<from-file>"),
+            corpus: PathBuf::from("<from-file>"),
+            threads: 4,
+            n: 7,
+            taskset: None,
+            json: false,
+            from_file: Some(path.clone()),
+        };
+        let r = run(&args).expect("conserving pathaccount should pass Gate-0");
+        // Marker byte-fraction surfaced (qwen literal-heavy: ~2-3%).
+        let bf = r.marker_byte_fraction.expect("marker byte fraction present");
+        assert!(bf < 0.035, "marker byte fraction {bf} should be tiny");
+        assert!(r.n_pathaccount >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
