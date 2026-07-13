@@ -182,7 +182,12 @@ pub fn fill_source_class(event: &str) -> Option<&'static str> {
 pub struct PerfRow {
     pub event: String,
     pub value: f64,
-    pub pct_running: f64,
+    /// Fraction of wall time this counter was actually scheduled (multiplexing
+    /// indicator; 100 = no multiplexing). `None` ⇒ perf did NOT emit the
+    /// run%-column for this row — the scheduling is UNKNOWN and MUST NOT be
+    /// fabricated as 100.0 (the P0b fix): a null-pct row is flagged as an
+    /// estimate, never reported as exact.
+    pub pct_running: Option<f64>,
 }
 
 /// Strip a hybrid-PMU wrapper (`cpu_core/EVENT/`, `cpu_atom/EVENT/`, `cpu/EVENT/`)
@@ -230,10 +235,9 @@ pub fn parse_perf_rows(text: &str) -> Vec<PerfRow> {
         let Ok(value) = raw_val.parse::<f64>() else {
             continue;
         };
-        let pct_running = f
-            .get(4)
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(100.0);
+        // P0b: a MISSING or unparseable run%-column is `None` (scheduling
+        // UNKNOWN → flagged as an estimate), NEVER fabricated as 100.0.
+        let pct_running = f.get(4).and_then(|s| s.trim().parse::<f64>().ok());
         out.push(PerfRow {
             event: normalize_event(event_raw),
             value,
@@ -241,6 +245,22 @@ pub fn parse_perf_rows(text: &str) -> Vec<PerfRow> {
         });
     }
     out
+}
+
+/// Reduce a counter's per-rep scheduled-pct samples to `(median_pct, estimate)`.
+/// PURE — unit-tested. P0b rule: the count is an ESTIMATE (scaled up from a
+/// partial schedule, NOT exact) when ANY rep lacked the run%-column (scheduling
+/// UNKNOWN → `median_pct = None`) OR the median schedule was < 80%. A null
+/// median is NEVER reported as 100.0.
+pub fn pct_estimate(samples: &[Option<f64>]) -> (Option<f64>, bool) {
+    let any_unknown = samples.iter().any(|s| s.is_none());
+    let present: Vec<f64> = samples.iter().filter_map(|s| *s).collect();
+    if any_unknown || present.is_empty() {
+        (None, true)
+    } else {
+        let mp = median(&present);
+        (Some(mp), mp < 80.0)
+    }
 }
 
 /// Implied core frequency (GHz) from a cycles count and a task-clock in
@@ -268,9 +288,15 @@ pub struct ArmProfile {
     pub raw: BTreeMap<String, f64>,
     /// event → relative inter-quartile spread across reps.
     pub spread: BTreeMap<String, f64>,
-    /// event → median pct-running (multiplexing indicator).
-    pub pct_running: BTreeMap<String, f64>,
-    /// events perf reported multiplexed (< 80% scheduled).
+    /// event → median scheduled-pct (multiplexing indicator). `null` ⇒ perf
+    /// never emitted the run%-column for this event, so scheduling is UNKNOWN
+    /// (the count is an estimate); NEVER silently 100.0 (P0b fix).
+    pub scheduled_pct: BTreeMap<String, Option<f64>>,
+    /// event → `true` when the count is an ESTIMATE (scaled from a partial
+    /// schedule): median pct < 80, OR pct unknown (null run%-column). A `true`
+    /// entry means the raw count was multiplied up by perf and is NOT exact.
+    pub estimate: BTreeMap<String, bool>,
+    /// events perf reported multiplexed / unknown-scheduled (estimate==true).
     pub multiplexed: Vec<String>,
     /// events requested but unavailable on this box.
     pub unavailable: Vec<String>,
@@ -380,7 +406,9 @@ fn measure_arm(
     let (sha, _b) = run_arm_sha(bin, args, corpus)?;
 
     let mut counts: EvMap = BTreeMap::new();
-    let mut pcts: EvMap = BTreeMap::new();
+    // Per-event scheduled-pct samples: `None` means perf emitted no run%-column
+    // for that sample (scheduling unknown), which must NOT be fabricated as 100.
+    let mut pcts: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
     for batch in batches {
         // drop unavailable events from this batch
         let events: Vec<String> = batch
@@ -405,7 +433,8 @@ fn measure_arm(
     let mut per_byte = BTreeMap::new();
     let mut raw = BTreeMap::new();
     let mut spread = BTreeMap::new();
-    let mut pct_running = BTreeMap::new();
+    let mut scheduled_pct: BTreeMap<String, Option<f64>> = BTreeMap::new();
+    let mut estimate: BTreeMap<String, bool> = BTreeMap::new();
     let mut multiplexed = Vec::new();
     for (ev, samples) in &counts {
         let m = median(samples);
@@ -414,9 +443,12 @@ fn measure_arm(
         spread.insert(ev.clone(), rel_spread(samples));
     }
     for (ev, samples) in &pcts {
-        let mp = median(samples);
-        pct_running.insert(ev.clone(), mp);
-        if mp < 80.0 {
+        // If ANY sample lacked the run%-column, scheduling is UNKNOWN → null +
+        // flagged as an estimate (we cannot prove it was 100%-scheduled).
+        let (med, is_estimate) = pct_estimate(samples);
+        scheduled_pct.insert(ev.clone(), med);
+        estimate.insert(ev.clone(), is_estimate);
+        if is_estimate {
             multiplexed.push(ev.clone());
         }
     }
@@ -437,7 +469,8 @@ fn measure_arm(
         per_byte,
         raw,
         spread,
-        pct_running,
+        scheduled_pct,
+        estimate,
         multiplexed,
         unavailable: unavailable.to_vec(),
     })
@@ -459,6 +492,11 @@ pub struct UarchConfig {
     pub out: Option<String>,
     pub gz_label: String,
     pub rg_label: String,
+    /// When false (default), any counter whose count is an ESTIMATE (multiplexed
+    /// < 80% scheduled, or unknown run%-column) FAILS the cell's Gate-0 — a
+    /// scaled estimate must not be trusted as exact. `--allow-multiplexed` opts
+    /// into estimates (still flagged per-counter, but the cell can pass).
+    pub allow_multiplexed: bool,
 }
 
 impl Default for UarchConfig {
@@ -477,6 +515,7 @@ impl Default for UarchConfig {
             out: None,
             gz_label: "gz".to_string(),
             rg_label: "rg".to_string(),
+            allow_multiplexed: false,
         }
     }
 }
@@ -592,10 +631,19 @@ fn run_cell(cfg: &UarchConfig, corpus: &str, thread: usize) -> Result<CellProfil
         }
         if !a.multiplexed.is_empty() {
             notes.push(format!(
-                "{} multiplexed (pct<80, count is an ESTIMATE): {}",
+                "{} multiplexed/unknown-schedule (count is an ESTIMATE, not exact): {}{}",
                 a.label,
-                a.multiplexed.join(",")
+                a.multiplexed.join(","),
+                if cfg.allow_multiplexed {
+                    " [--allow-multiplexed: not failing]"
+                } else {
+                    " [Gate-0 FAIL — pass --allow-multiplexed to accept estimates]"
+                }
             ));
+            // P0b: an estimate must not pass as exact unless explicitly allowed.
+            if !cfg.allow_multiplexed {
+                pass = false;
+            }
         }
         if !a.unavailable.is_empty() {
             notes.push(format!("{} unavailable events: {}", a.label, a.unavailable.join(",")));
@@ -750,10 +798,19 @@ fn render_box(bp: &BoxProfile) {
             let gv = c.gz.per_byte.get(ev).copied().unwrap_or(0.0);
             let rv = c.rg.per_byte.get(ev).copied().unwrap_or(0.0);
             let spr = c.gz.spread.get(ev).copied().unwrap_or(0.0) * 100.0;
-            let run = c.gz.pct_running.get(ev).copied().unwrap_or(100.0);
+            // null run% ⇒ "??" + an estimate marker, never a fabricated 100.0.
+            let run = match c.gz.scheduled_pct.get(ev).copied().flatten() {
+                Some(v) => format!("{v:>6.1}"),
+                None => "  ?? ".to_string(),
+            };
+            let est = if c.gz.estimate.get(ev).copied().unwrap_or(false) {
+                "~"
+            } else {
+                " "
+            };
             println!(
-                "   {:<44} {:>14.5} {:>14.5} {:>8.3} {:>7.1} {:>7.1}",
-                ev, gv, rv, r, spr, run
+                "   {:<44} {:>14.5} {:>14.5} {:>8.3} {:>7.1} {}{}",
+                ev, gv, rv, r, spr, run, est
             );
         }
         render_fill_breakdown(c);
@@ -844,6 +901,10 @@ fn cmd_cross(losing: &str, winning: &str) -> ExitCode {
         a.box_name, a.arch, a.vendor, b.box_name, b.arch, b.vendor
     );
     let bmap: BTreeMap<String, &CellProfile> = b.cells.iter().map(|c| (cell_key(c), c)).collect();
+    // P0b: a cross-machine ranking built on a Gate-0-FAILED cell would rank
+    // numbers the instrument itself declared untrustworthy. REFUSE such cells
+    // (no ranking) and fail the whole command with a non-zero exit.
+    let mut any_refused = false;
     for ca in &a.cells {
         let Some(cb) = bmap.get(&cell_key(ca)) else {
             println!("\n[skip {} — no matching cell on WIN box]", cell_key(ca));
@@ -855,11 +916,24 @@ fn cmd_cross(losing: &str, winning: &str) -> ExitCode {
                 cell_key(ca), ca.bytes, cb.bytes
             );
         }
+        if !ca.gate0_pass || !cb.gate0_pass {
+            any_refused = true;
+            println!(
+                "\n── cell {} ── REFUSED: no ranking — a source cell FAILED Gate-0 \
+                 (gate0 A={} B={}). The counters are not trustworthy; re-measure the \
+                 failing box before ranking a cross-machine divergence.",
+                cell_key(ca),
+                if ca.gate0_pass { "PASS" } else { "FAIL" },
+                if cb.gate0_pass { "PASS" } else { "FAIL" }
+            );
+            for n in ca.gate0_notes.iter().chain(cb.gate0_notes.iter()) {
+                println!("     - {n}");
+            }
+            continue;
+        }
         println!(
-            "\n── cell {} ── gz/rg wall-loser=A  (gate0 A={} B={})",
+            "\n── cell {} ── gz/rg wall-loser=A  (gate0 A=PASS B=PASS)",
             cell_key(ca),
-            if ca.gate0_pass { "PASS" } else { "FAIL" },
-            if cb.gate0_pass { "PASS" } else { "FAIL" }
         );
         let rows = cross_rows(&ca.gz_over_rg, &cb.gz_over_rg);
         println!(
@@ -878,7 +952,12 @@ fn cmd_cross(losing: &str, winning: &str) -> ExitCode {
             );
         }
     }
-    ExitCode::SUCCESS
+    if any_refused {
+        eprintln!("\nuarch cross: REFUSED — one or more cells failed Gate-0 (see above); exit non-zero.");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 // ── selftest (Gate-0) ────────────────────────────────────────────────────────
@@ -914,9 +993,15 @@ pub fn selftest() -> ExitCode {
     let rows = parse_perf_rows(sample);
     check!(rows.len() == 3, "parse drops <not counted> + comment (3 rows)");
     check!(rows[0].event == "cycles" && (rows[0].value - 903558.0).abs() < 1.0, "cpu_core cycles value parsed");
-    check!((rows[0].pct_running - 100.0).abs() < 0.01, "pct-running 100 parsed");
-    check!((rows[1].pct_running - 55.30).abs() < 0.01, "multiplexed pct-running 55.30 parsed");
+    check!(rows[0].pct_running.map(|v| (v - 100.0).abs() < 0.01).unwrap_or(false), "pct-running 100 parsed");
+    check!(rows[1].pct_running.map(|v| (v - 55.30).abs() < 0.01).unwrap_or(false), "multiplexed pct-running 55.30 parsed");
     check!(rows[2].event == "task-clock", "task-clock parsed");
+
+    // 2b. P0b: a MISSING run%-column ⇒ None, NEVER a fabricated 100.0.
+    let no_pct = "1234,,cycles,50000\n5678,,instructions"; // only 4 / 3 fields, no run% col
+    let rows_np = parse_perf_rows(no_pct);
+    check!(rows_np.len() == 2, "P0b: rows without run%-column still parse (2 rows)");
+    check!(rows_np.iter().all(|r| r.pct_running.is_none()), "P0b: missing run%-column ⇒ pct_running None (not 100.0)");
 
     // 3. implied GHz
     check!((implied_ghz(2_800_000_000.0, 1000.0) - 2.8).abs() < 1e-6, "implied GHz = cycles/(ms*1e6)");
@@ -953,6 +1038,32 @@ pub fn selftest() -> ExitCode {
     }
     check!(true, "curated batches ≤5 events each (100%-scheduled, no multiplexing)");
 
+    // 7b. P0b: pct_estimate — the multiplexing/unknown gate.
+    check!(pct_estimate(&[Some(100.0), Some(99.5)]) == (Some(99.75), false), "P0b: fully-scheduled ⇒ not an estimate");
+    check!({ let (m, e) = pct_estimate(&[Some(55.0), Some(60.0)]); m == Some(57.5) && e }, "P0b: pct<80 ⇒ estimate=true");
+    check!(pct_estimate(&[Some(100.0), None]) == (None, true), "P0b: any missing run%-column ⇒ null median + estimate");
+    check!(pct_estimate(&[]) == (None, true), "P0b: no samples ⇒ null + estimate");
+
+    // 7c. P0b: `uarch cross` REFUSES (non-zero exit) when a source cell failed Gate-0.
+    {
+        let good = mk_box_json("boxA", true);
+        let bad = mk_box_json("boxB", false);
+        let dir = std::env::temp_dir().join(format!("uarch_cross_selftest_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ga = dir.join("a.json");
+        let gb = dir.join("b.json");
+        let _ = std::fs::write(&ga, &good);
+        let _ = std::fs::write(&gb, &bad);
+        // B (win box) has a gate0-FAILED cell ⇒ cross must REFUSE with FAILURE.
+        let ec = cmd_cross(ga.to_str().unwrap(), gb.to_str().unwrap());
+        check!(ec == ExitCode::FAILURE, "P0b: cross REFUSES (non-zero) on a Gate-0-failed source cell");
+        // both PASS ⇒ SUCCESS.
+        let _ = std::fs::write(&gb, mk_box_json("boxB", true));
+        let ec2 = cmd_cross(ga.to_str().unwrap(), gb.to_str().unwrap());
+        check!(ec2 == ExitCode::SUCCESS, "P0b: cross ranks (SUCCESS) when both cells pass Gate-0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // 8. LIVE perf A/A check when perf is present — the real Gate-0.
     if Command::new("perf").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         match live_aa_check() {
@@ -973,6 +1084,39 @@ pub fn selftest() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// A minimal BoxProfile JSON with ONE cell (weights|T4) whose `gate0_pass` is
+/// set by the caller, plus a gz_over_rg map so a passing cell has something to
+/// rank. Used by the P0b cross-refuse selftest (no perf/box needed).
+fn mk_box_json(box_name: &str, gate0_pass: bool) -> String {
+    serde_json::json!({
+        "box_name": box_name,
+        "host": "selftest",
+        "arch": "x86_64",
+        "vendor": "Amd",
+        "timestamp": "epoch:1",
+        "cells": [{
+            "corpus": "/x/weights.gz",
+            "corpus_basename": "weights.gz",
+            "threads": 4,
+            "mask": "8-11",
+            "bytes": 1000.0,
+            "reference_sha": "deadbeefdeadbeef",
+            "n": 5,
+            "gz": {"label":"gz","bin":"gz","sha":"aa","bytes":1000.0,"ipc":2.0,"implied_ghz":3.0,
+                   "per_byte":{"cycles":1.0},"raw":{"cycles":1000.0},"spread":{},
+                   "scheduled_pct":{"cycles":100.0},"estimate":{"cycles":false},"multiplexed":[],"unavailable":[]},
+            "rg": {"label":"rg","bin":"rg","sha":"aa","bytes":1000.0,"ipc":2.0,"implied_ghz":3.0,
+                   "per_byte":{"cycles":0.9},"raw":{"cycles":900.0},"spread":{},
+                   "scheduled_pct":{"cycles":100.0},"estimate":{"cycles":false},"multiplexed":[],"unavailable":[]},
+            "gz_over_rg": {"cycles": 1.11},
+            "aa_max_dev": 0.0,
+            "gate0_pass": gate0_pass,
+            "gate0_notes": if gate0_pass { vec![] } else { vec!["synthetic Gate-0 fail".to_string()] },
+        }],
+    })
+    .to_string()
 }
 
 /// Build a small deterministic corpus, gzip it, run `gzip -dc` as BOTH arms under
@@ -1015,6 +1159,10 @@ fn live_aa_check() -> Result<f64, String> {
         out: None,
         gz_label: "A".to_string(),
         rg_label: "A2".to_string(),
+        // The live A/A check validates BOX stability, not the multiplexing gate
+        // (which check 7b covers purely); accept estimates so a counter-limited
+        // box doesn't spuriously refuse the A/A cell.
+        allow_multiplexed: true,
     };
     let bp = run(&cfg)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -1052,15 +1200,20 @@ USAGE:
     --mask <taskset -c value>      default base-8 contiguous (T4→8-11, T8→8-15)
     --oracle-cmd \"<cmd>\"           byte-exact reference (default \"gzip -dc\")
     --aa                           also run subject twice → A/A self-validation
+    --allow-multiplexed            accept estimate (multiplexed/unknown-schedule)
+                                   counters — else any estimate FAILS the cell Gate-0
     --box <name>                   provenance label
     --out <path.json>             write the BoxProfile JSON
 
   fulcrum uarch cross <lose_box.json> <win_box.json>
       Cross-machine divergence: per counter, gz/rg on each box + A/B divergence;
-      flags the counter high-on-LOSE / parity-on-WIN = the mechanism.
+      flags the counter high-on-LOSE / parity-on-WIN = the mechanism. REFUSES
+      (no ranking, non-zero exit) any cell where either box FAILED Gate-0.
 
-GATE-0: byte-exact sha==oracle; IPC∈[0.1,8]; cycles≈task-clock×freq; pct-running
-per counter (multiplexed<80 flagged); N-run spread; unavailable counters degrade.";
+GATE-0: byte-exact sha==oracle; IPC∈[0.1,8]; cycles≈task-clock×freq; per-counter
+scheduled_pct (null when perf omits run%-column, NEVER fabricated 100); an
+ESTIMATE counter (pct<80 or unknown) FAILS the cell unless --allow-multiplexed;
+N-run spread; unavailable counters degrade.";
 
 pub fn cmd_uarch(args: &[String]) -> ExitCode {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
@@ -1104,6 +1257,7 @@ pub fn cmd_uarch(args: &[String]) -> ExitCode {
             "--mask" => cfg.mask = Some(next()),
             "--oracle-cmd" => cfg.oracle_cmd = split_args(&next()),
             "--aa" => cfg.aa = true,
+            "--allow-multiplexed" => cfg.allow_multiplexed = true,
             "--box" => cfg.box_name = next(),
             "--out" => cfg.out = Some(next()),
             "--gz-label" => cfg.gz_label = next(),
@@ -1175,6 +1329,27 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default()
         };
+        // scheduled_pct is Option<f64> per event (null ⇒ unknown run%-column).
+        let sched = |k: &str| -> BTreeMap<String, Option<f64>> {
+            a.get(k)
+                .and_then(|m| m.as_object())
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_f64()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let estmap = |k: &str| -> BTreeMap<String, bool> {
+            a.get(k)
+                .and_then(|m| m.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         ArmProfile {
             label: a.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             bin: a.get("bin").and_then(|x| x.as_str()).unwrap_or("").to_string(),
@@ -1185,7 +1360,8 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
             per_byte: mapf("per_byte"),
             raw: mapf("raw"),
             spread: mapf("spread"),
-            pct_running: mapf("pct_running"),
+            scheduled_pct: sched("scheduled_pct"),
+            estimate: estmap("estimate"),
             multiplexed: vecs("multiplexed"),
             unavailable: vecs("unavailable"),
         }
@@ -1254,8 +1430,24 @@ mod tests {
         let r = parse_perf_rows(s);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].event, "cycles");
-        assert!((r[0].pct_running - 88.50).abs() < 1e-6);
-        assert!((r[1].pct_running - 42.10).abs() < 1e-6);
+        assert!((r[0].pct_running.unwrap() - 88.50).abs() < 1e-6);
+        assert!((r[1].pct_running.unwrap() - 42.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_run_pct_column_is_none_not_100() {
+        // P0b: perf rows without the run%-column must yield None, never 100.0.
+        let r = parse_perf_rows("1234,,cycles,50000\n5678,,instructions");
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|x| x.pct_running.is_none()));
+    }
+
+    #[test]
+    fn pct_estimate_flags_multiplexed_and_unknown() {
+        assert_eq!(pct_estimate(&[Some(100.0), Some(100.0)]), (Some(100.0), false));
+        assert_eq!(pct_estimate(&[Some(50.0)]), (Some(50.0), true));
+        assert_eq!(pct_estimate(&[Some(100.0), None]), (None, true));
+        assert_eq!(pct_estimate(&[]), (None, true));
     }
 
     #[test]
