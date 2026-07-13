@@ -128,6 +128,38 @@ USAGE:\n\
               box×comparator×corpus×T goal grid; every cell is W/T/L/V/STALE/UNMEASURED and the\n\
               exit code is the gate (SUCCESS only on SCOPE=WIN). The board can no longer silently\n\
               shrink to one comparator/box. `scope selftest` is the baked Gate-0.\n\
+  fulcrum gate --cand <bin[:tmpl]> --base <bin[:tmpl]> --rg <bin[:tmpl]> --target-cells c.gz:4,...\n\
+              [--breadth-corpora a.gz,b.gz --breadth-threads 1,4,8] [--freeze-each]\n\
+              [--scope-manifest scope.json --arch-json <banked> ...] [--out gate.json]\n\
+              the WHOLE lever verdict in ONE command: target-cell recovery vs rg + full-breadth\n\
+              no-regress vs base + per-cell peak-RSS + byte-exact + A/A floor + optional cross-arch\n\
+              merge. Exit = PASS|OPEN|VOID|FAIL. `gate selftest` is the baked Gate-0 (no box).\n\
+  fulcrum dispatchgap <event-log.jsonl> [--label L] [--workers N] [--json out.json]\n\
+              per-worker inter-chunk dispatch-gap attribution (H-QUEUE/BLOCKFIND/WINDOWDEP/\n\
+              DECODEWAIT/OTHER) from gzippy's GZIPPY_DISPATCHGAP event log; conservation +\n\
+              pairing + no-dropped-lines gates, non-zero exit on FAIL. `dispatchgap selftest`\n\
+              is the baked Gate-0 (synthetic logs, PASS + refusal paths).\n\
+  fulcrum uarch run|cross|selftest              hardware-counter microarch profiler (core/L1/TLB/\n\
+              LLC/stalls/branch + arch-specific memory-fill-source raw events) on a (bin,corpus,T)\n\
+              cell; `cross` explains a cross-machine win/loss divergence per counter. `uarch\n\
+              selftest` is the baked Gate-0 (pure logic + live perf A/A).\n\
+  fulcrum counterdiff --subject-bin <p> --comparator-cmd \"<cmd>\" --corpus <f.gz> [--threads 3,4]\n\
+              LIVE interleaved paired hw-counter diff + microarch attribution (frontend/backend/\n\
+              bad-spec/cache-memory), arch-aware event sets, A/A noise floor (Linux)\n\
+  fulcrum classhist --subject <elf> --comparator <elf> --corpus <f.gz>\n\
+              execution-weighted INSTRUCTION-CLASS histogram diff — is an instr surplus\n\
+              CONCENTRATED (code lever) or DISTRIBUTED (codegen)? (Linux/x86; mac: macmeasure)\n\
+  fulcrum locate <trace.json> [...] [--wall-ms X] [--threshold pct]\n\
+              closed WALL LEDGER over a span trace — every microsecond classified on the critical\n\
+              path or surfaced as RESIDUAL; refuses (FLAGGED) when the ledger cannot close\n\
+  fulcrum decide --feature <dir> [--ledger P] [--allow-thaw]   ONE artifact-dir → the ranked,\n\
+              causally-annotated next-actions table (wall-ms attribution + CAUSAL-OR-HYPOTHESIS\n\
+              + the exact re-verify command; fingerprint + ledger cross-checked)\n\
+  fulcrum sweep capture|mine|--cand ...         multi-factor lever-boundary characterizer (which\n\
+              corpus/T factors separate cand from base); `sweep --selftest` is the baked Gate-0\n\
+  fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
+              profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
+              faults, per-thread occupancy; Linux)\n\
   fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
   fulcrum mech-caps\n\
   fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\

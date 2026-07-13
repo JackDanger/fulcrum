@@ -36,6 +36,13 @@
 //!       == Σ gap within epsilon.
 //!   (d) PAIRING: every START has a matching FINISH (same key,worker); every
 //!       consumer ENTER has a matching EXIT.
+//!   (e) NO DROPPED LINES: every line in the log parses to a full event — a
+//!       malformed/truncated line means the log is corrupt or the schema moved,
+//!       and a silently-shrunk event set would fabricate a plausible breakdown.
+//!
+//! `fulcrum dispatchgap selftest` is the baked Gate-0: it drives the FULL
+//! analysis over synthetic logs and asserts both the PASS path (correct bucket
+//! attribution) and the REFUSAL paths (pairing break, inert log, dropped lines).
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -61,31 +68,44 @@ fn parse_field(line: &str, name: &str) -> Option<i64> {
     rest[..end].parse::<i64>().ok()
 }
 
-fn parse_log(text: &str) -> Vec<Ev> {
+/// Parse the event log. Returns `(events, dropped)` where `dropped` counts
+/// non-empty lines that failed to parse to a full event — a nonzero count is a
+/// Gate-0 FAIL (a silently-shrunk event set would fabricate a plausible
+/// breakdown from a corrupt/truncated log).
+fn parse_log(text: &str) -> (Vec<Ev>, usize) {
     let mut v = Vec::new();
+    let mut dropped = 0usize;
     for line in text.lines() {
         let line = line.trim();
-        if !line.starts_with('{') {
+        if line.is_empty() {
             continue;
         }
-        let (Some(t), Some(k), Some(key), Some(w), Some(f)) = (
-            parse_field(line, "t"),
-            parse_field(line, "k"),
-            parse_field(line, "key"),
-            parse_field(line, "w"),
-            parse_field(line, "f"),
-        ) else {
-            continue;
+        let parsed = if line.starts_with('{') {
+            match (
+                parse_field(line, "t"),
+                parse_field(line, "k"),
+                parse_field(line, "key"),
+                parse_field(line, "w"),
+                parse_field(line, "f"),
+            ) {
+                (Some(t), Some(k), Some(key), Some(w), Some(f)) => Some(Ev {
+                    t: t as u64,
+                    k: k as u8,
+                    key: key as u64,
+                    w: w as i32,
+                    f: f as u8,
+                }),
+                _ => None,
+            }
+        } else {
+            None
         };
-        v.push(Ev {
-            t: t as u64,
-            k: k as u8,
-            key: key as u64,
-            w: w as i32,
-            f: f as u8,
-        });
+        match parsed {
+            Some(ev) => v.push(ev),
+            None => dropped += 1,
+        }
     }
-    v
+    (v, dropped)
 }
 
 /// Closed intervals [start,end] built from paired ENTER/EXIT events.
@@ -178,7 +198,66 @@ fn pct(x: u64, whole: u64) -> f64 {
     }
 }
 
+/// The full analysis of one event log — everything the report prints and the
+/// Gate-0 gates check, computed PURELY from the log text (no I/O, no clock), so
+/// `selftest` can drive the identical path the CLI drives.
+struct Analysis {
+    n_events: usize,
+    dropped_lines: usize,
+    n_start: usize,
+    n_finish: usize,
+    worker_ids: Vec<i32>,
+    total_chunks: usize,
+    rows: Vec<WorkerRow>,
+    per_worker_buckets: HashMap<i32, Buckets>,
+    total_buckets: Buckets,
+    gap_sum: u64,
+    tot_window: u64,
+    tot_decode: u64,
+    n_bf: usize,
+    n_mw: usize,
+    n_dw: usize,
+    /// Gaps whose next task had NO known SUBMIT ≤ its start — those gaps were
+    /// booked as just-in-time H-QUEUE by necessity, so a large count means the
+    /// H-QUEUE share is a guess, not an attribution.
+    unknown_submit_gaps: usize,
+    // Gate-0 flags.
+    non_inert: bool,
+    all_reconciled: bool,
+    bucket_recon: bool,
+    pairing_ok: bool,
+    no_dropped: bool,
+}
+
+impl Analysis {
+    fn selftest_pass(&self, workers_ok: bool) -> bool {
+        self.non_inert
+            && self.all_reconciled
+            && self.bucket_recon
+            && self.pairing_ok
+            && self.no_dropped
+            && workers_ok
+    }
+
+    fn dominant(&self) -> (&'static str, u64) {
+        let tb = &self.total_buckets;
+        [
+            ("H-QUEUE", tb.queue),
+            ("H-BLOCKFIND", tb.blockfind),
+            ("H-WINDOWDEP", tb.windowdep),
+            ("H-DECODEWAIT", tb.decodewait),
+            ("H-OTHER", tb.other),
+        ]
+        .into_iter()
+        .max_by_key(|&(_, v)| v)
+        .unwrap()
+    }
+}
+
 pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
+    if args.first().map(|s| s.as_str()) == Some("selftest") {
+        return selftest();
+    }
     let mut path: Option<String> = None;
     let mut label = String::from("run");
     let mut json_out: Option<String> = None;
@@ -199,7 +278,7 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
                 expect_workers = args.get(i).and_then(|s| s.parse().ok());
             }
             "-h" | "--help" => {
-                eprintln!("usage: fulcrum dispatchgap <event-log.jsonl> [--label L] [--workers N] [--json out.json]");
+                eprintln!("usage: fulcrum dispatchgap <event-log.jsonl> [--label L] [--workers N] [--json out.json]\n       fulcrum dispatchgap selftest   (baked Gate-0 — synthetic logs, PASS + refusal paths)");
                 return ExitCode::SUCCESS;
             }
             s if path.is_none() => path = Some(s.to_string()),
@@ -218,7 +297,18 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let evs = parse_log(&text);
+    let a = analyze(&text);
+    let workers_ok = expect_workers.map(|n| n == a.worker_ids.len()).unwrap_or(true);
+    print_report(&a, &label, workers_ok, json_out.as_deref());
+    if a.selftest_pass(workers_ok) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn analyze(text: &str) -> Analysis {
+    let (evs, dropped_lines) = parse_log(text);
 
     // Consumer phase intervals.
     let bf = build_intervals(&evs, 3, 4);
@@ -269,8 +359,9 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
         }
     }
 
-    // Ignore the pseudo-worker -2 (unbound / consumer trial decodes) for the
-    // pool timeline but count it.
+    // The pseudo-worker -2 (unbound / consumer trial decodes) is EXCLUDED from
+    // both the pool timeline and the chunk counts — its "chunks" are not pool
+    // dispatches, so counting them would break per-worker conservation.
     let mut worker_ids: Vec<i32> = tasks.keys().copied().filter(|&w| w >= 0).collect();
     worker_ids.sort_unstable();
 
@@ -279,6 +370,7 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
     let mut total_buckets = Buckets::default();
     let mut per_worker_buckets: HashMap<i32, Buckets> = HashMap::new();
     let mut total_chunks = 0usize;
+    let mut unknown_submit_gaps = 0usize;
 
     for &w in &worker_ids {
         let mut ts = tasks.remove(&w).unwrap();
@@ -302,10 +394,15 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
             gap_total += gap;
 
             // Effective submit for next_key: latest submit <= next_start.
-            let t_submit = submits
+            let known_submit = submits
                 .get(&next_key)
-                .and_then(|v| v.iter().rev().find(|&&t| t <= next_start).copied())
-                .unwrap_or(next_start); // if unknown, treat as just-in-time
+                .and_then(|v| v.iter().rev().find(|&&t| t <= next_start).copied());
+            if known_submit.is_none() {
+                unknown_submit_gaps += 1;
+            }
+            // If unknown, treat as just-in-time (booked as H-QUEUE) — COUNTED
+            // above so a submit-less log can't silently pose as attributed.
+            let t_submit = known_submit.unwrap_or(next_start);
 
             if t_submit <= prev_finish {
                 // Task already queued when the worker freed: entire gap is
@@ -360,28 +457,65 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
     let non_inert = n_events > 0 && !worker_ids.is_empty() && total_chunks > 0 && gap_sum > 0;
     let all_reconciled = rows.iter().all(|r| r.reconciled);
     let bucket_recon = total_buckets.total().abs_diff(gap_sum) <= eps_ns * (rows.len() as u64 + 1);
-    let workers_ok = expect_workers.map(|n| n == worker_ids.len()).unwrap_or(true);
-    let selftest = non_inert && all_reconciled && bucket_recon && pairing_ok && workers_ok;
+    let tot_window: u64 = rows.iter().map(|r| r.window_ns).sum();
+    let tot_decode: u64 = rows.iter().map(|r| r.decode_ns).sum();
 
-    // ---- Report ----
+    Analysis {
+        n_events,
+        dropped_lines,
+        n_start,
+        n_finish,
+        worker_ids,
+        total_chunks,
+        rows,
+        per_worker_buckets,
+        total_buckets,
+        gap_sum,
+        tot_window,
+        tot_decode,
+        n_bf: bf.len(),
+        n_mw: mw.len(),
+        n_dw: dw.len(),
+        unknown_submit_gaps,
+        non_inert,
+        all_reconciled,
+        bucket_recon,
+        pairing_ok,
+        no_dropped: dropped_lines == 0,
+    }
+}
+
+fn print_report(a: &Analysis, label: &str, workers_ok: bool, json_out: Option<&str>) {
+    let rows = &a.rows;
+    let gap_sum = a.gap_sum;
     println!("== fulcrum dispatchgap :: {label} ==");
     println!(
-        "events={n_events} workers={} chunks={total_chunks} start/finish={n_start}/{n_finish}",
-        worker_ids.len()
+        "events={} workers={} chunks={} start/finish={}/{} dropped_lines={}",
+        a.n_events,
+        a.worker_ids.len(),
+        a.total_chunks,
+        a.n_start,
+        a.n_finish,
+        a.dropped_lines,
     );
     println!(
         "consumer-phase intervals: blockfind={} markerwait={} decodewait={}",
-        bf.len(),
-        mw.len(),
-        dw.len()
+        a.n_bf, a.n_mw, a.n_dw,
     );
+    if a.unknown_submit_gaps > 0 {
+        println!(
+            "WARN: {} gap(s) had NO known SUBMIT — booked as just-in-time H-QUEUE; \
+             the H-QUEUE share is partly a guess for this log",
+            a.unknown_submit_gaps
+        );
+    }
     println!();
     println!("per-worker occupancy (ms):");
     println!(
         "  {:>4}  {:>7}  {:>9}  {:>9}  {:>9}  {:>6}  {:>5}",
         "wkr", "chunks", "window", "decode", "gap", "gap%", "recon"
     );
-    for r in &rows {
+    for r in rows {
         println!(
             "  {:>4}  {:>7}  {:>9.2}  {:>9.2}  {:>9.2}  {:>5.1}%  {:>5}",
             r.w,
@@ -393,19 +527,17 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
             if r.reconciled { "ok" } else { "BAD" }
         );
     }
-    let tot_window: u64 = rows.iter().map(|r| r.window_ns).sum();
-    let tot_decode: u64 = rows.iter().map(|r| r.decode_ns).sum();
     println!();
     println!(
         "AGG  window={:.2}ms decode={:.2}ms gap={:.2}ms  gap-fraction={:.1}%",
-        ms(tot_window),
-        ms(tot_decode),
+        ms(a.tot_window),
+        ms(a.tot_decode),
         ms(gap_sum),
-        pct(gap_sum, tot_window)
+        pct(gap_sum, a.tot_window)
     );
     println!();
     println!("GAP BLOCKED-ON breakdown (share of total gap):");
-    let tb = &total_buckets;
+    let tb = &a.total_buckets;
     for (name, val) in [
         ("H-QUEUE     (pool pick/handoff latency)", tb.queue),
         ("H-BLOCKFIND (next boundary not found)", tb.blockfind),
@@ -416,16 +548,7 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
         println!("  {name:42}  {:>8.2}ms  {:>5.1}%", ms(val), pct(val, gap_sum));
     }
     // Named dominant cause.
-    let dom = [
-        ("H-QUEUE", tb.queue),
-        ("H-BLOCKFIND", tb.blockfind),
-        ("H-WINDOWDEP", tb.windowdep),
-        ("H-DECODEWAIT", tb.decodewait),
-        ("H-OTHER", tb.other),
-    ]
-    .into_iter()
-    .max_by_key(|&(_, v)| v)
-    .unwrap();
+    let dom = a.dominant();
     println!();
     println!(
         "DOMINANT CAUSE: {} ({:.1}% of gap, {:.2}ms)",
@@ -434,24 +557,35 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
         ms(dom.1)
     );
     println!();
+    let selftest = a.selftest_pass(workers_ok);
     println!(
-        "SELFTEST={} (non_inert={non_inert} reconciled={all_reconciled} bucket_recon={bucket_recon} pairing={pairing_ok} workers={workers_ok})",
-        if selftest { "PASS" } else { "FAIL" }
+        "SELFTEST={} (non_inert={} reconciled={} bucket_recon={} pairing={} no_dropped={} workers={workers_ok})",
+        if selftest { "PASS" } else { "FAIL" },
+        a.non_inert,
+        a.all_reconciled,
+        a.bucket_recon,
+        a.pairing_ok,
+        a.no_dropped,
     );
 
     if let Some(jp) = json_out {
         let mut s = String::new();
         s.push_str("{\n");
         s.push_str(&format!("  \"label\": \"{label}\",\n"));
-        s.push_str(&format!("  \"events\": {n_events},\n"));
-        s.push_str(&format!("  \"workers\": {},\n", worker_ids.len()));
-        s.push_str(&format!("  \"chunks\": {total_chunks},\n"));
-        s.push_str(&format!("  \"window_ms\": {:.3},\n", ms(tot_window)));
-        s.push_str(&format!("  \"decode_ms\": {:.3},\n", ms(tot_decode)));
+        s.push_str(&format!("  \"events\": {},\n", a.n_events));
+        s.push_str(&format!("  \"dropped_lines\": {},\n", a.dropped_lines));
+        s.push_str(&format!(
+            "  \"unknown_submit_gaps\": {},\n",
+            a.unknown_submit_gaps
+        ));
+        s.push_str(&format!("  \"workers\": {},\n", a.worker_ids.len()));
+        s.push_str(&format!("  \"chunks\": {},\n", a.total_chunks));
+        s.push_str(&format!("  \"window_ms\": {:.3},\n", ms(a.tot_window)));
+        s.push_str(&format!("  \"decode_ms\": {:.3},\n", ms(a.tot_decode)));
         s.push_str(&format!("  \"gap_ms\": {:.3},\n", ms(gap_sum)));
         s.push_str(&format!(
             "  \"gap_fraction_pct\": {:.3},\n",
-            pct(gap_sum, tot_window)
+            pct(gap_sum, a.tot_window)
         ));
         s.push_str("  \"gap_blocked_on_ms\": {\n");
         s.push_str(&format!("    \"H_QUEUE\": {:.3},\n", ms(tb.queue)));
@@ -479,7 +613,7 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
         s.push_str(&format!("  \"dominant_cause\": \"{}\",\n", dom.0));
         s.push_str("  \"per_worker\": [\n");
         for (idx, r) in rows.iter().enumerate() {
-            let b = per_worker_buckets.get(&r.w).copied().unwrap_or_default();
+            let b = a.per_worker_buckets.get(&r.w).copied().unwrap_or_default();
             s.push_str(&format!(
                 "    {{\"w\": {}, \"chunks\": {}, \"window_ms\": {:.3}, \"decode_ms\": {:.3}, \"gap_ms\": {:.3}, \"gap_pct\": {:.2}, \"reconciled\": {}, \"queue_ms\": {:.3}, \"blockfind_ms\": {:.3}, \"windowdep_ms\": {:.3}, \"decodewait_ms\": {:.3}, \"other_ms\": {:.3}}}{}\n",
                 r.w, r.n_chunks, ms(r.window_ns), ms(r.decode_ns), ms(r.gap_ns),
@@ -494,14 +628,146 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
             if selftest { "PASS" } else { "FAIL" }
         ));
         s.push_str("}\n");
-        if let Err(e) = std::fs::write(&jp, s) {
+        if let Err(e) = std::fs::write(jp, s) {
             eprintln!("fulcrum dispatchgap: cannot write {jp}: {e}");
         } else {
             println!("wrote {jp}");
         }
     }
+}
 
-    if selftest {
+// ---------------------------------------------------------------------------
+// selftest — the baked Gate-0 (synthetic logs; PASS path + every refusal path)
+// ---------------------------------------------------------------------------
+
+/// Synthetic 2-worker log with a KNOWN answer: worker 0 decodes chunks A,B with
+/// a 90ns gap fully covered by a blockfind interval mid-gap (60ns BF + queue
+/// residue), worker 1 decodes C,D with a pure queue gap (D submitted early).
+fn synth_log() -> String {
+    let mut l = String::new();
+    let push = |l: &mut String, t: u64, k: u8, key: u64, w: i32, f: u8| {
+        l.push_str(&format!(
+            "{{\"t\":{t},\"k\":{k},\"key\":{key},\"w\":{w},\"f\":{f}}}\n"
+        ));
+    };
+    // submits
+    push(&mut l, 0, 0, 100, -1, 0); // submit A
+    push(&mut l, 0, 0, 101, -1, 0); // submit C
+    // worker 0: A [10..110], gap (blockfind 120..180), B [200..300]
+    push(&mut l, 10, 1, 100, 0, 1);
+    push(&mut l, 110, 2, 100, 0, 1);
+    push(&mut l, 120, 3, 5, -1, 0); // BF enter
+    push(&mut l, 180, 4, 5, -1, 0); // BF exit
+    push(&mut l, 150, 0, 102, -1, 0); // submit B (mid-gap, after blockfind found it)
+    push(&mut l, 200, 1, 102, 0, 1);
+    push(&mut l, 300, 2, 102, 0, 1);
+    // worker 1: C [10..90], D [100..200] with D submitted at 0 (queue gap)
+    push(&mut l, 0, 0, 103, -1, 0); // submit D early
+    push(&mut l, 10, 1, 101, 1, 1);
+    push(&mut l, 90, 2, 101, 1, 1);
+    push(&mut l, 100, 1, 103, 1, 1);
+    push(&mut l, 200, 2, 103, 1, 1);
+    l
+}
+
+pub fn selftest() -> ExitCode {
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut check = |name: &str, ok: bool| {
+        if ok {
+            pass += 1;
+            println!("  PASS {name}");
+        } else {
+            fail += 1;
+            println!("  FAIL {name}");
+        }
+    };
+
+    // -- PASS path: the synthetic log must clear every gate AND attribute
+    //    correctly (this drives the FULL analyze(), not a helper in isolation).
+    {
+        let a = analyze(&synth_log());
+        check("synth: all Gate-0 gates pass", a.selftest_pass(true));
+        check("synth: 2 workers, 4 chunks", a.worker_ids == vec![0, 1] && a.total_chunks == 4);
+        check("synth: no dropped lines", a.dropped_lines == 0);
+        check("synth: no unknown-submit gaps", a.unknown_submit_gaps == 0);
+        // Worker 0's starve window [110,150] overlaps BF [120,180] for 30ns;
+        // post-submit handoff [150,200] is queue. Worker 1's whole 10ns gap is
+        // queue (D submitted before C finished).
+        check(
+            "synth: blockfind bucket carries exactly the BF-covered starve (30ns)",
+            a.total_buckets.blockfind == 30,
+        );
+        check(
+            "synth: queue bucket carries handoff + early-submit gaps (60ns)",
+            a.total_buckets.queue == 60,
+        );
+        check(
+            "synth: buckets conserve to the total gap",
+            a.total_buckets.total() == a.gap_sum && a.gap_sum == 100,
+        );
+        check("synth: dominant cause is H-QUEUE", a.dominant().0 == "H-QUEUE");
+        check(
+            "synth: --workers mismatch fails the gate",
+            !a.selftest_pass(false),
+        );
+    }
+
+    // -- REFUSAL: a START without its FINISH breaks pairing.
+    {
+        let mut log = synth_log();
+        log.push_str("{\"t\":400,\"k\":1,\"key\":999,\"w\":0,\"f\":0}\n");
+        let a = analyze(&log);
+        check("pairing: unmatched START refuses", !a.pairing_ok && !a.selftest_pass(true));
+    }
+
+    // -- REFUSAL: a FINISH with no START refuses too.
+    {
+        let mut log = synth_log();
+        log.push_str("{\"t\":400,\"k\":2,\"key\":999,\"w\":0,\"f\":0}\n");
+        let a = analyze(&log);
+        check("pairing: unmatched FINISH refuses", !a.pairing_ok && !a.selftest_pass(true));
+    }
+
+    // -- REFUSAL: an empty / eventless log is inert.
+    {
+        let a = analyze("");
+        check("inert: empty log refuses", !a.non_inert && !a.selftest_pass(true));
+        let a = analyze("not json at all\n");
+        check(
+            "inert: garbage-only log refuses (dropped + inert)",
+            !a.non_inert && !a.no_dropped && !a.selftest_pass(true),
+        );
+    }
+
+    // -- REFUSAL: a truncated/corrupt line among good ones is a dropped-line FAIL
+    //    (a silently-shrunk event set must never pose as a clean breakdown).
+    {
+        let mut log = synth_log();
+        log.push_str("{\"t\":400,\"k\":\n"); // truncated write
+        let a = analyze(&log);
+        check(
+            "dropped: truncated line refuses while the rest still parses",
+            a.dropped_lines == 1 && !a.no_dropped && !a.selftest_pass(true),
+        );
+    }
+
+    // -- COUNTED (not refused): a gap whose next task has no SUBMIT is booked
+    //    just-in-time H-QUEUE and COUNTED so the report can warn.
+    {
+        let log = synth_log().replace("{\"t\":0,\"k\":0,\"key\":103,\"w\":-1,\"f\":0}\n", "");
+        let a = analyze(&log);
+        check(
+            "unknown-submit: missing SUBMIT is counted (booked H-QUEUE)",
+            a.unknown_submit_gaps == 1 && a.selftest_pass(true),
+        );
+    }
+
+    println!(
+        "SELFTEST={} pass={pass} fail={fail}",
+        if fail == 0 { "PASS" } else { "FAIL" }
+    );
+    if fail == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -512,42 +778,18 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
-    // Synthetic 2-worker log: worker 0 runs chunks A,B with a gap where the
-    // consumer is in blockfind; worker 1 runs chunk C then D with a queue gap.
-    fn synth() -> String {
-        // times in ns
-        let mut l = String::new();
-        let push = |l: &mut String, t: u64, k: u8, key: u64, w: i32, f: u8| {
-            l.push_str(&format!(
-                "{{\"t\":{t},\"k\":{k},\"key\":{key},\"w\":{w},\"f\":{f}}}\n"
-            ));
-        };
-        // submits
-        push(&mut l, 0, 0, 100, -1, 0); // submit A
-        push(&mut l, 0, 0, 101, -1, 0); // submit C
-        // worker 0: A [10..110], gap (blockfind 120..180), B [200..300]
-        push(&mut l, 10, 1, 100, 0, 1);
-        push(&mut l, 110, 2, 100, 0, 1);
-        push(&mut l, 120, 3, 5, -1, 0); // BF enter
-        push(&mut l, 180, 4, 5, -1, 0); // BF exit
-        push(&mut l, 150, 0, 102, -1, 0); // submit B (mid-gap, after blockfind found it)
-        push(&mut l, 200, 1, 102, 0, 1);
-        push(&mut l, 300, 2, 102, 0, 1);
-        // worker 1: C [10..90], D [100..200] with D submitted at 0 (queue gap)
-        push(&mut l, 0, 0, 103, -1, 0); // submit D early
-        push(&mut l, 10, 1, 101, 1, 1);
-        push(&mut l, 90, 2, 101, 1, 1);
-        push(&mut l, 100, 1, 103, 1, 1);
-        push(&mut l, 200, 2, 103, 1, 1);
-        l
+    #[test]
+    fn parses_and_reconciles() {
+        let (evs, dropped) = parse_log(&synth_log());
+        assert!(evs.len() >= 14);
+        assert_eq!(dropped, 0);
+        let bf = build_intervals(&evs, 3, 4);
+        assert_eq!(bf, vec![(120, 180)]);
     }
 
     #[test]
-    fn parses_and_reconciles() {
-        let evs = parse_log(&synth());
-        assert!(evs.len() >= 14);
-        let bf = build_intervals(&evs, 3, 4);
-        assert_eq!(bf, vec![(120, 180)]);
+    fn selftest_passes() {
+        assert_eq!(selftest(), ExitCode::SUCCESS);
     }
 
     #[test]
