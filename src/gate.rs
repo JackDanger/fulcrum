@@ -160,6 +160,7 @@ fn cell_byte_ok(c: &MatrixCell) -> bool {
 ///                        target-cell ENUMERATION — its cells ARE the targets).
 ///   * `target_base_rg` — base(a) vs rg(b),   ours=a (the gap base had, for
 ///                        NARROWING + base RSS at the target cells).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_gate(
     cand_label: &str,
     base_label: &str,
@@ -168,6 +169,12 @@ pub fn evaluate_gate(
     target_cand_rg: &MatrixResult,
     target_base_rg: &MatrixResult,
     cross_arch: Option<&ScopeResult>,
+    // P0d: `cross_arch_void` = a cross-arch merge was REQUESTED
+    // (`--scope-manifest`/`--arch-json`) but the manifest or artifacts were
+    // UNPARSEABLE. The verdict must be VOID (numbers not merge-able across arch)
+    // — NOT a silent skip that lets a local PASS through. `cross_arch` is `None`
+    // in this case.
+    cross_arch_void: bool,
 ) -> GateResult {
     let mut targets = Vec::new();
     let mut unrecovered = Vec::new();
@@ -249,7 +256,13 @@ pub fn evaluate_gate(
         });
     }
 
-    let cross_arch_verdict = cross_arch.map(|s| s.summary.verdict.clone());
+    // P0d: a requested-but-unparseable cross-arch input surfaces as VOID (not a
+    // silent skip). It takes the cross_arch_verdict slot so the report shows it.
+    let cross_arch_verdict = if cross_arch_void {
+        Some("VOID".to_string())
+    } else {
+        cross_arch.map(|s| s.summary.verdict.clone())
+    };
     let cross_ok = match &cross_arch_verdict {
         None => true,
         Some(v) => v == "WIN",
@@ -258,7 +271,7 @@ pub fn evaluate_gate(
     // -- verdict precedence: FAIL > VOID > OPEN > PASS ----------------------
     let verdict = if any_byte_fail {
         "FAIL"
-    } else if any_void {
+    } else if any_void || cross_arch_void {
         "VOID"
     } else if !unrecovered.is_empty() || !regressions.is_empty() || !cross_ok {
         "OPEN"
@@ -678,10 +691,17 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
     );
 
     // -- optional cross-arch merge via scope::evaluate over banked artifacts.
-    let cross = build_cross_arch(args);
+    let (cross, cross_void) = match build_cross_arch(args) {
+        CrossArch::NotRequested => (None, false),
+        CrossArch::Resolved(s) => (Some(s), false),
+        CrossArch::Void(reason) => {
+            eprintln!("gate: CROSS-ARCH VOID — {reason}");
+            (None, true)
+        }
+    };
 
     let r = evaluate_gate(
-        cand, base, rg, &breadth, &target_cand_rg, &target_base_rg, cross.as_ref(),
+        cand, base, rg, &breadth, &target_cand_rg, &target_base_rg, cross.as_ref(), cross_void,
     );
 
     print_report(&r);
@@ -764,26 +784,48 @@ pub fn bank_artifacts(
     Ok(written)
 }
 
+/// The outcome of attempting a cross-arch merge. Distinguishes "not requested"
+/// (no cross-arch gate — a local verdict is fine) from "requested but the input
+/// could not be parsed" (VOID — the local verdict must not stand alone).
+#[derive(Debug)]
+pub enum CrossArch {
+    /// No `--scope-manifest` supplied — cross-arch not part of this gate.
+    NotRequested,
+    /// Requested, and the merge produced a scope verdict.
+    Resolved(ScopeResult),
+    /// Requested but the manifest/artifacts were UNPARSEABLE (P0d) ⇒ VOID.
+    Void(String),
+}
+
 /// Build a cross-arch ScopeResult from `--scope-manifest` + `--arch-json` banked
-/// matrix artifacts, if requested. Missing manifest ⇒ None (no cross-arch gate).
-fn build_cross_arch(args: &[String]) -> Option<ScopeResult> {
-    let manifest_path = cli_flag(args, "--scope-manifest")?;
+/// matrix artifacts, if requested. P0d: a REQUESTED-but-unparseable manifest or
+/// artifact set returns `CrossArch::Void` (⇒ the gate verdict VOIDs) instead of
+/// silently skipping the cross-arch requirement with a WARN.
+fn build_cross_arch(args: &[String]) -> CrossArch {
+    let Some(manifest_path) = cli_flag(args, "--scope-manifest") else {
+        return CrossArch::NotRequested;
+    };
     let banked: Vec<PathBuf> = cli_multi(args, "--arch-json").into_iter().map(PathBuf::from).collect();
     if banked.is_empty() {
-        eprintln!("gate: --scope-manifest given but no --arch-json artifacts — skipping cross-arch");
-        return None;
+        return CrossArch::Void(format!(
+            "--scope-manifest {manifest_path} given but no --arch-json artifacts — cross-arch \
+             requirement cannot be evaluated (VOID)"
+        ));
     }
     let manifest: ScopeManifest = match std::fs::read_to_string(manifest_path) {
         Ok(txt) => match serde_json::from_str(&txt) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("gate: WARN --scope-manifest parse error ({e}) — skipping cross-arch");
-                return None;
+                return CrossArch::Void(format!(
+                    "--scope-manifest {manifest_path} parse error ({e}) — cross-arch requirement \
+                     UNPARSEABLE (VOID)"
+                ));
             }
         },
         Err(e) => {
-            eprintln!("gate: WARN --scope-manifest {manifest_path}: {e} — skipping cross-arch");
-            return None;
+            return CrossArch::Void(format!(
+                "--scope-manifest {manifest_path}: {e} — cross-arch manifest UNREADABLE (VOID)"
+            ));
         }
     };
     let (arts, notes) = scope::load_artifacts(&banked);
@@ -791,10 +833,12 @@ fn build_cross_arch(args: &[String]) -> Option<ScopeResult> {
         eprintln!("  gate/scope note: {nt}");
     }
     if arts.is_empty() {
-        eprintln!("gate: no parseable arch artifacts — skipping cross-arch");
-        return None;
+        return CrossArch::Void(
+            "no parseable --arch-json artifacts — cross-arch requirement UNPARSEABLE (VOID)"
+                .to_string(),
+        );
     }
-    Some(scope::evaluate(&manifest, &arts))
+    CrossArch::Resolved(scope::evaluate(&manifest, &arts))
 }
 
 /// An empty MatrixResult (no cells) with a valid manifest — used when the gate is
@@ -973,7 +1017,7 @@ pub fn selftest() -> ExitCode {
             ("weights.gz", 4, "LOSS", 1.20, 210.0, 300.0, "OK", true),
             ("bigbuck.gz", 8, "LOSS", 1.15, 220.0, 260.0, "OK", true),
         ]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("PASS: verdict PASS", r.verdict == "PASS");
         check("PASS: all targets recovered", r.unrecovered.is_empty());
         check("PASS: zero regressions", r.regressions.is_empty());
@@ -1002,7 +1046,7 @@ pub fn selftest() -> ExitCode {
             ("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true),
             ("qwen.gz", 8, "LOSS", 1.3, 1.0, 1.0, "OK", true),
         ]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("OPEN: verdict OPEN (unrecovered target)", r.verdict == "OPEN");
         check("OPEN: qwen listed unrecovered", r.unrecovered.iter().any(|u| u.contains("qwen")));
     }
@@ -1015,7 +1059,7 @@ pub fn selftest() -> ExitCode {
         ]);
         let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
         let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("REGRESS: verdict OPEN", r.verdict == "OPEN");
         check("REGRESS: movie listed as a regression", r.regressions.iter().any(|u| u.contains("movie")));
     }
@@ -1026,7 +1070,7 @@ pub fn selftest() -> ExitCode {
         // cand-vs-rg cell WINS but its bytes are WRONG (sha_ok=false).
         let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.5, 1.0, 1.0, "FAIL", false)]);
         let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("FAIL: wrong-bytes arm ⇒ verdict FAIL", r.verdict == "FAIL");
         check("FAIL: any_byte_fail set", r.any_byte_fail);
     }
@@ -1036,7 +1080,7 @@ pub fn selftest() -> ExitCode {
         let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "VOID", f64::NAN, 1.0, 1.0, "VOID", true)]);
         let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
         let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("VOID: A/A harness bias ⇒ verdict VOID", r.verdict == "VOID");
         check("VOID: any_void set", r.any_void);
     }
@@ -1057,9 +1101,42 @@ pub fn selftest() -> ExitCode {
             corpus_aliases: Default::default(),
         };
         let scope_open = scope::evaluate(&manifest, &[]); // nothing banked ⇒ all UNMEASURED
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, Some(&scope_open));
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, Some(&scope_open), false);
         check("CROSS: local PASS held OPEN by a non-WIN scope", r.verdict == "OPEN");
         check("CROSS: cross_arch_verdict recorded", r.cross_arch_verdict.as_deref() == Some("OPEN"));
+    }
+
+    // -- P0d: a REQUESTED-but-unparseable cross-arch input ⇒ VOID, not skip ----
+    {
+        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
+        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
+        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        // Would be PASS locally; cross_arch_void forces VOID (numbers can't merge).
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, true);
+        check("P0d: requested-but-unparseable cross-arch ⇒ VOID", r.verdict == "VOID");
+        check("P0d: cross_arch_verdict recorded VOID", r.cross_arch_verdict.as_deref() == Some("VOID"));
+        // build_cross_arch: bad manifest PATH ⇒ CrossArch::Void (not NotRequested).
+        let void_args = vec![
+            "--scope-manifest".to_string(),
+            "/nonexistent/scope-manifest-xyz.json".to_string(),
+            "--arch-json".to_string(),
+            "/nonexistent/arch.json".to_string(),
+        ];
+        check(
+            "P0d: build_cross_arch(bad manifest path) ⇒ CrossArch::Void",
+            matches!(build_cross_arch(&void_args), CrossArch::Void(_)),
+        );
+        // --scope-manifest with NO --arch-json ⇒ Void (can't evaluate the requirement).
+        let no_art = vec!["--scope-manifest".to_string(), "/tmp/whatever.json".to_string()];
+        check(
+            "P0d: --scope-manifest with no --arch-json ⇒ CrossArch::Void",
+            matches!(build_cross_arch(&no_art), CrossArch::Void(_)),
+        );
+        // No --scope-manifest ⇒ NotRequested (a local-only gate is legitimate).
+        check(
+            "P0d: no --scope-manifest ⇒ CrossArch::NotRequested",
+            matches!(build_cross_arch(&[]), CrossArch::NotRequested),
+        );
     }
 
     // -- BANKING: --out-dir writes gate.json + the THREE sub-matrices, and the
@@ -1070,7 +1147,7 @@ pub fn selftest() -> ExitCode {
         let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
         let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
         let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         let dir = std::env::temp_dir().join(format!("fulcrum-gate-selftest-{}", std::process::id()));
         let banked = bank_artifacts(&dir, &r, &breadth, &c_rg, &b_rg);
         check(
@@ -1103,7 +1180,7 @@ pub fn selftest() -> ExitCode {
         let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "TIE", 1.0, 1.0, 1.0, "OK", true)]);
         let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.95, 1.0, 1.0, "OK", true)]);
         let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "WIN", 0.90, 1.0, 1.0, "OK", true)]);
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("NARROW: recovered yes, narrowed no (cand 0.95 > base 0.90)", {
             let t = &r.targets[0];
             t.recovered && !t.narrowed
@@ -1147,7 +1224,7 @@ mod tests {
         let c_rg = sm("a", "cand", "rg", &[("w.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
         let b_rg = sm("a", "base", "rg", &[("w.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
         assert_eq!(
-            evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None).verdict,
+            evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false).verdict,
             "PASS"
         );
     }
