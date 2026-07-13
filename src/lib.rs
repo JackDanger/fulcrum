@@ -105,6 +105,7 @@ pub mod stats;
 pub mod sweep;
 pub mod sweep_factor;
 pub mod trace;
+pub mod uarch;
 pub mod validate;
 pub mod verbose_stats;
 pub mod vs;

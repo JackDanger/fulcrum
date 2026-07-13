@@ -4368,6 +4368,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "uarch" => fulcrum::uarch::cmd_uarch(rest),
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "help" | "--help" | "-h" => {
             usage();
