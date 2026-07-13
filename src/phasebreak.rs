@@ -485,10 +485,13 @@ pub enum PhaseLine {
 }
 
 /// Peek the `"kind"` field of ONE emitter line and route to the matching strict
-/// parser. PURE — unit-tested. A blank line returns `Ok(None)`. An unknown kind
-/// REFUSES (an emitter that adds an un-handled line type must be noticed, not
-/// silently dropped). Accepts the raw `[phase-timing]`/`[pathaccount]` stderr
-/// prefixes and the bare `{...}` file form.
+/// parser. PURE — unit-tested. A blank line returns `Ok(None)`. A line whose
+/// `kind` is NEITHER `phasebreak` NOR `pathaccount` (e.g. the emitter's
+/// `outerbreak` line, or a future kind we don't consume) is SKIPPED (`Ok(None)`)
+/// — we route the two kinds we understand and ignore the rest, rather than
+/// refusing on a legitimately-emitted foreign line. Only MALFORMED JSON REFUSES
+/// (a corrupt line must be noticed). Accepts the raw `[phase-timing]` /
+/// `[pathaccount]` stderr prefixes and the bare `{...}` file form.
 pub fn parse_line_by_kind(line: &str) -> Result<Option<PhaseLine>, String> {
     let t = line.trim();
     if t.is_empty() {
@@ -504,10 +507,9 @@ pub fn parse_line_by_kind(line: &str) -> Result<Option<PhaseLine>, String> {
     match v.get("kind").and_then(|x| x.as_str()) {
         Some("phasebreak") => Ok(Some(PhaseLine::Phase(parse_phase_line(line)?))),
         Some("pathaccount") => Ok(Some(PhaseLine::Path(parse_pathaccount_line(line)?))),
-        other => Err(format!(
-            "phasebreak: unexpected 'kind' field {other:?} (want \"phasebreak\" or \
-             \"pathaccount\"): {line:?}"
-        )),
+        // Any other kind (e.g. "outerbreak") is a legitimately-emitted line we do
+        // not consume here — skip it, never refuse the whole run over it.
+        _ => Ok(None),
     }
 }
 
@@ -1347,9 +1349,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_line_by_kind_refuses_unknown_kind() {
-        assert!(parse_line_by_kind(r#"{"kind":"somethingelse","protocol":1}"#).is_err());
+    fn parse_line_by_kind_skips_foreign_kind_but_refuses_malformed() {
+        // A foreign-but-legitimate kind (e.g. the emitter's "outerbreak") is
+        // SKIPPED, not refused — else a real run would abort over a line we
+        // simply don't consume.
+        assert!(parse_line_by_kind(r#"{"kind":"outerbreak","protocol":1,"x":1}"#).unwrap().is_none());
+        assert!(parse_line_by_kind(r#"{"kind":"somethingelse"}"#).unwrap().is_none());
         assert_eq!(parse_line_by_kind("   ").unwrap().is_none(), true);
+        // Malformed JSON still REFUSES (a corrupt line must be noticed).
+        assert!(parse_line_by_kind("{not json").is_err());
+    }
+
+    #[test]
+    fn split_by_kind_ignores_outerbreak_line() {
+        // The real emitter also writes an "outerbreak" line alongside the two we
+        // consume; it must not derail the split.
+        let outer = r#"{"kind":"outerbreak","protocol":1,"entry_ns":123}"#;
+        let content = format!("{PHASE_LINE}\n{outer}\n{QWEN_T4_PATHACCOUNT}\n");
+        let (phases, paths) = split_by_kind(&content).unwrap();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(paths.len(), 1);
     }
 
     #[test]
