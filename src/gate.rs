@@ -449,7 +449,10 @@ fn usage() -> ExitCode {
          \x20              [--ref-cmd 'gunzip -c {{corpus}}'] [--no-pin|--pin <tmpl>]\n\
          \x20              [--freeze-each [--freeze-procs ...] [--freeze-ttl-s 600]]\n\
          \x20              [--scope-manifest scope.json --arch-json <file-or-dir> ...]\n\
-         \x20              [--out gate.json]\n\
+         \x20              [--out gate.json] [--out-dir DIR]\n\
+         \x20                (--out-dir BANKS gate.json + the three sub-matrices as durable\n\
+         \x20                 MatrixResult artifacts — the per-box input the cross-arch merge\n\
+         \x20                 consumes via --arch-json / scope --banked)\n\
          \x20 fulcrum gate selftest        Gate-0: synthetic matrices, no box needed\n\
          \n\
          Each of --cand/--base/--rg is `<bin>` or `<bin>:<argtmpl>` (argtmpl may carry {{threads}}\n\
@@ -696,10 +699,69 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
         }
     }
 
+    // BANK the three sub-matrices (+ the joined verdict) as durable artifacts.
+    // Without this a gate run is a dead end for the cross-arch merge: scope /
+    // `gate --arch-json` consume MATRIX artifacts, and the joined GateResult
+    // alone cannot be re-joined on another box. `--out-dir` makes one gate run
+    // per box sufficient for the cross-arch verdict.
+    if let Some(dir) = cli_flag(args, "--out-dir") {
+        match bank_artifacts(
+            std::path::Path::new(dir),
+            &r,
+            &breadth,
+            &target_cand_rg,
+            &target_base_rg,
+        ) {
+            Ok(written) => {
+                for w in &written {
+                    eprintln!("gate: banked {}", w.display());
+                }
+            }
+            Err(e) => eprintln!("gate: WARN could not bank --out-dir {dir}: {e}"),
+        }
+    }
+
     match r.verdict.as_str() {
         "PASS" => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
+}
+
+/// Bank the joined verdict plus the THREE sub-matrices into `dir` as durable
+/// JSON artifacts (`gate.json`, `breadth.matrix.json`, `target_cand_rg.matrix.json`,
+/// `target_base_rg.matrix.json`). The matrix files are ordinary `MatrixResult`
+/// artifacts — parseable by `scope --banked` / `gate --arch-json` — so a single
+/// per-box gate run feeds the cross-arch merge. Returns the written paths.
+pub fn bank_artifacts(
+    dir: &std::path::Path,
+    r: &GateResult,
+    breadth: &MatrixResult,
+    target_cand_rg: &MatrixResult,
+    target_base_rg: &MatrixResult,
+) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
+    let mut written = Vec::new();
+    let mut write = |name: &str, js: String| -> Result<(), String> {
+        let p = dir.join(name);
+        std::fs::write(&p, js).map_err(|e| format!("write {}: {e}", p.display()))?;
+        written.push(p);
+        Ok(())
+    };
+    write(
+        "gate.json",
+        serde_json::to_string_pretty(r).map_err(|e| format!("serialize gate: {e}"))?,
+    )?;
+    for (name, m) in [
+        ("breadth.matrix.json", breadth),
+        ("target_cand_rg.matrix.json", target_cand_rg),
+        ("target_base_rg.matrix.json", target_base_rg),
+    ] {
+        write(
+            name,
+            serde_json::to_string_pretty(m).map_err(|e| format!("serialize {name}: {e}"))?,
+        )?;
+    }
+    Ok(written)
 }
 
 /// Build a cross-arch ScopeResult from `--scope-manifest` + `--arch-json` banked
@@ -998,6 +1060,41 @@ pub fn selftest() -> ExitCode {
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, Some(&scope_open));
         check("CROSS: local PASS held OPEN by a non-WIN scope", r.verdict == "OPEN");
         check("CROSS: cross_arch_verdict recorded", r.cross_arch_verdict.as_deref() == Some("OPEN"));
+    }
+
+    // -- BANKING: --out-dir writes gate.json + the THREE sub-matrices, and the
+    //    matrix files round-trip as ordinary MatrixResult artifacts (the exact
+    //    shape scope --banked / gate --arch-json consume for the cross-arch
+    //    merge — a gate run must never be a dead end for another box).
+    {
+        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
+        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
+        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None);
+        let dir = std::env::temp_dir().join(format!("fulcrum-gate-selftest-{}", std::process::id()));
+        let banked = bank_artifacts(&dir, &r, &breadth, &c_rg, &b_rg);
+        check(
+            "BANK: --out-dir writes gate.json + 3 matrix artifacts",
+            banked.as_ref().map(|v| v.len()) == Ok(4)
+                && dir.join("gate.json").exists()
+                && dir.join("breadth.matrix.json").exists()
+                && dir.join("target_cand_rg.matrix.json").exists()
+                && dir.join("target_base_rg.matrix.json").exists(),
+        );
+        let round_trip = |name: &str| -> bool {
+            std::fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|t| serde_json::from_str::<MatrixResult>(&t).ok())
+                .map(|m| !m.cells.is_empty() && m.manifest.n == 51)
+                .unwrap_or(false)
+        };
+        check(
+            "BANK: banked matrices round-trip as MatrixResult (scope-consumable)",
+            round_trip("breadth.matrix.json")
+                && round_trip("target_cand_rg.matrix.json")
+                && round_trip("target_base_rg.matrix.json"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- narrowing edge: base already beat rg, cand slightly worse-than-base but
