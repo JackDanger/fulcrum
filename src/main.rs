@@ -152,6 +152,12 @@ USAGE:\n\
   fulcrum locate <trace.json> [...] [--wall-ms X] [--threshold pct]\n\
               closed WALL LEDGER over a span trace — every microsecond classified on the critical\n\
               path or surfaced as RESIDUAL; refuses (FLAGGED) when the ledger cannot close\n\
+  fulcrum cellwhy <corpus>:<T> --gz <bin> --rg <bin> [--instrumented <bin>] [--budget-s S] [--out j.json]\n\
+              the ONE-COMMAND LOCATE for a loss cell: preflight (pin+ParallelSM+flavor+/dev/null) →\n\
+              magnitude (paired; WIN/TIE ⇒ CELLWHY=NOLOSS stop) → budgeted instrument suite →\n\
+              taxonomy join with CONSERVATION-OR-NO-LOCATE, emitting RANKED candidates + the exact\n\
+              `fulcrum perturb` Gate-2 spec per candidate (never runs a perturbation). `cellwhy\n\
+              selftest` is the baked Gate-0 (synthetic, no box).\n\
   fulcrum decide --feature <dir> [--ledger P] [--allow-thaw]   ONE artifact-dir → the ranked,\n\
               causally-annotated next-actions table (wall-ms attribution + CAUSAL-OR-HYPOTHESIS\n\
               + the exact re-verify command; fingerprint + ledger cross-checked)\n\
@@ -4402,6 +4408,7 @@ fn main() -> ExitCode {
             }
         }
         "uarch" => fulcrum::uarch::cmd_uarch(rest),
+        "cellwhy" => fulcrum::cellwhy::cmd_cellwhy(rest),
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "help" | "--help" | "-h" => {
             usage();
