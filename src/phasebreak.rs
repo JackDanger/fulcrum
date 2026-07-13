@@ -309,6 +309,160 @@ pub fn check_inert_oracle_trap(r: &PhaseRecord) -> Option<String> {
     }
 }
 
+// ── pathaccount: per-decode-PATH byte-conservation decomposition ─────────────
+//
+// The gzippy emitter writes a SECOND JSON line per decode alongside
+// `phasebreak`: `{"kind":"pathaccount",...}` (protocol 1,
+// `src/decompress/parallel/phase_timing.rs::emit_pathaccount`). Where
+// `phasebreak` decomposes the CONSUMER's wall into waits, `pathaccount`
+// decomposes the WORKERS' decoded output BYTES across the disjoint decode
+// paths — clean contig vs the u16-marker fast loop vs the careful tail vs
+// STORED — with a paired ns time and call count per path. This is the
+// instrument that answers "on near-pure-literal data, does gz decode literals
+// into u16 markers (unnecessary marker machinery) or straight into the clean
+// contig path?" — a question the consumer-side `phasebreak` line cannot.
+//
+// Conservation is EXACT here (byte counts, not timings): the six byte buckets
+// must sum to the emitted `total_bytes`, and — since every logical decoded
+// byte lands in exactly one bucket — mismatch means a miscounted/omitted
+// output site, not overlap. That makes it a stronger Gate-0 than the
+// consumer-wall residual, so it is a hard REFUSAL.
+
+/// One decode's parsed `{"kind":"pathaccount",...}` line. Byte buckets are
+/// disjoint LOGICAL decoded-output bytes; `*_ns` are coarse RAII-bracketed
+/// per-path decode times (instrumented, so inflated — use for RELATIVE share,
+/// not absolute wall). Matches the emitter's protocol-1 wire schema exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathAccountRecord {
+    pub mfast_lit_bytes: u64,
+    pub mfast_backref_bytes: u64,
+    pub cfast_lit_bytes: u64,
+    pub cfast_backref_bytes: u64,
+    pub careful_bytes: u64,
+    pub stored_special_bytes: u64,
+    pub stored_perbyte_bytes: u64,
+    pub contig_bytes: u64,
+    pub total_bytes: u64,
+    pub mfast_ns: u64,
+    pub cfast_ns: u64,
+    pub careful_ns: u64,
+    pub stored_special_ns: u64,
+    pub stored_perbyte_ns: u64,
+    pub contig_ns: u64,
+}
+
+impl PathAccountRecord {
+    /// Sum of the six disjoint byte buckets (must equal `total_bytes`).
+    pub fn bucket_byte_sum(&self) -> u64 {
+        self.mfast_lit_bytes
+            + self.mfast_backref_bytes
+            + self.cfast_lit_bytes
+            + self.cfast_backref_bytes
+            + self.careful_bytes
+            + self.stored_special_bytes
+            + self.stored_perbyte_bytes
+            + self.contig_bytes
+    }
+    /// Bytes decoded through the u16-marker machinery (marker fast loop, both
+    /// the post-flip clean fast loop, and the careful per-symbol tail — every
+    /// path that is NOT the straight window-present contiguous clean decode nor
+    /// a STORED bulk copy). This is the "speculative / window-absent" share
+    /// that exists ONLY because of parallel chunking; at T1 it is ~0.
+    pub fn marker_machinery_bytes(&self) -> u64 {
+        self.mfast_lit_bytes
+            + self.mfast_backref_bytes
+            + self.cfast_lit_bytes
+            + self.cfast_backref_bytes
+            + self.careful_bytes
+    }
+    /// Fraction (0.0..=1.0) of decoded output bytes that went through the
+    /// marker machinery. Near 0 ⇒ the data decoded almost entirely clean
+    /// (literal-heavy); marker-resolution work is NOT the wall lever there,
+    /// however many chunks bootstrapped window-absent.
+    pub fn marker_machinery_byte_fraction(&self) -> f64 {
+        let total = self.total_bytes;
+        if total == 0 {
+            return 0.0;
+        }
+        self.marker_machinery_bytes() as f64 / total as f64
+    }
+    /// Marker machinery share of accumulated decode TIME (relative, since the
+    /// ns are instrument-inflated). contig+stored are the clean paths.
+    pub fn marker_machinery_ns_fraction(&self) -> f64 {
+        let marker = self.mfast_ns + self.cfast_ns + self.careful_ns;
+        let total = marker + self.contig_ns + self.stored_special_ns + self.stored_perbyte_ns;
+        if total == 0 {
+            return 0.0;
+        }
+        marker as f64 / total as f64
+    }
+}
+
+/// Parse ONE pathaccount JSON line (raw `[pathaccount] {...}` stderr form or a
+/// bare `{...}` line from `GZIPPY_PHASE_OUT` — both accepted). PURE, unit-
+/// tested. Refuses on a missing field, a non-`"pathaccount"` kind, or an
+/// unsupported protocol — an inert emitter must not silently yield zeros.
+pub fn parse_pathaccount_line(line: &str) -> Result<PathAccountRecord, String> {
+    let line = line.trim();
+    let json_part = line.strip_prefix("[pathaccount] ").unwrap_or(line);
+    let v: serde_json::Value = serde_json::from_str(json_part)
+        .map_err(|e| format!("pathaccount: cannot parse phase-timing JSON ({e}): {line:?}"))?;
+
+    let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+    if kind != "pathaccount" {
+        return Err(format!(
+            "pathaccount: unexpected 'kind' field {kind:?} (want \"pathaccount\"): {line:?}"
+        ));
+    }
+    let protocol = v.get("protocol").and_then(|x| x.as_u64()).unwrap_or(0);
+    if protocol != 1 {
+        return Err(format!(
+            "pathaccount: unsupported protocol {protocol} (this build understands protocol 1 only)"
+        ));
+    }
+    let field = |k: &str| -> Result<u64, String> {
+        v.get(k)
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| format!("pathaccount: missing/non-integer field '{k}' in {line:?}"))
+    };
+    Ok(PathAccountRecord {
+        mfast_lit_bytes: field("mfast_lit_bytes")?,
+        mfast_backref_bytes: field("mfast_backref_bytes")?,
+        cfast_lit_bytes: field("cfast_lit_bytes")?,
+        cfast_backref_bytes: field("cfast_backref_bytes")?,
+        careful_bytes: field("careful_bytes")?,
+        stored_special_bytes: field("stored_special_bytes")?,
+        stored_perbyte_bytes: field("stored_perbyte_bytes")?,
+        contig_bytes: field("contig_bytes")?,
+        total_bytes: field("total_bytes")?,
+        mfast_ns: field("mfast_ns")?,
+        cfast_ns: field("cfast_ns")?,
+        careful_ns: field("careful_ns")?,
+        stored_special_ns: field("stored_special_ns")?,
+        stored_perbyte_ns: field("stored_perbyte_ns")?,
+        contig_ns: field("contig_ns")?,
+    })
+}
+
+/// Gate-0 (pathaccount): the six disjoint byte buckets must sum EXACTLY to the
+/// emitted `total_bytes`. Unlike the consumer-wall residual this is not a
+/// timing tolerance — every decoded byte is accounted to exactly one bucket, so
+/// any mismatch is a real miscount (an omitted output site) and REFUSES.
+/// Returns the signed residual `total_bytes - sum(buckets)` (0 on success).
+pub fn check_pathaccount_conservation(r: &PathAccountRecord) -> Result<i64, String> {
+    let sum = r.bucket_byte_sum();
+    let residual = r.total_bytes as i64 - sum as i64;
+    if residual != 0 {
+        return Err(format!(
+            "GATE0-PATHACCOUNT-CONSERVATION: sum(buckets)={sum} != total_bytes={} \
+             (residual={residual}) — a decode-output site is unaccounted; \
+             instrument it before trusting the per-path breakdown",
+            r.total_bytes
+        ));
+    }
+    Ok(residual)
+}
+
 // ── Subprocess plumbing ──────────────────────────────────────────────────────
 
 /// Build the argv for one phasebreak run:
@@ -975,5 +1129,50 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["kind"], "phasebreak_report");
         assert_eq!(v["threads"], 1);
+    }
+
+    // ── pathaccount ──────────────────────────────────────────────────────
+
+    /// A real qwen-T4 pathaccount line (2026-07-13 solvency measurement): the
+    /// literal-heavy case that motivated this decomposition. 96.7% contig,
+    /// 2.2% marker fast loop — proves literals decode CLEAN, not into markers.
+    const QWEN_T4_PATHACCOUNT: &str = "[pathaccount] {\"kind\":\"pathaccount\",\"protocol\":1,\"mfast_lit_bytes\":14785259,\"mfast_backref_bytes\":7386402,\"cfast_lit_bytes\":28323,\"cfast_backref_bytes\":13671,\"careful_bytes\":9724346,\"stored_special_bytes\":423471,\"stored_perbyte_bytes\":30202,\"contig_bytes\":956183883,\"total_bytes\":988575557,\"mfast_ns\":129823028,\"cfast_ns\":325100,\"careful_ns\":74533913,\"stored_special_ns\":296530,\"stored_perbyte_ns\":51390,\"contig_ns\":3528143589,\"mfast_calls\":801,\"cfast_calls\":1,\"careful_calls\":379,\"stored_special_calls\":8,\"stored_perbyte_calls\":1,\"contig_calls\":22618}";
+
+    #[test]
+    fn parse_pathaccount_real_line_and_conserves() {
+        let r = parse_pathaccount_line(QWEN_T4_PATHACCOUNT).unwrap();
+        assert_eq!(r.contig_bytes, 956_183_883);
+        assert_eq!(r.total_bytes, 988_575_557);
+        // The real emitter conserves EXACTLY: buckets sum to total_bytes.
+        assert_eq!(r.bucket_byte_sum(), r.total_bytes);
+        check_pathaccount_conservation(&r).unwrap();
+    }
+
+    #[test]
+    fn pathaccount_literal_heavy_marker_share_is_tiny() {
+        // The load-bearing datum: on ~97%-literal data the marker machinery
+        // touches ~2-3% of bytes, so it CANNOT be the wall lever — literals
+        // decode straight into the clean contig path.
+        let r = parse_pathaccount_line(QWEN_T4_PATHACCOUNT).unwrap();
+        let f = r.marker_machinery_byte_fraction();
+        assert!(f < 0.035, "marker byte fraction {f} should be tiny (<3.5%)");
+        assert!(r.contig_bytes as f64 / r.total_bytes as f64 > 0.96);
+    }
+
+    #[test]
+    fn pathaccount_conservation_refuses_on_miscount() {
+        // Drop one byte from contig: sum no longer equals total_bytes.
+        let mut r = parse_pathaccount_line(QWEN_T4_PATHACCOUNT).unwrap();
+        r.contig_bytes -= 1;
+        assert!(check_pathaccount_conservation(&r).is_err());
+    }
+
+    #[test]
+    fn pathaccount_rejects_wrong_kind_and_protocol() {
+        assert!(parse_pathaccount_line("{\"kind\":\"phasebreak\",\"protocol\":1}").is_err());
+        assert!(parse_pathaccount_line(
+            "{\"kind\":\"pathaccount\",\"protocol\":2,\"total_bytes\":0}"
+        )
+        .is_err());
     }
 }
