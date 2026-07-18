@@ -64,6 +64,19 @@ pub struct ScopeManifest {
     /// and a run with no aliases behaves exactly as before.
     #[serde(default)]
     pub corpus_aliases: std::collections::BTreeMap<String, Vec<String>>,
+    /// Compression LEVELS the goal grid asserts (the extra axis for compress
+    /// scope: box × comparator × corpus × LEVEL × threads). Empty ⇒ decode mode
+    /// — the grid enumerates a single implicit level 0 and behaves exactly as
+    /// before (back-compat; a decode `MatrixCell` carries `level=0`).
+    #[serde(default)]
+    pub levels: Vec<u32>,
+    /// The ratio-neutrality tolerance ε this certificate ASSERTS. When set, a
+    /// source `MatrixResult` whose own manifest ε is LOOSER (numerically larger)
+    /// than this is ε-STALE for every cell it would cover — a looser ε could
+    /// flip a size LOSS into a WIN, so it may never silently satisfy a stricter
+    /// goal. `None` ⇒ no ε assertion (any source ε accepted; decode back-compat).
+    #[serde(default)]
+    pub epsilon: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,9 +114,23 @@ pub struct ScopeCell {
     pub comparator: String,
     pub corpus: String,
     pub threads: u32,
+    /// Compression level of the matched cell (compress mode). 0 ⇒ decode / the
+    /// single implicit level; defaulted so decode artifacts are unaffected.
+    #[serde(default)]
+    pub level: u32,
     pub status: ScopeStatus,
     /// Oriented ratio ours/theirs from the matched cell (NaN when unmatched).
     pub ratio: f64,
+    /// Oriented compressed-SIZE ratio ours/theirs from the matched compress cell
+    /// (`>1+ε` ⇒ ours bigger = worse). NaN when unmatched; 0.0 for decode cells.
+    /// Present so the certificate shows BOTH Pareto axes, not just the wall.
+    #[serde(default)]
+    pub size_ratio: f64,
+    /// The loss AXIS (`RATIO` | `SPEED` | "") copied from the matched compress
+    /// cell, so an OPEN compress cell can name which objective is open without
+    /// re-deriving it here. "" for decode / non-loss cells.
+    #[serde(default)]
+    pub loss_axis: String,
     /// Timestamp of the artifact the verdict came from ("" when unmatched).
     pub source_timestamp: String,
 }
@@ -162,16 +189,30 @@ fn cell_status(class: &str) -> ScopeStatus {
     }
 }
 
+/// The level axis to enumerate: the manifest's `levels`, or a single implicit
+/// level 0 when empty (decode mode — a decode `MatrixCell` carries `level=0`, so
+/// the grid shape and behavior are unchanged).
+fn level_axis(manifest: &ScopeManifest) -> Vec<u32> {
+    if manifest.levels.is_empty() {
+        vec![0]
+    } else {
+        manifest.levels.clone()
+    }
+}
+
 /// Evaluate the goal grid against banked artifacts. Pure: no clock, no I/O.
 pub fn evaluate(manifest: &ScopeManifest, artifacts: &[MatrixResult]) -> ScopeResult {
     let mut cells = Vec::new();
+    let levels = level_axis(manifest);
     for box_name in &manifest.boxes {
         for comparator in &manifest.comparators {
             for corpus in &manifest.corpora {
-                for &threads in &manifest.threads {
-                    cells.push(join_cell(
-                        manifest, artifacts, box_name, comparator, corpus, threads,
-                    ));
+                for &level in &levels {
+                    for &threads in &manifest.threads {
+                        cells.push(join_cell(
+                            manifest, artifacts, box_name, comparator, corpus, level, threads,
+                        ));
+                    }
                 }
             }
         }
@@ -184,12 +225,14 @@ pub fn evaluate(manifest: &ScopeManifest, artifacts: &[MatrixResult]) -> ScopeRe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_cell(
     manifest: &ScopeManifest,
     artifacts: &[MatrixResult],
     box_name: &str,
     comparator: &str,
     corpus: &str,
+    level: u32,
     threads: u32,
 ) -> ScopeCell {
     let comp_lc = comparator.to_ascii_lowercase();
@@ -211,7 +254,7 @@ fn join_cell(
         if !comparator_cmd(art).to_ascii_lowercase().contains(&comp_lc) {
             continue;
         }
-        let fresh = match &manifest.require_sha {
+        let sha_ok = match &manifest.require_sha {
             Some(sha) => art
                 .manifest
                 .sha_pins
@@ -219,9 +262,22 @@ fn join_cell(
                 .any(|p| p.contains(sha.as_str())),
             None => true,
         };
+        // ε-freshness: when the certificate ASSERTS an ε, a source whose own ε
+        // is LOOSER (numerically larger) cannot supply a fresh verdict — a
+        // looser tolerance could have turned a size LOSS into a WIN. Such a
+        // source is treated exactly like a sha-stale one (fresh=false ⇒ the cell
+        // reports STALE unless a truly-fresh artifact also covers it).
+        let eps_ok = match manifest.epsilon {
+            Some(asserted) => art.manifest.epsilon <= asserted,
+            None => true,
+        };
+        let fresh = sha_ok && eps_ok;
         let ts = timestamp_key(&art.manifest.timestamp);
         for cell in &art.cells {
             if cell.threads != threads {
+                continue;
+            }
+            if cell.level != level {
                 continue;
             }
             let bn = basename(&cell.corpus).to_ascii_lowercase();
@@ -241,8 +297,11 @@ fn join_cell(
             comparator: comparator.to_string(),
             corpus: corpus.to_string(),
             threads,
+            level,
             status: ScopeStatus::Unmeasured,
             ratio: f64::NAN,
+            size_ratio: f64::NAN,
+            loss_axis: String::new(),
             source_timestamp: String::new(),
         },
         Some((cell, fresh, _, ts)) => ScopeCell {
@@ -250,12 +309,15 @@ fn join_cell(
             comparator: comparator.to_string(),
             corpus: corpus.to_string(),
             threads,
+            level,
             status: if *fresh {
                 cell_status(&cell.class)
             } else {
                 ScopeStatus::Stale
             },
             ratio: cell.ratio,
+            size_ratio: cell.size_ratio,
+            loss_axis: cell.loss_axis.clone(),
             source_timestamp: (*ts).to_string(),
         },
     }
@@ -342,6 +404,8 @@ pub fn print_report(r: &ScopeResult) {
     if let Some(sha) = &r.manifest.require_sha {
         println!("freshness pin: sha contains '{sha}'");
     }
+    let levels = level_axis(&r.manifest);
+    let compress = !r.manifest.levels.is_empty();
     for box_name in &r.manifest.boxes {
         for comparator in &r.manifest.comparators {
             println!("\n== box={box_name} vs {comparator} ==");
@@ -351,25 +415,35 @@ pub fn print_report(r: &ScopeResult) {
             }
             println!();
             for corpus in &r.manifest.corpora {
-                print!("{corpus:<16}");
-                for &t in &r.manifest.threads {
-                    let cell = r
-                        .cells
-                        .iter()
-                        .find(|c| {
-                            &c.box_name == box_name
-                                && &c.comparator == comparator
-                                && &c.corpus == corpus
-                                && c.threads == t
-                        })
-                        .expect("grid cell present by construction");
-                    if cell.ratio.is_nan() {
-                        print!(" {:<6}", cell.status.letter());
+                for &level in &levels {
+                    // Decode: the row is just the corpus. Compress: append the
+                    // level so each (corpus, level) row is distinct.
+                    let label = if compress {
+                        format!("{corpus} L{level}")
                     } else {
-                        print!(" {}{:<5.2}", cell.status.letter(), cell.ratio);
+                        corpus.clone()
+                    };
+                    print!("{label:<16}");
+                    for &t in &r.manifest.threads {
+                        let cell = r
+                            .cells
+                            .iter()
+                            .find(|c| {
+                                &c.box_name == box_name
+                                    && &c.comparator == comparator
+                                    && &c.corpus == corpus
+                                    && c.level == level
+                                    && c.threads == t
+                            })
+                            .expect("grid cell present by construction");
+                        if cell.ratio.is_nan() {
+                            print!(" {:<6}", cell.status.letter());
+                        } else {
+                            print!(" {}{:<5.2}", cell.status.letter(), cell.ratio);
+                        }
                     }
+                    println!();
                 }
-                println!();
             }
         }
     }
@@ -388,13 +462,34 @@ pub fn print_report(r: &ScopeResult) {
                     | ScopeStatus::Stale
                     | ScopeStatus::Unmeasured
             ) {
+                // Compress cells name the SIZE axis (the second Pareto objective)
+                // so an OPEN cell says which objective is open, e.g.
+                //   Loss solvency vs rapidgzip silesia L6 T8 axis=RATIO size_ratio=1.030 ratio=0.950
+                let level_part = if compress {
+                    format!(" L{}", c.level)
+                } else {
+                    String::new()
+                };
+                let axis_part = if compress && !c.loss_axis.is_empty() {
+                    format!(" axis={}", c.loss_axis)
+                } else {
+                    String::new()
+                };
+                let size_part = if compress && !c.size_ratio.is_nan() {
+                    format!(" size_ratio={:.3}", c.size_ratio)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {:?} {} vs {} {} T{}{}",
+                    "  {:?} {} vs {} {}{} T{}{}{}{}",
                     c.status,
                     c.box_name,
                     c.comparator,
                     c.corpus,
+                    level_part,
                     c.threads,
+                    axis_part,
+                    size_part,
                     if c.ratio.is_nan() {
                         String::new()
                     } else {
@@ -608,6 +703,84 @@ fn synth_artifact(
     }
 }
 
+/// COMPRESS-mode synthetic artifact: cells carry `(corpus, level, threads,
+/// class, ratio, size_ratio, loss_axis)` and the manifest stamps
+/// mode="compress" + `levels` + `epsilon`. The `class` is what `classify_compress`
+/// ALREADY folded (a size regression beyond ε is `LOSS` even when faster) — scope
+/// consumes it verbatim, exactly as it does a decode class.
+#[allow(clippy::too_many_arguments)]
+fn synth_artifact_compress(
+    box_name: &str,
+    ours: &str,
+    a_cmd: &str,
+    b_cmd: &str,
+    timestamp: &str,
+    sha_pins: &[&str],
+    epsilon: f64,
+    cells: &[(&str, u32, u32, &str, f64, f64, &str)],
+) -> MatrixResult {
+    use crate::matrix::{MatrixSummary, RunManifest};
+    let levels: Vec<u32> = {
+        let mut ls: Vec<u32> = cells.iter().map(|(_, l, ..)| *l).collect();
+        ls.sort_unstable();
+        ls.dedup();
+        ls
+    };
+    let cells: Vec<MatrixCell> = cells
+        .iter()
+        .map(
+            |(corpus, level, threads, class, ratio, size_ratio, loss_axis)| MatrixCell {
+                corpus: corpus.to_string(),
+                threads: *threads,
+                class: class.to_string(),
+                ratio: *ratio,
+                a_peak_rss_mb: 0.0,
+                b_peak_rss_mb: 0.0,
+                paired: None,
+                error: None,
+                level: *level,
+                size_ratio: *size_ratio,
+                size_class: String::new(),
+                a_size_bytes: 0,
+                b_size_bytes: 0,
+                loss_axis: loss_axis.to_string(),
+            },
+        )
+        .collect();
+    let summary = MatrixResult::summarize(&cells);
+    MatrixResult {
+        manifest: RunManifest {
+            a_cmd: a_cmd.to_string(),
+            b_cmd: b_cmd.to_string(),
+            ref_cmd: "gzip -dc {corpus}".to_string(),
+            ours: ours.to_string(),
+            n: 51,
+            warmup: 2,
+            corpora: vec![],
+            threads: vec![],
+            box_name: box_name.to_string(),
+            sha_pins: sha_pins.iter().map(|s| s.to_string()).collect(),
+            timestamp: timestamp.to_string(),
+            method: "selftest-synthetic".to_string(),
+            pin: "pin=selftest".to_string(),
+            rss_reps: 0,
+            mode: "compress".to_string(),
+            levels,
+            epsilon,
+            roundtrip_cmd: "gzip -dc {corpus}".to_string(),
+        },
+        cells,
+        summary: MatrixSummary {
+            win: summary.win,
+            tie: summary.tie,
+            loss: summary.loss,
+            void: summary.void,
+            total: summary.total,
+            status: summary.status,
+        },
+    }
+}
+
 pub fn selftest() -> ExitCode {
     let pass = std::cell::Cell::new(0u32);
     let fail = std::cell::Cell::new(0u32);
@@ -629,6 +802,8 @@ pub fn selftest() -> ExitCode {
         threads: vec![1, 4],
         require_sha: Some("deadbeef".into()),
         corpus_aliases: std::collections::BTreeMap::new(),
+        levels: vec![],
+        epsilon: None,
     };
     // Full goal grid = 2 boxes × 2 comparators × 2 corpora × 2 T = 16 cells.
 
@@ -841,6 +1016,8 @@ pub fn selftest() -> ExitCode {
         corpus_aliases: [("purestored".to_string(), vec!["pure_stored".to_string()])]
             .into_iter()
             .collect(),
+        levels: vec![],
+        epsilon: None,
     };
     let alias_art = synth_artifact(
         "solvency",
@@ -894,6 +1071,163 @@ pub fn selftest() -> ExitCode {
     check(
         "empty goal grid is OPEN, never WIN",
         r.summary.verdict == "OPEN" && r.summary.total == 0,
+    );
+
+    // =======================================================================
+    // COMPRESS mode — the two-objective (Pareto@matched-level) certificate.
+    // The size axis is ALREADY folded into `class` by `classify_compress`; scope
+    // only adds LEVEL to the join key, the ε-staleness guard, and size-axis
+    // visibility. These checks prove exactly those additions.
+    // =======================================================================
+    let compress_manifest = ScopeManifest {
+        goal: Some("compress-pareto".into()),
+        boxes: vec!["solvency".into()],
+        comparators: vec!["libdeflate".into()],
+        corpora: vec!["silesia".into()],
+        threads: vec![8],
+        require_sha: None,
+        corpus_aliases: std::collections::BTreeMap::new(),
+        levels: vec![6, 9],
+        epsilon: Some(0.01),
+    };
+    // Full grid = 1 box × 1 comparator × 1 corpus × 2 levels × 1 T = 2 cells.
+
+    // (1) B ALREADY folded a size regression into LOSS: L6 is faster on the wall
+    //     (ratio 0.90) but 3% BIGGER (size_ratio 1.03 > 1+ε) so its class is LOSS
+    //     with loss_axis=RATIO; L9 is a clean WIN.
+    let folded = synth_artifact_compress(
+        "solvency",
+        "a",
+        "gzippy -{level} -k {corpus}",
+        "libdeflate_gzip -{level} {corpus}",
+        "epoch:200",
+        &["gz:deadbeef"],
+        0.01,
+        &[
+            ("/corpora/silesia.tar", 6, 8, "LOSS", 0.90, 1.03, "RATIO"),
+            ("/corpora/silesia.tar", 9, 8, "WIN", 0.92, 0.99, ""),
+        ],
+    );
+    let r = evaluate(&compress_manifest, std::slice::from_ref(&folded));
+    check(
+        "compress: size-regressed-but-faster L6 folded to LOSS by B (scope reports L)",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "silesia" && c.level == 6 && c.threads == 8)
+            .is_some_and(|c| {
+                c.status == ScopeStatus::Loss
+                    && c.loss_axis == "RATIO"
+                    && (c.size_ratio - 1.03).abs() < 1e-12
+            }),
+    );
+    check(
+        "compress: the RATIO-LOSS cell blocks SCOPE=WIN",
+        r.summary.verdict == "OPEN" && r.summary.loss == 1,
+    );
+    check(
+        "compress: plaintext corpus basename 'silesia.tar' joins goal token 'silesia'",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "silesia" && c.level == 9 && c.threads == 8)
+            .is_some_and(|c| c.status == ScopeStatus::Win),
+    );
+
+    // (2) ε-mismatch: a SOURCE whose own ε (0.05) is LOOSER than the certificate's
+    //     asserted ε (0.01) is ε-STALE — a looser tolerance could have turned a
+    //     size LOSS into a WIN, so it may not silently satisfy the stricter goal.
+    let loose_eps = synth_artifact_compress(
+        "solvency",
+        "a",
+        "gzippy -{level} -k {corpus}",
+        "libdeflate_gzip -{level} {corpus}",
+        "epoch:900", // NEWER than `folded`, yet must not outrank a fresh verdict
+        &["gz:deadbeef"],
+        0.05, // LOOSER than the manifest's asserted 0.01
+        &[
+            ("/corpora/silesia.tar", 6, 8, "WIN", 0.90, 1.03, ""),
+            ("/corpora/silesia.tar", 9, 8, "WIN", 0.92, 0.99, ""),
+        ],
+    );
+    let r = evaluate(&compress_manifest, std::slice::from_ref(&loose_eps));
+    check(
+        "compress: source with a LOOSER ε than asserted ⇒ cell STALE",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "silesia" && c.level == 6 && c.threads == 8)
+            .is_some_and(|c| c.status == ScopeStatus::Stale),
+    );
+    check(
+        "compress: ε-STALE cells block SCOPE=WIN (like UNMEASURED)",
+        r.summary.verdict == "OPEN" && r.summary.stale == 2,
+    );
+    check("compress: a source with ε EQUAL-or-stricter is fresh", {
+        let strict_eps = synth_artifact_compress(
+            "solvency",
+            "a",
+            "gzippy -{level} -k {corpus}",
+            "libdeflate_gzip -{level} {corpus}",
+            "epoch:300",
+            &["gz:deadbeef"],
+            0.01, // exactly the asserted ε — NOT looser
+            &[
+                ("/corpora/silesia.tar", 6, 8, "WIN", 0.90, 0.98, ""),
+                ("/corpora/silesia.tar", 9, 8, "WIN", 0.92, 0.99, ""),
+            ],
+        );
+        let rr = evaluate(&compress_manifest, std::slice::from_ref(&strict_eps));
+        rr.summary.verdict == "WIN" && rr.summary.stale == 0
+    });
+
+    // (3) LEVEL is part of the join key: two cells same corpus/threads but
+    //     different level are DISTINCT — a WIN at L6 must not cover an L9 goal.
+    let one_level_only = synth_artifact_compress(
+        "solvency",
+        "a",
+        "gzippy -{level} -k {corpus}",
+        "libdeflate_gzip -{level} {corpus}",
+        "epoch:200",
+        &["gz:deadbeef"],
+        0.01,
+        &[("/corpora/silesia.tar", 6, 8, "WIN", 0.90, 0.98, "")],
+    );
+    let r = evaluate(&compress_manifest, std::slice::from_ref(&one_level_only));
+    check(
+        "compress: level is a join-key axis — L6 WIN does NOT satisfy the L9 goal cell",
+        r.cells
+            .iter()
+            .find(|c| c.corpus == "silesia" && c.level == 6 && c.threads == 8)
+            .is_some_and(|c| c.status == ScopeStatus::Win)
+            && r.cells
+                .iter()
+                .find(|c| c.corpus == "silesia" && c.level == 9 && c.threads == 8)
+                .is_some_and(|c| c.status == ScopeStatus::Unmeasured),
+    );
+
+    // (4) full-WIN compress surface (both levels W/T) ⇒ SCOPE=WIN.
+    let full_compress = synth_artifact_compress(
+        "solvency",
+        "a",
+        "gzippy -{level} -k {corpus}",
+        "libdeflate_gzip -{level} {corpus}",
+        "epoch:400",
+        &["gz:deadbeef"],
+        0.01,
+        &[
+            ("/corpora/silesia.tar", 6, 8, "WIN", 0.90, 0.99, ""),
+            ("/corpora/silesia.tar", 9, 8, "TIE", 1.00, 0.995, ""),
+        ],
+    );
+    let r = evaluate(&compress_manifest, std::slice::from_ref(&full_compress));
+    check(
+        "compress: full W/T surface across both levels ⇒ SCOPE=WIN",
+        r.summary.verdict == "WIN" && r.summary.total == 2 && r.summary.unmeasured == 0,
+    );
+
+    // (5) decode back-compat: a decode manifest (no levels/epsilon) is byte-for-byte
+    //     unchanged — the earlier full-coverage decode WIN still holds identically.
+    check(
+        "decode back-compat: level-less manifest still SCOPE=WIN on full decode coverage",
+        evaluate(&manifest, &full).summary.verdict == "WIN",
     );
 
     println!("SCOPE-SELFTEST pass={} fail={}", pass.get(), fail.get());

@@ -1120,6 +1120,8 @@ pub fn selftest() -> ExitCode {
             threads: vec![4],
             require_sha: None,
             corpus_aliases: Default::default(),
+            levels: vec![],
+            epsilon: None,
         };
         let scope_open = scope::evaluate(&manifest, &[]); // nothing banked ⇒ all UNMEASURED
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, Some(&scope_open), false);
