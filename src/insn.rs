@@ -1045,5 +1045,104 @@ pub const INSN_CATEGORIES: &[CategoryDef] = &[
     ),
 ];
 
+// ---------------------------------------------------------------------------
+// The ENCODER (compression) hot-path category flavor. Selected by
+// `--feature compress-encode`, this partitions a compression cell's perf-report
+// symbols into ROLE buckets so gzippy and a rival encoder (igzip / libdeflate)
+// line up BY ROLE — the "where do gzippy's excess ENCODE instructions go"
+// answer, without reading gzippy source, purely from symbol names.
+//
+// ⚠️ FIRST-CUT / UNCALIBRATED (2026-07-18): these substrings are a STARTING
+// partition, NOT yet validated against a real gzippy/igzip encode capture (that
+// needs perf on a Linux box). Two properties are guaranteed regardless:
+//   * a symbol matching TWO categories REFUSES (`INSN-AMBIGUOUS-PARTITION`) —
+//     it never silently picks one (the closed-ledger invariant);
+//   * a symbol matching NONE lands in `(uncategorized)` and FLAGS the ledger
+//     when the unaccounted fraction exceeds the threshold — never invented away.
+// So an over-broad substring (e.g. output_io's `write` vs huffman_encode's
+// `write_bits`, both firing on a real `write_bits` symbol) surfaces LOUDLY as a
+// refusal that PULLS the calibration edit here, rather than a silent mis-split.
+// This is the ONE place to edit the map when calibrating against a real capture.
+// ---------------------------------------------------------------------------
+
+/// The ENCODE (compression) hot-path role taxonomy (ordered, matched
+/// case-insensitively as substrings). A FIRST-CUT partition to be calibrated
+/// against a real perf capture; the closure + ambiguity guards make a wrong
+/// first cut fail LOUD, not silently. Selected via `--feature compress-encode`.
+pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
+    (
+        "match_finder",
+        &[
+            "longest_match",
+            "deflate_medium",
+            "deflate_quick",
+            "match",
+            "hash",
+            "find_match",
+            "icf",
+            "skip_match",
+        ],
+    ),
+    (
+        "huffman_build",
+        &[
+            "build_huff",
+            "gen_huff",
+            "create_huff",
+            "tree",
+            "histogram",
+            "freq",
+            "code_length",
+            "count_syms",
+        ],
+    ),
+    (
+        "huffman_encode",
+        &[
+            "encode_block",
+            "huff_encode",
+            "flush_bits",
+            "put_bits",
+            "write_bits",
+            "compress_block",
+            "encode_lit",
+        ],
+    ),
+    (
+        "block_split",
+        &[
+            "split",
+            "block_boundary",
+            "flush_block",
+            "end_block",
+            "tally",
+        ],
+    ),
+    ("crc", &["crc", "adler", "checksum", "fold"]),
+    (
+        "output_io",
+        &[
+            "write",
+            "copy_bytes",
+            "memcpy",
+            "output",
+            "stream",
+            "flush_output",
+        ],
+    ),
+];
+
+/// Select the category taxonomy for an `insn` run from the `--feature` value.
+/// `compress-encode` (alias `encode`) picks the ENCODER role partition; any
+/// other value (including `None`/empty, the historical DECODE default) keeps
+/// [`INSN_CATEGORIES`]. Case-insensitive, trims surrounding whitespace. Additive:
+/// the decode path is unchanged when no encode feature is requested.
+pub fn categories_for_feature(feature: Option<&str>) -> &'static [CategoryDef] {
+    match feature.map(|f| f.trim().to_ascii_lowercase()).as_deref() {
+        Some("compress-encode") | Some("encode") => ENCODE_INSN_CATEGORIES,
+        _ => INSN_CATEGORIES,
+    }
+}
+
 #[cfg(test)]
 mod tests;

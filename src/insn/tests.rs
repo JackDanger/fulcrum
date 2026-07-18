@@ -693,6 +693,164 @@ fn calib_fixed_patterns_no_accidental_match() {
 }
 
 // ===========================================================================
+// ENCODE (compress-encode) role partition — item D. The ENCODER hot-path
+// taxonomy is a FIRST-CUT, so the tests pin exactly the properties the closed
+// ledger guarantees regardless of calibration: it CLOSES with no double-count,
+// a two-category symbol REFUSES, an unknown symbol FLAGS (never invented away),
+// and conservation holds. Uses FIXTURE perf text (no live perf needed).
+// ===========================================================================
+
+/// A fixture perf-report whose symbols each land in exactly ONE encode role.
+/// match_finder 400, huffman_build 150, huffman_encode 200, block_split 50,
+/// crc 100, output_io 100 -> 1000 == STAT_1000.
+const ENCODE_REPORT_CLEAN: &str = "# Samples: 4K of event 'instructions:u'\n  \
+     400  [.] longest_match\n  \
+     150  [.] gen_huff_codes\n  \
+     200  [.] compress_block\n  \
+      50  [.] flush_block\n  \
+     100  [.] crc32_fold\n  \
+     100  [.] copy_bytes\n";
+
+fn encode_from_text(
+    stat: &str,
+    report: &str,
+    label: Option<&str>,
+    volume_bytes: Option<i64>,
+    thresholds: Thresholds,
+) -> Result<Ledger, InvariantViolation> {
+    insn_from_text(
+        stat,
+        report,
+        ENCODE_INSN_CATEGORIES,
+        label,
+        volume_bytes,
+        thresholds,
+    )
+}
+
+#[test]
+fn encode_partition_closes_no_double_count() {
+    // --threshold 5: the clean fixture must close to >=95% (here 100%), no flag.
+    let th = Thresholds {
+        tol_pct: DEFAULT_TOL_PCT,
+        threshold_pct: 5.0,
+    };
+    let led = encode_from_text(STAT_1000, ENCODE_REPORT_CLEAN, Some("gzippy"), Some(10), th).unwrap();
+
+    // per-role insns exact (role-matched, single bucket each).
+    assert_eq!(cat_row(&led, "match_finder").insns, 400);
+    assert_eq!(cat_row(&led, "huffman_build").insns, 150);
+    assert_eq!(cat_row(&led, "huffman_encode").insns, 200);
+    assert_eq!(cat_row(&led, "block_split").insns, 50);
+    assert_eq!(cat_row(&led, "crc").insns, 100);
+    assert_eq!(cat_row(&led, "output_io").insns, 100);
+
+    // closes to >=95% (categorized fraction), no double-count over the total.
+    assert_eq!(led.categorized, 1000);
+    assert_eq!(led.uncategorized, 0);
+    assert_eq!(led.residual, 0);
+    assert!(led.categorized as f64 / led.measured_total as f64 >= 0.95);
+    assert!(!led.flagged);
+    // CONSERVATION: Σcategory + uncategorized + residual == total.
+    assert_eq!(
+        led.categorized + led.uncategorized + led.residual,
+        led.measured_total
+    );
+}
+
+#[test]
+fn encode_ambiguous_symbol_refuses() {
+    // A real encoder symbol `write_bits` matches output_io ("write") AND
+    // huffman_encode ("write_bits") — the first-cut overlap the map exposes.
+    // It must REFUSE by name, never silently pick one bucket.
+    assert!(
+        raises_named(
+            resolve_category("write_bits", ENCODE_INSN_CATEGORIES),
+            "INSN-AMBIGUOUS-PARTITION"
+        ),
+        "a symbol matching 2 encode roles must refuse by name"
+    );
+    // The refusal propagates through a full ledger build, not just resolve.
+    let report = "# Samples: 4K of event 'instructions:u'\n  600  [.] write_bits\n  \
+                  400  [.] longest_match\n";
+    assert!(raises_named(
+        encode_from_text(STAT_1000, report, None, None, Thresholds::default()),
+        "INSN-AMBIGUOUS-PARTITION"
+    ));
+}
+
+#[test]
+fn encode_unknown_symbol_flagged_uncategorized() {
+    // An unknown symbol lands in (uncategorized) and FLAGS the ledger; it is
+    // surfaced verbatim, NEVER silently dropped or invented into a role.
+    let report = "# Samples: 4K of event 'instructions:u'\n  \
+        600  [.] longest_match\n  \
+        200  [.] some_mystery_helper\n  \
+        200  [.] compress_block\n";
+    let led = encode_from_text(STAT_1000, report, None, None, Thresholds::default()).unwrap();
+    assert!(led.flagged);
+    assert_eq!(led.uncategorized, 200);
+    assert!(led.uncategorized_symbols[0].0.contains("some_mystery_helper"));
+    assert!(led.flag_reason.is_some());
+    // still CLOSES despite the gap (conservation).
+    assert_eq!(
+        led.categorized + led.uncategorized + led.residual,
+        led.measured_total
+    );
+}
+
+#[test]
+fn encode_cross_binary_delta_role_matched_and_closes() {
+    // gzippy (A) spends more in match_finder than igzip (B); the excess
+    // localizes to match_finder and the delta ledger CLOSES.
+    let rep_a = "# Samples: 4K of event 'instructions:u'\n  600  [.] longest_match\n  \
+                 300  [.] compress_block\n  100  [.] crc32_fold\n";
+    let rep_b = "# Samples: 4K of event 'instructions:u'\n  300  [.] longest_match\n  \
+                 300  [.] compress_block\n  100  [.] crc32_fold\n";
+    let led_a = encode_from_text(
+        "  1,000  instructions:u\n",
+        rep_a,
+        Some("gzippy"),
+        Some(10),
+        Thresholds::default(),
+    )
+    .unwrap();
+    let led_b = encode_from_text(
+        "  700  instructions:u\n",
+        rep_b,
+        Some("igzip"),
+        Some(10),
+        Thresholds::default(),
+    )
+    .unwrap();
+    let cmp = compare(&led_a, &led_b).unwrap();
+    assert_eq!(cmp.rows[0].category, "match_finder");
+    assert_eq!(cmp.rows[0].delta, 300);
+    assert_eq!(cmp.total_delta, 300);
+    assert!(cmp.delta_closes);
+    // independent re-sum of every row delta equals total delta (closes).
+    let s: i64 = cmp.rows.iter().map(|r| r.delta).sum();
+    assert_eq!(s, cmp.total_delta);
+}
+
+#[test]
+fn encode_feature_selector_picks_map() {
+    // --feature compress-encode (and the `encode` alias) select the ENCODE map;
+    // anything else — including None/empty — keeps the DECODE default. Consts
+    // have no stable address in Rust, so distinguish by the map's first role.
+    let first = |cats: &[CategoryDef]| cats[0].0;
+    let enc = first(ENCODE_INSN_CATEGORIES); // "match_finder"
+    let dec = first(INSN_CATEGORIES); // "marker_emit"
+    assert_ne!(enc, dec);
+    assert_eq!(first(categories_for_feature(Some("compress-encode"))), enc);
+    assert_eq!(first(categories_for_feature(Some("Compress-Encode"))), enc);
+    assert_eq!(first(categories_for_feature(Some("  encode  "))), enc);
+    assert_eq!(first(categories_for_feature(None)), dec);
+    assert_eq!(first(categories_for_feature(Some(""))), dec);
+    assert_eq!(first(categories_for_feature(Some("gzippy-isal"))), dec);
+}
+
+// ===========================================================================
 // INSN-CLOSURE is REGISTERED and the enforcement wires to this module.
 // ===========================================================================
 #[test]

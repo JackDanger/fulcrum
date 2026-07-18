@@ -3572,6 +3572,7 @@ fn cmd_insn(args: &[String]) -> ExitCode {
     let mut a_bytes: Option<i64> = None;
     let mut a_label: Option<String> = None;
     let mut b = insn::BInputs::default();
+    let mut feature: Option<String> = None;
     let known = "--a-stat --a-report --a-bytes --a-label --b-stat --b-report --b-bytes --b-label --tol --threshold --feature";
     let mut i = 0;
     while i < args.len() {
@@ -3596,7 +3597,7 @@ fn cmd_insn(args: &[String]) -> ExitCode {
                     threshold = v;
                 }
             }
-            "--feature" => {} // gzippy has a single category map; --feature is a no-op
+            "--feature" => feature = val(), // decode (default) vs compress-encode role map
             other => {
                 eprintln!("insn: unknown/unexpected argument {other}; known: {known}");
                 return ExitCode::from(2);
@@ -3614,7 +3615,7 @@ fn cmd_insn(args: &[String]) -> ExitCode {
     match insn::insn_from_files(
         &a_stat,
         &a_report,
-        insn::INSN_CATEGORIES,
+        insn::categories_for_feature(feature.as_deref()),
         a_label.as_deref(),
         a_bytes,
         &b,
