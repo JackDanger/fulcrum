@@ -952,6 +952,33 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Map the `--pin` CLI value (and `--no-pin`) to a [`Pin`]. `per-thread`/`perthread`
+/// ⇒ `Pin::PerThread` (`taskset -c 0-(T-1)`), `none` ⇒ `Pin::None`, any other value
+/// ⇒ a custom taskset mask template. Absent ⇒ `None` on macOS (no taskset) else
+/// `PerThread`.
+///
+/// BUG FIX (2026-07-18): the previous inline parse treated EVERY `--pin <val>` as a
+/// literal mask, so `--pin per-thread` produced `taskset -c per-thread <cmd>`, which
+/// fail-spawns (exit 256) and VOIDs every cell — a whole trainer curve came back
+/// 34/34 VOID from exactly this. The keyword mapping below is regression-tested.
+pub(crate) fn pin_from_cli(pin_val: Option<&str>, no_pin: bool) -> Pin {
+    if no_pin {
+        return Pin::None;
+    }
+    match pin_val {
+        Some("per-thread") | Some("perthread") => Pin::PerThread,
+        Some("none") => Pin::None,
+        Some(tmpl) => Pin::Tmpl(tmpl.to_string()),
+        None => {
+            if std::env::consts::OS == "macos" {
+                Pin::None
+            } else {
+                Pin::PerThread
+            }
+        }
+    }
+}
+
 pub fn cmd_frontier(args: &[String]) -> ExitCode {
     match args.first().map(|s| s.as_str()) {
         Some("selftest") => return selftest(),
@@ -1052,15 +1079,7 @@ pub fn cmd_frontier(args: &[String]) -> ExitCode {
     let rss_reps: usize = cli_flag(args, "--rss-reps").and_then(|v| v.parse().ok()).unwrap_or(0);
     let timestamp = cli_flag(args, "--timestamp").map(String::from).unwrap_or_else(now_epoch_string);
 
-    let pin = if cli_has(args, "--no-pin") {
-        Pin::None
-    } else if let Some(tmpl) = cli_flag(args, "--pin") {
-        Pin::Tmpl(tmpl.to_string())
-    } else if std::env::consts::OS == "macos" {
-        Pin::None
-    } else {
-        Pin::PerThread
-    };
+    let pin = pin_from_cli(cli_flag(args, "--pin"), cli_has(args, "--no-pin"));
 
     // corpora existence check (fail-soft would just VOID everything).
     for c in &corpora {

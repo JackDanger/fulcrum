@@ -11,6 +11,26 @@ mod tests {
     }
 
     #[test]
+    fn pin_from_cli_maps_keywords_not_literal_mask() {
+        // The bug: `--pin per-thread` became Pin::Tmpl("per-thread") →
+        // `taskset -c per-thread` → spawn fail → 34/34 VOID.
+        assert!(matches!(pin_from_cli(Some("per-thread"), false), Pin::PerThread));
+        assert!(matches!(pin_from_cli(Some("perthread"), false), Pin::PerThread));
+        assert!(matches!(pin_from_cli(Some("none"), false), Pin::None));
+        // a real custom mask still passes through as a template.
+        match pin_from_cli(Some("2-5"), false) {
+            Pin::Tmpl(s) => assert_eq!(s, "2-5"),
+            other => panic!("expected Tmpl, got {other:?}"),
+        }
+        // --no-pin always wins.
+        assert!(matches!(pin_from_cli(Some("per-thread"), true), Pin::None));
+        // and the per-thread pin yields a VALID taskset mask (the void reason
+        // was an invalid mask, so pin the concrete output too).
+        assert_eq!(Pin::PerThread.mask(1).as_deref(), Some("0"));
+        assert_eq!(Pin::PerThread.mask(8).as_deref(), Some("0-7"));
+    }
+
+    #[test]
     fn envelope_exact_lower_left() {
         let pts = vec![
             SweptPoint::synth("v", 1, 100, 50.0),
