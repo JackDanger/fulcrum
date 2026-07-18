@@ -77,6 +77,21 @@ pub struct ScopeManifest {
     /// goal. `None` ⇒ no ε assertion (any source ε accepted; decode back-compat).
     #[serde(default)]
     pub epsilon: Option<f64>,
+    /// PER-COMPARATOR level sets (the frontier axis). Comparators have NATIVE,
+    /// unequal level ranges (igzip 0..3, libdeflate 1..12), so a single shared
+    /// `levels` axis would enumerate phantom UNMEASURED cells (e.g. igzip-L9).
+    /// A comparator present here uses ITS list; one absent falls back to the
+    /// shared `levels` (or the single implicit level 0 in decode mode). Empty by
+    /// default — back-compat: behaves exactly as the shared axis.
+    #[serde(default)]
+    pub comparator_levels: std::collections::BTreeMap<String, Vec<u32>>,
+    /// If set, an artifact only supplies a FRESH verdict when its manifest
+    /// `method` CONTAINS this substring (e.g. `"frontier-v1"`), so a per-label
+    /// `matrix --mode compress` artifact can NOT silently satisfy a
+    /// curve-dominance goal cell. Cells whose only coverage fails this are STALE
+    /// (like a failed `require_sha`). `None` ⇒ no method assertion (back-compat).
+    #[serde(default)]
+    pub require_method: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,12 +215,23 @@ fn level_axis(manifest: &ScopeManifest) -> Vec<u32> {
     }
 }
 
+/// The level axis to enumerate FOR ONE COMPARATOR: its own `comparator_levels`
+/// entry when present (the native, per-tool range), else the shared axis. This is
+/// what lets igzip-0..3 and libdeflate-1..12 coexist without phantom UNMEASURED
+/// cells at levels a tool never supports.
+fn levels_for(manifest: &ScopeManifest, comparator: &str) -> Vec<u32> {
+    match manifest.comparator_levels.get(comparator) {
+        Some(ls) if !ls.is_empty() => ls.clone(),
+        _ => level_axis(manifest),
+    }
+}
+
 /// Evaluate the goal grid against banked artifacts. Pure: no clock, no I/O.
 pub fn evaluate(manifest: &ScopeManifest, artifacts: &[MatrixResult]) -> ScopeResult {
     let mut cells = Vec::new();
-    let levels = level_axis(manifest);
     for box_name in &manifest.boxes {
         for comparator in &manifest.comparators {
+            let levels = levels_for(manifest, comparator);
             for corpus in &manifest.corpora {
                 for &level in &levels {
                     for &threads in &manifest.threads {
@@ -271,7 +297,14 @@ fn join_cell(
             Some(asserted) => art.manifest.epsilon <= asserted,
             None => true,
         };
-        let fresh = sha_ok && eps_ok;
+        // require_method: a source only supplies a FRESH verdict when its method
+        // carries the asserted substring — so a per-label matrix cannot satisfy a
+        // curve-dominance goal cell (treated exactly like a sha/ε staleness).
+        let method_ok = match &manifest.require_method {
+            Some(m) => art.manifest.method.contains(m.as_str()),
+            None => true,
+        };
+        let fresh = sha_ok && eps_ok && method_ok;
         let ts = timestamp_key(&art.manifest.timestamp);
         for cell in &art.cells {
             if cell.threads != threads {
@@ -404,10 +437,10 @@ pub fn print_report(r: &ScopeResult) {
     if let Some(sha) = &r.manifest.require_sha {
         println!("freshness pin: sha contains '{sha}'");
     }
-    let levels = level_axis(&r.manifest);
-    let compress = !r.manifest.levels.is_empty();
+    let compress = !r.manifest.levels.is_empty() || !r.manifest.comparator_levels.is_empty();
     for box_name in &r.manifest.boxes {
         for comparator in &r.manifest.comparators {
+            let levels = levels_for(&r.manifest, comparator);
             println!("\n== box={box_name} vs {comparator} ==");
             print!("{:<16}", "corpus");
             for t in &r.manifest.threads {
@@ -804,6 +837,8 @@ pub fn selftest() -> ExitCode {
         corpus_aliases: std::collections::BTreeMap::new(),
         levels: vec![],
         epsilon: None,
+        comparator_levels: std::collections::BTreeMap::new(),
+        require_method: None,
     };
     // Full goal grid = 2 boxes × 2 comparators × 2 corpora × 2 T = 16 cells.
 
@@ -1018,6 +1053,8 @@ pub fn selftest() -> ExitCode {
             .collect(),
         levels: vec![],
         epsilon: None,
+        comparator_levels: std::collections::BTreeMap::new(),
+        require_method: None,
     };
     let alias_art = synth_artifact(
         "solvency",
@@ -1089,6 +1126,8 @@ pub fn selftest() -> ExitCode {
         corpus_aliases: std::collections::BTreeMap::new(),
         levels: vec![6, 9],
         epsilon: Some(0.01),
+        comparator_levels: std::collections::BTreeMap::new(),
+        require_method: None,
     };
     // Full grid = 1 box × 1 comparator × 1 corpus × 2 levels × 1 T = 2 cells.
 

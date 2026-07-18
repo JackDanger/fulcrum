@@ -229,6 +229,10 @@ fn sha_of_arm(cmd: &str) -> Result<String, String> {
 /// Unix). Returns wall milliseconds. Correctness is NOT checked here — that is
 /// the separate untimed [`sha_of_arm`] pass, so hashing never contaminates the
 /// wall and a fast/wrong arm never slips through.
+///
+/// `pub` alias [`wall_once`] exists so `fulcrum frontier`'s coarse (PROVISIONAL)
+/// sweep does not fork a SECOND timing path — the coarse walls ride the exact
+/// same `sh -c` + `Stdio::null()` + `Instant` measurement the gated engine uses.
 fn timed_arm(cmd: &str) -> Result<f64, String> {
     let t0 = Instant::now();
     let status = Command::new("sh")
@@ -244,6 +248,14 @@ fn timed_arm(cmd: &str) -> Result<f64, String> {
         return Err(format!("`{cmd}` exited {status:?} (timed pass)"));
     }
     Ok(ms)
+}
+
+/// Public one-shot wall timer — the SAME `sh -c` + `Stdio::null()` (SINK LAW) +
+/// `Instant` path [`timed_arm`] uses, exported so other subcommands (notably
+/// `fulcrum frontier`'s coarse PROVISIONAL sweep) do not hand-roll a second,
+/// drift-prone timing loop. A coarse wall is geometry only — NEVER a verdict.
+pub fn wall_once(cmd: &str) -> Result<f64, String> {
+    timed_arm(cmd)
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +895,14 @@ pub fn selftest() -> ExitCode {
     check("file-sink rejected", sink_is_devnull(&tmpfile).is_err());
     check("/dev/null sink accepted", sink_is_devnull(&devnull).is_ok());
     let _ = std::fs::remove_file(&tmpfile);
+
+    // 2b. wall_once (the public coarse-timer alias frontier rides) times a real
+    //     command to a finite, non-negative wall and errors on a failing command.
+    match wall_once("sleep 0.01") {
+        Ok(ms) => check("wall_once returns a finite non-negative wall", ms.is_finite() && ms >= 0.0),
+        Err(e) => check(&format!("wall_once run ({e})"), false),
+    }
+    check("wall_once errors on a failing command", wall_once("false").is_err());
 
     // 3. A/A certificate brackets 1.0 (same trivial command both slots).
     //    `sleep 0.02` produces no stdout, so the byte-exact ref is `true` (empty).

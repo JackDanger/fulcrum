@@ -115,6 +115,14 @@ USAGE:\n\
               JSON artifact (subsumes breadth_driver.sh; kills the never-banked-N=51-table debt).\n\
               Fail-soft per cell → MATRIX=OK|PARTIAL. `matrix selftest` is the baked Gate-0.\n\
               Composes: `fulcrum freeze run -- fulcrum matrix ...`\n\
+  fulcrum frontier --ours gzippy --ours-cmd '<tmpl {{level}}/{{threads}}/{{corpus}}>' --ours-levels 1-9\n\
+              --rival 'pigz=pigz -{{level}} -c -p {{threads}} {{corpus}}=1-9' [--rival ...] --corpus <plaintext>\n\
+              [--threads 1,8] [--gate curve|per-label|both] [--tie-policy beat|pareto] [--exhaustive] [--out f.json]\n\
+              the size↔time Pareto-CURVE verdict engine: sweeps every (tool,level) into a gated\n\
+              size↔time point, builds each tool's frontier, and per vendor op-point runs a REAL\n\
+              gated paired of gzippy's storage-matched witness vs the vendor point → CURVE-DOMINATES /\n\
+              CURVE-OPEN + the vendor→gzippy level-alignment map. Kills level whack-a-mole. Ship gate =\n\
+              curve-dominance (`--exhaustive` for the certificate). `frontier selftest` is the Gate-0.\n\
   fulcrum bisect --bins <l1=p1,l2=p2,...> --run '<tmpl {{bin}} {{threads}} {{corpus}}>'\n\
               --corpus <path> --threads <T> [--n 51] [--min-effect 0.02] [--out result.json]\n\
               native-vs-native paired REGRESSOR-HUNT: races each ADJACENT pair of an ordered build\n\
@@ -4376,6 +4384,7 @@ fn main() -> ExitCode {
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "paired" => fulcrum::paired::cmd_paired(rest),
         "matrix" => fulcrum::matrix::cmd_matrix(rest),
+        "frontier" => fulcrum::frontier::cmd_frontier(rest),
         "gate" => fulcrum::gate::cmd_gate(rest),
         "bisect" => fulcrum::bisect::cmd_bisect(rest),
         "scope" => fulcrum::scope::cmd_scope(rest),
