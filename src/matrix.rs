@@ -2216,6 +2216,19 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         return selftest();
     }
 
+    // -- COMPRESS PREFLIGHT submode: `matrix --mode compress preflight ...` (or
+    //    `preflight` as a bare positional). The mechanical refuse-to-measure gate
+    //    for a COMPRESSION measurement — a number is void until CPREFLIGHT=OK.
+    //    Routes here BEFORE the normal compress/decode run so it never measures.
+    if args.iter().any(|s| s == "preflight") {
+        let mode = cli_flag(args, "--mode").unwrap_or("compress");
+        if mode != "compress" {
+            eprintln!("MATRIX=FAIL preflight submode requires --mode compress (got '{mode}')");
+            return ExitCode::FAILURE;
+        }
+        return crate::cpreflight::run(args);
+    }
+
     // -- load --spec (if any), then let explicit flags override its fields.
     let mut spec = Spec::default();
     if let Some(path) = cli_flag(args, "--spec") {

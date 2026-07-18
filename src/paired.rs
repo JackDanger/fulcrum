@@ -343,7 +343,11 @@ fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, 
 /// `(size_bytes, size_stable, roundtrip_ok)`: size = first rep's exact byte
 /// count, size_stable = every rep identical, roundtrip_ok = every rep's
 /// decompressed sha == `input_sha`.
-fn compress_gate_arm(
+///
+/// `pub` so the compress-preflight (`fulcrum matrix --mode compress preflight`)
+/// can reuse the exact roundtrip+size measurement path the matrix uses, rather
+/// than re-implement a second (drift-prone) copy of the correctness gate.
+pub fn compress_gate_arm(
     cmd: &str,
     roundtrip_cmd: &str,
     input_sha: &str,

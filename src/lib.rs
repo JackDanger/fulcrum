@@ -51,6 +51,7 @@ pub mod compare_cli;
 pub mod config;
 pub mod consumer;
 pub mod counterdiff;
+pub mod cpreflight;
 pub mod coz;
 pub mod coz_jsonl;
 pub mod critpath;
