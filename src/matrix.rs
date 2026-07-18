@@ -78,8 +78,9 @@
 //! asserting a stochastic grid is "always TIE".)
 
 use crate::freeze::AcquireOpts;
-use crate::paired::{run_paired, PairedResult};
+use crate::paired::{run_paired, run_paired_inner, CompressCfg, PairedResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -259,6 +260,30 @@ pub fn expand_threads(template: &str, threads: u32) -> String {
     template.replace("{threads}", &threads.to_string())
 }
 
+/// Substitute `{level}` in a command template (compress mode). Mirrors
+/// [`expand_threads`]; `{threads}`/`{corpus}` survive for later substitution.
+pub fn expand_level(template: &str, level: u32) -> String {
+    template.replace("{level}", &level.to_string())
+}
+
+/// Enumerate the (corpus, level, thread) cells in corpus-outer, then level, then
+/// thread order — the order a compress grid renders and the JSON banks.
+pub fn plan_cells_compress(
+    corpora: &[PathBuf],
+    levels: &[u32],
+    threads: &[u32],
+) -> Vec<(PathBuf, u32, u32)> {
+    let mut v = Vec::with_capacity(corpora.len() * levels.len() * threads.len());
+    for c in corpora {
+        for &l in levels {
+            for &t in threads {
+                v.push((c.clone(), l, t));
+            }
+        }
+    }
+    v
+}
+
 // ---------------------------------------------------------------------------
 // Per-cell CPU pinning — the rg-reference-DRIFT fix (advisor-flagged confound)
 // ---------------------------------------------------------------------------
@@ -425,6 +450,27 @@ pub struct MatrixCell {
     /// Per-cell error (fail-soft) — the sweep records it and carries on.
     #[serde(default)]
     pub error: Option<String>,
+    // -- COMPRESS mode (two-objective Pareto@matched-level). Defaults ⇒ decode. --
+    /// Compression level for this cell (`{level}` substituted). 0 ⇒ decode mode.
+    #[serde(default)]
+    pub level: u32,
+    /// Oriented compressed-size ratio ours/theirs (`>1+ε` ⇒ ours BIGGER = worse).
+    /// 0.0 ⇒ decode mode (size not measured).
+    #[serde(default)]
+    pub size_ratio: f64,
+    /// SMALLER / NEUTRAL / BIGGER from `size_class(size_ratio, ε)`. "" ⇒ decode.
+    #[serde(default)]
+    pub size_class: String,
+    /// Subject (A) compressed output size in bytes — exact integer count.
+    #[serde(default)]
+    pub a_size_bytes: u64,
+    /// Comparator (B) compressed output size in bytes — exact integer count.
+    #[serde(default)]
+    pub b_size_bytes: u64,
+    /// The loss AXIS for a compress LOSS cell: RATIO | SPEED | "" (not a loss /
+    /// decode).
+    #[serde(default)]
+    pub loss_axis: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -457,6 +503,20 @@ pub struct RunManifest {
     /// back-compat with pre-RSS banked artifacts.
     #[serde(default)]
     pub rss_reps: usize,
+    // -- COMPRESS mode (two-objective). Defaults ⇒ decode (back-compat). --------
+    /// "decode" | "compress". Defaulted to "decode" for pre-compress artifacts.
+    #[serde(default)]
+    pub mode: String,
+    /// The compression LEVELS swept (`{level}` axis). Empty ⇒ decode mode.
+    #[serde(default)]
+    pub levels: Vec<u32>,
+    /// The ratio-neutrality tolerance ε stamped into every compress verdict.
+    #[serde(default)]
+    pub epsilon: f64,
+    /// The roundtrip decompressor (`--roundtrip-cmd`) used to gate compress
+    /// correctness (e.g. `gzip -dc`). "" ⇒ decode mode.
+    #[serde(default)]
+    pub roundtrip_cmd: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -683,6 +743,12 @@ pub fn run_matrix_gated_pinned(
                     error: Some(format!(
                         "freeze-each acquire FAILED — cell NOT measured (never unfrozen): {e}"
                     )),
+                    level: 0,
+                    size_ratio: 0.0,
+                    size_class: String::new(),
+                    a_size_bytes: 0,
+                    b_size_bytes: 0,
+                    loss_axis: String::new(),
                 });
                 continue;
             }
@@ -713,6 +779,12 @@ pub fn run_matrix_gated_pinned(
                     b_peak_rss_mb,
                     paired: Some(r),
                     error: None,
+                    level: 0,
+                    size_ratio: 0.0,
+                    size_class: String::new(),
+                    a_size_bytes: 0,
+                    b_size_bytes: 0,
+                    loss_axis: String::new(),
                 }
             }
             Err(e) => MatrixCell {
@@ -724,6 +796,12 @@ pub fn run_matrix_gated_pinned(
                 b_peak_rss_mb: 0.0,
                 paired: None,
                 error: Some(e),
+                level: 0,
+                size_ratio: 0.0,
+                size_class: String::new(),
+                a_size_bytes: 0,
+                b_size_bytes: 0,
+                loss_axis: String::new(),
             },
         };
         cells.push(cell);
@@ -750,6 +828,288 @@ pub fn run_matrix_gated_pinned(
         method,
         pin: pin_prov,
         rss_reps,
+        mode: "decode".to_string(),
+        levels: vec![],
+        epsilon: 0.0,
+        roundtrip_cmd: String::new(),
+    };
+    MatrixResult { manifest, cells, summary }
+}
+
+// ---------------------------------------------------------------------------
+// The COMPRESS sweep (two-objective Pareto@matched-level)
+// ---------------------------------------------------------------------------
+//
+// Decode is one-objective (output bytes fixed ⇒ faster wall = WIN). Compression
+// is TWO-objective (size AND speed): per cell (corpus × LEVEL × threads) it drives
+// the SAME per-cell freeze + pin scoreboard as the decode runner, but through the
+// COMPRESS-mode paired engine (`CompressCfg` ⇒ roundtrip correctness gate + exact
+// compressed-size capture). The two axes are combined by `classify_compress` (a
+// ratio regression beyond ε is a LOSS even when faster). The plaintext oracle sha
+// is resolved ONCE per corpus (Gate-0) and reused across that corpus's whole
+// level×thread block.
+
+/// Run the full corpus×LEVEL×T COMPRESS sweep, PINNING each cell's timed arms to a
+/// fixed core-set and optionally freezing the box PER CELL via `gate`. The
+/// compress analogue of [`run_matrix_gated_pinned`]: identical per-cell freeze +
+/// pin + fail-soft machinery, but the paired engine runs in COMPRESS mode
+/// (roundtrip gate + exact-size), and each cell is classified two-objective by
+/// [`classify_compress`]. `input_sha_map` supplies a precomputed plaintext oracle
+/// sha per corpus (else it is computed once via `sha256_of_file`).
+///
+/// GATE-0 (baked, refuse-to-run): the plaintext oracle sha MUST be resolvable for
+/// EVERY corpus before any cell runs — an unresolvable oracle would silently pass
+/// the roundtrip gate against an empty sha and mis-score, so we `Err` out instead
+/// of measuring. On success prints a one-line `matrix(compress): gate-0 OK …`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_matrix_compress_pinned(
+    a_cmd_tmpl: &str,
+    b_cmd_tmpl: &str,
+    roundtrip_cmd: &str,
+    corpora: &[PathBuf],
+    levels: &[u32],
+    threads: &[u32],
+    n: usize,
+    warmup: usize,
+    sink: &Path,
+    size_reps: usize,
+    ours: Arm,
+    epsilon: f64,
+    box_name: &str,
+    sha_pins: &[String],
+    timestamp: &str,
+    pin: &Pin,
+    rss_reps: usize,
+    input_sha_map: &HashMap<PathBuf, String>,
+    mut gate: Option<&mut dyn CellGate>,
+) -> Result<MatrixResult, String> {
+    // -- GATE-0: resolve every corpus's plaintext oracle sha ONCE, BEFORE any
+    //    cell. An unresolvable oracle ⇒ refuse to run (never measure blind).
+    let mut sha_cache: HashMap<PathBuf, String> = HashMap::new();
+    for c in corpora {
+        let sha = match input_sha_map.get(c) {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => crate::paired::sha256_of_file(c).map_err(|e| {
+                format!(
+                    "matrix(compress): GATE-0 FAILED — cannot compute plaintext oracle sha for \
+                     corpus {} ({e}); refusing to run (would mis-score against an empty oracle)",
+                    c.display()
+                )
+            })?,
+        };
+        sha_cache.insert(c.clone(), sha);
+    }
+    println!(
+        "matrix(compress): gate-0 OK corpora={} levels={} ε={} roundtrip=\"{}\"",
+        corpora.len(),
+        levels
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        epsilon,
+        roundtrip_cmd,
+    );
+
+    let freeze_each = gate.is_some();
+    let mut cells = Vec::new();
+    for (corpus, level, t) in plan_cells_compress(corpora, levels, threads) {
+        // Per-cell freeze: acquire BEFORE any wall (a failure VOIDs the cell).
+        if let Some(g) = gate.as_deref_mut() {
+            if let Err(e) = g.enter(&corpus, t) {
+                cells.push(compress_void_cell(
+                    &corpus,
+                    level,
+                    t,
+                    format!("freeze-each acquire FAILED — cell NOT measured (never unfrozen): {e}"),
+                ));
+                continue;
+            }
+        }
+        // Substitute {level} then {threads}, then pin BOTH arms to the SAME mask.
+        let a_lvl = expand_level(a_cmd_tmpl, level);
+        let b_lvl = expand_level(b_cmd_tmpl, level);
+        let (a_t, b_t) = cell_cmds(&a_lvl, &b_lvl, t, pin);
+        let input_sha = sha_cache.get(&corpus).cloned().unwrap_or_default();
+        let cfg = CompressCfg {
+            roundtrip_cmd: roundtrip_cmd.to_string(),
+            input_sha,
+            size_reps,
+        };
+        // ref_cmd is unused in compress mode; "true" is a harmless placeholder.
+        let result = run_paired_inner(
+            &a_t, &b_t, "true", &corpus, n, warmup, sink, false, rss_reps, Some(&cfg),
+        );
+        if let Some(g) = gate.as_deref_mut() {
+            g.exit(&corpus, t);
+        }
+        let cell = match result {
+            Ok(r) => {
+                let class = classify_compress(&r.status, &r.verdict, r.size_ratio, ours, epsilon);
+                let oriented_size = oriented_ratio(r.size_ratio, ours);
+                let sc = size_class(oriented_size, epsilon);
+                let axis = compress_loss_axis(class, oriented_size, epsilon).unwrap_or("");
+                MatrixCell {
+                    corpus: corpus.display().to_string(),
+                    threads: t,
+                    class: class.token().to_string(),
+                    ratio: oriented_ratio(r.ratio, ours),
+                    a_peak_rss_mb: r.a_peak_rss_mb,
+                    b_peak_rss_mb: r.b_peak_rss_mb,
+                    level,
+                    size_ratio: oriented_size,
+                    size_class: sc.to_string(),
+                    a_size_bytes: r.a_size_bytes,
+                    b_size_bytes: r.b_size_bytes,
+                    loss_axis: axis.to_string(),
+                    paired: Some(r),
+                    error: None,
+                }
+            }
+            Err(e) => compress_void_cell(&corpus, level, t, e),
+        };
+        cells.push(cell);
+    }
+
+    let summary = MatrixResult::summarize(&cells);
+    let pin_prov = pin.provenance();
+    let mut method = format!(
+        "{METHOD};mode=compress(roundtrip+exact-size);ε={epsilon};{pin_prov};rss_reps={rss_reps}"
+    );
+    if freeze_each {
+        method.push_str(";freeze-per-cell(acquire+release+watchdog-per-cell)");
+    }
+    let manifest = RunManifest {
+        a_cmd: a_cmd_tmpl.to_string(),
+        b_cmd: b_cmd_tmpl.to_string(),
+        ref_cmd: String::new(),
+        ours: ours.token().to_string(),
+        n,
+        warmup,
+        corpora: corpora.iter().map(|c| c.display().to_string()).collect(),
+        threads: threads.to_vec(),
+        box_name: box_name.to_string(),
+        sha_pins: sha_pins.to_vec(),
+        timestamp: timestamp.to_string(),
+        method,
+        pin: pin_prov,
+        rss_reps,
+        mode: "compress".to_string(),
+        levels: levels.to_vec(),
+        epsilon,
+        roundtrip_cmd: roundtrip_cmd.to_string(),
+    };
+    Ok(MatrixResult { manifest, cells, summary })
+}
+
+/// A VOID compress cell (freeze-acquire failure or a per-cell run error).
+fn compress_void_cell(corpus: &Path, level: u32, threads: u32, error: String) -> MatrixCell {
+    MatrixCell {
+        corpus: corpus.display().to_string(),
+        threads,
+        class: CellClass::Void.token().to_string(),
+        ratio: f64::NAN,
+        a_peak_rss_mb: 0.0,
+        b_peak_rss_mb: 0.0,
+        level,
+        size_ratio: f64::NAN,
+        size_class: String::new(),
+        a_size_bytes: 0,
+        b_size_bytes: 0,
+        loss_axis: String::new(),
+        paired: None,
+        error: Some(error),
+    }
+}
+
+/// Build a synthetic compress cell straight from `classify_compress` (no walls) —
+/// deterministic fixture for the render/selftest. The wall `ratio` is a
+/// representative synthetic value (faster⇒0.90, slower⇒1.10) so the LOSS LIST
+/// severity is well-defined; `size_ratio` is the oriented size ratio.
+#[allow(clippy::too_many_arguments)]
+pub fn synth_compress_cell(
+    corpus: &str,
+    level: u32,
+    threads: u32,
+    status: &str,
+    verdict: &str,
+    size_ratio_ab: f64,
+    ours: Arm,
+    epsilon: f64,
+) -> MatrixCell {
+    let class = classify_compress(status, verdict, size_ratio_ab, ours, epsilon);
+    let oriented_size = oriented_ratio(size_ratio_ab, ours);
+    let ours_faster = matches!(
+        (verdict, ours),
+        ("RESOLVED-b-slower", Arm::A) | ("RESOLVED-a-slower", Arm::B)
+    );
+    let ours_slower = matches!(
+        (verdict, ours),
+        ("RESOLVED-a-slower", Arm::A) | ("RESOLVED-b-slower", Arm::B)
+    );
+    let ratio = if ours_faster {
+        0.90
+    } else if ours_slower {
+        1.10
+    } else {
+        1.0
+    };
+    MatrixCell {
+        corpus: corpus.to_string(),
+        threads,
+        class: class.token().to_string(),
+        ratio,
+        a_peak_rss_mb: 0.0,
+        b_peak_rss_mb: 0.0,
+        level,
+        size_ratio: oriented_size,
+        size_class: size_class(oriented_size, epsilon).to_string(),
+        a_size_bytes: 0,
+        b_size_bytes: 0,
+        loss_axis: compress_loss_axis(class, oriented_size, epsilon)
+            .unwrap_or("")
+            .to_string(),
+        paired: None,
+        error: None,
+    }
+}
+
+/// Wrap synthetic compress cells into a `mode=compress` `MatrixResult` (manifest
+/// carries the levels/ε/roundtrip so `render_grid` dispatches to the compress
+/// renderer). Corpora/threads are derived from the cells, preserving order.
+pub fn synth_compress_result(cells: Vec<MatrixCell>, levels: Vec<u32>) -> MatrixResult {
+    let mut corpora: Vec<String> = Vec::new();
+    for c in &cells {
+        if !corpora.contains(&c.corpus) {
+            corpora.push(c.corpus.clone());
+        }
+    }
+    let mut threads: Vec<u32> = Vec::new();
+    for c in &cells {
+        if !threads.contains(&c.threads) {
+            threads.push(c.threads);
+        }
+    }
+    let summary = MatrixResult::summarize(&cells);
+    let manifest = RunManifest {
+        a_cmd: "gzippy -{level} -c -p {threads} {corpus}".to_string(),
+        b_cmd: "pigz -{level} -c -p {threads} {corpus}".to_string(),
+        ref_cmd: String::new(),
+        ours: "a".to_string(),
+        n: 51,
+        warmup: 2,
+        corpora,
+        threads,
+        box_name: "synthetic".to_string(),
+        sha_pins: vec![],
+        timestamp: "epoch:1".to_string(),
+        method: "synthetic-compress".to_string(),
+        pin: "pin=selftest".to_string(),
+        rss_reps: 0,
+        mode: "compress".to_string(),
+        levels,
+        epsilon: DEFAULT_EPSILON,
+        roundtrip_cmd: "gzip -dc".to_string(),
     };
     MatrixResult { manifest, cells, summary }
 }
@@ -763,8 +1123,12 @@ fn basename(p: &str) -> &str {
 }
 
 /// The human loss-surface grid: corpus rows × T cols, cell = oriented ratio +
-/// class glyph. Void cells render `  --  V`.
+/// class glyph. Void cells render `  --  V`. Dispatches to the compress renderer
+/// (per-LEVEL grids + a LOSS LIST) when the result is a compress sweep.
 pub fn render_grid(r: &MatrixResult) -> String {
+    if r.manifest.mode == "compress" {
+        return render_grid_compress(r);
+    }
     let mut out = String::new();
     out.push_str(&format!(
         "fulcrum matrix  ours={}  n={}  warmup={}  box={}  ts={}  {}\n",
@@ -864,10 +1228,153 @@ fn class_glyph(token: &str) -> char {
     }
 }
 
+/// Wall deficit of a compress cell: `max(0, ratio-1)` (non-finite ⇒ 0).
+fn wall_deficit(c: &MatrixCell) -> f64 {
+    if c.ratio.is_finite() {
+        (c.ratio - 1.0).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Size deficit of a compress cell: `max(0, size_ratio-1)` (non-finite ⇒ 0).
+fn size_deficit(c: &MatrixCell) -> f64 {
+    if c.size_ratio.is_finite() {
+        (c.size_ratio - 1.0).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Two-objective compress render: PER LEVEL a corpus×T grid of the class glyph +
+/// oriented WALL ratio, then a LOSS LIST of every LOSS/VOID cell sorted by
+/// severity = max(wall_deficit, size_deficit), each row showing the loss AXIS
+/// (SPEED vs RATIO). A full-WIN result prints `LOSS LIST: none`.
+pub fn render_grid_compress(r: &MatrixResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "fulcrum matrix (compress)  ours={}  n={}  warmup={}  ε={}  box={}  ts={}  {}\n",
+        r.manifest.ours,
+        r.manifest.n,
+        r.manifest.warmup,
+        r.manifest.epsilon,
+        r.manifest.box_name,
+        r.manifest.timestamp,
+        if r.manifest.pin.is_empty() { "pin=?" } else { &r.manifest.pin },
+    ));
+    out.push_str(&format!("  a(ours-if-a)= {}\n", r.manifest.a_cmd));
+    out.push_str(&format!("  b(ours-if-b)= {}\n", r.manifest.b_cmd));
+    out.push_str(&format!("  roundtrip= {}\n", r.manifest.roundtrip_cmd));
+
+    let corpus_w = r
+        .manifest
+        .corpora
+        .iter()
+        .map(|c| basename(c).len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    // -- PER-LEVEL grid: corpus rows × T cols, cell = oriented WALL ratio + class.
+    for level in &r.manifest.levels {
+        out.push_str(&format!(
+            "\nlevel {level}  (cell = oriented wall ratio + class glyph; a size regression is L on the RATIO axis):\n"
+        ));
+        out.push_str(&format!("{:<width$}", "corpus", width = corpus_w + 2));
+        for t in &r.manifest.threads {
+            out.push_str(&format!("{:>10}", format!("T{t}")));
+        }
+        out.push('\n');
+        for c in &r.manifest.corpora {
+            let cb = basename(c);
+            out.push_str(&format!("{:<width$}", cb, width = corpus_w + 2));
+            for t in &r.manifest.threads {
+                let cell = r
+                    .cells
+                    .iter()
+                    .find(|x| basename(&x.corpus) == cb && x.threads == *t && x.level == *level);
+                let s = match cell {
+                    Some(cl) if cl.ratio.is_finite() => {
+                        format!("{:.2}{}", cl.ratio, class_glyph(&cl.class))
+                    }
+                    Some(cl) => format!("--{}", class_glyph(&cl.class)),
+                    None => "  ?".to_string(),
+                };
+                out.push_str(&format!("{s:>10}"));
+            }
+            out.push('\n');
+        }
+    }
+
+    // -- LOSS LIST: every LOSS/VOID cell, most-severe first.
+    let mut losers: Vec<&MatrixCell> = r
+        .cells
+        .iter()
+        .filter(|c| c.class == "LOSS" || c.class == "VOID")
+        .collect();
+    losers.sort_by(|a, b| {
+        let (sa, sb) = (
+            wall_deficit(a).max(size_deficit(a)),
+            wall_deficit(b).max(size_deficit(b)),
+        );
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if losers.is_empty() {
+        out.push_str("\nLOSS LIST: none\n");
+    } else {
+        out.push_str("\nLOSS LIST (severity = max(wall_deficit, size_deficit); axis SPEED|RATIO):\n");
+        for c in losers {
+            let sev = wall_deficit(c).max(size_deficit(c));
+            let axis = if !c.loss_axis.is_empty() {
+                c.loss_axis.as_str()
+            } else if c.class == "VOID" {
+                "VOID"
+            } else {
+                "-"
+            };
+            let wall = if c.ratio.is_finite() {
+                format!("{:.3}", c.ratio)
+            } else {
+                "--".to_string()
+            };
+            let size = if c.size_ratio.is_finite() {
+                format!("{:.4}", c.size_ratio)
+            } else {
+                "--".to_string()
+            };
+            out.push_str(&format!(
+                "  {corpus}  L{level} T{threads}  {class}  axis={axis}  wall={wall}  size={size}  sev={sev:.4}\n",
+                corpus = basename(&c.corpus),
+                level = c.level,
+                threads = c.threads,
+                class = c.class,
+            ));
+        }
+    }
+
+    out.push_str(&format!(
+        "summary: WIN={} TIE={} LOSS={} VOID={} total={}  MATRIX={}\n",
+        r.summary.win, r.summary.tie, r.summary.loss, r.summary.void, r.summary.total, r.summary.status
+    ));
+    out
+}
+
 /// The machine-checkable one-liner other tooling greps for.
 pub fn print_machine_line(r: &MatrixResult) {
+    // Compress sweeps append the mode/level/ε fields so a grep can tell a
+    // two-objective surface from a decode one; decode omits them (back-compat).
+    let compress_fields = if r.manifest.mode == "compress" {
+        format!(
+            " mode=compress levels={} epsilon={} roundtrip=\"{}\"",
+            r.manifest.levels.len(),
+            r.manifest.epsilon,
+            r.manifest.roundtrip_cmd,
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "MATRIX={} win={} tie={} loss={} void={} total={} ours={} n={} rss_reps={} corpora={} threads={} method=\"{}\"",
+        "MATRIX={} win={} tie={} loss={} void={} total={} ours={} n={} rss_reps={} corpora={} threads={}{} method=\"{}\"",
         r.summary.status,
         r.summary.win,
         r.summary.tie,
@@ -879,6 +1386,7 @@ pub fn print_machine_line(r: &MatrixResult) {
         r.manifest.rss_reps,
         r.manifest.corpora.len(),
         r.manifest.threads.len(),
+        compress_fields,
         r.manifest.method,
     );
 }
@@ -1422,6 +1930,134 @@ pub fn selftest() -> ExitCode {
         );
     }
 
+    // -- COMPRESS mode: end-to-end A/A + synthetic classify render --------------
+    // (1) e2e: gzip -{level} -c {corpus} in BOTH arms (A/A) over a real temp
+    //     fixture at levels 1,6 threads 1. A/A ⇒ identical compressed size ⇒
+    //     size_ratio == 1.0, size_class NEUTRAL — a DETERMINISTIC size assertion
+    //     (integer byte counts, no CI). We deliberately DO NOT assert the wall
+    //     verdict (sub-ms gzip walls flake / A/A false-resolves ~5%); we assert
+    //     size/class/JSON, which are deterministic. Skips if gzip is unavailable.
+    {
+        use std::process::Command as PCommand;
+        let gzip_ok = PCommand::new("sh")
+            .args(["-c", "command -v gzip >/dev/null 2>&1"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !gzip_ok {
+            println!("  NOTE compress e2e skipped (gzip unavailable)");
+        } else {
+            let fx = std::env::temp_dir().join(format!("fulcrum-matrix-cm-{}.raw", std::process::id()));
+            // A compressible-but-nontrivial fixture (repeated but not all-zero).
+            let body: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            let fx_ok = std::fs::write(&fx, &body).is_ok();
+            if !fx_ok {
+                println!("  NOTE compress e2e skipped (could not write fixture)");
+            } else {
+                let corpora = vec![fx.clone()];
+                let levels = vec![1u32, 6u32];
+                let one_t = vec![1u32];
+                let r = run_matrix_compress_pinned(
+                    "gzip -{level} -c {corpus}",
+                    "gzip -{level} -c {corpus}",
+                    "gzip -dc",
+                    &corpora, &levels, &one_t, 7, 1, &devnull, 2, Arm::A, DEFAULT_EPSILON,
+                    "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::None, 0, &HashMap::new(),
+                    None,
+                );
+                match r {
+                    Ok(r) => {
+                        check("compress e2e: 2 cells present (levels 1,6 × T1)", r.cells.len() == 2);
+                        check(
+                            "compress e2e: manifest mode=compress + levels + ε + roundtrip",
+                            r.manifest.mode == "compress"
+                                && r.manifest.levels == vec![1u32, 6]
+                                && (r.manifest.epsilon - DEFAULT_EPSILON).abs() < 1e-12
+                                && r.manifest.roundtrip_cmd == "gzip -dc",
+                        );
+                        check(
+                            "compress e2e: A/A ⇒ size_ratio≈1.0 every cell",
+                            r.cells.iter().all(|c| (c.size_ratio - 1.0).abs() < DEFAULT_EPSILON),
+                        );
+                        check(
+                            "compress e2e: A/A ⇒ size_class NEUTRAL every cell",
+                            r.cells.iter().all(|c| c.size_class == "NEUTRAL"),
+                        );
+                        check(
+                            "compress e2e: exact equal byte counts (>0) both arms",
+                            r.cells.iter().all(|c| c.a_size_bytes == c.b_size_bytes && c.a_size_bytes > 0),
+                        );
+                        check(
+                            "compress e2e: cells carry the LEVEL axis (1 and 6)",
+                            r.cells.iter().any(|c| c.level == 1) && r.cells.iter().any(|c| c.level == 6),
+                        );
+                        // JSON round-trips with the new fields.
+                        match serde_json::to_string(&r).and_then(|js| {
+                            serde_json::from_str::<MatrixResult>(&js).map(|rt| (js, rt))
+                        }) {
+                            Ok((js, rt)) => {
+                                check(
+                                    "compress e2e: JSON carries new cell+manifest fields",
+                                    js.contains("\"size_ratio\"")
+                                        && js.contains("\"size_class\"")
+                                        && js.contains("\"loss_axis\"")
+                                        && js.contains("\"level\"")
+                                        && js.contains("\"a_size_bytes\"")
+                                        && js.contains("\"mode\":\"compress\"")
+                                        && js.contains("\"roundtrip_cmd\""),
+                                );
+                                check(
+                                    "compress e2e: JSON round-trips (cells + mode + levels)",
+                                    rt.cells.len() == 2
+                                        && rt.manifest.mode == "compress"
+                                        && rt.manifest.levels == vec![1u32, 6],
+                                );
+                            }
+                            Err(e) => check(&format!("compress e2e: JSON round-trip ({e})"), false),
+                        }
+                        // render (compress branch) does not panic and prints a LOSS LIST line.
+                        let g = render_grid(&r);
+                        check(
+                            "compress e2e: render has per-level grid + LOSS LIST",
+                            g.contains("level 1") && g.contains("level 6") && g.contains("LOSS LIST"),
+                        );
+                    }
+                    Err(e) => check(&format!("compress e2e: runner errored ({e})"), false),
+                }
+                let _ = std::fs::remove_file(&fx);
+            }
+        }
+    }
+
+    // (2) synthetic classify → render LOSS LIST axis labelling (DETERMINISTIC:
+    //     no walls, cells built directly via classify_compress). A RATIO loss and
+    //     a SPEED loss must be labelled correctly; an all-WIN result prints
+    //     `LOSS LIST: none`.
+    {
+        let e = DEFAULT_EPSILON;
+        // RATIO loss: faster but 2% bigger output.
+        let ratio_loss = synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
+        // SPEED loss: size-neutral but slower.
+        let speed_loss = synth_compress_cell("silesia", 6, 4, "OK", "RESOLVED-a-slower", 1.0, Arm::A, e);
+        // WIN: size-neutral + faster.
+        let win = synth_compress_cell("weights", 6, 1, "OK", "RESOLVED-b-slower", 1.0, Arm::A, e);
+
+        check("synth: RATIO-loss cell classes LOSS/axis=RATIO",
+            ratio_loss.class == "LOSS" && ratio_loss.loss_axis == "RATIO");
+        check("synth: SPEED-loss cell classes LOSS/axis=SPEED",
+            speed_loss.class == "LOSS" && speed_loss.loss_axis == "SPEED");
+        check("synth: WIN cell classes WIN/no axis", win.class == "WIN" && win.loss_axis.is_empty());
+
+        let mixed = synth_compress_result(vec![ratio_loss, speed_loss, win.clone()], vec![6]);
+        let gm = render_grid(&mixed);
+        check("synth: render LOSS LIST labels axis=RATIO", gm.contains("axis=RATIO"));
+        check("synth: render LOSS LIST labels axis=SPEED", gm.contains("axis=SPEED"));
+
+        let all_win = synth_compress_result(vec![win.clone()], vec![6]);
+        let gw = render_grid(&all_win);
+        check("synth: all-WIN render prints `LOSS LIST: none`", gw.contains("LOSS LIST: none"));
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -1462,6 +2098,17 @@ struct Spec {
     n: Option<usize>,
     #[serde(default)]
     warmup: Option<usize>,
+    // -- COMPRESS mode --------------------------------------------------------
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    levels: Vec<u32>,
+    #[serde(default)]
+    epsilon: Option<f64>,
+    #[serde(default)]
+    roundtrip_cmd: Option<String>,
+    #[serde(default)]
+    size_reps: Option<usize>,
 }
 
 fn cli_flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -1533,8 +2180,16 @@ fn usage() -> ExitCode {
          \x20 fulcrum matrix --spec cells.json    (JSON: corpora/threads/a_cmd/b_cmd/ref_cmd/ours/n/warmup)\n\
          \x20 fulcrum matrix selftest             Gate-0: fake commands, no box needed\n\
          \n\
-         Templates substitute {{threads}} then {{corpus}}. --a-cmd is the SUBJECT (ours by\n\
-         default); --ours b scores the comparator instead.\n\
+         COMPRESS MODE (two-objective Pareto@matched-level — size AND speed):\n\
+         \x20 fulcrum matrix --mode compress --a-cmd 'gzippy -{{level}} -c -p {{threads}} {{corpus}}'\n\
+         \x20                --b-cmd 'pigz -{{level}} -c -p {{threads}} {{corpus}}' --corpora nasa.raw\n\
+         \x20                --levels 1,6,9 --threads 1,4 --roundtrip-cmd 'gzip -dc' --epsilon 0.001\n\
+         \x20                [--size-reps 2] [--input-sha-map corpus=sha,corpus=sha]\n\
+         Corpus is the PLAINTEXT being compressed. WIN = size no worse than rival within ε AND\n\
+         faster; a ratio regression is a LOSS even if faster. `{{level}}` substitutes into both arms.\n\
+         \n\
+         Templates substitute {{level}} (compress) then {{threads}} then {{corpus}}. --a-cmd is the\n\
+         SUBJECT (ours by default); --ours b scores the comparator instead.\n\
          \n\
          PIN (default ON — a scoreboard must not drift): each cell's TWO timed arms are pinned\n\
          to the SAME fixed cores (`taskset -c 0-(T-1)`), exactly like a hand-pinned `fulcrum\n\
@@ -1643,6 +2298,53 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         .unwrap_or_else(now_epoch_string);
     let dry_run = cli_has(args, "--dry-run");
 
+    // -- MODE: decode (default; existing path, untouched) | compress (two-objective
+    //    Pareto@matched-level, size AND speed). Compress adds a LEVEL axis + the
+    //    roundtrip correctness gate + exact-size capture.
+    let mode = cli_flag(args, "--mode")
+        .map(String::from)
+        .or(spec.mode.clone())
+        .unwrap_or_else(|| "decode".to_string());
+    if mode != "decode" && mode != "compress" {
+        eprintln!("MATRIX=FAIL --mode must be 'decode' or 'compress' (got '{mode}')");
+        return ExitCode::FAILURE;
+    }
+    let is_compress = mode == "compress";
+    let levels: Vec<u32> = match cli_flag(args, "--levels") {
+        Some(s) => match parse_threads(s) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("MATRIX=FAIL bad --levels ({e})");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => spec.levels.clone(),
+    };
+    let epsilon: f64 = cli_flag(args, "--epsilon")
+        .and_then(|v| v.parse().ok())
+        .or(spec.epsilon)
+        .unwrap_or(DEFAULT_EPSILON);
+    let roundtrip_cmd = cli_flag(args, "--roundtrip-cmd")
+        .map(String::from)
+        .or(spec.roundtrip_cmd.clone())
+        .unwrap_or_else(|| "gzip -dc".to_string());
+    let size_reps: usize = cli_flag(args, "--size-reps")
+        .and_then(|v| v.parse().ok())
+        .or(spec.size_reps)
+        .unwrap_or(2);
+    let input_sha_map: HashMap<PathBuf, String> = match cli_flag(args, "--input-sha-map") {
+        Some(s) => s
+            .split(',')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (PathBuf::from(k.trim()), v.trim().to_string()))
+            .collect(),
+        None => HashMap::new(),
+    };
+    if is_compress && levels.is_empty() {
+        eprintln!("MATRIX=FAIL --mode compress requires --levels (e.g. --levels 1,6,9)");
+        return usage();
+    }
+
     // -- PIN (the rg-reference-drift fix). A scoreboard must NOT drift: pin every
     //    cell's timed arms to a fixed core-set, BOTH arms identically, exactly as
     //    a hand-pinned `fulcrum paired` does. DEFAULT ON — canonical per-T mask
@@ -1684,6 +2386,47 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
 
     // -- DRY-RUN: print the plan + manifest, no walls (composes under freeze).
     if dry_run {
+        if is_compress {
+            let cells = plan_cells_compress(&corpora, &levels, &threads);
+            println!(
+                "MATRIX=DRYRUN mode=compress cells={} corpora={} levels={} threads={} n={} size_reps={} ε={} rss_reps={} ours={} box={} freeze_each={} {}",
+                cells.len(),
+                corpora.len(),
+                levels.len(),
+                threads.len(),
+                n,
+                size_reps,
+                epsilon,
+                rss_reps,
+                ours.token(),
+                box_name,
+                freeze_each,
+                pin.provenance(),
+            );
+            if freeze_each {
+                println!(
+                    "  freeze-each: procs=[{freeze_procs}] ttl_s={freeze_ttl_s} state={freeze_state} \
+                     (per-cell acquire/release+watchdog; do NOT also wrap in `fulcrum freeze run`)"
+                );
+            }
+            println!("  a-cmd: {a_cmd}");
+            println!("  b-cmd: {b_cmd}");
+            println!("  roundtrip-cmd: {roundtrip_cmd}  (untimed roundtrip correctness gate)");
+            for (c, l, t) in &cells {
+                let a_lvl = expand_level(&a_cmd, *l);
+                let b_lvl = expand_level(&b_cmd, *l);
+                let (a_run, b_run) = cell_cmds(&a_lvl, &b_lvl, *t, &pin);
+                println!(
+                    "  plan cell: corpus={} level={} threads={} -> a='{}' b='{}'",
+                    c.display(),
+                    l,
+                    t,
+                    a_run,
+                    b_run,
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
         let cells = plan_cells(&corpora, &threads);
         println!(
             "MATRIX=DRYRUN cells={} corpora={} threads={} n={} rss_reps={} ours={} box={} freeze_each={} {}",
@@ -1753,11 +2496,27 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         None
     };
 
-    let r = run_matrix_gated_pinned(
-        &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
-        &sha_pins, &timestamp, &pin, rss_reps,
-        gate.as_mut().map(|g| g as &mut dyn CellGate),
-    );
+    let r = if is_compress {
+        match run_matrix_compress_pinned(
+            &a_cmd, &b_cmd, &roundtrip_cmd, &corpora, &levels, &threads, n, warmup, &sink,
+            size_reps, ours, epsilon, &box_name, &sha_pins, &timestamp, &pin, rss_reps,
+            &input_sha_map, gate.as_mut().map(|g| g as &mut dyn CellGate),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // GATE-0 refuse-to-run: a corpus oracle sha was unresolvable → do
+                // NOT measure (a blind compress score is worse than no score).
+                eprintln!("MATRIX=FAIL {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        run_matrix_gated_pinned(
+            &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
+            &sha_pins, &timestamp, &pin, rss_reps,
+            gate.as_mut().map(|g| g as &mut dyn CellGate),
+        )
+    };
 
     print!("{}", render_grid(&r));
     print_machine_line(&r);
@@ -1884,6 +2643,123 @@ mod tests {
             expand_threads("gz -p {threads} {corpus}", 8),
             "gz -p 8 {corpus}"
         );
+    }
+
+    #[test]
+    fn expand_level_substitutes_and_keeps_other_tokens() {
+        assert_eq!(
+            expand_level("gz -{level} -c -p {threads} {corpus}", 6),
+            "gz -6 -c -p {threads} {corpus}"
+        );
+    }
+
+    #[test]
+    fn plan_cells_compress_corpus_level_thread_order() {
+        let corpora = vec![PathBuf::from("a"), PathBuf::from("b")];
+        let levels = vec![1u32, 6u32];
+        let threads = vec![1u32, 4u32];
+        let plan = plan_cells_compress(&corpora, &levels, &threads);
+        // corpus-outer, then level, then thread.
+        assert_eq!(plan.len(), 8);
+        assert_eq!(plan[0], (PathBuf::from("a"), 1, 1));
+        assert_eq!(plan[1], (PathBuf::from("a"), 1, 4));
+        assert_eq!(plan[2], (PathBuf::from("a"), 6, 1));
+        assert_eq!(plan[3], (PathBuf::from("a"), 6, 4));
+        assert_eq!(plan[4], (PathBuf::from("b"), 1, 1));
+    }
+
+    #[test]
+    fn compress_render_loss_list_labels_ratio_and_speed_axes() {
+        let e = DEFAULT_EPSILON;
+        // RATIO loss (faster but 2% bigger), SPEED loss (neutral size but slower),
+        // and a WIN — all built directly from classify_compress (deterministic).
+        let ratio_loss =
+            synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
+        let speed_loss =
+            synth_compress_cell("silesia", 6, 4, "OK", "RESOLVED-a-slower", 1.0, Arm::A, e);
+        let win = synth_compress_cell("weights", 6, 1, "OK", "RESOLVED-b-slower", 1.0, Arm::A, e);
+
+        assert_eq!(ratio_loss.class, "LOSS");
+        assert_eq!(ratio_loss.loss_axis, "RATIO");
+        assert_eq!(ratio_loss.size_class, "BIGGER");
+        assert_eq!(speed_loss.class, "LOSS");
+        assert_eq!(speed_loss.loss_axis, "SPEED");
+        assert_eq!(speed_loss.size_class, "NEUTRAL");
+        assert_eq!(win.class, "WIN");
+        assert!(win.loss_axis.is_empty());
+
+        let mixed = synth_compress_result(vec![ratio_loss, speed_loss, win.clone()], vec![6]);
+        let g = render_grid(&mixed);
+        assert!(g.contains("level 6"), "missing per-level grid:\n{g}");
+        assert!(g.contains("LOSS LIST"), "missing LOSS LIST:\n{g}");
+        assert!(g.contains("axis=RATIO"), "missing RATIO axis:\n{g}");
+        assert!(g.contains("axis=SPEED"), "missing SPEED axis:\n{g}");
+        // The RATIO loss (size_deficit 0.02) is more severe than the SPEED loss
+        // (wall_deficit 0.10)? No — SPEED's synthetic ratio is 1.10 (0.10) > 0.02,
+        // so SPEED sorts first. Assert both present; ordering asserted via index.
+        let ratio_pos = g.find("axis=RATIO").unwrap();
+        let speed_pos = g.find("axis=SPEED").unwrap();
+        assert!(speed_pos < ratio_pos, "severity order wrong:\n{g}");
+    }
+
+    #[test]
+    fn compress_render_all_win_prints_empty_loss_list() {
+        let e = DEFAULT_EPSILON;
+        let win = synth_compress_cell("weights", 6, 1, "OK", "RESOLVED-b-slower", 1.0, Arm::A, e);
+        let r = synth_compress_result(vec![win], vec![6]);
+        let g = render_grid(&r);
+        assert!(g.contains("LOSS LIST: none"), "expected empty LOSS LIST:\n{g}");
+    }
+
+    #[test]
+    fn compress_result_json_round_trips_with_new_fields() {
+        let e = DEFAULT_EPSILON;
+        let cell = synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
+        let r = synth_compress_result(vec![cell], vec![1, 6, 9]);
+        let js = serde_json::to_string(&r).unwrap();
+        for f in [
+            "\"level\"",
+            "\"size_ratio\"",
+            "\"size_class\"",
+            "\"a_size_bytes\"",
+            "\"b_size_bytes\"",
+            "\"loss_axis\"",
+            "\"mode\":\"compress\"",
+            "\"epsilon\"",
+            "\"roundtrip_cmd\"",
+            "\"levels\"",
+        ] {
+            assert!(js.contains(f), "missing {f} in JSON");
+        }
+        let rt: MatrixResult = serde_json::from_str(&js).unwrap();
+        assert_eq!(rt.manifest.mode, "compress");
+        assert_eq!(rt.manifest.levels, vec![1u32, 6, 9]);
+        assert_eq!(rt.cells[0].loss_axis, "RATIO");
+        assert_eq!(rt.cells[0].level, 6);
+    }
+
+    #[test]
+    fn decode_cell_json_defaults_new_fields() {
+        // A decode-mode banked artifact (no compress fields) still round-trips —
+        // the new fields default to 0/"".
+        let corpora = vec![PathBuf::from("/tmp/a.gz")];
+        let threads = vec![1u32];
+        let r = run_matrix(
+            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
+            true, Arm::A, "t", &[], "ts",
+        );
+        assert_eq!(r.manifest.mode, "decode");
+        assert!(r.manifest.levels.is_empty());
+        for c in &r.cells {
+            assert_eq!(c.level, 0);
+            assert_eq!(c.size_ratio, 0.0);
+            assert!(c.size_class.is_empty());
+            assert!(c.loss_axis.is_empty());
+        }
+        // Decode render is UNCHANGED (no per-level grid / LOSS LIST).
+        let g = render_grid(&r);
+        assert!(!g.contains("LOSS LIST"));
+        assert!(g.contains("MATRIX="));
     }
 
     // ---- PIN: the rg-reference-drift fix (advisor-flagged confound) ----------
@@ -2230,6 +3106,12 @@ mod tests {
             b_peak_rss_mb: 0.0,
             paired: None,
             error: None,
+            level: 0,
+            size_ratio: 0.0,
+            size_class: String::new(),
+            a_size_bytes: 0,
+            b_size_bytes: 0,
+            loss_axis: String::new(),
         };
         let cells = vec![mk("WIN"), mk("WIN"), mk("TIE"), mk("LOSS"), mk("VOID")];
         let s = MatrixResult::summarize(&cells);

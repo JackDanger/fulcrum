@@ -566,6 +566,12 @@ fn synth_artifact(
             b_peak_rss_mb: 0.0,
             paired: None,
             error: None,
+            level: 0,
+            size_ratio: 0.0,
+            size_class: String::new(),
+            a_size_bytes: 0,
+            b_size_bytes: 0,
+            loss_axis: String::new(),
         })
         .collect();
     let summary = MatrixResult::summarize(&cells);
@@ -585,6 +591,10 @@ fn synth_artifact(
             method: "selftest-synthetic".to_string(),
             pin: "pin=selftest".to_string(),
             rss_reps: 0,
+            mode: "decode".to_string(),
+            levels: vec![],
+            epsilon: 0.0,
+            roundtrip_cmd: String::new(),
         },
         cells,
         summary: MatrixSummary {
