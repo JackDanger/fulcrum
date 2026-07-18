@@ -170,6 +170,86 @@ pub fn oriented_ratio(ratio_ab: f64, ours: Arm) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Two-objective (compress) classification — Pareto @ matched level
+// ---------------------------------------------------------------------------
+//
+// Decode is one-objective (output bytes fixed ⇒ faster wall = WIN). Compression
+// is TWO-objective (size AND speed): a faster encoder that produces a BIGGER file
+// is not a legitimate win. The user's win definition: per cell (corpus × level ×
+// threads) compare gzippy -L vs rival -L; WIN = size no worse than rival within ε
+// AND wall faster than spread; a ratio regression is a LOSS even if faster.
+//
+// WHY ε CANNOT BE GAMED. Size is an EXACT integer count (not a noisy stat), so
+// there is no spread to hide a regression behind. The gate is DIRECTIONAL (only
+// oriented-size > 1+ε triggers LOSS), so loosening ε can only ever turn a LOSS
+// into a WIN — and ε is stamped into every banked cell + the manifest, so a
+// loosening is diffable provenance, never silent.
+
+/// Default ratio-neutrality tolerance: 0.1%. A faithful libdeflate/igzip port
+/// should reproduce the rival's size to within rounding, so "no worse within ε"
+/// encodes byte-neutrality at matched level.
+pub const DEFAULT_EPSILON: f64 = 0.001;
+
+/// Size-axis label for a cell from the ORIENTED (ours/theirs) size ratio.
+/// `>1+ε` ⇒ ours BIGGER (worse); `<1−ε` ⇒ ours SMALLER (better); else NEUTRAL.
+pub fn size_class(oriented_size_ratio: f64, epsilon: f64) -> &'static str {
+    if oriented_size_ratio > 1.0 + epsilon {
+        "BIGGER"
+    } else if oriented_size_ratio < 1.0 - epsilon {
+        "SMALLER"
+    } else {
+        "NEUTRAL"
+    }
+}
+
+/// Pareto@matched-level cell class (compress mode). `status`/`wall_verdict` come
+/// from a compress-mode paired run; `size_ratio_ab` is its a/b compressed-size
+/// ratio; `ours` orients BOTH axes. SIZE IS GATED FIRST: a ratio regression
+/// beyond ε ⇒ LOSS even if the subject is faster. Otherwise the wall verdict is
+/// the class (faster ⇒ WIN, noisy ⇒ TIE, slower ⇒ LOSS). A non-OK paired status
+/// (roundtrip FAIL / size-nondeterministic VOID / A/A bias) ⇒ VOID.
+pub fn classify_compress(
+    status: &str,
+    wall_verdict: &str,
+    size_ratio_ab: f64,
+    ours: Arm,
+    epsilon: f64,
+) -> CellClass {
+    let wall = classify(status, wall_verdict, ours);
+    if wall == CellClass::Void {
+        return CellClass::Void;
+    }
+    let oriented_size = oriented_ratio(size_ratio_ab, ours);
+    if oriented_size > 1.0 + epsilon {
+        // Ratio regression dominates — a LOSS regardless of the wall verdict.
+        return CellClass::Loss;
+    }
+    // Size neutral-or-better: the wall verdict stands. (A subject that is SMALLER
+    // but SLOWER is a genuine Pareto-mixed point; it classifies LOSS on the
+    // primary speed-at-matched-ratio axis, and `size_class`=SMALLER is recorded
+    // so the tradeoff is visible in `render`, never hidden.)
+    wall
+}
+
+/// The loss AXIS for a compress cell (RATIO vs SPEED), or `None` when not a LOSS.
+/// RATIO when the subject's output is bigger beyond ε (the dominant gate); else
+/// SPEED (the wall lost while size was neutral-or-better).
+pub fn compress_loss_axis(
+    class: CellClass,
+    oriented_size_ratio: f64,
+    epsilon: f64,
+) -> Option<&'static str> {
+    if class != CellClass::Loss {
+        return None;
+    }
+    if oriented_size_ratio > 1.0 + epsilon {
+        Some("RATIO")
+    } else {
+        Some("SPEED")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
 
@@ -1727,6 +1807,75 @@ mod tests {
     fn oriented_ratio_flips() {
         assert!((oriented_ratio(0.5, Arm::A) - 0.5).abs() < 1e-12);
         assert!((oriented_ratio(0.5, Arm::B) - 2.0).abs() < 1e-12);
+    }
+
+    // ---- classify_compress: the two-objective Pareto@matched-level truth table -
+    #[test]
+    fn classify_compress_truth_table() {
+        let e = DEFAULT_EPSILON; // 0.001
+        // ours = A (subject is the a-cmd). size_ratio is a/b (ours/theirs here).
+        // size NEUTRAL (within ε) + faster ⇒ WIN.
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-b-slower", 1.0005, Arm::A, e),
+            CellClass::Win
+        );
+        // size NEUTRAL + noisy ⇒ TIE.
+        assert_eq!(
+            classify_compress("OK", "NOISY", 1.0, Arm::A, e),
+            CellClass::Tie
+        );
+        // size NEUTRAL + slower ⇒ LOSS (on the SPEED axis).
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-a-slower", 1.0, Arm::A, e),
+            CellClass::Loss
+        );
+        // 1 (relative) unit OVER ε + FASTER ⇒ LOSS — a ratio regression dominates.
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-b-slower", 1.002, Arm::A, e),
+            CellClass::Loss
+        );
+        // SMALLER but SLOWER ⇒ LOSS (Pareto-mixed; primary speed axis lost).
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-a-slower", 0.90, Arm::A, e),
+            CellClass::Loss
+        );
+        // non-OK paired status ⇒ VOID (roundtrip FAIL / size-nondeterministic).
+        assert_eq!(
+            classify_compress("FAIL", "FAIL-roundtrip", 1.0, Arm::A, e),
+            CellClass::Void
+        );
+        assert_eq!(
+            classify_compress("VOID", "VOID-size-nondeterministic", 1.0, Arm::A, e),
+            CellClass::Void
+        );
+
+        // orientation flip (ours = B): a/b = 0.998 ⇒ ours(B) is BIGGER
+        // (b/a = 1.002 > 1+ε), and A-slower ⇒ B faster. Size regression dominates
+        // ⇒ LOSS despite ours being faster (mirror of the ours=A ratio-loss case).
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-a-slower", 0.998, Arm::B, e),
+            CellClass::Loss
+        );
+        // ours = B, a/b = 1.002 ⇒ ours(B) SMALLER (b/a=0.998) + B faster
+        // (A-slower) ⇒ WIN.
+        assert_eq!(
+            classify_compress("OK", "RESOLVED-a-slower", 1.002, Arm::B, e),
+            CellClass::Win
+        );
+    }
+
+    #[test]
+    fn size_class_and_loss_axis() {
+        let e = DEFAULT_EPSILON;
+        assert_eq!(size_class(1.05, e), "BIGGER");
+        assert_eq!(size_class(0.95, e), "SMALLER");
+        assert_eq!(size_class(1.0, e), "NEUTRAL");
+        assert_eq!(size_class(1.0005, e), "NEUTRAL");
+        // RATIO loss (oriented size bigger) vs SPEED loss (size neutral, wall lost).
+        assert_eq!(compress_loss_axis(CellClass::Loss, 1.02, e), Some("RATIO"));
+        assert_eq!(compress_loss_axis(CellClass::Loss, 1.0, e), Some("SPEED"));
+        assert_eq!(compress_loss_axis(CellClass::Win, 1.02, e), None);
+        assert_eq!(compress_loss_axis(CellClass::Tie, 1.0, e), None);
     }
 
     #[test]
