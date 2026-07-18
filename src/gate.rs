@@ -950,6 +950,13 @@ fn synth_paired(status: &str, sha_ok: bool) -> crate::paired::PairedResult {
         a_peak_rss_spread: 0.0,
         b_peak_rss_spread: 0.0,
         rss_reps: 3,
+        mode: "decode".into(),
+        a_size_bytes: 0,
+        b_size_bytes: 0,
+        size_ratio: 0.0,
+        size_stable: false,
+        roundtrip_ok: false,
+        input_sha: String::new(),
     }
 }
 

@@ -2817,6 +2817,7 @@ mod tests {
             a_peak_rss_spread: 0.0,
             b_peak_rss_spread: 0.0,
             rss_reps: 0,
+            ..Default::default()
         };
         assert_eq!(classify(&pr), "WIN");
         pr.verdict = "RESOLVED-a-slower".into();
@@ -2933,6 +2934,7 @@ mod tests {
             a_peak_rss_spread: 1.5,
             b_peak_rss_spread: 3.0,
             rss_reps: 3,
+            ..Default::default()
         };
         let r = ScorePairedResult {
             score_status: "OK".into(),

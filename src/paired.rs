@@ -247,6 +247,123 @@ fn timed_arm(cmd: &str) -> Result<f64, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Compress mode: roundtrip gate + exact-size co-capture (the RATIO half)
+// ---------------------------------------------------------------------------
+//
+// Decode arms must emit BYTE-IDENTICAL output (== the reference decode); compress
+// arms emit DIFFERENT bytes on purpose, so identity is the wrong gate. A compress
+// arm is correct iff `decompress(arm_output)` reproduces the ORIGINAL plaintext
+// (its sha256 == the plaintext oracle). Alongside that we capture the arm's exact
+// compressed SIZE — a deterministic integer count, not a timed sample, so it
+// carries no CI; its only reproducibility check is that it is IDENTICAL across
+// reps (`size_stable`). Both passes are UNTIMED (like `sha_of_arm`), so the wall
+// stays pristine on `Stdio::null()`.
+
+/// Compress-mode config threaded into [`run_paired_inner`]. `None` ⇒ decode mode
+/// (byte-exact gate, current behavior); `Some` ⇒ roundtrip gate + size capture.
+#[derive(Clone, Debug)]
+pub struct CompressCfg {
+    /// Decompressor applied to an arm's stdout for the roundtrip gate (e.g.
+    /// `gzip -dc`). Reads the compressed bytes on stdin, emits the plaintext.
+    pub roundtrip_cmd: String,
+    /// sha256 (hex) of the ORIGINAL plaintext — the correctness oracle every
+    /// arm's roundtrip output must match.
+    pub input_sha: String,
+    /// How many times to re-measure each arm's compressed size; all reps must be
+    /// identical for `size_stable`. `>=2` proves determinism (T>1 encoders can
+    /// vary output with block boundaries).
+    pub size_reps: usize,
+}
+
+/// sha256 (hex) of a file's contents — the plaintext oracle when `--input-sha`
+/// is not supplied.
+pub fn sha256_of_file(path: &Path) -> Result<String, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let digest = crate::compare::sha256_reader(f).map_err(|e| format!("hash {}: {e}", path.display()))?;
+    Ok(crate::compare::hex32(&digest))
+}
+
+/// Run one arm (a COMPRESSOR) UNTIMED: buffer its compressed stdout (→ exact
+/// `size_bytes`), then feed those bytes into `roundtrip_cmd` and sha256 the
+/// decompressed output. Returns `(roundtrip_sha_hex, size_bytes)`.
+fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, u64), String> {
+    use std::io::Write;
+    // Pass 1: run the compressor, buffer the compressed bytes (untimed).
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn `{cmd}`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("`{cmd}` exited {:?} during roundtrip pass", out.status));
+    }
+    let size = out.stdout.len() as u64;
+    // Pass 2: decompress the buffered bytes and sha256 the plaintext. The write
+    // to the child's stdin runs on its own thread so a full pipe buffer can't
+    // deadlock against our read of its stdout.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(roundtrip_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn roundtrip `{roundtrip_cmd}`: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "no stdin pipe for roundtrip".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout pipe for roundtrip".to_string())?;
+    let compressed = out.stdout;
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&compressed);
+        // stdin drops here → EOF to the decompressor.
+    });
+    let digest = crate::compare::sha256_reader(stdout).map_err(|e| format!("hash roundtrip of `{roundtrip_cmd}`: {e}"))?;
+    let status = child.wait().map_err(|e| format!("wait roundtrip `{roundtrip_cmd}`: {e}"))?;
+    let _ = writer.join();
+    if !status.success() {
+        // The DECOMPRESSOR choked on this arm's output (e.g. truncated/corrupt
+        // stream). That is a compress CORRECTNESS failure, not a broken
+        // measurement: return an empty sha (never matches the 64-hex oracle) so
+        // the caller records roundtrip_ok=false → status FAIL. Only the
+        // COMPRESSOR arm exiting nonzero (above) is a hard Err.
+        return Ok((String::new(), size));
+    }
+    Ok((crate::compare::hex32(&digest), size))
+}
+
+/// The compress correctness+size gate for ONE arm, run `reps` times. Returns
+/// `(size_bytes, size_stable, roundtrip_ok)`: size = first rep's exact byte
+/// count, size_stable = every rep identical, roundtrip_ok = every rep's
+/// decompressed sha == `input_sha`.
+fn compress_gate_arm(
+    cmd: &str,
+    roundtrip_cmd: &str,
+    input_sha: &str,
+    reps: usize,
+) -> Result<(u64, bool, bool), String> {
+    let mut sizes = Vec::new();
+    let mut roundtrip_ok = true;
+    for _ in 0..reps.max(1) {
+        let (sha, size) = roundtrip_and_size_of_arm(cmd, roundtrip_cmd)?;
+        sizes.push(size);
+        if sha != input_sha {
+            roundtrip_ok = false;
+        }
+    }
+    let size = sizes[0];
+    let size_stable = sizes.iter().all(|s| *s == size);
+    Ok((size, size_stable, roundtrip_ok))
+}
+
+// ---------------------------------------------------------------------------
 // Peak-RSS co-capture (the MEMORY half of the scoreboard)
 // ---------------------------------------------------------------------------
 //
@@ -405,7 +522,7 @@ pub fn ab_verdict(lr_ci: &Ci) -> &'static str {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairedResult {
     pub status: String,
     pub verdict: String,
@@ -455,10 +572,33 @@ pub struct PairedResult {
     /// Peak-RSS reps actually CAPTURED per arm (0 ⇒ RSS off / uninstrumentable).
     #[serde(default)]
     pub rss_reps: usize,
+    // -- RATIO half (compress mode only; defaults ⇒ decode mode) --------------
+    /// "decode" (byte-exact gate) | "compress" (roundtrip gate + size capture).
+    #[serde(default)]
+    pub mode: String,
+    /// Subject (A) compressed output size in bytes — exact integer count.
+    #[serde(default)]
+    pub a_size_bytes: u64,
+    /// Comparator (B) compressed output size in bytes — exact integer count.
+    #[serde(default)]
+    pub b_size_bytes: u64,
+    /// `a_size / b_size`. >1 ⇒ subject's output is BIGGER (worse ratio).
+    #[serde(default)]
+    pub size_ratio: f64,
+    /// Every size rep identical, BOTH arms (a non-deterministic size VOIDs the
+    /// ratio axis — you can't reproduce a ratio you can't reproduce).
+    #[serde(default)]
+    pub size_stable: bool,
+    /// Both arms' decompressed output sha == `input_sha` (compress correctness).
+    #[serde(default)]
+    pub roundtrip_ok: bool,
+    /// The plaintext oracle sha256 (hex) both arms' roundtrips must reproduce.
+    #[serde(default)]
+    pub input_sha: String,
 }
 
-/// The full paired run: byte-exact gate → A/A certificate → interleaved A/B.
-/// `sink` is validated (SINK LAW) but timing always uses Stdio::null()/dev/null.
+/// Decode-mode paired run (byte-exact gate). Thin wrapper over
+/// [`run_paired_inner`] with no compress config — existing callers unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn run_paired(
     a_cmd_tmpl: &str,
@@ -471,6 +611,27 @@ pub fn run_paired(
     do_sha: bool,
     rss_reps: usize,
 ) -> Result<PairedResult, String> {
+    run_paired_inner(
+        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpus, n, warmup, sink, do_sha, rss_reps, None,
+    )
+}
+
+/// The full paired run: correctness gate (byte-exact in decode mode / roundtrip
+/// + exact-size in compress mode) → A/A certificate → interleaved A/B → peak-RSS.
+/// `sink` is validated (SINK LAW) but timing always uses Stdio::null()/dev/null.
+#[allow(clippy::too_many_arguments)]
+pub fn run_paired_inner(
+    a_cmd_tmpl: &str,
+    b_cmd_tmpl: &str,
+    ref_cmd_tmpl: &str,
+    corpus: &Path,
+    n: usize,
+    warmup: usize,
+    sink: &Path,
+    do_sha: bool,
+    rss_reps: usize,
+    compress: Option<&CompressCfg>,
+) -> Result<PairedResult, String> {
     // -- SINK LAW (before anything spawns)
     sink_is_devnull(sink)?;
 
@@ -478,10 +639,25 @@ pub fn run_paired(
     let b_cmd = expand(b_cmd_tmpl, corpus);
     let ref_cmd = expand(ref_cmd_tmpl, corpus);
 
-    // -- byte-exact gate (untimed): each arm vs the reference decode
+    // -- correctness gate (untimed).
+    //    decode:   each arm's decoded bytes == the reference decode.
+    //    compress: each arm's output DEcompresses back to the plaintext oracle
+    //    (roundtrip), and its exact compressed size is captured + determinism-checked.
     let (mut sha_ok, mut ref_sha, mut a_sha, mut b_sha) =
         (true, String::new(), String::new(), String::new());
-    if do_sha {
+    let (mut a_size_bytes, mut b_size_bytes, mut size_ratio, mut size_stable, mut roundtrip_ok) =
+        (0u64, 0u64, 0.0f64, false, false);
+    if let Some(cfg) = compress {
+        let (asz, a_stable, a_rt) =
+            compress_gate_arm(&a_cmd, &cfg.roundtrip_cmd, &cfg.input_sha, cfg.size_reps)?;
+        let (bsz, b_stable, b_rt) =
+            compress_gate_arm(&b_cmd, &cfg.roundtrip_cmd, &cfg.input_sha, cfg.size_reps)?;
+        a_size_bytes = asz;
+        b_size_bytes = bsz;
+        size_ratio = if bsz > 0 { asz as f64 / bsz as f64 } else { 0.0 };
+        size_stable = a_stable && b_stable;
+        roundtrip_ok = a_rt && b_rt;
+    } else if do_sha {
         ref_sha = sha_of_arm(&ref_cmd)?;
         a_sha = sha_of_arm(&a_cmd)?;
         b_sha = sha_of_arm(&b_cmd)?;
@@ -521,8 +697,25 @@ pub fn run_paired(
         .filter(|d| d.signum() == dmed.signum() && **d != 0.0)
         .count();
 
-    // -- verdict precedence: FAIL (wrong bytes) > VOID (harness bias) > A/B verdict
-    let (status, verdict) = if !sha_ok {
+    // -- verdict precedence.
+    //    compress: FAIL-roundtrip (wrong bytes) > VOID-size-nondeterministic >
+    //              VOID-aa (harness bias) > wall verdict.
+    //    decode:   FAIL-sha-mismatch > VOID-aa > wall verdict.
+    //    NOTE: compress mode reports the WALL verdict + size_ratio; the
+    //    two-objective Pareto@matched-level combination (a size regression is a
+    //    LOSS even if faster) is `matrix`'s classify_compress — `paired` stays a
+    //    pure measurement atom, verdict-agnostic on the two-objective question.
+    let (status, verdict) = if compress.is_some() {
+        if !roundtrip_ok {
+            (Status::Fail, "FAIL-roundtrip".to_string())
+        } else if !size_stable {
+            (Status::Void, "VOID-size-nondeterministic".to_string())
+        } else if !aa_brackets_1 {
+            (Status::Void, format!("VOID-aa_bias={:.4}", aa_bias))
+        } else {
+            (Status::Ok, ab_verdict(&lr_ci).to_string())
+        }
+    } else if !sha_ok {
         (Status::Fail, "FAIL-sha-mismatch".to_string())
     } else if !aa_brackets_1 {
         (Status::Void, format!("VOID-aa_bias={:.4}", aa_bias))
@@ -530,9 +723,14 @@ pub fn run_paired(
         (Status::Ok, ab_verdict(&lr_ci).to_string())
     };
 
+    let gate = if compress.is_some() {
+        "roundtrip+exact-size-gate"
+    } else {
+        "byte-exact-gate"
+    };
     let method = format!(
         "fulcrum-paired-v1:interleaved-order-alt,devnull-both-arms,paired-logratio-ci95(t-df),\
-         aa-certificate,byte-exact-gate,peak-rss-dedicated-probe;n={n},warmup={warmup},\
+         aa-certificate,{gate},peak-rss-dedicated-probe;n={n},warmup={warmup},\
          rss_reps={rss_reps_got}"
     );
 
@@ -564,16 +762,38 @@ pub fn run_paired(
         a_peak_rss_spread,
         b_peak_rss_spread,
         rss_reps: rss_reps_got,
+        mode: if compress.is_some() {
+            "compress".to_string()
+        } else {
+            "decode".to_string()
+        },
+        a_size_bytes,
+        b_size_bytes,
+        size_ratio,
+        size_stable,
+        roundtrip_ok,
+        input_sha: compress.map(|c| c.input_sha.clone()).unwrap_or_default(),
     })
 }
 
 /// The machine-checkable one-liner other tooling greps for.
 pub fn print_machine_line(r: &PairedResult) {
+    // In compress mode the RATIO half is appended inline (the size axis the
+    // Pareto verdict needs); decode mode omits it (empty ⇒ back-compat line).
+    let compress_fields = if r.mode == "compress" {
+        format!(
+            " mode=compress a_size_bytes={} b_size_bytes={} size_ratio={:.6} \
+             size_stable={} roundtrip_ok={}",
+            r.a_size_bytes, r.b_size_bytes, r.size_ratio, r.size_stable, r.roundtrip_ok,
+        )
+    } else {
+        String::new()
+    };
     println!(
         "PAIRED={} verdict={} ratio={:.4} logratio_ci=[{:.4},{:.4}] \
          delta_median_ms={:.3} delta_ci95=[{:.3},{:.3}] a_median={:.3} b_median={:.3} \
          n={} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] aa_bias={:.4} sha_ok={} \
-         a_peak_rss_mb={:.1} b_peak_rss_mb={:.1} rss_reps={} \
+         a_peak_rss_mb={:.1} b_peak_rss_mb={:.1} rss_reps={}{} \
          method=\"{}\"",
         r.status,
         r.verdict,
@@ -595,6 +815,7 @@ pub fn print_machine_line(r: &PairedResult) {
         r.a_peak_rss_mb,
         r.b_peak_rss_mb,
         r.rss_reps,
+        compress_fields,
         r.method,
     );
 }
@@ -790,6 +1011,207 @@ pub fn selftest() -> ExitCode {
         }
     }
 
+    // 7. COMPRESS MODE (Gate-0 for the RATIO half). Needs `gzip` (universal on
+    //    Linux/macOS); if absent the whole block is skipped, never failed.
+    {
+        let have_gzip = Command::new("sh")
+            .arg("-c")
+            .arg("gzip --version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !have_gzip {
+            println!("  NOTE compress: gzip unavailable — compress-mode selftests skipped");
+        } else {
+            let pid = std::process::id();
+            // ~24 KiB compressible-but-nontrivial text fixture (the PLAINTEXT).
+            let fixture = std::env::temp_dir().join(format!("fulcrum-paired-cst-{pid}"));
+            let mut body = String::new();
+            for i in 0..512 {
+                body.push_str(&format!("the quick brown fox {i} jumps over the lazy dog {i}\n"));
+            }
+            let _ = std::fs::write(&fixture, body.as_bytes());
+            let input_sha = sha256_of_file(&fixture).unwrap_or_default();
+            let cfg = |reps: usize| CompressCfg {
+                roundtrip_cmd: "gzip -dc".to_string(),
+                input_sha: input_sha.clone(),
+                size_reps: reps,
+            };
+
+            // (a) roundtrip gate PASSES for valid gzip arms; size exact+stable+ordered.
+            match run_paired_inner(
+                "gzip -1 -c {corpus}",
+                "gzip -9 -c {corpus}",
+                "true",
+                &fixture,
+                9,
+                1,
+                &devnull,
+                false,
+                0,
+                Some(&cfg(2)),
+            ) {
+                Ok(r) => {
+                    check("compress: roundtrip_ok (valid gzip arms)", r.roundtrip_ok);
+                    check("compress: size_stable across reps", r.size_stable);
+                    check("compress: mode==compress", r.mode == "compress");
+                    // Sizes are CAPTURED and reflect REAL compressed bytes (both
+                    // >0 and smaller than the ~26 KiB compressible plaintext).
+                    // NOTE: gzip level→size monotonicity is NOT asserted — it does
+                    // not hold for tiny inputs, and the ratio axis never depends on it.
+                    let raw_len = body.len() as u64;
+                    check(
+                        "compress: both sizes captured (>0)",
+                        r.a_size_bytes > 0 && r.b_size_bytes > 0,
+                    );
+                    check(
+                        "compress: sizes reflect real compression (< raw plaintext)",
+                        r.a_size_bytes < raw_len && r.b_size_bytes < raw_len,
+                    );
+                    check(
+                        "compress: size_ratio == a_size/b_size exactly",
+                        (r.size_ratio - (r.a_size_bytes as f64 / r.b_size_bytes as f64)).abs()
+                            < 1e-12,
+                    );
+                    // NOTE: wall verdict/status is NOT asserted here — gzip on a
+                    // ~26 KiB fixture is sub-millisecond, so the A/A harness
+                    // certificate is timing-noisy under load. The ratio/roundtrip
+                    // machinery this block validates is deterministic; wall-verdict
+                    // stability is the decode `sleep 0.02` block's job.
+                }
+                Err(e) => check(&format!("compress: valid run ({e})"), false),
+            }
+
+            // (b) corrupting arm (truncated gzip) ⇒ roundtrip_ok=false ⇒ FAIL.
+            match run_paired_inner(
+                "gzip -c {corpus} | head -c 10",
+                "gzip -9 -c {corpus}",
+                "true",
+                &fixture,
+                9,
+                1,
+                &devnull,
+                false,
+                0,
+                Some(&cfg(1)),
+            ) {
+                Ok(r) => {
+                    check("compress: corrupt arm roundtrip_ok=false", !r.roundtrip_ok);
+                    check("compress: corrupt arm status FAIL", r.status == "FAIL");
+                    check(
+                        "compress: corrupt arm verdict FAIL-roundtrip",
+                        r.verdict == "FAIL-roundtrip",
+                    );
+                }
+                Err(e) => check(&format!("compress: corrupt run ({e})"), false),
+            }
+
+            // (c) size-NONdeterministic arm ⇒ size_stable=false ⇒ VOID, while STILL
+            //     roundtripping. The subject appends a per-rep-INCREASING count of
+            //     empty gzip members (a counter file drives it): each empty member
+            //     decompresses to nothing, so gzip -dc still yields the plaintext
+            //     (roundtrip_ok), but the compressed SIZE strictly grows each rep.
+            let ctr = std::env::temp_dir().join(format!("fulcrum-paired-cst-ctr-{pid}"));
+            let _ = std::fs::remove_file(&ctr);
+            let ctr_s = ctr.display();
+            let nondet_arm = format!(
+                "gzip -c {{corpus}}; N=$(cat {ctr_s} 2>/dev/null || echo 0); \
+                 echo $((N+1)) > {ctr_s}; i=0; while [ $i -lt $N ]; do printf '' | gzip -c; i=$((i+1)); done"
+            );
+            match run_paired_inner(
+                &nondet_arm,
+                "gzip -9 -c {corpus}",
+                "true",
+                &fixture,
+                9,
+                1,
+                &devnull,
+                false,
+                0,
+                Some(&cfg(3)),
+            ) {
+                Ok(r) => {
+                    check(
+                        "compress: nondeterministic size ⇒ size_stable=false",
+                        !r.size_stable,
+                    );
+                    check(
+                        "compress: nondeterministic ⇒ status VOID",
+                        r.status == "VOID",
+                    );
+                    check(
+                        "compress: nondeterministic verdict VOID-size-nondeterministic",
+                        r.verdict == "VOID-size-nondeterministic",
+                    );
+                    check(
+                        "compress: nondeterministic arm STILL roundtrips",
+                        r.roundtrip_ok,
+                    );
+                }
+                Err(e) => check(&format!("compress: nondeterministic run ({e})"), false),
+            }
+            let _ = std::fs::remove_file(&ctr);
+
+            // (d) SIZE isolated from wall: B is artificially slower (30 ms sleep)
+            //     yet size-neutral — size_ratio ≈ 1.0 regardless of the wall gap
+            //     (the size axis is an exact untimed count, structurally immune to
+            //     wall differences). Wall verdict not asserted (see (a) note).
+            match run_paired_inner(
+                "gzip -6 -c {corpus}",
+                "sleep 0.03; gzip -6 -c {corpus}",
+                "true",
+                &fixture,
+                9,
+                1,
+                &devnull,
+                false,
+                0,
+                Some(&cfg(2)),
+            ) {
+                Ok(r) => {
+                    check(
+                        "compress: size-neutral despite wall gap (size_ratio ≈ 1.0)",
+                        (r.size_ratio - 1.0).abs() < 0.001,
+                    );
+                    check("compress: wall-gap arm still roundtrips", r.roundtrip_ok);
+                }
+                Err(e) => check(&format!("compress: wall-isolation run ({e})"), false),
+            }
+
+            // (e) A/A size symmetry: same compressor both slots ⇒ size_ratio == 1.0
+            //     exactly (deterministic; the wall A/A certificate is the decode
+            //     block's concern, not asserted here).
+            match run_paired_inner(
+                "gzip -6 -c {corpus}",
+                "gzip -6 -c {corpus}",
+                "true",
+                &fixture,
+                9,
+                1,
+                &devnull,
+                false,
+                0,
+                Some(&cfg(2)),
+            ) {
+                Ok(r) => {
+                    check(
+                        "compress: A/A size_ratio == 1.0",
+                        (r.size_ratio - 1.0).abs() < 1e-12,
+                    );
+                    check(
+                        "compress: A/A a_size == b_size",
+                        r.a_size_bytes == r.b_size_bytes,
+                    );
+                }
+                Err(e) => check(&format!("compress: A/A run ({e})"), false),
+            }
+
+            let _ = std::fs::remove_file(&fixture);
+        }
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -829,11 +1251,19 @@ fn usage() -> ExitCode {
          \x20 fulcrum paired --a-cmd <tmpl> --b-cmd <tmpl> --corpus <path>\n\
          \x20                [--n 51] [--warmup 2] [--sink /dev/null] [--ref-cmd 'gunzip -c {{corpus}}']\n\
          \x20                [--rss-reps 3] [--no-sha] [--out result.json] [--label ...]\n\
+         \x20                [--mode decode|compress]\n\
+         \x20                # compress mode: {{corpus}} is the PLAINTEXT, arms are compressors:\n\
+         \x20                [--roundtrip-cmd 'gzip -dc'] [--input-sha <64hex>] [--size-reps 2]\n\
          \x20 fulcrum paired selftest                 Gate-0: fake commands, no box needed\n\
          \n\
          {{corpus}} is substituted in every template. --a-cmd is the SUBJECT, --b-cmd the\n\
-         COMPARATOR; ratio = A/B. Any decoder pair (gzippy/rapidgzip/libdeflate-gunzip/igzip/\n\
-         minigzip) drops in.  Compose under a freeze:\n\
+         COMPARATOR; ratio = A/B. DECODE mode (default): any decoder pair (gzippy/rapidgzip/\n\
+         libdeflate-gunzip/igzip/minigzip); byte-exact gate vs --ref-cmd. COMPRESS mode: any\n\
+         compressor pair (gzippy/pigz/libdeflate-gzip/igzip); correctness is the ROUNDTRIP gate\n\
+         (decompress(arm) sha == --input-sha, default = sha of --corpus) and each arm's exact\n\
+         compressed SIZE is co-captured (size_ratio, size_stable). The two-objective Pareto\n\
+         verdict lives in `matrix --mode compress`; here the line carries wall verdict + size.\n\
+         Compose under a freeze:\n\
          \x20 fulcrum freeze run --ttl-s 1500 -- fulcrum paired --a-cmd ... --b-cmd ... --corpus ...\n\
          \n\
          MACHINE LINE: PAIRED=OK|VOID|FAIL ... (VOID = A/A harness bias; FAIL = byte mismatch)."
@@ -864,6 +1294,7 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
     let rss_reps: usize = cli_flag(args, "--rss-reps")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
+    let mode = cli_flag(args, "--mode").unwrap_or("decode");
     let corpus_path = PathBuf::from(corpus);
 
     if n < 7 {
@@ -878,7 +1309,34 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match run_paired(
+    // Compress mode: build the roundtrip+size config. {corpus} is the PLAINTEXT
+    // input; the arms are compressors. The plaintext oracle sha is --input-sha
+    // or, absent that, computed from the corpus file itself.
+    let compress_cfg = if mode == "compress" {
+        let roundtrip_cmd = cli_flag(args, "--roundtrip-cmd").unwrap_or("gzip -dc").to_string();
+        let size_reps: usize = cli_flag(args, "--size-reps")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let input_sha = match cli_flag(args, "--input-sha") {
+            Some(s) => s.to_string(),
+            None => match sha256_of_file(&corpus_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("PAIRED=FAIL could not compute --input-sha from corpus: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        Some(CompressCfg {
+            roundtrip_cmd,
+            input_sha,
+            size_reps,
+        })
+    } else {
+        None
+    };
+
+    match run_paired_inner(
         a_cmd,
         b_cmd,
         ref_cmd,
@@ -888,6 +1346,7 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
         &sink,
         do_sha,
         rss_reps,
+        compress_cfg.as_ref(),
     ) {
         Ok(r) => {
             print_machine_line(&r);

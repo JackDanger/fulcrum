@@ -1,0 +1,1350 @@
+{
+  "manifest": {
+    "goal": "strictly-fastest gzip decompressor per (arch x threads x archive) vs rapidgzip — the FULL cross-arch Gate-3 grid (solvency AMD-Zen2, trainer Intel i7-13700T, m1pro Apple-Silicon) x 12 corpora x T{1,4,8,16}; SCOPE=WIN only when every cell is a measured WIN/TIE. gz_src 9c84b0ee (Intel/M1) vs authoritative HEAD 25863516 (AMD native).",
+    "boxes": [
+      "solvency",
+      "trainer-i7-13700T",
+      "m1pro"
+    ],
+    "comparators": [
+      "rapidgzip"
+    ],
+    "corpora": [
+      "silesia",
+      "monorepo",
+      "markup",
+      "logs",
+      "nasa",
+      "weights",
+      "movie",
+      "dovi",
+      "photo",
+      "incompressible",
+      "storedheavy",
+      "purestored"
+    ],
+    "threads": [
+      1,
+      4,
+      8,
+      16
+    ],
+    "require_sha": null,
+    "corpus_aliases": {
+      "logs": [
+        "access.log"
+      ],
+      "purestored": [
+        "pure_stored"
+      ]
+    }
+  },
+  "cells": [
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.8282160962509411,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.9219141863776472,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8237250476752559,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.7842704438555704,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.6024693062634405,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.6866051877337611,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.7883316075227341,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.8615096076029365,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.6725258029772274,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.6575138980090512,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.6285932299020014,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.6345458548192232,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.5414621816408184,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.589671050230203,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.5600163474014667,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.5713859906263855,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.47355434868768465,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.5019021177646397,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.7650063147329212,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.7696836519820127,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.9554248828904404,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 4,
+      "status": "Loss",
+      "ratio": 1.040040535772948,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8834971499807462,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.9667307598707376,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.8558591368354833,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 4,
+      "status": "Loss",
+      "ratio": 1.0435962281072313,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8656718696262923,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 16,
+      "status": "Void",
+      "ratio": 0.8975619832441405,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.8532084405074024,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.8980492717676772,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 8,
+      "status": "Void",
+      "ratio": 0.7558446452905817,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.8201021342866969,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.8778597459812439,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.984524690356526,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8308183422310095,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.8238384275214657,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.5836490579711193,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.6209563165581795,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.6897799028239567,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.6942202642180442,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.7272094802978257,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 4,
+      "status": "Loss",
+      "ratio": 1.1024798779599416,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 8,
+      "status": "Loss",
+      "ratio": 1.4789425941634358,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 16,
+      "status": "Loss",
+      "ratio": 1.4998627687324415,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.6130924458646214,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.6177351871307771,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.6245284213719361,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "solvency",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.703115039792606,
+      "source_timestamp": "epoch:1783754666"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.7916669597807355,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.8150021315098579,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.7830630032352783,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.71891772226825,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.5015211798104675,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.4099187664985767,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.637207213717189,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.580498948994302,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.3147740579806508,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.267225087387679,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 8,
+      "status": "Void",
+      "ratio": 0.2974778176229864,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.31174295832144205,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.6539594239869789,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.45422140300590313,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.6484407634044687,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.6462348730675757,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.47079237283936975,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.3687250453574412,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.5191138134150651,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.6507545451356352,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.90384813716007,
+      "source_timestamp": "epoch:1783784337"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.8548379490642334,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8138538139387256,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.702548058515308,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.6089969768575682,
+      "source_timestamp": "epoch:1783784337"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.5555325528800982,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.49640594979089975,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.4191206951588856,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.4092901094923439,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.4169347344029521,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.36392133275771493,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.32643411068132083,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.5351183229543959,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.4695002334697233,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.4400015802039514,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.3498964536229832,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.2177751590930928,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.19711870702646556,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.21846914890356103,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.24457674838552923,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 1,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.8412955849410383,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.8409356117340813,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.6920139219756515,
+      "source_timestamp": "epoch:1783782409"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.26474303484039313,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.2524991396672119,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.2632404353555117,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "trainer-i7-13700T",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.28666693704483565,
+      "source_timestamp": "epoch:1783782983"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.3267326929570315,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.4947777036715654,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 8,
+      "status": "Void",
+      "ratio": 0.4936549143138762,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "silesia",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.24538703987627883,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.47018359692177536,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.4488008093409917,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "monorepo",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.23819384217456235,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.3118709546940023,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.3038855463332611,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "markup",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.2831170648020858,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.4860377625493067,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.5135898232722127,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "logs",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.2391271858658518,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.43058040859991864,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.6726461079050092,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "nasa",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.4806635806528732,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.5022269229650523,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 8,
+      "status": "Void",
+      "ratio": 0.4650497246721154,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "weights",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.3796233790598177,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.3736559863934143,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.34455190594101515,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "movie",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.2687615403719571,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.3093057068945752,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.3125373016916039,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "dovi",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.34813414975177803,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.33401643039878537,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.317625709032764,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "photo",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 1,
+      "status": "Win",
+      "ratio": 0.2873239103692541,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.2801961530302596,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.29161030002617355,
+      "source_timestamp": "epoch:1783781715"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "incompressible",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 1,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 4,
+      "status": "Win",
+      "ratio": 0.5096431940809152,
+      "source_timestamp": "epoch:1783782257"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 8,
+      "status": "Win",
+      "ratio": 0.503638869457553,
+      "source_timestamp": "epoch:1783782257"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "storedheavy",
+      "threads": 16,
+      "status": "Win",
+      "ratio": 0.5828451173182498,
+      "source_timestamp": "epoch:1783782257"
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 1,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 4,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 8,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    },
+    {
+      "box_name": "m1pro",
+      "comparator": "rapidgzip",
+      "corpus": "purestored",
+      "threads": 16,
+      "status": "Unmeasured",
+      "ratio": null,
+      "source_timestamp": ""
+    }
+  ],
+  "summary": {
+    "total": 144,
+    "win": 118,
+    "tie": 0,
+    "loss": 5,
+    "void": 5,
+    "stale": 0,
+    "unmeasured": 16,
+    "verdict": "OPEN"
+  }
+}

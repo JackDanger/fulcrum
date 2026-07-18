@@ -69,7 +69,7 @@ libdeflater = { version = "=1.25.2", optional = true }
 # to external gz/rg) never load it, so the crate builds even when this path is
 # stale/absent. When you DO enable the feature, point `path` at a gzippy checkout
 # that exposes `fulcrum_phase` (e.g. /Users/jackdanger/www/gzippy-matchcopy-3d59).
-gzippy = { path = "/Users/jackdanger/www/gzippy-matchcopy-3d59", default-features = false, features = ["pure-rust-inflate", "fulcrum_phase"], optional = true }
+gzippy = { path = "/Users/jackdanger/www/gzippy", default-features = false, features = ["pure-rust-inflate"], optional = true }
 # critpath DIFFERENTIAL: instrumented libdeflate 1.25 carrying the SAME region
 # markers, for `fulcrum critpath --target libdeflate`. Public symbols are cpld_-
 # prefixed so this never collides with the `libdeflater` crate above. OPTIONAL —
