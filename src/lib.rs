@@ -96,6 +96,7 @@ pub mod probe;
 pub mod provenance;
 pub mod quantity;
 pub mod rank;
+pub mod ratio;
 pub mod region_hw;
 pub mod report;
 pub mod rg_verbose;

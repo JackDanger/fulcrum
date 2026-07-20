@@ -4421,6 +4421,7 @@ fn main() -> ExitCode {
         "cellwhy" => fulcrum::cellwhy::cmd_cellwhy(rest),
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "behavior" => fulcrum::behavior::cmd_behavior(rest),
+        "ratio" => fulcrum::ratio::cmd_ratio(rest),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
