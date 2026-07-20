@@ -2475,7 +2475,10 @@ fn cmd_sweep(args: &[String]) -> ExitCode {
     // FACTOR mode (multi-factor lever-boundary characterizer): dispatched when
     // the caller passes `--cand`/`--selftest` instead of a capture/mine phase.
     // `fulcrum sweep --cand <bin> --base <bin> --run '...' --corpora ... --threads ...`
-    if args.iter().any(|a| a == "--cand" || a == "--selftest" || a == "--analyze") {
+    if args
+        .iter()
+        .any(|a| a == "--cand" || a == "--selftest" || a == "--analyze")
+    {
         return fulcrum::sweep_factor::cmd(args);
     }
     let Some(phase) = args.first().map(|s| s.as_str()) else {
@@ -3972,7 +3975,10 @@ fn cmd_optimality(args: &[String]) -> ExitCode {
                 i += 2;
             }
             other => {
-                eprintln!("optimality: unexpected arg '{other}'\n\n{}", optimality::HELP);
+                eprintln!(
+                    "optimality: unexpected arg '{other}'\n\n{}",
+                    optimality::HELP
+                );
                 return ExitCode::from(2);
             }
         }
@@ -4019,7 +4025,10 @@ fn cmd_optimality(args: &[String]) -> ExitCode {
 
     // full manifest mode
     let Some(manifest_path) = manifest else {
-        eprintln!("optimality: need --manifest, --self-cal --script, or --gen-fixture\n\n{}", optimality::HELP);
+        eprintln!(
+            "optimality: need --manifest, --self-cal --script, or --gen-fixture\n\n{}",
+            optimality::HELP
+        );
         return ExitCode::from(2);
     };
     let text = match std::fs::read_to_string(&manifest_path) {
@@ -4421,6 +4430,7 @@ fn main() -> ExitCode {
         "cellwhy" => fulcrum::cellwhy::cmd_cellwhy(rest),
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "behavior" => fulcrum::behavior::cmd_behavior(rest),
+        "ratio" => fulcrum::ratio::cmd_ratio(rest),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
