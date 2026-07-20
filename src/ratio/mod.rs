@@ -138,7 +138,10 @@ pub struct TokenStream {
     pub blocks: Vec<Block>,
     pub raw_len: u64,
     pub raw_sha: [u8; 32],
-    /// gzip wrapper: header bytes before the deflate stream + 8 trailer bytes.
+    /// Total NON-DEFLATE gzip wrapper bytes = (leading header bytes before the
+    /// deflate stream) + (8-byte CRC32/ISIZE trailer). Invariant:
+    /// `gzip_header_bytes + deflate_bytes == file_bytes`; the deflate stream
+    /// begins at file byte offset `gzip_header_bytes - 8`.
     pub gzip_header_bytes: u64,
     /// Deflate stream length in BYTES (padding included).
     pub deflate_bytes: u64,
@@ -192,7 +195,10 @@ impl PosMatches {
             let idx = self.pareto.partition_point(|&(l, _)| l < len);
             self.pareto.insert(idx, (len, dist));
         }
-        debug_assert!(self.pareto.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        debug_assert!(self
+            .pareto
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
     }
     /// Longest available length (0 if none).
     pub fn max_len(&self) -> u16 {
@@ -250,7 +256,11 @@ const fn len_code_table() -> [u8; 259] {
     let mut c = 0;
     while c < 29 {
         let lo = base[c];
-        let hi = if c == 28 { 258 } else { base[c] as u32 + (1u32 << extra[c]) - 1 } as u16;
+        let hi = if c == 28 {
+            258
+        } else {
+            base[c] as u32 + (1u32 << extra[c]) - 1
+        } as u16;
         let mut l = lo;
         while l <= hi && l <= 258 {
             t[l as usize] = c as u8;
