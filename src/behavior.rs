@@ -388,6 +388,260 @@ fn register_named(rest: &str, table: &mut BTreeMap<u64, String>) -> String {
 }
 
 // ======================================================================
+// callgrind + nm symbolization (fixes st_size=0 nasm syms, e.g. ISA-L igzip)
+// ======================================================================
+//
+// cachegrind attributes per-function costs from `fn=` records, which come from
+// ELF st_size. nasm-assembled binaries (igzip) ship st_size=0 syms, so ~98.6%
+// of Ir lands in `fn=???` and the comparator is symbol-blind. The fix (proven
+// by hand, sf1_cgmap.py): run callgrind with `--dump-instr=yes` so positions
+// become instruction addresses, then map each address to the nearest preceding
+// `nm --defined-only` symbol (sorted, bisect). Conservation self-check: Σ mapped
+// Ir must equal the callgrind `summary:` Ir — the Gate-0 for this mapper.
+
+/// Result of mapping a callgrind `--dump-instr=yes` out-file onto nm symbols.
+struct SymbolizedCg {
+    /// per-symbol Ir buckets (incl. the `[other-obj]` catch-all), sorted Ir desc.
+    fns: Vec<FnCost>,
+    /// Σ Ir over every cost line (all objects).
+    grand_ir: u64,
+    /// Σ Ir over all buckets — equals `grand_ir` by construction.
+    mapped_ir: u64,
+    /// Ir from the callgrind `summary:`/`totals:` line, if present.
+    summary_ir: Option<u64>,
+}
+
+/// Pure `nm --defined-only` output parser (no subprocess, so the selftest can
+/// drive it): keeps text/weak syms (t/T/w/W), drops nasm-local `..@` labels so
+/// the enclosing global wins, and returns `(addr, name)` sorted by address.
+fn parse_nm(text: &str) -> Vec<(u64, String)> {
+    let mut syms: Vec<(u64, String)> = vec![];
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        if !matches!(parts[1], "t" | "T" | "w" | "W") {
+            continue;
+        }
+        let name = parts[2];
+        if name.starts_with("..@") {
+            continue; // nasm local labels — fall through to the enclosing global
+        }
+        if let Ok(addr) = u64::from_str_radix(parts[0], 16) {
+            syms.push((addr, name.to_string()));
+        }
+    }
+    syms.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    syms
+}
+
+/// Run `nm --defined-only <binary>` and parse it into a sorted symbol table.
+fn nm_symbols(binary_path: &str) -> Result<Vec<(u64, String)>, String> {
+    let o = Command::new("nm")
+        .arg("--defined-only")
+        .arg(binary_path)
+        .output()
+        .map_err(|e| format!("spawn nm: {e}"))?;
+    if !o.status.success() {
+        return Err(format!(
+            "nm failed on {binary_path}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ));
+    }
+    let syms = parse_nm(&String::from_utf8_lossy(&o.stdout));
+    if syms.is_empty() {
+        return Err(format!("nm produced no usable symbols for {binary_path}"));
+    }
+    Ok(syms)
+}
+
+/// Resolve a callgrind instr-position token against the last-seen address.
+/// Forms: `0xABC` absolute hex, `+N`/`-N` relative (decimal), `*` = same addr.
+fn resolve_addr(tok: &str, last: u64) -> Option<u64> {
+    if let Some(hex) = tok.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else if tok == "*" {
+        Some(last)
+    } else if tok.starts_with('+') || tok.starts_with('-') {
+        let delta: i64 = tok.parse().ok()?;
+        Some((last as i64).wrapping_add(delta) as u64)
+    } else {
+        u64::from_str_radix(tok, 16).ok()
+    }
+}
+
+/// Map a callgrind instr-level out-file to nm symbols. `syms` MUST be sorted by
+/// address. Faithful Rust port of sf1_cgmap.py. Honors the `positions:` /
+/// `events:` headers (never hardcodes Ir's column), tracks `ob=` to only
+/// symbolize the target binary (others → `[other-obj]`), and resolves relative
+/// instruction addresses against the last-seen address.
+fn parse_callgrind_symbolized(
+    text: &str,
+    main_basename: &str,
+    syms: &[(u64, String)],
+) -> Result<SymbolizedCg, String> {
+    let addrs: Vec<u64> = syms.iter().map(|(a, _)| *a).collect();
+    // Nearest preceding symbol: largest i with addrs[i] <= addr (bisect_right-1).
+    let lookup = |addr: u64| -> String {
+        match addrs.binary_search(&addr) {
+            Ok(i) => syms[i].1.clone(),
+            Err(0) => "<none>".to_string(),
+            Err(i) => syms[i - 1].1.clone(),
+        }
+    };
+
+    let mut positions: Vec<String> = vec![];
+    let mut events: Vec<String> = vec![];
+    let mut ob_table: BTreeMap<u64, String> = BTreeMap::new();
+    let mut cur_is_main = false;
+    let mut last_addr: u64 = 0;
+    let mut grand_ir: u64 = 0;
+    let mut summary_ir: Option<u64> = None;
+    let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("positions:") {
+            positions = rest.split_whitespace().map(|s| s.to_string()).collect();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("events:") {
+            events = rest.split_whitespace().map(|s| s.to_string()).collect();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ob=") {
+            // ob= may use `(N) name` / `(N)` reference compression, like fn=.
+            let name = register_named(rest, &mut ob_table);
+            cur_is_main = name.contains(main_basename);
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("summary:")
+            .or_else(|| line.strip_prefix("totals:"))
+        {
+            let vals: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u64>().ok())
+                .collect();
+            let ir_i = events.iter().position(|e| e == "Ir").unwrap_or(0);
+            summary_ir = vals.get(ir_i).copied();
+            continue;
+        }
+        // A cost line begins with an instr position: 0x.. hex, +/-N relative, *.
+        let b0 = line.as_bytes().first().copied().unwrap_or(0);
+        if !(b0.is_ascii_digit() || b0 == b'+' || b0 == b'-' || b0 == b'*') {
+            continue;
+        }
+        if positions.is_empty() || events.is_empty() {
+            continue;
+        }
+        let instr_pos = match positions.iter().position(|p| p == "instr") {
+            Some(i) => i,
+            None => continue, // not an instr-level dump — cannot symbolize
+        };
+        let ir_ev = events.iter().position(|e| e == "Ir").unwrap_or(0);
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        // fields: [positions...][events...]; Ir lives at positions.len()+ir_ev.
+        if toks.len() < positions.len() + events.len() {
+            continue;
+        }
+        let addr = match resolve_addr(toks[instr_pos], last_addr) {
+            Some(a) => a,
+            None => continue,
+        };
+        last_addr = addr;
+        let ir: u64 = toks[positions.len() + ir_ev].parse().unwrap_or(0);
+        grand_ir += ir;
+        let key = if cur_is_main {
+            lookup(addr)
+        } else {
+            "[other-obj]".to_string()
+        };
+        *buckets.entry(key).or_insert(0) += ir;
+    }
+
+    let mapped_ir: u64 = buckets.values().sum();
+    let mut fns: Vec<FnCost> = buckets
+        .into_iter()
+        .map(|(name, ir)| FnCost {
+            name,
+            ir,
+            dr: 0,
+            dw: 0,
+            d1_miss: 0,
+            ll_miss: 0,
+        })
+        .collect();
+    fns.sort_by(|a, b| b.ir.cmp(&a.ir).then(a.name.cmp(&b.name)));
+    Ok(SymbolizedCg {
+        fns,
+        grand_ir,
+        mapped_ir,
+        summary_ir,
+    })
+}
+
+/// Run `valgrind --tool=callgrind --dump-instr=yes <workload>`, then map the
+/// instruction addresses to `nm` symbols. Returns Ir-only `FnCost`s (no cache
+/// events; this pass exists purely to NAME the hot functions cachegrind left as
+/// `???`). Enforces the Gate-0 conservation check before returning.
+fn run_callgrind_symbolized(spec: &RunSpec, binary_path: &str) -> Result<Vec<FnCost>, String> {
+    let out = spec.outdir.join(format!("cg_instr.{}.out", spec.tag));
+    let mut c = Command::new("valgrind");
+    c.arg("--tool=callgrind")
+        .arg("--dump-instr=yes")
+        .arg("--collect-jumps=no")
+        .arg("--cache-sim=no")
+        .arg("--branch-sim=no")
+        .arg(format!("--callgrind-out-file={}", out.display()));
+    push_workload(&mut c, spec);
+    let o = c
+        .stdout(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn valgrind callgrind: {e}"))?;
+    if !out.exists() {
+        return Err(format!(
+            "callgrind produced no out-file. stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ));
+    }
+    let text = std::fs::read_to_string(&out).map_err(|e| format!("read callgrind out: {e}"))?;
+    let basename = Path::new(binary_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| binary_path.to_string());
+    let syms = nm_symbols(binary_path)?;
+    let mapped = parse_callgrind_symbolized(&text, &basename, &syms)?;
+    // Gate-0: Σ mapped Ir must equal the callgrind summary Ir.
+    if let Some(sir) = mapped.summary_ir {
+        if mapped.grand_ir != sir {
+            return Err(format!(
+                "callgrind conservation FAIL: mapped Ir={} != summary Ir={}",
+                mapped.grand_ir, sir
+            ));
+        }
+    }
+    debug_assert_eq!(mapped.mapped_ir, mapped.grand_ir);
+    Ok(mapped.fns)
+}
+
+/// Fraction of a cachegrind profile's Ir attributed to unknown (`???`) funcs.
+/// A high value means the binary is symbol-blind (nasm st_size=0) and needs the
+/// callgrind+nm symbolization pass.
+fn unknown_ir_fraction(cache: &CacheProfile) -> f64 {
+    if cache.ir == 0 {
+        return 0.0;
+    }
+    let unknown: u64 = cache
+        .fns
+        .iter()
+        .filter(|f| f.name == "???" || f.name.is_empty() || f.name == "<none>")
+        .map(|f| f.ir)
+        .sum();
+    unknown as f64 / cache.ir as f64
+}
+
+// ======================================================================
 // /usr/bin/time -v  and  strace -c -f  parsing
 // ======================================================================
 
@@ -743,7 +997,31 @@ fn capture_tool(
     eprintln!("  [behavior] {label} run#{run_idx}: dhat…");
     let alloc = run_dhat(&spec)?;
     eprintln!("  [behavior] {label} run#{run_idx}: cachegrind…");
-    let cache = run_cachegrind(&spec)?;
+    let mut cache = run_cachegrind(&spec)?;
+    // If cachegrind came back symbol-blind (nasm st_size=0 binaries like ISA-L
+    // igzip land ~all Ir in `fn=???`), run the additive callgrind+nm pass to
+    // NAME the hot functions. Cheap, well-symbolized tools skip this entirely.
+    let unk = unknown_ir_fraction(&cache);
+    if unk > 0.5 {
+        eprintln!(
+            "  [behavior] {label} run#{run_idx}: cachegrind symbol-blind ({:.1}% Ir in ???) — \
+             running callgrind+nm symbolization…",
+            unk * 100.0
+        );
+        match run_callgrind_symbolized(&spec, bin) {
+            Ok(fns) => {
+                eprintln!(
+                    "  [behavior] {label} run#{run_idx}: symbolized {} buckets (top: {})",
+                    fns.len(),
+                    fns.first().map(|f| f.name.as_str()).unwrap_or("<none>")
+                );
+                cache.fns = fns;
+            }
+            Err(e) => {
+                eprintln!("  [behavior] {label} run#{run_idx}: symbolization skipped: {e}")
+            }
+        }
+    }
     eprintln!("  [behavior] {label} run#{run_idx}: time -v…");
     let peak_rss_kb = run_time_v(&spec)?;
     eprintln!("  [behavior] {label} run#{run_idx}: strace…");
@@ -971,6 +1249,19 @@ fn report(
             f.ir,
             f.name
         );
+    }
+    // Comparator top functions. For a symbol-blind (nasm) comparator these names
+    // come from the callgrind+nm pass and are Ir-only (Dr+Dw==0).
+    if !l.cache.fns.is_empty() {
+        println!("\n{} top functions (by Ir):", l.label);
+        for f in l.cache.fns.iter().take(6) {
+            let traffic = f.dr + f.dw;
+            if traffic > 0 {
+                println!("  Ir={:>14}  Dr+Dw={:>14}  {}", f.ir, traffic, f.name);
+            } else {
+                println!("  Ir={:>14}  {}", f.ir, f.name);
+            }
+        }
     }
 
     // ---- write JSON artifact ----
@@ -1242,6 +1533,65 @@ pub fn selftest() -> ExitCode {
     // ---- 7. /usr/bin/time -v parser ----
     let tv = "\tCommand being timed: \"gzippy\"\n\tMaximum resident set size (kbytes): 8452\n";
     check(&mut fails, "time -v peak_rss", parse_time_v(tv) == Some(8452));
+
+    // ---- 8. callgrind+nm symbolization (the nasm st_size=0 fix) ----
+    // nm table: three keepable globals + one nasm-local `..@` label that MUST be
+    // dropped so its Ir folds into the enclosing global.
+    let nm = "0000000000001000 T func_alpha\n\
+              0000000000001500 t ..@local_label\n\
+              0000000000002000 T func_beta\n\
+              0000000000003000 W func_weak\n\
+              0000000000000800 d ignored_data\n";
+    let syms = parse_nm(nm);
+    check(&mut fails, "nm drops ..@ local + keeps 3", syms.len() == 3);
+    check(
+        &mut fails,
+        "nm sorted by addr",
+        syms[0].1 == "func_alpha" && syms[1].1 == "func_beta" && syms[2].1 == "func_weak",
+    );
+
+    // callgrind out (positions: instr line; events: Ir). Addresses exercise the
+    // absolute (0x..), relative (+16), and same (*) forms, plus a second object
+    // whose Ir must land in [other-obj]. main basename = "igzip".
+    let cg_instr = "positions: instr line\n\
+                    events: Ir\n\
+                    ob=(1) /usr/bin/igzip\n\
+                    fn=(1) ???\n\
+                    0x1000 10 100\n\
+                    +16 10 50\n\
+                    0x2000 20 200\n\
+                    0x3000 30 300\n\
+                    * 30 5\n\
+                    ob=(2) /lib/x86_64-linux-gnu/libc.so.6\n\
+                    fn=(2) ???\n\
+                    0x9000 5 40\n\
+                    summary: 695\n";
+    let sym = parse_callgrind_symbolized(cg_instr, "igzip", &syms).expect("cg symbolize");
+    // conservation: Σ mapped Ir == grand Ir == summary Ir.
+    check(
+        &mut fails,
+        "cg-sym conservation grand==summary",
+        sym.summary_ir == Some(695) && sym.grand_ir == 695,
+    );
+    check(
+        &mut fails,
+        "cg-sym conservation mapped==grand",
+        sym.mapped_ir == sym.grand_ir,
+    );
+    let ir_of = |name: &str| sym.fns.iter().find(|f| f.name == name).map(|f| f.ir);
+    // 0x1000 (100) + relative +16→0x1010 (50) both fall in func_alpha.
+    check(&mut fails, "cg-sym relative addr → alpha=150", ir_of("func_alpha") == Some(150));
+    check(&mut fails, "cg-sym beta=200", ir_of("func_beta") == Some(200));
+    // 0x3000 (300) + `*` same-addr (5) both fall in func_weak.
+    check(&mut fails, "cg-sym same-addr(*) → weak=305", ir_of("func_weak") == Some(305));
+    // second object's 40 Ir must NOT be attributed to a target symbol.
+    check(&mut fails, "cg-sym other-obj bucket=40", ir_of("[other-obj]") == Some(40));
+    // hottest is func_weak (305), sorted first.
+    check(
+        &mut fails,
+        "cg-sym top fn is func_weak",
+        sym.fns.first().map(|f| f.name.as_str()) == Some("func_weak"),
+    );
 
     // ---- report ----
     if fails.is_empty() {
