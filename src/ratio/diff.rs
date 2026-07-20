@@ -345,6 +345,11 @@ pub struct MapReport {
     pub probe_chain: u32,
     pub encoders: Vec<EncSummary>,
     pub frontier: EncSummary,
+    /// Which encoders' matches were folded into the frontier ("ALL" or a list).
+    pub fold_set: String,
+    /// Frontier deflate bits minus the smallest FOLDED encoder's bits: >0 ⇒ the
+    /// frontier BEATS the best folded encoder (real surpass from that matchset).
+    pub surpass_folded_bits: i64,
     /// Each encoder vs the frontier.
     pub diffs: Vec<DiffReport>,
     /// Pairwise encoder-vs-encoder (first two encoders), if ≥2 given.
@@ -358,6 +363,19 @@ pub struct MapOpts {
     pub probe_chain: u32,
     pub top_k: usize,
     pub emit_path: Option<String>,
+    /// Which encoders' tokens are FOLDED into the frontier's match set (via
+    /// `fold_edge`). `None` = all encoders (the FULL frontier = absolute
+    /// achievable lower bound). `Some([names])` = only those encoders — e.g.
+    /// `Some(["gzippy"])` yields the GZIPPY-MATCHSET-ONLY frontier: an optimal
+    /// parse over (fulcrum's own BT-class hash-chain finder at `max_chain`) ∪
+    /// (gzippy's own tokens), with NO ECT/zopfli fold. The difference between
+    /// the two frontiers is exactly the achievable bits contributed by the
+    /// unfolded encoders' specific matches beyond gzippy + a strong BT finder —
+    /// i.e. the finder gap that decides parse-closable vs finder-bound.
+    /// NOTE: the min-over-encoder-bytes floor that guarantees G0c is ALSO
+    /// restricted to the folded set, so a gzippy-only frontier is never capped
+    /// by ECT's actual bytes — it reflects only what gzippy's matchset reaches.
+    pub fold_only: Option<Vec<String>>,
 }
 
 impl Default for MapOpts {
@@ -368,6 +386,7 @@ impl Default for MapOpts {
             probe_chain: 128,
             top_k: 25,
             emit_path: None,
+            fold_only: None,
         }
     }
 }
@@ -451,7 +470,31 @@ pub fn map_core(
     // optimal tables can only match-or-beat that seed's actual bits, so the min
     // is provably ≤ every encoder. We pick by ACTUAL emitted deflate bits (not
     // the block_cost estimate) so stored-alignment slack can never break G0c.
-    let seed_refs: Vec<&TokenStream> = streams.iter().map(|(_, ts)| ts).collect();
+    // Restrict the folded seed set (and the G0c encoder-bytes floor) to
+    // `fold_only` when set — this is how the GZIPPY-MATCHSET-ONLY frontier is
+    // computed (fold gzippy only; the frontier is then never capped by ECT's
+    // bytes and reflects only what gzippy's own matchset + a strong BT finder
+    // reach).
+    let folded = |name: &str| {
+        opts.fold_only
+            .as_ref()
+            .map(|v| v.iter().any(|n| n == name))
+            .unwrap_or(true)
+    };
+    let seed_refs: Vec<&TokenStream> = streams
+        .iter()
+        .filter(|(n, _)| folded(n))
+        .map(|(_, ts)| ts)
+        .collect();
+    gate0.push(format!(
+        "frontier fold set: {} ({} of {} encoders)",
+        opts.fold_only
+            .as_ref()
+            .map(|v| v.join("+"))
+            .unwrap_or_else(|| "ALL".into()),
+        seed_refs.len(),
+        streams.len()
+    ));
     let squeezed = squeeze::squeeze(
         raw,
         opts.max_chain,
@@ -478,14 +521,22 @@ pub fn map_core(
     let mut frontier_gz = squeeze_gz;
     let mut frontier_bits = squeeze_bits;
     for ((name, ts), (_, gz)) in streams.iter().zip(encs.iter()) {
-        if ts.deflate_bits < frontier_bits {
+        // Only FOLDED encoders may floor the frontier (a gzippy-only frontier
+        // must not be pinned to ECT's bytes).
+        if folded(name) && ts.deflate_bits < frontier_bits {
             frontier_bits = ts.deflate_bits;
             frontier_gz = gz.clone();
             frontier_src = format!("encoder:{name}");
         }
     }
+    let min_folded_bits = streams
+        .iter()
+        .filter(|(n, _)| folded(n))
+        .map(|(_, t)| t.deflate_bits)
+        .min()
+        .unwrap_or(0);
     let surpass = if frontier_src == "squeeze" {
-        summaries.iter().map(|s| s.deflate_bits).min().unwrap_or(0) as i64 - squeeze_bits as i64
+        min_folded_bits as i64 - squeeze_bits as i64
     } else {
         0
     };
@@ -508,23 +559,22 @@ pub fn map_core(
     gate0.push("G0b frontier round-trip: PASS".into());
     let (fts, fsum) = extract_checked("frontier", &frontier_gz, raw)?;
     gate0.push("G0a conservation frontier: PASS".into());
-    // G0c: true-frontier check against every encoder.
-    for (name, ts) in &streams {
+    // G0c: true-frontier check against every FOLDED encoder. (A restricted
+    // fold set — e.g. gzippy-only — may legitimately land ABOVE an UNFOLDED
+    // encoder like ECT; that overshoot is the finder gap being measured, not a
+    // bug. The lower-bound guarantee only holds over the folded set, whose
+    // tokens the DP can always reproduce.)
+    for (name, ts) in streams.iter().filter(|(n, _)| folded(n)) {
         if fts.deflate_bits > ts.deflate_bits {
             return Err(void(&format!(
-                "G0c FRONTIER NOT A LOWER BOUND: frontier {} bits > {name} {} bits — DP/cost model buggy",
+                "G0c FRONTIER NOT A LOWER BOUND: frontier {} bits > folded {name} {} bits — DP/cost model buggy",
                 fts.deflate_bits, ts.deflate_bits
             )));
         }
     }
     gate0.push(format!(
-        "G0c frontier ≤ all encoders: PASS (frontier {} bits ≤ min enc {} bits)",
-        fts.deflate_bits,
-        streams
-            .iter()
-            .map(|(_, t)| t.deflate_bits)
-            .min()
-            .unwrap_or(0)
+        "G0c frontier ≤ folded encoders: PASS (frontier {} bits ≤ min folded {} bits)",
+        fts.deflate_bits, min_folded_bits
     ));
     if fts.tokens.is_empty() || (raw.len() > 4096 && fsum.matches == 0) {
         return Err(void(
@@ -583,6 +633,12 @@ pub fn map_core(
         probe_chain: opts.probe_chain,
         encoders: summaries,
         frontier: fsum,
+        fold_set: opts
+            .fold_only
+            .as_ref()
+            .map(|v| v.join("+"))
+            .unwrap_or_else(|| "ALL".into()),
+        surpass_folded_bits: min_folded_bits as i64 - fts.deflate_bits as i64,
         diffs,
         enc_vs_enc,
         gate0,
@@ -765,6 +821,9 @@ pub fn cmd_map(args: &[String]) -> ExitCode {
         opts.top_k = v.parse().unwrap_or(opts.top_k);
     }
     opts.emit_path = arg_val(args, "--emit");
+    if let Some(v) = arg_val(args, "--fold") {
+        opts.fold_only = Some(v.split(',').map(|s| s.trim().to_string()).collect());
+    }
 
     match map_core(&raw, &encs, &opts) {
         Ok((report, frontier_gz)) => {

@@ -111,6 +111,7 @@ pub fn run() -> ExitCode {
         ("degraded".to_string(), deg_gz),
     ];
     let opts = diff::MapOpts {
+        fold_only: None,
         max_chain: 1024,
         iters: 6,
         probe_chain: 64,
@@ -133,6 +134,7 @@ pub fn run() -> ExitCode {
     let big_opts = diff::MapOpts {
         top_k: usize::MAX,
         emit_path: None,
+        fold_only: None,
         ..opts
     };
     let (rep_big, _) = match diff::map_core(&raw, &encs, &big_opts) {
