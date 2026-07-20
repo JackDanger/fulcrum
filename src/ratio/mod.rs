@@ -362,6 +362,11 @@ pub fn usage() -> String {
        fulcrum ratio extract --gz FILE.gz [--json]\n\
        fulcrum ratio map --raw FILE --enc NAME=FILE.gz [--enc NAME=FILE.gz ...]\n\
                          [--emit OUT.gz] [--max-chain N] [--iters N]\n\
-                         [--top K] [--json OUT.json]\n"
+                         [--fold NAME[,NAME...]] [--top K] [--json OUT.json]\n\
+     \n\
+     --fold restricts which encoders' matches seed the frontier: omit for the\n\
+     FULL frontier (absolute lower bound over all encoders' matches); pass\n\
+     e.g. --fold gzippy for the GZIPPY-MATCHSET-ONLY frontier (what gzippy's\n\
+     own matches + a strong BT finder reach — never capped by ECT's bytes).\n"
         .to_string()
 }
