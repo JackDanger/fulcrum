@@ -396,7 +396,11 @@ fn void(reason: &str) -> String {
 }
 
 /// Extract + Gate-0a conservation for one .gz against the known raw bytes.
-fn extract_checked(name: &str, gz: &[u8], raw: &[u8]) -> Result<(TokenStream, EncSummary), String> {
+pub fn extract_checked(
+    name: &str,
+    gz: &[u8],
+    raw: &[u8],
+) -> Result<(TokenStream, EncSummary), String> {
     let (ts, dec) = inflate::extract_gz(gz).map_err(|e| void(&format!("{name}: extract: {e}")))?;
     if dec != raw {
         return Err(void(&format!("{name}: decoded bytes != raw input")));

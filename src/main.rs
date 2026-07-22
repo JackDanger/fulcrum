@@ -4440,6 +4440,7 @@ fn main() -> ExitCode {
         "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
         "behavior" => fulcrum::behavior::cmd_behavior(rest),
         "ratio" => fulcrum::ratio::cmd_ratio(rest),
+        "anatomy" => fulcrum::anatomy::cmd_anatomy(rest),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

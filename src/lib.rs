@@ -36,6 +36,7 @@ pub const PROTOCOL_VERSION: &str = "fulcrum-v3";
 
 pub mod abmeasure;
 pub mod alloc;
+pub mod anatomy;
 pub mod audit;
 pub mod behavior;
 pub mod binloc;

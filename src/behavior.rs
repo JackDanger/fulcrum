@@ -585,7 +585,10 @@ fn parse_callgrind_symbolized(
 /// instruction addresses to `nm` symbols. Returns Ir-only `FnCost`s (no cache
 /// events; this pass exists purely to NAME the hot functions cachegrind left as
 /// `???`). Enforces the Gate-0 conservation check before returning.
-fn run_callgrind_symbolized(spec: &RunSpec, binary_path: &str) -> Result<Vec<FnCost>, String> {
+pub(crate) fn run_callgrind_symbolized(
+    spec: &RunSpec,
+    binary_path: &str,
+) -> Result<Vec<FnCost>, String> {
     let out = spec.outdir.join(format!("cg_instr.{}.out", spec.tag));
     let mut c = Command::new("valgrind");
     c.arg("--tool=callgrind")
@@ -628,7 +631,7 @@ fn run_callgrind_symbolized(spec: &RunSpec, binary_path: &str) -> Result<Vec<FnC
 /// Fraction of a cachegrind profile's Ir attributed to unknown (`???`) funcs.
 /// A high value means the binary is symbol-blind (nasm st_size=0) and needs the
 /// callgrind+nm symbolization pass.
-fn unknown_ir_fraction(cache: &CacheProfile) -> f64 {
+pub(crate) fn unknown_ir_fraction(cache: &CacheProfile) -> f64 {
     if cache.ir == 0 {
         return 0.0;
     }
@@ -882,14 +885,14 @@ pub fn self_diff_max(a: &ToolProfile, b: &ToolProfile, input_bytes: u64) -> f64 
 // Backends (shell out to valgrind / time / strace) — box-side.
 // ======================================================================
 
-struct RunSpec<'a> {
-    bin: &'a str,
-    input: &'a str,
-    level: u32,
+pub(crate) struct RunSpec<'a> {
+    pub(crate) bin: &'a str,
+    pub(crate) input: &'a str,
+    pub(crate) level: u32,
     /// gzippy needs `-p1`; libdeflate has no thread flag.
-    single_thread_flag: bool,
-    outdir: &'a Path,
-    tag: &'a str,
+    pub(crate) single_thread_flag: bool,
+    pub(crate) outdir: &'a Path,
+    pub(crate) tag: &'a str,
 }
 
 fn run_dhat(spec: &RunSpec) -> Result<AllocProfile, String> {
@@ -913,7 +916,7 @@ fn run_dhat(spec: &RunSpec) -> Result<AllocProfile, String> {
     parse_dhat(&json)
 }
 
-fn run_cachegrind(spec: &RunSpec) -> Result<CacheProfile, String> {
+pub(crate) fn run_cachegrind(spec: &RunSpec) -> Result<CacheProfile, String> {
     let out = spec.outdir.join(format!("cg.{}.out", spec.tag));
     let mut c = Command::new("valgrind");
     c.arg("--tool=cachegrind")
