@@ -496,10 +496,41 @@ fn resolve_addr(tok: &str, last: u64) -> Option<u64> {
 }
 
 /// Map a callgrind instr-level out-file to nm symbols. `syms` MUST be sorted by
-/// address. Faithful Rust port of sf1_cgmap.py. Honors the `positions:` /
-/// `events:` headers (never hardcodes Ir's column), tracks `ob=` to only
-/// symbolize the target binary (others → `[other-obj]`), and resolves relative
-/// instruction addresses against the last-seen address.
+/// address. Honors the `positions:` / `events:` headers (never hardcodes Ir's
+/// column), tracks `ob=` to only symbolize the target binary (others →
+/// `[other-obj]`), and resolves relative instruction addresses against the
+/// last-seen address.
+///
+/// Two conservation bugs were found (and fixed here) via a real igzip
+/// `--dump-instr=yes` trace (`/root/locate5/cg/igzip_text6.callgrind`,
+/// SF-igzip-symbolization campaign):
+///
+/// 1. **`ob=`/`cob=` share ONE id namespace, but only `ob=` was tracked.**
+///    callgrind may introduce an object's canonical path via a `cob=`
+///    (call-target-object) directive rather than `ob=` — e.g. igzip's own
+///    path in that trace appears ONLY as `cob=(5) /root/isal-src/.../igzip`;
+///    every later self-cost section switches to it via the short form
+///    `ob=(5)`. A parser that only registers ids seen on `ob=` lines never
+///    learns id 5 → igzip, so 100% of igzip's own code silently misattributes
+///    to `[other-obj]` (this is the exact failure that killed the prior
+///    `sf1_cgmap.py`). Fix: `register_named` runs on BOTH `ob=` and `cob=`
+///    lines into the SAME `ob_table`; only `ob=` (not `cob=`) flips the
+///    "are we currently in the main object" context, since `cob=` merely
+///    names the callee of an upcoming call annotation.
+/// 2. **Call-arc inclusive-cost lines were double-counted as self-cost.**
+///    Every `calls=<N> <pos>` directive is followed by exactly one cost line
+///    that reports the INCLUSIVE cost of that call (aggregated over all N
+///    invocations) — this is the same underlying instructions' cost that is
+///    ALSO recorded, in full, under the callee's own `fn=`/`ob=` self-cost
+///    section elsewhere in the file. Summing every cost-shaped line
+///    (self-cost AND call-arc) inflates the total by one extra copy per
+///    ancestor call-site on the path to each instruction — measured 9.02x
+///    inflation vs the file's own `summary:` on a real igzip trace (naive
+///    sum 1,180,477,361 vs summary 130,862,918; excluding exactly the 546
+///    call-arc lines that follow the 546 `calls=` directives lands EXACTLY
+///    on 130,862,918 — verified on two independent traces, text6 and bin6).
+///    Fix: track a `pending_call_arc` flag set by `calls=` and cleared by
+///    the next cost line, which is skipped (not summed) when the flag is set.
 fn parse_callgrind_symbolized(
     text: &str,
     main_basename: &str,
@@ -517,12 +548,17 @@ fn parse_callgrind_symbolized(
 
     let mut positions: Vec<String> = vec![];
     let mut events: Vec<String> = vec![];
+    // Shared id->path table: `ob=` and `cob=` reference-compress into ONE
+    // namespace (bug 1 above) — both directives register into it.
     let mut ob_table: BTreeMap<u64, String> = BTreeMap::new();
     let mut cur_is_main = false;
     let mut last_addr: u64 = 0;
     let mut grand_ir: u64 = 0;
     let mut summary_ir: Option<u64> = None;
     let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
+    // Set by `calls=`, consumed (and cleared) by the very next cost line,
+    // which is the call-arc's inclusive-cost annotation, not self-cost.
+    let mut pending_call_arc = false;
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("positions:") {
@@ -533,10 +569,21 @@ fn parse_callgrind_symbolized(
             events = rest.split_whitespace().map(|s| s.to_string()).collect();
             continue;
         }
+        if let Some(rest) = line.strip_prefix("cob=") {
+            // cob= (call-target object) may be the ONLY place an object's
+            // full path is ever introduced (bug 1) — register it, but it
+            // does NOT change "current object" context; only `ob=` does.
+            register_named(rest, &mut ob_table);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("ob=") {
             // ob= may use `(N) name` / `(N)` reference compression, like fn=.
             let name = register_named(rest, &mut ob_table);
             cur_is_main = name.contains(main_basename);
+            continue;
+        }
+        if line.starts_with("calls=") {
+            pending_call_arc = true;
             continue;
         }
         if let Some(rest) = line
@@ -573,7 +620,16 @@ fn parse_callgrind_symbolized(
             Some(a) => a,
             None => continue,
         };
+        // Position state (last_addr) is tracked across ALL position-bearing
+        // lines, self-cost and call-arc alike — callgrind's position stream
+        // is global, not reset per fn=/cfn= context — but call-arc lines'
+        // Ir is skipped (bug 2): it is already counted under the callee's
+        // own fn= self-cost section elsewhere in the file.
         last_addr = addr;
+        if pending_call_arc {
+            pending_call_arc = false;
+            continue;
+        }
         let ir: u64 = toks[positions.len() + ir_ev].parse().unwrap_or(0);
         grand_ir += ir;
         let key = if cur_is_main {
@@ -1621,6 +1677,59 @@ pub fn selftest() -> ExitCode {
         sym.fns.first().map(|f| f.name.as_str()) == Some("func_weak"),
     );
 
+    // ---- 9. callgrind+nm: cob=-only object id + call-arc double-count ----
+    // Reproduces the two conservation bugs found on a real igzip
+    // `--dump-instr=yes` trace: (a) the main object's path is introduced
+    // ONLY via `cob=`, never `ob=` — a parser that only tracks `ob=` never
+    // learns the id and silently misattributes 100% of the main binary's
+    // own cost to `[other-obj]`; (b) the cost line following `calls=` is the
+    // CALL-ARC's inclusive cost (already counted under the callee's own
+    // `fn=`/`ob=` self-cost section elsewhere in the file) — summing it too
+    // measured a 9.02x mapped-Ir-vs-summary blowup on the real trace.
+    let nm9 = "0000000000002000 T igzip_worker_sym\n";
+    let syms9 = parse_nm(nm9);
+    let cg9 = "positions: instr line\n\
+              events: Ir\n\
+              ob=(1) /usr/lib/other.so\n\
+              fn=(1) caller_fn\n\
+              0x1000 1 100\n\
+              cfi=(2) some.c\n\
+              cfn=(2) igzip_worker\n\
+              cob=(9) /usr/bin/igzip\n\
+              calls=1 0x1000 1\n\
+              * * 999\n\
+              ob=(9)\n\
+              fn=(2) igzip_worker\n\
+              0x2000 1 40\n\
+              0x2010 1 60\n\
+              summary: 200\n";
+    match parse_callgrind_symbolized(cg9, "igzip", &syms9) {
+        Ok(sym9) => {
+            check(
+                &mut fails,
+                "cg-sym cob-fixture conservation == summary(200)",
+                sym9.summary_ir == Some(200) && sym9.grand_ir == 200 && sym9.mapped_ir == 200,
+            );
+            let ir_of9 = |name: &str| sym9.fns.iter().find(|f| f.name == name).map(|f| f.ir);
+            check(
+                &mut fails,
+                "cg-sym cob-fixture call-arc 999 excluded",
+                sym9.fns.iter().all(|f| f.ir != 999),
+            );
+            check(
+                &mut fails,
+                "cg-sym cob-fixture cob=-only main object attributed",
+                ir_of9("igzip_worker_sym") == Some(100),
+            );
+            check(
+                &mut fails,
+                "cg-sym cob-fixture other-obj = caller only",
+                ir_of9("[other-obj]") == Some(100),
+            );
+        }
+        Err(e) => fails.push(format!("cg-sym cob-fixture parse failed: {e}")),
+    }
+
     // ---- report ----
     if fails.is_empty() {
         println!("BEHAVIOR_SELFTEST=PASS checks=all-green method=\"behavior-v1;parsers+diff\"");
@@ -1658,5 +1767,66 @@ mod tests {
         let p = parse_dhat(d).unwrap();
         assert_eq!(p.total_bytes, 10);
         assert_eq!(p.total_count, 1);
+    }
+
+    /// Fixture reproducing BOTH conservation bugs found on a real igzip
+    /// `--dump-instr=yes` trace (`/root/locate5/cg/igzip_text6.callgrind`):
+    ///
+    /// 1. the main object ("igzip") is introduced ONLY via a `cob=` line
+    ///    (never a plain `ob=` with a path) — a parser that only tracks
+    ///    `ob=` for the id->path table never learns id 9 means igzip, so the
+    ///    later short-form `ob=(9)` context switch fails to recognize it as
+    ///    "main" and its self-cost silently falls into `[other-obj]`.
+    /// 2. the `calls=1 ...` directive is followed by ONE inclusive-cost line
+    ///    (`* * 999`) that double-counts the real self-cost (100) already
+    ///    recorded under igzip_worker's own `fn=`/`ob=(9)` section — a naive
+    ///    parser that sums every cost-shaped line regardless of context
+    ///    inflates the total (this is the mechanism behind the measured
+    ///    9.02x mapped-Ir-vs-summary blowup on the real trace).
+    ///
+    /// A correct parser must (a) attribute the 100 Ir of `igzip_worker` to
+    /// its symbol (not `[other-obj]`), and (b) exclude the 999 call-arc line
+    /// entirely, landing exactly on `summary: 200`.
+    #[test]
+    fn cg_symbolize_cob_only_object_and_call_arc_conservation() {
+        let nm = "0000000000002000 T igzip_worker_sym\n";
+        let syms = parse_nm(nm);
+        assert_eq!(syms.len(), 1);
+
+        let cg_instr = "positions: instr line\n\
+                        events: Ir\n\
+                        ob=(1) /usr/lib/other.so\n\
+                        fn=(1) caller_fn\n\
+                        0x1000 1 100\n\
+                        cfi=(2) some.c\n\
+                        cfn=(2) igzip_worker\n\
+                        cob=(9) /usr/bin/igzip\n\
+                        calls=1 0x1000 1\n\
+                        * * 999\n\
+                        ob=(9)\n\
+                        fn=(2) igzip_worker\n\
+                        0x2000 1 40\n\
+                        0x2010 1 60\n\
+                        summary: 200\n";
+        let sym = parse_callgrind_symbolized(cg_instr, "igzip", &syms)
+            .expect("cg symbolize (cob fixture)");
+
+        // Gate-0: conservation against the file's OWN declared summary, not
+        // just the parser's two internal accumulators agreeing with each
+        // other (that agreement is true by construction and proves nothing
+        // — this is the trap the prior cgmap2.py self-check fell into).
+        assert_eq!(sym.summary_ir, Some(200));
+        assert_eq!(sym.grand_ir, 200);
+        assert_eq!(sym.mapped_ir, 200);
+
+        let ir_of = |name: &str| sym.fns.iter().find(|f| f.name == name).map(|f| f.ir);
+        // The call-arc's 999 must be excluded entirely — it appears nowhere.
+        assert!(sym.fns.iter().all(|f| f.ir != 999));
+        // igzip_worker's real self-cost (40+60) must land on its symbol, via
+        // the cob=-introduced id 9 being recognized as "main" on `ob=(9)`.
+        assert_eq!(ir_of("igzip_worker_sym"), Some(100));
+        // The caller's own cost (in a genuinely different object) is the
+        // only thing that should land in [other-obj].
+        assert_eq!(ir_of("[other-obj]"), Some(100));
     }
 }
