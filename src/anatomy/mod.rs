@@ -355,12 +355,28 @@ fn arg_val(args: &[String], key: &str) -> Option<String> {
 
 /// Run `CMD -{level} -c {input}` (the gzip-compatible CLI convention already
 /// used by `behavior::push_args_only`) and capture stdout as the `.gz` bytes.
-fn run_encoder(cmd: &str, level: u32, input: &str) -> Result<Vec<u8>, String> {
-    let out = Command::new(cmd)
-        .arg(format!("-{level}"))
-        .arg("-c")
-        .arg(input)
-        .stdin(Stdio::null())
+/// Encoder identity check mirroring `macmeasure::insnattr_is_gzippy` — gzippy
+/// defaults `-p` to "all CPUs" (`--help`), which silently switches it onto the
+/// pure-Rust PARALLEL multi-block encoder and produces different token-level
+/// structure than a single-stream comparator (igzip has no such default). Any
+/// `--enc NAME=CMD` whose NAME contains "gzippy" (case-insensitive) gets a
+/// forced `-p1` so every arm (token-level, --exec, --counters-from-stderr)
+/// measures the SAME single-stream engine the anatomy-counters integration
+/// test pins (`tests/anatomy_counters.rs`'s `compress_with_counters` also
+/// hardcodes `-p 1`). Comparators without a thread flag (igzip) are
+/// unaffected.
+fn is_gzippy_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("gzippy")
+}
+
+fn run_encoder(name: &str, cmd: &str, level: u32, input: &str) -> Result<Vec<u8>, String> {
+    let mut c = Command::new(cmd);
+    c.arg(format!("-{level}"));
+    if is_gzippy_name(name) {
+        c.arg("-p1");
+    }
+    c.arg("-c").arg(input).stdin(Stdio::null());
+    let out = c
         .output()
         .map_err(|e| format!("spawn '{cmd}': {e}"))?;
     if !out.status.success() {
@@ -483,7 +499,7 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
 
     let mut anatomies: Vec<Anatomy> = Vec::new();
     for (name, cmd) in &encs {
-        let gz = match run_encoder(cmd, level, &input_path) {
+        let gz = match run_encoder(name, cmd, level, &input_path) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("{}", void(name, &e));

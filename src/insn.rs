@@ -1081,6 +1081,23 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             "find_match",
             "icf",
             "skip_match",
+            // CALIBRATED 2026-07-22 (gzippy @ 6726cf38, dd79_text6/dd79_bin6
+            // L1, cachegrind+`--read-inline-info=yes` vs the gzippy
+            // `anatomy-counters` exact side): at L1/L0, LTO fuses the ENTIRE
+            // igzip-class chainless single-probe matchfinder
+            // (`compress/deflate/parse/fast.rs` -- see that file's own doc
+            // comment, "The match finder is a port of igzip's level-0/1
+            // deflate body") into one outer `fn=compress` symbol shared with
+            // unrelated wrapper code, so the bare function name carries no
+            // signal (confirmed: `hc_probe_attempts`/`bt_probe_attempts` are
+            // BOTH EXACTLY ZERO at L1 on both corpora -- L1 does not call
+            // `HcMatchfinder`/`BtMatchfinder` at all). `FnCost::file` (this
+            // module's caller folds it into the categorization haystack)
+            // recovers the split via cachegrind's inline-info `fl=`
+            // attribution: match this specific file fragment, not `fast`
+            // alone (huffman/fast.rs — the UNRELATED L1-named-coincidence
+            // Huffman-code builder file — would collide on a bare "fast").
+            "parse/fast.rs",
         ],
     ),
     (
@@ -1094,6 +1111,20 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             "freq",
             "code_length",
             "count_syms",
+            // CALIBRATED 2026-07-22 (see match_finder's note above for the
+            // method): `make_huffman_code` (huffman/fast.rs) and
+            // `build_dynamic_header` (huffman/header.rs) are REAL,
+            // NOT-inlined-away symbols on gzippy's L1/L6 path (confirmed
+            // present as their own `fn=` entries in cachegrind, ~1-2% of
+            // total Ir each) that the original keyword list missed entirely
+            // -- neither symbol's bare name contains any prior keyword, so
+            // 100% of their Ir silently fell into `uncategorized_ir`. Cross-
+            // checked against the exact `huffman_make_code_calls` counter
+            // (gzippy `anatomy-counters`): L1/text6 = 290 calls, reconciling
+            // exactly to `2 + 3*blocks_emitted_dynamic` per the integration
+            // test's closed-form (`tests/anatomy_counters.rs`).
+            "make_huffman",
+            "dynamic_header",
         ],
     ),
     (
@@ -1106,6 +1137,21 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             "write_bits",
             "compress_block",
             "encode_lit",
+            // CALIBRATED 2026-07-22: `emit_sequences` (parse/mod.rs) is the
+            // shared token->bitstream encoder EVERY parse strategy funnels
+            // through (greedy/lazy/fast/near_optimal all call the same
+            // `emit_block`->`emit_sequences`) -- it is gzippy's single
+            // largest standalone (non-fused) symbol on the L1 profile
+            // (~28% of total Ir) and matched NO prior keyword, so it was
+            // 100% uncategorized. `emit_block` (parse/mod.rs) is the
+            // block-type dispatch (stored/fixed/dynamic) + header write
+            // wrapping `emit_sequences`; kept in this category (not
+            // `block_split`, which is reserved for `block_split.rs`'s
+            // SPLIT-DECISION heuristic/tally machinery, a distinct concept
+            // the gzippy `anatomy_counters` module also keeps separate as
+            // `block_split_observations` vs `blocks_emitted_*`).
+            "emit_sequences",
+            "emit_block",
         ],
     ),
     (
@@ -1126,7 +1172,20 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             "copy_bytes",
             "memcpy",
             "output",
-            "stream",
+            // "stream" REMOVED 2026-07-22 (calibration pass, see
+            // match_finder/huffman_build/huffman_encode's CALIBRATED notes
+            // above): once `FnCost::file` folds the cachegrind `fl=` source
+            // path into the categorization haystack, a bare "stream" is a
+            // landmine in this domain -- gzippy's `bitstream.rs` (the
+            // bit-level I/O primitive `emit_sequences` inlines from) matches
+            // it on EVERY encode-side profile, colliding with
+            // `huffman_encode`'s "emit_sequences"/"write_bits" (REFUSING
+            // ambiguity, confirmed: `ANATOMY=VOID ... matches categories
+            // ['huffman_encode','output_io']` on gzippy L1/dd79_text6
+            // before this fix). `write`/`output`/`flush_output` already
+            // cover the intended "actual syscall-level I/O" symbols
+            // (`write`, `fwrite`, `flush_output_buffer`-style names)
+            // without the collision.
             "flush_output",
         ],
     ),

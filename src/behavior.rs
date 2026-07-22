@@ -225,6 +225,17 @@ pub fn parse_dhat(json: &str) -> Result<AllocProfile, String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnCost {
     pub name: String,
+    /// Source file this cost was attributed to, from cachegrind's `fl=`
+    /// directive (present when the capture used `--read-inline-info=yes`).
+    /// After full LTO inlining, MANY semantically-distinct call sites (a
+    /// match-finder probe, a Sink push, a bitstream write) can share ONE
+    /// physical `fn=` symbol (the outer function they got inlined into) —
+    /// `fl=` still disambiguates them by ORIGIN FILE even though `name` is
+    /// identical, because cachegrind's inline-info attributes each cost line
+    /// to the source location it actually came from. `None` when the
+    /// capture had no `fl=` context (the callgrind+nm symbol-blind fallback,
+    /// which only recovers addresses -> nm symbols, no source file).
+    pub file: Option<String>,
     pub ir: u64,
     pub dr: u64,
     pub dw: u64,
@@ -256,8 +267,14 @@ pub fn parse_cachegrind(text: &str) -> Result<CacheProfile, String> {
     // event name -> column index within a cost line
     let mut ev_idx: BTreeMap<String, usize> = BTreeMap::new();
     let mut fn_names: BTreeMap<u64, String> = BTreeMap::new();
+    let mut file_names: BTreeMap<u64, String> = BTreeMap::new();
     let mut cur_fn: Option<String> = None;
-    let mut per_fn: BTreeMap<String, FnCost> = BTreeMap::new();
+    // `fl=` is STICKY (persists across subsequent `fn=` blocks until another
+    // `fl=` appears) -- separate numbering pool from `fn=`'s `(N)` refs, so a
+    // dedicated `file_names` table (never `fn_names`) per cachegrind's
+    // per-specification-type compression scheme.
+    let mut cur_file: Option<String> = None;
+    let mut per_fn: BTreeMap<(String, String), FnCost> = BTreeMap::new();
     let mut summary: Option<Vec<u64>> = None;
 
     let col = |ev_idx: &BTreeMap<String, usize>, name: &str| -> Option<usize> {
@@ -283,8 +300,11 @@ pub fn parse_cachegrind(text: &str) -> Result<CacheProfile, String> {
             cur_fn = Some(register_named(rest, &mut fn_names));
             continue;
         }
-        if line.starts_with("fl=")
-            || line.starts_with("fi=")
+        if let Some(rest) = line.strip_prefix("fl=") {
+            cur_file = Some(register_named(rest, &mut file_names));
+            continue;
+        }
+        if line.starts_with("fi=")
             || line.starts_with("fe=")
             || line.starts_with("desc:")
             || line.starts_with("cmd:")
@@ -315,14 +335,18 @@ pub fn parse_cachegrind(text: &str) -> Result<CacheProfile, String> {
                 continue;
             }
             if let Some(fname) = &cur_fn {
-                let e = per_fn.entry(fname.clone()).or_insert(FnCost {
-                    name: fname.clone(),
-                    ir: 0,
-                    dr: 0,
-                    dw: 0,
-                    d1_miss: 0,
-                    ll_miss: 0,
-                });
+                let file_key = cur_file.clone().unwrap_or_default();
+                let e = per_fn
+                    .entry((file_key, fname.clone()))
+                    .or_insert(FnCost {
+                        name: fname.clone(),
+                        file: cur_file.clone(),
+                        ir: 0,
+                        dr: 0,
+                        dw: 0,
+                        d1_miss: 0,
+                        ll_miss: 0,
+                    });
                 let g = |name: &str| col(&ev_idx, name).and_then(|i| nums.get(i)).copied().unwrap_or(0);
                 e.ir += g("Ir");
                 e.dr += g("Dr");
@@ -565,6 +589,7 @@ fn parse_callgrind_symbolized(
         .into_iter()
         .map(|(name, ir)| FnCost {
             name,
+            file: None,
             ir,
             dr: 0,
             dw: 0,

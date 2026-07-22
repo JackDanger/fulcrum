@@ -191,7 +191,15 @@ fn categorize(fns: &[behavior::FnCost]) -> Result<(BTreeMap<String, u64>, u64, u
     let mut total_ir = 0u64;
     for f in fns {
         total_ir += f.ir;
-        match resolve_category(&f.name, ENCODE_INSN_CATEGORIES) {
+        // See `behavior::FnCost::file` doc: fold the originating source file
+        // into the haystack `resolve_category` matches keywords against, so
+        // LTO-fused symbols (e.g. everything inlined into one `fn=compress`)
+        // can still be told apart by which FILE the cost line came from.
+        let haystack = match &f.file {
+            Some(file) => format!("{file} {}", f.name),
+            None => f.name.clone(),
+        };
+        match resolve_category(&haystack, ENCODE_INSN_CATEGORIES) {
             Ok(Some(cat)) => {
                 *category_ir.entry(cat.to_string()).or_insert(0) += f.ir;
             }
@@ -211,6 +219,7 @@ fn categorize(fns: &[behavior::FnCost]) -> Result<(BTreeMap<String, u64>, u64, u
 pub(crate) fn selftest_categorize() -> Result<(), String> {
     let mk = |name: &str, ir: u64| behavior::FnCost {
         name: name.to_string(),
+        file: None,
         ir,
         dr: 0,
         dw: 0,
@@ -267,11 +276,16 @@ pub fn run_exec_anatomy(
     let outdir = Path::new("/tmp/fulcrum-anatomy");
     std::fs::create_dir_all(outdir).map_err(|e| format!("mkdir {}: {e}", outdir.display()))?;
     let tag = format!("{name}.L{level}");
+    // See `anatomy::is_gzippy_name` doc: gzippy defaults `-p` to "all CPUs",
+    // which would silently swap the cachegrind arm onto the parallel
+    // multi-block encoder. Pin `-p1` for any gzippy-named encoder so the
+    // Ir-share attribution is measured against the SAME single-stream
+    // engine the token-level arm and the exact counters arm both use.
     let spec = RunSpec {
         bin: cmd,
         input,
         level,
-        single_thread_flag: false,
+        single_thread_flag: super::is_gzippy_name(name),
         outdir,
         tag: &tag,
     };
@@ -362,11 +376,13 @@ pub fn run_gzippy_counters(
     level: u32,
     input: &str,
 ) -> Result<GzippyExecCounters, String> {
-    let out = std::process::Command::new(cmd)
-        .arg(format!("-{level}"))
-        .arg("-c")
-        .arg(input)
-        .stdin(std::process::Stdio::null())
+    let mut gc_cmd = std::process::Command::new(cmd);
+    gc_cmd.arg(format!("-{level}"));
+    if super::is_gzippy_name(name) {
+        gc_cmd.arg("-p1");
+    }
+    gc_cmd.arg("-c").arg(input).stdin(std::process::Stdio::null());
+    let out = gc_cmd
         .output()
         .map_err(|e| format!("spawn '{cmd}': {e}"))?;
     if !out.status.success() {
