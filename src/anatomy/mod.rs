@@ -427,6 +427,7 @@ struct Report<'a> {
     encoders: &'a [Anatomy],
     diffs: &'a [AnatomyDiff],
     exec: &'a [exec::ExecAnatomy],
+    gzippy_counters: &'a [exec::GzippyExecCounters],
 }
 
 pub fn cmd_anatomy(args: &[String]) -> ExitCode {
@@ -442,6 +443,13 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
         .unwrap_or(6);
     let json_out = arg_val(args, "--json");
     let want_exec = args.iter().any(|a| a == "--exec");
+    // Ingest gzippy's own `anatomy-counters` feature output instead of (or
+    // alongside) cachegrind: exact semantic-work-unit counts gathered DURING
+    // the same `cmd -{level} -c {input}` run, versus `--exec`'s whole-program
+    // Ir-share attribution. Best-effort per encoder (an `--enc` entry that
+    // isn't a gzippy-with-counters binary just gets SKIPPED for this arm,
+    // same non-blocking contract `--exec`'s cachegrind pass already has).
+    let want_counters_from_stderr = args.iter().any(|a| a == "--counters-from-stderr");
     let top_k: usize = arg_val(args, "--top")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
@@ -502,6 +510,17 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
         }
     }
 
+    let mut gzippy_counters: Vec<exec::GzippyExecCounters> = Vec::new();
+    if want_counters_from_stderr {
+        for (name, cmd) in &encs {
+            eprintln!("  [anatomy] exec-level {name}: gzippy anatomy-counters…");
+            match exec::run_gzippy_counters(name, cmd, level, &input_path) {
+                Ok(gc) => gzippy_counters.push(gc),
+                Err(e) => eprintln!("  [anatomy] exec-level {name}: SKIPPED ({e})"),
+            }
+        }
+    }
+
     for a in &anatomies {
         println!("{}", render_human(a));
     }
@@ -516,6 +535,9 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     for ea in &exec_anatomies {
         println!("{}", exec::render_human(ea));
     }
+    for gc in &gzippy_counters {
+        println!("{}", exec::render_gzippy_counters_human(gc));
+    }
 
     if let Some(p) = &json_out {
         let rep = Report {
@@ -524,6 +546,7 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
             encoders: &anatomies,
             diffs: &diffs,
             exec: &exec_anatomies,
+            gzippy_counters: &gzippy_counters,
         };
         match serde_json::to_string_pretty(&rep) {
             Ok(j) => {
@@ -540,10 +563,11 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     }
 
     println!(
-        "ANATOMY=PASS encoders={} pairs={} exec_arms={}",
+        "ANATOMY=PASS encoders={} pairs={} exec_arms={} gzippy_counter_arms={}",
         anatomies.len(),
         diffs.len(),
-        exec_anatomies.len()
+        exec_anatomies.len(),
+        gzippy_counters.len(),
     );
     ExitCode::SUCCESS
 }
@@ -554,7 +578,8 @@ pub fn usage() -> String {
      Usage:\n\
        fulcrum anatomy selftest\n\
        fulcrum anatomy --enc NAME=CMD [--enc NAME=CMD ...] --input FILE\n\
-                       [--level N] [--top K] [--exec] [--json OUT.json]\n\
+                       [--level N] [--top K] [--exec] [--counters-from-stderr]\n\
+                       [--json OUT.json]\n\
      \n\
      CMD is invoked as `CMD -{level} -c {input}` (the gzip-CLI convention);\n\
      stdout must be the .gz bytes. Token-level structure (tokens, literals,\n\
@@ -563,7 +588,13 @@ pub fn usage() -> String {
      needed. --exec additionally runs each CMD under cachegrind and buckets\n\
      Ir by role (match_finder/huffman_build/huffman_encode/block_split/crc/\n\
      output_io); that arm is CALIBRATION-PENDING (see `anatomy::exec` docs)\n\
-     and requires `valgrind` + `nm` on PATH.\n"
+     and requires `valgrind` + `nm` on PATH. --counters-from-stderr instead\n\
+     (or additionally) reads an EXACT execution-level count straight off a\n\
+     gzippy-with-`anatomy-counters`-feature binary's stderr\n\
+     (`ANATOMY_COUNTERS={json}` at process end) -- no valgrind needed, no\n\
+     calibration gap, best-effort per encoder (a non-gzippy or feature-off\n\
+     CMD just gets SKIPPED for this arm, same as a failed --exec cachegrind\n\
+     run).\n"
         .to_string()
 }
 

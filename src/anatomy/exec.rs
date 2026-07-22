@@ -328,6 +328,113 @@ pub fn run_exec_anatomy(
     })
 }
 
+/// Exact execution-level counters read from a gzippy-with-`anatomy-counters`
+/// binary's stderr, instead of a whole-program cachegrind Ir-share
+/// attribution. This is the CALIBRATED half the module doc's SPEC promised —
+/// `calibration_status` says so, in contrast to [`ExecAnatomy`]'s perpetual
+/// "UNCALIBRATED". Ingests the gzippy-side counter list the SPEC above
+/// specifies (`src/compress/deflate/anatomy_counters.rs`, gzippy repo
+/// `feat/pure-rust-encoder`): `hc_*`/`bt_*` match-finder probe/hash/table
+/// events, `literals_emitted`/`matches_emitted`(`_fast`)/`histogram_updates`,
+/// `block_split_observations`, `blocks_emitted_{stored,fixed,dynamic}`,
+/// `huffman_tree_nodes_visited`/`huffman_length_limited_calls`/
+/// `huffman_make_code_calls`, `alloc_events`/`alloc_bytes`,
+/// `match_length_bytes_total` (the gzippy-side worker's two justified
+/// additions beyond the SPEC's literal list — see that module's doc for why).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GzippyExecCounters {
+    pub name: String,
+    /// Raw key→count map, field names matching gzippy's `AnatomyCounters`
+    /// struct 1:1 (its `to_json`'s declared output shape).
+    pub counters: BTreeMap<String, u64>,
+    pub calibration_status: &'static str,
+}
+
+/// Run `cmd -{level} -c {input}` and parse the `ANATOMY_COUNTERS={json}`
+/// line gzippy's `anatomy-counters` feature prints to stderr at process end.
+/// Best-effort, like [`run_exec_anatomy`]'s cachegrind arm: `Err` (never a
+/// panic) when the binary doesn't emit the line — a comparator that isn't
+/// gzippy-with-counters, or a gzippy build without the feature — so the
+/// caller can skip just this arm rather than voiding the whole `anatomy` run.
+pub fn run_gzippy_counters(
+    name: &str,
+    cmd: &str,
+    level: u32,
+    input: &str,
+) -> Result<GzippyExecCounters, String> {
+    let out = std::process::Command::new(cmd)
+        .arg(format!("-{level}"))
+        .arg("-c")
+        .arg(input)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn '{cmd}': {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "'{cmd} -{level} -c {input}' exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("ANATOMY_COUNTERS="))
+        .ok_or_else(|| {
+            format!(
+                "no ANATOMY_COUNTERS= line on '{cmd}' stderr \
+                 (not gzippy-with-`anatomy-counters`, or the feature is off)"
+            )
+        })?;
+    let counters = parse_flat_json_u64(line)?;
+    Ok(GzippyExecCounters {
+        name: name.to_string(),
+        counters,
+        calibration_status: "EXACT (gzippy anatomy-counters feature: semantic-work-unit counts \
+                              gathered DURING this run, not a whole-program Ir-share \
+                              attribution — see src/compress/deflate/anatomy_counters.rs in the \
+                              gzippy repo)",
+    })
+}
+
+/// Parse the flat `{"key":123,...}` object gzippy's `AnatomyCounters::to_json`
+/// emits: no nesting, no strings-with-commas, unsigned integers only, so a
+/// hand-rolled split is sufficient (no `serde_json` value round-trip needed).
+fn parse_flat_json_u64(s: &str) -> Result<BTreeMap<String, u64>, String> {
+    let body = s
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| format!("not a flat JSON object: {s}"))?;
+    let mut map = BTreeMap::new();
+    if body.is_empty() {
+        return Ok(map);
+    }
+    for pair in body.split(',') {
+        let (k, v) = pair
+            .split_once(':')
+            .ok_or_else(|| format!("malformed key:value pair {pair:?} in {s}"))?;
+        let key = k.trim().trim_matches('"').to_string();
+        let val: u64 = v
+            .trim()
+            .parse()
+            .map_err(|_| format!("non-integer value for {key}: {v:?}"))?;
+        map.insert(key, val);
+    }
+    Ok(map)
+}
+
+pub fn render_gzippy_counters_human(e: &GzippyExecCounters) -> String {
+    let mut s = format!(
+        "EXEC-ANATOMY(EXACT) {} -- {}\n",
+        e.name, e.calibration_status
+    );
+    for (k, v) in &e.counters {
+        s.push_str(&format!("  {k:<28} {v:>14}\n"));
+    }
+    s
+}
+
 pub fn render_human(e: &ExecAnatomy) -> String {
     let mut s = format!(
         "EXEC-ANATOMY {} [{}] total_ir={} uncategorized_ir={} ({:.1}%) -- {}\n",
@@ -365,5 +472,27 @@ mod tests {
         assert_eq!(uncat, 0);
         assert_eq!(total, 0);
         assert!(cats.values().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn parse_flat_json_u64_basic() {
+        let m = parse_flat_json_u64(r#"{"a":1,"b":23,"c":0}"#).expect("parse");
+        assert_eq!(m.get("a"), Some(&1));
+        assert_eq!(m.get("b"), Some(&23));
+        assert_eq!(m.get("c"), Some(&0));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn parse_flat_json_u64_empty_object() {
+        let m = parse_flat_json_u64("{}").expect("parse empty");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_flat_json_u64_rejects_malformed() {
+        assert!(parse_flat_json_u64("not json").is_err());
+        assert!(parse_flat_json_u64(r#"{"a":not_a_number}"#).is_err());
+        assert!(parse_flat_json_u64(r#"{"a"}"#).is_err());
     }
 }
