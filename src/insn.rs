@@ -1077,9 +1077,51 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             "deflate_medium",
             "deflate_quick",
             "match",
-            "hash",
+            // NARROWED 2026-07-22 (igzip head-to-head re-verification,
+            // SF-igzip-symbolization): bare "hash" collided with
+            // `crc32fast::hash` (gzippy's CRC32 symbol legitimately contains
+            // the substring "hash" -- `INSN-AMBIGUOUS-PARTITION` against
+            // `crc`'s "crc" keyword, refused by `resolve_category` on a real
+            // igzip-vs-gzippy L1 exec run). Replaced with the SPECIFIC
+            // matchfinder identifiers actually used in gzippy's own
+            // `compress/deflate/matchfinder/{common,hc,bt,lzfind}.rs`
+            // (`lz_hash`, `hash3_tab`, `hash4_tab`, `hash_at`) so real
+            // matchfinder hashing still categorizes correctly without the
+            // bare substring catching every unrelated "*hash*" symbol
+            // (crc32fast::hash, std HashMap internals, etc).
+            "lz_hash",
+            "hash3_tab",
+            "hash4_tab",
+            "hash_at",
             "find_match",
-            "icf",
+            // NARROWED 2026-07-22 (igzip head-to-head re-verification,
+            // same campaign as the "hash" narrowing above): bare "icf"
+            // collided THREE ways on igzip's real symbol table (nm on
+            // /root/isal-src/programs/igzip), because igzip embeds "icf" in
+            // every ICF-related function name regardless of PASS:
+            //   - `isal_deflate_icf_body_hash_hist_04.*`  -- pass-1 (hash +
+            //     match-find + ICF-token build, fused kernel) -- correctly
+            //     match_finder.
+            //   - `encode_deflate_icf_04.*`  -- pass-2 (ICF-token ->
+            //     DEFLATE bitstream) -- this is igzip's EMIT stage, the
+            //     direct counterpart of gzippy's `emit_sequences`/
+            //     `emit_block` below, and bare "icf" was silently
+            //     MISCATEGORIZING it as match_finder (no ambiguity error --
+            //     it only hit ONE keyword, just the wrong one; the token-
+            //     level "does igzip's emit really run ~4x cheaper per
+            //     token" re-verification this fix exists for depends on
+            //     this landing in the RIGHT bucket).
+            //   - `create_hufftables_icf`  -- huffman table build -- also
+            //     matches huffman_build's "create_huff", so bare "icf" made
+            //     it INSN-AMBIGUOUS-PARTITION (REFUSED, blocking the whole
+            //     igzip exec run).
+            // Fixed by using the SPECIFIC longer prefix each pass actually
+            // uses instead of the bare 3-letter substring: "deflate_icf_
+            // body" stays in match_finder (pass-1 only); "encode_deflate_
+            // icf" moves to huffman_encode (pass-2, see that category's
+            // list below); `create_hufftables_icf` now matches ONLY
+            // huffman_build's "create_huff".
+            "deflate_icf_body",
             "skip_match",
             // CALIBRATED 2026-07-22 (gzippy @ 6726cf38, dd79_text6/dd79_bin6
             // L1, cachegrind+`--read-inline-info=yes` vs the gzippy
@@ -1152,6 +1194,11 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             // `block_split_observations` vs `blocks_emitted_*`).
             "emit_sequences",
             "emit_block",
+            // igzip's pass-2 ICF-token -> DEFLATE-bitstream encoder (see
+            // match_finder's "icf" narrowing note above) -- the direct
+            // structural counterpart of `emit_sequences`/`emit_block` on
+            // igzip's side, e.g. `encode_deflate_icf_04.main_loop`.
+            "encode_deflate_icf",
         ],
     ),
     (
@@ -1168,10 +1215,6 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
     (
         "output_io",
         &[
-            "write",
-            "copy_bytes",
-            "memcpy",
-            "output",
             // "stream" REMOVED 2026-07-22 (calibration pass, see
             // match_finder/huffman_build/huffman_encode's CALIBRATED notes
             // above): once `FnCost::file` folds the cachegrind `fl=` source
@@ -1182,10 +1225,36 @@ pub const ENCODE_INSN_CATEGORIES: &[CategoryDef] = &[
             // `huffman_encode`'s "emit_sequences"/"write_bits" (REFUSING
             // ambiguity, confirmed: `ANATOMY=VOID ... matches categories
             // ['huffman_encode','output_io']` on gzippy L1/dd79_text6
-            // before this fix). `write`/`output`/`flush_output` already
-            // cover the intended "actual syscall-level I/O" symbols
-            // (`write`, `fwrite`, `flush_output_buffer`-style names)
-            // without the collision.
+            // before this fix).
+            //
+            // bare "write" REMOVED 2026-07-22 (igzip head-to-head
+            // re-verification, SF-igzip-symbolization): the exact same
+            // landmine as "stream" above -- "write" is a substring of
+            // `huffman_encode`'s own "write_bits" keyword AND of igzip's
+            // real pass-1-body symbols `write_lit_bits`/`write_lit_bits_
+            // finish`/`write_first_byte` (which belong to match_finder/ICF
+            // build, not I/O -- confirmed via nm on
+            // /root/isal-src/programs/igzip: those are
+            // `isal_deflate_icf_body_hash_hist_04.write_lit_bits`, part of
+            // the fused hash/ICF-build kernel, NOT `fwrite_safe`, igzip's
+            // actual file-write function). `resolve_category` REFUSED with
+            // `INSN-AMBIGUOUS-PARTITION` on
+            // `isal_deflate_icf_body_hash_hist_04.write_lit_bits` matching
+            // ['match_finder','output_io'] before this fix. Replaced with
+            // the SPECIFIC stdio identifiers real I/O symbols actually use
+            // (igzip: `fread_safe`/`fwrite_safe`; libc: `fwrite`/`fread`) so
+            // genuine file I/O still categorizes without the collision.
+            "fwrite",
+            "fread",
+            "copy_bytes",
+            "memcpy",
+            // bare "output" REMOVED 2026-07-22 (same campaign as "write"
+            // above): collided with igzip's real pass-1-body finalizer
+            // `isal_deflate_icf_body_hash_hist_04.output_end` (match_finder
+            // via the "deflate_icf_body" prefix keyword), REFUSED as
+            // INSN-AMBIGUOUS-PARTITION. `flush_output` (kept below) already
+            // covers the intended "actual I/O buffer flush" symbols without
+            // the bare substring catching every unrelated "*output*" name.
             "flush_output",
         ],
     ),

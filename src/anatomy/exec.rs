@@ -247,14 +247,23 @@ pub(crate) fn selftest_categorize() -> Result<(), String> {
             "uncategorized should be 250 (some_unrelated_glibc_fn), got {uncat}"
         ));
     }
-    // Ambiguous refusal: "hash_tree_build" matches match_finder's "hash" AND
-    // huffman_build's "tree" patterns -- categorize() MUST refuse, not
-    // silently pick one (that would double-count-by-omission the other way).
-    let ambiguous = vec![mk("hash_tree_build", 10)];
+    // Ambiguous refusal: "lz_hash_tree_build" matches match_finder's
+    // "lz_hash" AND huffman_build's "tree" patterns -- categorize() MUST
+    // refuse, not silently pick one (that would double-count-by-omission
+    // the other way).
+    //
+    // (NOTE 2026-07-22: this fixture used to be the bare "hash_tree_build",
+    // relying on match_finder's then-bare "hash" keyword -- that keyword was
+    // REMOVED (see ENCODE_INSN_CATEGORIES' 2026-07-22 comment) because it
+    // collided for real with `crc32fast::hash` and blocked a real
+    // igzip-vs-gzippy exec run. Updated to `lz_hash_tree_build` so this
+    // selftest keeps proving the REFUSE invariant against the NEW keyword
+    // set instead of pinning the fixed bug.)
+    let ambiguous = vec![mk("lz_hash_tree_build", 10)];
     match categorize(&ambiguous) {
         Err(_) => Ok(()),
         Ok(_) => Err(
-            "categorize() did not refuse an ambiguous symbol (hash_tree_build matches \
+            "categorize() did not refuse an ambiguous symbol (lz_hash_tree_build matches \
              match_finder AND huffman_build)"
                 .into(),
         ),

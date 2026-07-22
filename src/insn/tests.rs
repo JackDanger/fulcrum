@@ -760,18 +760,31 @@ fn encode_partition_closes_no_double_count() {
 
 #[test]
 fn encode_ambiguous_symbol_refuses() {
-    // A real encoder symbol `write_bits` matches output_io ("write") AND
-    // huffman_encode ("write_bits") — the first-cut overlap the map exposes.
-    // It must REFUSE by name, never silently pick one bucket.
+    // A synthetic symbol `lz_hash_write_bits` matches match_finder
+    // ("lz_hash") AND huffman_encode ("write_bits") — genuine overlap
+    // between two roles' keyword lists. It must REFUSE by name, never
+    // silently pick one bucket.
+    //
+    // (NOTE 2026-07-22: this test previously used the real encoder symbol
+    // `write_bits`, which matched output_io's bare "write" AND
+    // huffman_encode's "write_bits" -- that was an ACTUAL BUG, not an
+    // intentional fixture: it also collided with igzip's real pass-1-body
+    // symbols `write_lit_bits`/`write_first_byte` (match_finder/ICF-build,
+    // confirmed via nm on /root/isal-src/programs/igzip), which blocked a
+    // real igzip-vs-gzippy `fulcrum anatomy --exec` run with
+    // INSN-AMBIGUOUS-PARTITION. Fixed by removing output_io's bare "write"
+    // (see ENCODE_INSN_CATEGORIES' 2026-07-22 comment); this test now uses
+    // a synthetic collision to keep proving the REFUSE invariant without
+    // pinning the fixed bug as "expected" behavior.)
     assert!(
         raises_named(
-            resolve_category("write_bits", ENCODE_INSN_CATEGORIES),
+            resolve_category("lz_hash_write_bits", ENCODE_INSN_CATEGORIES),
             "INSN-AMBIGUOUS-PARTITION"
         ),
         "a symbol matching 2 encode roles must refuse by name"
     );
     // The refusal propagates through a full ledger build, not just resolve.
-    let report = "# Samples: 4K of event 'instructions:u'\n  600  [.] write_bits\n  \
+    let report = "# Samples: 4K of event 'instructions:u'\n  600  [.] lz_hash_write_bits\n  \
                   400  [.] longest_match\n";
     assert!(raises_named(
         encode_from_text(STAT_1000, report, None, None, Thresholds::default()),
