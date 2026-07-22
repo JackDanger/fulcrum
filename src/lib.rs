@@ -73,6 +73,7 @@ pub mod insn_attr;
 pub mod invariants;
 pub mod labels;
 pub mod ledger;
+pub mod levelsweep;
 pub mod locate;
 pub mod matrix;
 // macmeasure drives the IN-PROCESS gzippy decode subject, so it only builds

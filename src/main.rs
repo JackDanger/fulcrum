@@ -2481,6 +2481,15 @@ fn cmd_sweep(args: &[String]) -> ExitCode {
     {
         return fulcrum::sweep_factor::cmd(args);
     }
+    // LEVEL-CURVE LOSS-MAP mode (the level-curve generator: `--ours`/`--rival
+    // name=CMD` across `--levels`/`--corpus`), or its Gate-0 `sweep selftest`.
+    // Flag-sniffed exactly like the FACTOR mode above, so all three `sweep`
+    // shapes (thread-count capture/mine, FACTOR, LEVEL) coexist unambiguously.
+    if args.iter().any(|a| a == "--ours" || a == "--rival")
+        || args.first().map(|s| s.as_str()) == Some("selftest")
+    {
+        return fulcrum::levelsweep::cmd(args);
+    }
     let Some(phase) = args.first().map(|s| s.as_str()) else {
         eprintln!(
             "sweep needs a phase: 'capture', 'mine', or the FACTOR mode (--cand ...)\n  \
