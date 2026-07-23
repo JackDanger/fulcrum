@@ -90,6 +90,13 @@ pub struct DiffReport {
     pub len_bucket_bits: BTreeMap<String, i64>,
     /// Δbits by the region's smallest B-side match distance.
     pub dist_bucket_bits: BTreeMap<String, i64>,
+    /// Δbits by the JOINT (len_bucket, dist_bucket) pair, key
+    /// `"<len_bucket>|<dist_bucket>"`. Same per-region attribution as the two
+    /// marginals above (each region contributes to exactly one len bucket AND
+    /// exactly one dist bucket, so it lands in exactly one joint cell too) —
+    /// this is the cross-tab the marginals alone cannot answer (e.g. "9-16 len
+    /// AND ≤64 dist, specifically" vs len-9-16-anywhere or dist-≤64-at-any-len).
+    pub len_dist_bucket_bits: BTreeMap<String, i64>,
     /// Σ of regions where A locally beats B (global-table tradeoffs).
     pub negative_region_bits: i64,
     /// Top-K regions by Δbits.
@@ -264,6 +271,7 @@ pub fn diff_streams(
     let mut class_bits: BTreeMap<String, i64> = BTreeMap::new();
     let mut len_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
     let mut dist_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
+    let mut len_dist_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
     let mut negative = 0i64;
     for r in &regions {
         if r.delta_bits < 0 {
@@ -296,6 +304,9 @@ pub fn diff_streams(
             Some(_) => "16k-32k",
         };
         *dist_bucket_bits.entry(db.to_string()).or_default() += r.delta_bits;
+        *len_dist_bucket_bits
+            .entry(format!("{lb}|{db}"))
+            .or_default() += r.delta_bits;
     }
 
     let region_count = regions.len() as u64;
@@ -317,6 +328,7 @@ pub fn diff_streams(
         class_bits,
         len_bucket_bits,
         dist_bucket_bits,
+        len_dist_bucket_bits,
         negative_region_bits: negative,
         top_regions: top,
     })
@@ -714,6 +726,14 @@ pub fn render_human(r: &MapReport) -> String {
             "    by frontier match dist: {:?}\n",
             d.dist_bucket_bits
         ));
+        {
+            let mut joint: Vec<(&String, &i64)> = d.len_dist_bucket_bits.iter().collect();
+            joint.sort_by(|x, y| y.1.abs().cmp(&x.1.abs()));
+            s.push_str("    by frontier (len|dist) joint bucket, top 12 by |Δ|:\n");
+            for (k, v) in joint.iter().take(12) {
+                s.push_str(&format!("      {k:<16} {v:>10}\n"));
+            }
+        }
         s.push_str("    top moves (frontier tokens shown; Δ = bits A overpaid):\n");
         for reg in d.top_regions.iter().take(10) {
             let mv = reg
