@@ -36,6 +36,7 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 
+use super::finder_model::{self, FinderModel};
 use super::{encode, inflate, matchfinder, squeeze, Tok, TokenStream};
 use crate::compare::{hex32, sha256};
 
@@ -341,6 +342,11 @@ pub struct MapReport {
     pub raw_len: u64,
     pub raw_sha: String,
     pub max_chain: u32,
+    /// The finder-model spec actually used to build the frontier's candidate
+    /// set (see `ratio::finder_model`); `chain:<max_chain>,15,3` when
+    /// `--finder-model` was not given (the legacy default, byte-identical to
+    /// pre-finder-model behavior).
+    pub finder_model: String,
     pub iters: u32,
     pub probe_chain: u32,
     pub encoders: Vec<EncSummary>,
@@ -376,6 +382,12 @@ pub struct MapOpts {
     /// restricted to the folded set, so a gzippy-only frontier is never capped
     /// by ECT's actual bytes — it reflects only what gzippy's matchset reaches.
     pub fold_only: Option<Vec<String>>,
+    /// Restrict the frontier's match candidates to this finder shape (see
+    /// `ratio::finder_model`). `None` = derive `FinderModel::Chain{max_chain,
+    /// hash_bits:15, min_len:3}` from `max_chain` above — the legacy default,
+    /// byte-identical to pre-finder-model behavior. `Some(_)` (via
+    /// `--finder-model` on the CLI) overrides `max_chain` entirely.
+    pub finder_model: Option<FinderModel>,
 }
 
 impl Default for MapOpts {
@@ -387,6 +399,7 @@ impl Default for MapOpts {
             top_k: 25,
             emit_path: None,
             fold_only: None,
+            finder_model: None,
         }
     }
 }
@@ -499,9 +512,15 @@ pub fn map_core(
         seed_refs.len(),
         streams.len()
     ));
+    let finder = opts.finder_model.unwrap_or(FinderModel::Chain {
+        max_chain: opts.max_chain,
+        hash_bits: 15,
+        min_len: 3,
+    });
+    gate0.push(format!("finder model: {}", finder.label()));
     let squeezed = squeeze::squeeze(
         raw,
-        opts.max_chain,
+        &finder,
         opts.iters,
         &seed_refs,
         &encode::block_cost_exact,
@@ -633,6 +652,7 @@ pub fn map_core(
         raw_len: raw.len() as u64,
         raw_sha: hex32(&sha256(raw)),
         max_chain: opts.max_chain,
+        finder_model: finder.label(),
         iters: opts.iters,
         probe_chain: opts.probe_chain,
         encoders: summaries,
@@ -655,10 +675,10 @@ pub fn map_core(
 pub fn render_human(r: &MapReport) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "RATIO MAP  raw={} bytes  sha={}  (max_chain={} iters={} probe_chain={})\n",
+        "RATIO MAP  raw={} bytes  sha={}  (finder_model={} iters={} probe_chain={})\n",
         r.raw_len,
         &r.raw_sha[..16],
-        r.max_chain,
+        r.finder_model,
         r.iters,
         r.probe_chain
     ));
@@ -800,10 +820,11 @@ pub fn cmd_map(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
-    if encs.is_empty() {
-        eprintln!("need at least one --enc NAME=FILE.gz");
-        return ExitCode::from(2);
-    }
+    // `--enc` is optional (2026-07-23, finder-model reach queries): with zero
+    // encoders, `map_core` still computes+validates the frontier (G0a-c/f all
+    // still apply to it) and reports its achievable size — just skips the
+    // per-encoder diff/G0d section, which needs at least one real stream to
+    // diff against.
     let raw = match std::fs::read(&raw_path) {
         Ok(b) => b,
         Err(e) => {
@@ -827,6 +848,15 @@ pub fn cmd_map(args: &[String]) -> ExitCode {
     opts.emit_path = arg_val(args, "--emit");
     if let Some(v) = arg_val(args, "--fold") {
         opts.fold_only = Some(v.split(',').map(|s| s.trim().to_string()).collect());
+    }
+    if let Some(v) = arg_val(args, "--finder-model") {
+        match finder_model::parse(&v) {
+            Ok(m) => opts.finder_model = Some(m),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     match map_core(&raw, &encs, &opts) {

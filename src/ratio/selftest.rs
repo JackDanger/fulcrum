@@ -100,9 +100,21 @@ pub fn run() -> ExitCode {
     let raw = synth_raw();
 
     // Build the two synthetic encoders.
-    let weak_blocks = squeeze::squeeze(&raw, 4, 1, &[], &encode::block_cost_exact);
+    let weak_blocks = squeeze::squeeze(
+        &raw,
+        &crate::ratio::finder_model::FinderModel::chain(4),
+        1,
+        &[],
+        &encode::block_cost_exact,
+    );
     let weak_gz = encode::emit_gz(&raw, &weak_blocks);
-    let good_blocks = squeeze::squeeze(&raw, 1024, 4, &[], &encode::block_cost_exact);
+    let good_blocks = squeeze::squeeze(
+        &raw,
+        &crate::ratio::finder_model::FinderModel::chain(1024),
+        4,
+        &[],
+        &encode::block_cost_exact,
+    );
     let (deg_blocks, injected) = degrade(&raw, &good_blocks);
     let deg_gz = encode::emit_gz(&raw, &deg_blocks);
 
@@ -117,6 +129,7 @@ pub fn run() -> ExitCode {
         probe_chain: 64,
         top_k: 50,
         emit_path: None,
+        finder_model: None,
     };
 
     // S1: the pipeline itself is the gate — map_core errors on any G0 breach.
@@ -191,7 +204,13 @@ pub fn run() -> ExitCode {
     while rep3.len() < 30_000 {
         rep3.extend_from_slice(b"abc");
     }
-    let enc3_blocks = squeeze::squeeze(&rep3, 64, 2, &[], &encode::block_cost_exact);
+    let enc3_blocks = squeeze::squeeze(
+        &rep3,
+        &crate::ratio::finder_model::FinderModel::chain(64),
+        2,
+        &[],
+        &encode::block_cost_exact,
+    );
     let enc3 = encode::emit_gz(&rep3, &enc3_blocks);
     match diff::map_core(&rep3, &[("self".to_string(), enc3)], &opts) {
         Ok((r3, fgz)) => {

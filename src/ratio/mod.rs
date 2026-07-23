@@ -63,6 +63,7 @@ use std::process::ExitCode;
 
 pub mod diff;
 pub mod encode;
+pub mod finder_model;
 pub mod inflate;
 pub mod matchfinder;
 pub mod selftest;
@@ -347,6 +348,8 @@ pub fn cmd_ratio(args: &[String]) -> ExitCode {
         Some("selftest") => selftest::run(),
         Some("extract") => diff::cmd_extract(&args[1..]),
         Some("map") => diff::cmd_map(&args[1..]),
+        Some("finder-selftest") => finder_model::cmd_selftest(&args[1..]),
+        Some("finder-calibrate") => finder_model::cmd_calibrate(&args[1..]),
         _ => {
             eprintln!("{}", usage());
             ExitCode::from(2)
@@ -359,14 +362,27 @@ pub fn usage() -> String {
      \n\
      Usage:\n\
        fulcrum ratio selftest\n\
+       fulcrum ratio finder-selftest\n\
+       fulcrum ratio finder-calibrate [--file NAME] [--corpus-dir P] [--gzippy-bin P]\n\
        fulcrum ratio extract --gz FILE.gz [--json]\n\
-       fulcrum ratio map --raw FILE --enc NAME=FILE.gz [--enc NAME=FILE.gz ...]\n\
+       fulcrum ratio map --raw FILE [--enc NAME=FILE.gz ...]\n\
                          [--emit OUT.gz] [--max-chain N] [--iters N]\n\
                          [--fold NAME[,NAME...]] [--top K] [--json OUT.json]\n\
+                         [--finder-model NAME[:params]]\n\
      \n\
      --fold restricts which encoders' matches seed the frontier: omit for the\n\
      FULL frontier (absolute lower bound over all encoders' matches); pass\n\
      e.g. --fold gzippy for the GZIPPY-MATCHSET-ONLY frontier (what gzippy's\n\
-     own matches + a strong BT finder reach — never capped by ECT's bytes).\n"
+     own matches + a strong BT finder reach — never capped by ECT's bytes).\n\
+     \n\
+     --finder-model restricts the frontier's match CANDIDATES to a specific\n\
+     matchfinder SHAPE (see `ratio::finder_model`'s module doc for the full\n\
+     grammar): full | chain:K[,hash_bits,min_len] |\n\
+     singleton[:hash_bits,min_len,insert_policy] | hash3chain:K[,K3].\n\
+     Answers \"what compressed size could encoder-architecture X reach on\n\
+     THIS data\" directly, without building/running that encoder — omit for\n\
+     the legacy default (a `chain:<max_chain>,15,3` frontier). `--enc` is now\n\
+     OPTIONAL: a bare `--finder-model` reach query needs no rival .gz at all\n\
+     (the report's `frontier` row is the achievable size on its own).\n"
         .to_string()
 }

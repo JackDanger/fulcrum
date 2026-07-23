@@ -4,21 +4,32 @@
 
 use super::PosMatches;
 
+/// Default hash-table width (log2 slots) and minimum match length for the
+/// plain [`find_range`] entry point — unchanged from the original
+/// single-configuration finder. [`find_range_params`] is the generalized
+/// engine `find_range` now delegates to (see its doc comment); every OTHER
+/// caller (`ratio::finder_model`'s `chain:K[,hash_bits,min_len]` model) goes
+/// through `find_range_params` directly so the hash width and accept
+/// threshold are runtime-configurable without touching this default.
 const HASH_BITS: u32 = 15;
-const HASH_SIZE: usize = 1 << HASH_BITS;
 const WSIZE: usize = 32768;
 const SENTINEL: u32 = u32::MAX;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 
-/// Fixed multiplicative hash of the 3 bytes at `data[i..i+3]`. Two equal
-/// 3-grams always land in the same bucket (so a full-budget chain walk sees
-/// every candidate for a length-≥3 match); collisions are harmless (bytes are
-/// re-verified).
+/// Fixed multiplicative hash of the 3 bytes at `data[i..i+3]`, spread over
+/// `1 << hash_bits` buckets. Two equal 3-grams always land in the same
+/// bucket for a FIXED `hash_bits` (so a full-budget chain walk sees every
+/// candidate for a length-≥3 match); collisions are harmless (bytes are
+/// re-verified). The key width is always 3 bytes regardless of `hash_bits`
+/// or the caller's `min_match` — a narrower/wider `min_match` only changes
+/// which VERIFIED real-byte lengths are accepted into the Pareto set, never
+/// the hash key (see `ratio::finder_model`'s module doc for the resulting
+/// fidelity note on `hash3chain`'s primary chain component).
 #[inline]
-fn hash3(data: &[u8], i: usize) -> usize {
+fn hash3(data: &[u8], i: usize, hash_bits: u32) -> usize {
     let v = (data[i] as u32) << 16 | (data[i + 1] as u32) << 8 | (data[i + 2] as u32);
-    (v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
+    (v.wrapping_mul(0x9E37_79B1) >> (32 - hash_bits)) as usize
 }
 
 /// Length of the common prefix of `data[j..]` and `data[p..]`, capped at
@@ -42,6 +53,25 @@ fn match_len(data: &[u8], j: usize, p: usize, maxlen: usize) -> usize {
 }
 
 pub fn find_range(data: &[u8], start: usize, end: usize, max_chain: u32) -> Vec<PosMatches> {
+    find_range_params(data, start, end, max_chain, HASH_BITS, MIN_MATCH)
+}
+
+/// Generalized hash-chain finder: `hash_bits` sets the table width (log2
+/// slots) and `min_match` sets the shortest length a candidate must verify
+/// to enter the Pareto set (both fixed at 15 / 3 in [`find_range`]).
+/// `ratio::finder_model`'s `chain:K[,hash_bits,min_len]` model is this
+/// function directly; `full` is this function at `max_chain = u32::MAX`.
+/// Behavior (including determinism, Pareto invariants, and the
+/// budgeted-finder-is-subset property) is otherwise IDENTICAL to
+/// [`find_range`] — same algorithm, parameterized.
+pub fn find_range_params(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    max_chain: u32,
+    hash_bits: u32,
+    min_match: usize,
+) -> Vec<PosMatches> {
     if start >= end {
         return Vec::new();
     }
@@ -49,26 +79,27 @@ pub fn find_range(data: &[u8], start: usize, end: usize, max_chain: u32) -> Vec<
     let mut out = vec![PosMatches::default(); n_out];
     // Matches may not extend past `end` nor past the data itself.
     let data_end = end.min(data.len());
-    if data_end < start + MIN_MATCH {
-        // No position in the range can host a length-≥3 match.
+    if data_end < start + min_match {
+        // No position in the range can host a length-≥min_match match.
         return out;
     }
 
     // Hash chains reach back one full window before the range start so matches
     // whose only source lies before `start` are still found.
     let base = start.saturating_sub(WSIZE);
-    let mut head = vec![SENTINEL; HASH_SIZE];
+    let hash_size = 1usize << hash_bits;
+    let mut head = vec![SENTINEL; hash_size];
     let mut prev = vec![SENTINEL; end - base];
 
     for i in base..end {
-        // Query positions inside the range that can host a length-≥3 match.
-        if i >= start && i + MIN_MATCH <= data_end {
+        // Query positions inside the range that can host a length-≥min_match match.
+        if i >= start && i + min_match <= data_end {
             let p = i;
             let maxlen = MAX_MATCH.min(data_end - p);
             let limit = p.saturating_sub(WSIZE); // min source position (dist <= 32768)
             let pm = &mut out[p - start];
-            let mut best_len = MIN_MATCH - 1;
-            let mut cur = head[hash3(data, p)];
+            let mut best_len = min_match - 1;
+            let mut cur = head[hash3(data, p, hash_bits)];
             let mut steps = 0u32;
             while cur != SENTINEL {
                 let j = cur as usize;
@@ -103,9 +134,10 @@ pub fn find_range(data: &[u8], start: usize, end: usize, max_chain: u32) -> Vec<
                 cur = prev[j - base];
             }
         }
-        // Insert i (needs a full 3-gram to hash).
+        // Insert i (needs a full 3-gram to hash — the hash KEY is always 3
+        // bytes regardless of `min_match`, see `hash3`'s doc comment).
         if i + MIN_MATCH <= data.len() {
-            let h = hash3(data, i);
+            let h = hash3(data, i, hash_bits);
             prev[i - base] = head[h];
             head[h] = i as u32;
         }

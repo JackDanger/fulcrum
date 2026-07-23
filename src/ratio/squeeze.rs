@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use super::matchfinder::find_range;
+use super::finder_model::{find_range_model, FinderModel};
 use super::{
     dist_code_index, len_code_index, PosMatches, Prices, Tok, TokenStream, DIST_EXTRA, LEN_EXTRA,
 };
@@ -395,7 +395,7 @@ fn nearest_token(prefix: &[u64], byte: u64) -> usize {
 
 pub fn squeeze(
     data: &[u8],
-    max_chain: u32,
+    finder: &FinderModel,
     iters: u32,
     seeds: &[&TokenStream],
     block_cost: &dyn Fn(&[Tok]) -> u64,
@@ -407,8 +407,9 @@ pub fn squeeze(
     while mstart < n {
         let mend = (mstart + MASTER_BLOCK).min(n);
 
-        // 1. rich match set for the master range.
-        let mut matches = find_range(data, mstart, mend, max_chain);
+        // 1. rich match set for the master range, restricted to the
+        //    candidates `finder`'s shape can see (see `ratio::finder_model`).
+        let mut matches = find_range_model(data, mstart, mend, finder);
         // 2. fold every seed encoder's matches so the DP's edge set contains
         //    each seed's parse (structural basis of frontier ≤ min(encoders)).
         for seed in seeds {
@@ -512,6 +513,7 @@ pub fn squeeze(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ratio::matchfinder::find_range;
     use crate::ratio::{Block, BlockKind, Token};
 
     struct Rng(u64);
@@ -752,7 +754,13 @@ mod tests {
         let seed_tokens: Vec<Tok> = seed.tokens.iter().map(|t| t.tok).collect();
         let seed_cost = fixed_block_cost(&seed_tokens);
 
-        let out = squeeze(&data, 1, 6, &[&seed], &fixed_block_cost);
+        let out = squeeze(
+            &data,
+            &FinderModel::chain(1),
+            6,
+            &[&seed],
+            &fixed_block_cost,
+        );
         let flat: Vec<Tok> = out.iter().flatten().copied().collect();
         let got_cost = fixed_block_cost(&flat);
         assert!(
@@ -783,8 +791,8 @@ mod tests {
         while data.len() < 100_000 {
             data.extend_from_slice(words[(rng.next() % 6) as usize]);
         }
-        let run1 = squeeze(&data, 256, 8, &[], &fixed_block_cost);
-        let run2 = squeeze(&data, 256, 8, &[], &fixed_block_cost);
+        let run1 = squeeze(&data, &FinderModel::chain(256), 8, &[], &fixed_block_cost);
+        let run2 = squeeze(&data, &FinderModel::chain(256), 8, &[], &fixed_block_cost);
         assert_eq!(run1, run2, "squeeze must be deterministic");
         // Covers input exactly.
         let adv: u64 = run1.iter().flatten().map(|t| t.advance()).sum();
@@ -812,7 +820,7 @@ mod tests {
         for _ in 0..40_000 {
             data.push(200 + (rng.next() % 8) as u8);
         }
-        let out = squeeze(&data, 64, 6, &[], &entropy_block_cost);
+        let out = squeeze(&data, &FinderModel::chain(64), 6, &[], &entropy_block_cost);
         assert!(
             out.len() >= 2,
             "expected the stream to be split into >=2 blocks"
@@ -841,7 +849,7 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        let out = squeeze(&[], 32, 4, &[], &fixed_block_cost);
+        let out = squeeze(&[], &FinderModel::chain(32), 4, &[], &fixed_block_cost);
         assert_eq!(out.iter().flatten().count(), 0);
     }
 
@@ -861,7 +869,7 @@ mod tests {
         }
         data.truncate(1 << 20);
         let t0 = std::time::Instant::now();
-        let out = squeeze(&data, 8192, 15, &[], &fixed_block_cost);
+        let out = squeeze(&data, &FinderModel::chain(8192), 15, &[], &fixed_block_cost);
         let dt = t0.elapsed();
         let adv: u64 = out.iter().flatten().map(|t| t.advance()).sum();
         assert_eq!(adv, data.len() as u64);
