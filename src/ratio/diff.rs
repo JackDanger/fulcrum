@@ -63,10 +63,66 @@ pub struct Region {
     pub a_matches: u32,
     pub b_lits: u32,
     pub b_matches: u32,
+    /// A-side tokens for naming the move (capped at 32 entries), symmetric to
+    /// `b_toks`: (pos, len, dist); dist==0 ⇒ a literal RUN of `len` bytes.
+    /// Added alongside `decision_pattern` so a region's divergence can be
+    /// read as "A did THIS, B did THAT" without re-deriving it from counts.
+    pub a_toks: Vec<(u64, u16, u16)>,
     /// B-side tokens for naming the move (capped at 32 entries):
     /// (pos, len, dist); dist==0 ⇒ a literal RUN of `len` bytes.
     pub b_toks: Vec<(u64, u16, u16)>,
     pub class: RegionClass,
+    /// Coarse SHAPE of the divergence, from (a_matches==0?, b_matches==0?)
+    /// alone — orthogonal to `class` (which is about candidate VISIBILITY,
+    /// not shape). See [`DecisionPattern`] for the four cases.
+    pub decision_pattern: DecisionPattern,
+}
+
+/// Which side used literals vs matches in a divergence region — the coarsest
+/// possible cut of "what kind of decision differed", independent of whether
+/// the frontier's matches were probe-visible (that's `RegionClass`). Read as
+/// "A did ROW, B did COLUMN":
+///   - `MatchDiff`      — both sides matched here, but chose differently
+///     (classic squeeze/parse territory: length, distance, or token-count
+///     tradeoff over the SAME candidate pool).
+///   - `GreedyUnderMatch` — A used only literals where B (the optimal parse)
+///     found and used a match: a genuine miss, not an over-eager one.
+///   - `GreedyOverMatch`  — A matched where B's optimal parse preferred
+///     literals (over-matching: A's match costs more than literals under the
+///     final tables). Byte-identical in scope to `RegionClass::LitOnly`
+///     (kept as a named pattern for symmetry/table-legibility, not as new
+///     information).
+///   - `BothLitOnly`      — structurally unreachable: two literal-only spans
+///     over the same raw bytes are token-identical, so they never form a
+///     divergence region in the first place. Kept as an explicit variant
+///     (rather than silently folded into another) so a reconciliation bug
+///     that DID produce one would show up as a nonzero count instead of
+///     disappearing into a misleading bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DecisionPattern {
+    MatchDiff,
+    GreedyUnderMatch,
+    GreedyOverMatch,
+    BothLitOnly,
+}
+
+impl DecisionPattern {
+    pub fn classify(a_matches: u32, b_matches: u32) -> Self {
+        match (a_matches == 0, b_matches == 0) {
+            (false, false) => DecisionPattern::MatchDiff,
+            (true, false) => DecisionPattern::GreedyUnderMatch,
+            (false, true) => DecisionPattern::GreedyOverMatch,
+            (true, true) => DecisionPattern::BothLitOnly,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            DecisionPattern::MatchDiff => "match_diff",
+            DecisionPattern::GreedyUnderMatch => "greedy_under_match",
+            DecisionPattern::GreedyOverMatch => "greedy_over_match",
+            DecisionPattern::BothLitOnly => "both_lit_only(unreachable)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +153,16 @@ pub struct DiffReport {
     /// this is the cross-tab the marginals alone cannot answer (e.g. "9-16 len
     /// AND ≤64 dist, specifically" vs len-9-16-anywhere or dist-≤64-at-any-len).
     pub len_dist_bucket_bits: BTreeMap<String, i64>,
+    /// Δbits by [`DecisionPattern`] (match_diff / greedy_under_match /
+    /// greedy_over_match) — orthogonal cut to `class_bits`: this is SHAPE
+    /// (who used a match vs a literal), `class_bits` is VISIBILITY (was the
+    /// frontier's match probe-reachable). Reconciles to `region_delta_bits`
+    /// exactly, same guarantee as `class_bits` (checked, VOID else).
+    pub decision_pattern_bits: BTreeMap<String, i64>,
+    /// Region COUNT by the same [`DecisionPattern`] key (not bits) — lets a
+    /// consumer compute bits-per-region (cheap-rule cost/benefit) without
+    /// re-deriving it from `top_regions` (which is capped at `top_k`).
+    pub decision_pattern_regions: BTreeMap<String, u64>,
     /// Σ of regions where A locally beats B (global-table tradeoffs).
     pub negative_region_bits: i64,
     /// Top-K regions by Δbits.
@@ -143,7 +209,27 @@ pub fn diff_streams(
         let (mut a_end, mut b_end) = (pa, pb);
         let (mut a_bits, mut b_bits) = (0u64, 0u64);
         let (mut a_lits, mut a_matches, mut b_lits, mut b_matches) = (0u32, 0u32, 0u32, 0u32);
+        let mut a_toks: Vec<(u64, u16, u16)> = Vec::new();
         let mut b_toks: Vec<(u64, u16, u16)> = Vec::new();
+        // Coalesce literal runs in the move description; shared by both sides.
+        fn push_tok(toks: &mut Vec<(u64, u16, u16)>, pos: u64, tok: Tok) {
+            match tok {
+                Tok::Lit(_) => {
+                    let coalesced =
+                        matches!(toks.last(), Some(e) if e.2 == 0 && e.0 + e.1 as u64 == pos);
+                    if coalesced {
+                        toks.last_mut().unwrap().1 += 1;
+                    } else if toks.len() < 32 {
+                        toks.push((pos, 1, 0));
+                    }
+                }
+                Tok::Match { len, dist } => {
+                    if toks.len() < 32 {
+                        toks.push((pos, len, dist));
+                    }
+                }
+            }
+        }
         let mut consumed = 0u32;
         loop {
             if consumed > 0 && a_end == b_end {
@@ -156,29 +242,17 @@ pub fn diff_streams(
                     Tok::Lit(_) => a_lits += 1,
                     Tok::Match { .. } => a_matches += 1,
                 }
+                push_tok(&mut a_toks, t.pos, t.tok);
                 a_end += t.tok.advance();
                 ia += 1;
             } else if ib < bt.len() {
                 let t = &bt[ib];
                 b_bits += t.bits as u64;
                 match t.tok {
-                    Tok::Lit(_) => {
-                        b_lits += 1;
-                        // Coalesce literal runs in the move description.
-                        let coalesced = matches!(b_toks.last(), Some(e) if e.2 == 0 && e.0 + e.1 as u64 == t.pos);
-                        if coalesced {
-                            b_toks.last_mut().unwrap().1 += 1;
-                        } else if b_toks.len() < 32 {
-                            b_toks.push((t.pos, 1, 0));
-                        }
-                    }
-                    Tok::Match { len, dist } => {
-                        b_matches += 1;
-                        if b_toks.len() < 32 {
-                            b_toks.push((t.pos, len, dist));
-                        }
-                    }
+                    Tok::Lit(_) => b_lits += 1,
+                    Tok::Match { .. } => b_matches += 1,
                 }
+                push_tok(&mut b_toks, t.pos, t.tok);
                 b_end += t.tok.advance();
                 ib += 1;
             } else if ia < at.len() {
@@ -189,6 +263,7 @@ pub fn diff_streams(
                     Tok::Lit(_) => a_lits += 1,
                     Tok::Match { .. } => a_matches += 1,
                 }
+                push_tok(&mut a_toks, t.pos, t.tok);
                 a_end += t.tok.advance();
                 ia += 1;
             } else {
@@ -198,6 +273,7 @@ pub fn diff_streams(
             }
             consumed += 1;
         }
+        let decision_pattern = DecisionPattern::classify(a_matches, b_matches);
         regions.push(Region {
             start,
             end: a_end,
@@ -208,8 +284,10 @@ pub fn diff_streams(
             a_matches,
             b_lits,
             b_matches,
+            a_toks,
             b_toks,
             class: RegionClass::Parse, // provisional; probe pass below
+            decision_pattern,
         });
     }
 
@@ -272,6 +350,8 @@ pub fn diff_streams(
     let mut len_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
     let mut dist_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
     let mut len_dist_bucket_bits: BTreeMap<String, i64> = BTreeMap::new();
+    let mut decision_pattern_bits: BTreeMap<String, i64> = BTreeMap::new();
+    let mut decision_pattern_regions: BTreeMap<String, u64> = BTreeMap::new();
     let mut negative = 0i64;
     for r in &regions {
         if r.delta_bits < 0 {
@@ -283,6 +363,9 @@ pub fn diff_streams(
             RegionClass::LitOnly => "lit_only",
         };
         *class_bits.entry(cname.to_string()).or_default() += r.delta_bits;
+        let pname = r.decision_pattern.label();
+        *decision_pattern_bits.entry(pname.to_string()).or_default() += r.delta_bits;
+        *decision_pattern_regions.entry(pname.to_string()).or_default() += 1;
         let max_len = r.b_toks.iter().filter(|t| t.2 > 0).map(|t| t.1).max();
         let lb = match max_len {
             None => "lit",
@@ -309,6 +392,25 @@ pub fn diff_streams(
             .or_default() += r.delta_bits;
     }
 
+    // G0d-style reconciliation for the new cut: every region contributes to
+    // exactly one decision_pattern bucket (classify() is total over the two
+    // bools), so the sum must equal region_delta exactly — VOID else.
+    let decision_pattern_sum: i64 = decision_pattern_bits.values().sum();
+    if decision_pattern_sum != region_delta {
+        return Err(format!(
+            "G0d decision_pattern RECONCILIATION FAILED ({a_name} vs {b_name}): Σdecision_pattern_bits={decision_pattern_sum} ≠ region_delta_bits={region_delta}"
+        ));
+    }
+    let both_lit_only = decision_pattern_regions
+        .get(DecisionPattern::BothLitOnly.label())
+        .copied()
+        .unwrap_or(0);
+    if both_lit_only != 0 {
+        return Err(format!(
+            "G0d decision_pattern INVARIANT FAILED ({a_name} vs {b_name}): {both_lit_only} BothLitOnly region(s) — two literal-only spans over identical raw bytes should be token-identical and never form a divergence region"
+        ));
+    }
+
     let region_count = regions.len() as u64;
     let mut top = regions;
     top.sort_by(|x, y| y.delta_bits.cmp(&x.delta_bits).then(x.start.cmp(&y.start)));
@@ -329,6 +431,8 @@ pub fn diff_streams(
         len_bucket_bits,
         dist_bucket_bits,
         len_dist_bucket_bits,
+        decision_pattern_bits,
+        decision_pattern_regions,
         negative_region_bits: negative,
         top_regions: top,
     })
@@ -719,6 +823,14 @@ pub fn render_human(r: &MapReport) -> String {
         ));
         s.push_str(&format!("    by stage: {:?}\n", d.class_bits));
         s.push_str(&format!(
+            "    by decision pattern (bits): {:?}\n",
+            d.decision_pattern_bits
+        ));
+        s.push_str(&format!(
+            "    by decision pattern (regions): {:?}\n",
+            d.decision_pattern_regions
+        ));
+        s.push_str(&format!(
             "    by frontier match len: {:?}\n",
             d.len_bucket_bits
         ));
@@ -734,11 +846,9 @@ pub fn render_human(r: &MapReport) -> String {
                 s.push_str(&format!("      {k:<16} {v:>10}\n"));
             }
         }
-        s.push_str("    top moves (frontier tokens shown; Δ = bits A overpaid):\n");
-        for reg in d.top_regions.iter().take(10) {
-            let mv = reg
-                .b_toks
-                .iter()
+        s.push_str("    top moves (A vs frontier tokens shown; Δ = bits A overpaid):\n");
+        fn fmt_toks(toks: &[(u64, u16, u16)]) -> String {
+            toks.iter()
                 .take(4)
                 .map(|&(p, l, dd)| {
                     if dd == 0 {
@@ -748,10 +858,20 @@ pub fn render_human(r: &MapReport) -> String {
                     }
                 })
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join(" ")
+        }
+        for reg in d.top_regions.iter().take(10) {
             s.push_str(&format!(
-                "      [{}..{}) {:?} A={}b F={}b Δ={}  frontier: {}\n",
-                reg.start, reg.end, reg.class, reg.a_bits, reg.b_bits, reg.delta_bits, mv
+                "      [{}..{}) {:?}/{} A={}b F={}b Δ={}\n        a: {}\n        f: {}\n",
+                reg.start,
+                reg.end,
+                reg.class,
+                reg.decision_pattern.label(),
+                reg.a_bits,
+                reg.b_bits,
+                reg.delta_bits,
+                fmt_toks(&reg.a_toks),
+                fmt_toks(&reg.b_toks),
             ));
         }
     }

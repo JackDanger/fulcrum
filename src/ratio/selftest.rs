@@ -15,6 +15,12 @@
 //!   S3 DETERMINISM: two full map_core runs serialize byte-identically.
 //!   S4 KNOWN OPTIMAL SHAPE: on pure period-3 repetition the frontier uses
 //!      matches and lands far below literal cost (≥50× compression).
+//!   S5 DECISION_PATTERN RECONCILES + KNOWN SHAPE (feat/decision-classes):
+//!      Σdecision_pattern_bits/_regions equal region_delta_bits/region_count
+//!      exactly on every diff already built above, the structurally-
+//!      unreachable BothLitOnly bucket is never populated, and the
+//!      "degraded" arm (matches replaced by literals) is dominated by
+//!      greedy_under_match as expected from its construction.
 
 use std::process::ExitCode;
 
@@ -199,6 +205,58 @@ pub fn run() -> ExitCode {
         fails.push("S3: two identical runs produced different reports".into());
     }
 
+    // S5: decision_pattern (feat/decision-classes) reconciles exactly for
+    // every diff report already built above — the region-level invariant is
+    // enforced inside diff_streams (VOID on mismatch), so a clean map_core
+    // return already proves it; this re-derives the same equalities from the
+    // PUBLIC report fields so a future refactor that broke the wiring
+    // between diff_streams and DiffReport (but not the internal check) would
+    // still be caught here.
+    for d in rep1.diffs.iter().chain(rep_big.diffs.iter()) {
+        let pat_bits_sum: i64 = d.decision_pattern_bits.values().sum();
+        if pat_bits_sum != d.region_delta_bits {
+            fails.push(format!(
+                "S5 {}: Σdecision_pattern_bits={pat_bits_sum} ≠ region_delta_bits={}",
+                d.a_name, d.region_delta_bits
+            ));
+        }
+        let pat_region_sum: u64 = d.decision_pattern_regions.values().sum();
+        if pat_region_sum != d.region_count {
+            fails.push(format!(
+                "S5 {}: Σdecision_pattern_regions={pat_region_sum} ≠ region_count={}",
+                d.a_name, d.region_count
+            ));
+        }
+        if d
+            .decision_pattern_regions
+            .get(crate::ratio::diff::DecisionPattern::BothLitOnly.label())
+            .is_some()
+        {
+            fails.push(format!(
+                "S5 {}: BothLitOnly key present (should be structurally unreachable, never inserted)",
+                d.a_name
+            ));
+        }
+        // The degraded encoder was built by replacing matches with literals,
+        // so its divergences from the (optimal, original-raw) frontier
+        // should be dominated by greedy_under_match (A went literal-only
+        // where the optimal parse still matched) — a known-shape check, not
+        // just a reconciliation check.
+        if d.a_name == "degraded" {
+            let under = d
+                .decision_pattern_bits
+                .get("greedy_under_match")
+                .copied()
+                .unwrap_or(0);
+            if under <= 0 || under < d.region_delta_bits / 2 {
+                fails.push(format!(
+                    "S5 degraded: expected greedy_under_match to dominate region_delta_bits ({under} of {})",
+                    d.region_delta_bits
+                ));
+            }
+        }
+    }
+
     // S4: known optimal shape on period-3 repetition.
     let mut rep3: Vec<u8> = Vec::new();
     while rep3.len() < 30_000 {
@@ -228,7 +286,7 @@ pub fn run() -> ExitCode {
 
     if fails.is_empty() {
         println!(
-            "RATIO_SELFTEST=PASS checks=4 (pipeline+G0a-f; injected-suboptimality covered {covered}/{}; determinism; known-shape)",
+            "RATIO_SELFTEST=PASS checks=5 (pipeline+G0a-f; injected-suboptimality covered {covered}/{}; determinism; known-shape; decision-pattern-reconciliation)",
             injected.len()
         );
         ExitCode::SUCCESS
