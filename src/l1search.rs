@@ -96,6 +96,17 @@ use std::process::{Command, ExitCode, Stdio};
 pub struct L1TuneSpec {
     pub peekmax: u32,
     pub peekdist: usize,
+    /// Mirrors gzippy's `lazy_peek_cost_gate_enabled` (2026-07-23 COST-GATE
+    /// axis: standalone bits(match)-vs-bits(literals) reject at lazy-peek
+    /// time — see gzippy's `LAZY_PEEK_COST_GATE_ENABLED` doc comment).
+    /// FALSIFIED at `LAZY_PEEK_COST_GATE_MARGIN_BITS=0` on 2026-07-23
+    /// (`fulcrum paired --mode compress`: +3.3-5.6% wall on every fixture
+    /// tested for noise-level, inconsistently-signed size movement) — kept
+    /// here so a future session can re-sweep without re-deriving the CLI
+    /// grammar.
+    pub peekcost: bool,
+    /// Mirrors gzippy's `lazy_peek_cost_margin_bits`.
+    pub peekcostmargin: i32,
     pub depth: usize,
     pub block: usize,
     pub bucket2: bool,
@@ -123,6 +134,8 @@ impl Default for L1TuneSpec {
         L1TuneSpec {
             peekmax: 4,
             peekdist: 8192,
+            peekcost: false,
+            peekcostmargin: 0,
             depth: 3,
             block: 65536,
             bucket2: false,
@@ -166,12 +179,14 @@ impl L1TuneSpec {
     /// contract.
     pub fn to_spec(&self) -> String {
         format!(
-            "peekmax={},peekdist={},depth={},block={},bucket2={},gate={},\
+            "peekmax={},peekdist={},peekcost={},peekcostmargin={},depth={},block={},bucket2={},gate={},\
              chain={},chainthreshold={},chaindepth={},\
              hash3={},hash3bits={},hash3always={},hash3maxdist={},hash3insertalways={},\
              hash3gated={},hash3gatethreshold={},hash3gatewarm={},hash3gateinit={}",
             self.peekmax,
             self.peekdist,
+            b(self.peekcost),
+            self.peekcostmargin,
             self.depth,
             self.block,
             b(self.bucket2),
@@ -387,6 +402,32 @@ pub fn named_configs() -> Vec<(String, L1TuneSpec)> {
         }
     }
 
+    // Axis I: COST-GATE margin sweep (2026-07-23 "cost-based tie-break"
+    // mission), composed on top of the shipped widened-peek + `hash3gate-
+    // t48-w0-i1` baseline (`base` already carries `peekmax=16`/`peekdist=0`
+    // via `L1TuneSpec::default()`... NOTE: `default()` above is the
+    // ALL-LEVERS-OFF `peekmax=4`/`peekdist=8192` point, not the shipped
+    // widened config — callers sweeping this axis against the ACTUAL
+    // shipped baseline should compose `peekcost`/`peekcostmargin` with
+    // `peekmax: 16, peekdist: 0, ..hash3gate-t48-w0-i1`, not bare `base`).
+    // FALSIFIED at `margin=0` (2026-07-23, `fulcrum paired --mode
+    // compress`, N=21, /dev/null sink): +3.3-5.6% wall on every fixture
+    // tested for noise-level size movement — kept swept here (rather than
+    // deleted) so a future session re-opening this axis does not have to
+    // re-derive the grid.
+    for margin in [-16i32, -8, -4, 0, 4, 8, 16] {
+        v.push((
+            format!("peekcost-m{margin}"),
+            L1TuneSpec {
+                peekmax: 16,
+                peekdist: 0,
+                peekcost: true,
+                peekcostmargin: margin,
+                ..h3
+            },
+        ));
+    }
+
     v
 }
 
@@ -431,6 +472,8 @@ fn parse_inline_spec(spec: &str) -> L1TuneSpec {
         match k {
             "peekmax" => cfg.peekmax = v.parse().unwrap_or(cfg.peekmax),
             "peekdist" => cfg.peekdist = v.parse().unwrap_or(cfg.peekdist),
+            "peekcost" => cfg.peekcost = flag,
+            "peekcostmargin" => cfg.peekcostmargin = v.parse().unwrap_or(cfg.peekcostmargin),
             "depth" => cfg.depth = v.parse().unwrap_or(cfg.depth),
             "block" => cfg.block = v.parse().unwrap_or(cfg.block),
             "bucket2" => cfg.bucket2 = flag,
@@ -939,8 +982,9 @@ fn selftest() -> ExitCode {
     let configs = named_configs();
     // 1 baseline + 6 peekmax + 7 peekdist + 15 insdepth + 5 block + 6 bucket2
     // + 24 chain (4x6) + 8 hand-depth-gate (4x2) + 20 hash3-b-d (4x5) + 4
-    // hash3-policy (2x2) + 4 hand-hash3 (2x2) + 28 hash3gate (7x2x2) = 128.
-    let expected = 1 + 6 + 7 + 15 + 5 + 6 + 24 + 8 + 20 + 4 + 4 + 28;
+    // hash3-policy (2x2) + 4 hand-hash3 (2x2) + 28 hash3gate (7x2x2)
+    // + 7 peekcost-margin (Axis I) = 135.
+    let expected = 1 + 6 + 7 + 15 + 5 + 6 + 24 + 8 + 20 + 4 + 4 + 28 + 7;
     if configs.len() != expected {
         failures.push(format!(
             "axis count: named_configs() has {} entries, expected {expected} \
@@ -962,6 +1006,8 @@ fn selftest() -> ExitCode {
     let expect_keys = [
         "peekmax",
         "peekdist",
+        "peekcost",
+        "peekcostmargin",
         "depth",
         "block",
         "bucket2",
@@ -982,6 +1028,8 @@ fn selftest() -> ExitCode {
     let sample = L1TuneSpec {
         peekmax: 6,
         peekdist: 4096,
+        peekcost: true,
+        peekcostmargin: -4,
         depth: 12,
         block: 131072,
         bucket2: true,
