@@ -72,6 +72,7 @@ pub mod gate;
 pub mod insn;
 pub mod insn_attr;
 pub mod invariants;
+pub mod l1search;
 pub mod labels;
 pub mod ledger;
 pub mod levelsweep;

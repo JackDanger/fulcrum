@@ -4441,6 +4441,7 @@ fn main() -> ExitCode {
         "behavior" => fulcrum::behavior::cmd_behavior(rest),
         "ratio" => fulcrum::ratio::cmd_ratio(rest),
         "anatomy" => fulcrum::anatomy::cmd_anatomy(rest),
+        "l1search" => fulcrum::l1search::cmd_l1search(rest),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
