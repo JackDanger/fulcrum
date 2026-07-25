@@ -2486,7 +2486,13 @@ fn cmd_sweep(args: &[String]) -> ExitCode {
     // Flag-sniffed exactly like the FACTOR mode above, so all three `sweep`
     // shapes (thread-count capture/mine, FACTOR, LEVEL) coexist unambiguously.
     if args.iter().any(|a| a == "--ours" || a == "--rival")
-        || args.first().map(|s| s.as_str()) == Some("selftest")
+        || matches!(
+            args.first().map(|s| s.as_str()),
+            // `reclassify` re-derives banked cells' classes in place after a
+            // classifier fix (resume reuses a cached class, so a fix never
+            // reaches already-measured runs without it).
+            Some("selftest") | Some("reclassify")
+        )
     {
         return fulcrum::levelsweep::cmd(args);
     }

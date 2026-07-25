@@ -206,6 +206,28 @@ pub fn classify_cell(
 // Cell schema (the bankable, resumable per-cell artifact)
 // ---------------------------------------------------------------------------
 
+fn f64_nan() -> f64 {
+    f64::NAN
+}
+
+/// serde_json serializes non-finite f64 (NaN/Inf) as JSON `null`, but a plain
+/// `f64` field FAILS to deserialize `null` — so every banked cell carrying an
+/// unmeasured ratio silently vanished on re-load. That is every SKIP cell (no
+/// measurement ever ran) and any VOID without a size. The failure mode is the
+/// dangerous kind: the cells that disappear from a re-loaded census are
+/// exactly the ones that did not measure, so a summary rebuilt from banked
+/// cells would quietly omit its own failures.
+///
+/// Found 2026-07-25 while building `sweep reclassify`: reading back a real
+/// run's cells reported `scanned=1` on a directory holding 2 files. Round-trip
+/// coverage is in the Gate-0 selftest.
+fn de_f64_nan_null<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SweepCell {
     pub rival: String,
@@ -214,9 +236,11 @@ pub struct SweepCell {
     /// WIN / SIZE-ONLY / SPEED-ONLY / LOSS / TIE / VOID / SKIP.
     pub class: String,
     /// Oriented ours/rival compressed-size ratio. NaN when not measured.
+    #[serde(default = "f64_nan", deserialize_with = "de_f64_nan_null")]
     pub size_ratio: f64,
     /// Oriented ours/rival wall ratio (`PairedResult::ratio`, a=ours). NaN
     /// when not measured.
+    #[serde(default = "f64_nan", deserialize_with = "de_f64_nan_null")]
     pub wall_ratio: f64,
     pub wall_verdict: String,
     pub wall_status: String,
@@ -646,6 +670,53 @@ pub fn selftest() -> ExitCode {
         "classify_cell: size neutral + wall slower ⇒ SIZE-ONLY (size leg satisfied, NOT a both-axes loss)",
         classify_cell("OK", "RESOLVED-a-slower", 1.0, eps) == "SIZE-ONLY",
     );
+    // ---- reclassify: repairs banked cells after a classifier fix ----------
+    // Exercises the real `reclassify_dir` path (not a re-implementation) on a
+    // temp dir holding one STALE-classed cell (the exact 2026-07-25 bug shape:
+    // byte-identical + slower, banked as LOSS) plus a SKIP cell that must be
+    // left alone. Resume reuses cached classes, so without this path a
+    // classifier fix silently never reaches already-measured runs.
+    {
+        let dir =
+            std::env::temp_dir().join(format!("fulcrum-sweep-reclass-{}", std::process::id()));
+        let cells = dir.join("cells");
+        let _ = std::fs::create_dir_all(&cells);
+        let mut stale = placeholder_cell("ld", Path::new("c.bin"), 6, "LOSS", String::new());
+        stale.error = None;
+        stale.size_ratio = 1.0; // byte-identical output
+        stale.wall_status = "OK".into();
+        stale.wall_verdict = "RESOLVED-a-slower".into();
+        let _ = std::fs::write(
+            cells.join("ld__c__L06.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        );
+        let skip = placeholder_cell("ld", Path::new("c.bin"), 99, "SKIP", "unsupported".into());
+        let _ = std::fs::write(
+            cells.join("ld__c__L99.json"),
+            serde_json::to_string_pretty(&skip).unwrap(),
+        );
+        let (scanned, changed, _before, after) = reclassify_dir(&dir, DEFAULT_EPSILON, false);
+        check(
+            "reclassify: repairs a stale byte-identical-but-slower LOSS ⇒ SIZE-ONLY",
+            scanned == 2 && changed == 1 && after.get("SIZE-ONLY") == Some(&1),
+        );
+        check(
+            "reclassify: leaves SKIP cells untouched (they never entered the harness)",
+            after.get("SKIP") == Some(&1),
+        );
+        let reread = load_cell(&cells.join("ld__c__L06.json")).map(|c| c.class);
+        check(
+            "reclassify: rewrites the cell file in place (repair survives reload)",
+            reread.as_deref() == Some("SIZE-ONLY"),
+        );
+        let (_, changed2, _, _) = reclassify_dir(&dir, DEFAULT_EPSILON, false);
+        check(
+            "reclassify: idempotent — a second pass changes nothing",
+            changed2 == 0,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     check(
         "classify_cell: size bigger + wall tie ⇒ LOSS",
         classify_cell("OK", "NOISY", 1.10, eps) == "LOSS",
@@ -939,9 +1010,120 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// `fulcrum sweep reclassify --out DIR [--epsilon E]` — re-derive every banked
+/// cell's class from its STORED `size_ratio` / `wall_verdict` / `wall_status`.
+///
+/// Why this exists: resume deliberately reuses a banked cell's class verbatim
+/// (see the `resume {id} (cached class=…)` path), so a classifier FIX does not
+/// reach already-measured runs — re-running `sweep` would skip them and keep
+/// the stale verdict. Classification is a pure function of values the cell
+/// already stores, so repairing a run needs NO re-measurement (no box time, no
+/// freeze, no rival re-runs). Introduced with the 2026-07-25 fix that stopped
+/// byte-identical-but-slower cells from being reported as both-axes LOSSes.
+///
+/// Prints every changed cell and a before/after census; rewrites in place.
+fn reclassify(args: &[String]) -> ExitCode {
+    let Some(dir) = cli_flag(args, "--out") else {
+        eprintln!("sweep reclassify: --out DIR is required");
+        return ExitCode::from(2);
+    };
+    let epsilon = cli_flag(args, "--epsilon")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_EPSILON);
+    let (scanned, changed, before, after) = reclassify_dir(Path::new(&dir), epsilon, true);
+    println!("reclassify: scanned={scanned} changed={changed}");
+    let fmt = |m: &BTreeMap<String, usize>| {
+        m.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!("reclassify: before  {}", fmt(&before));
+    println!("reclassify: after   {}", fmt(&after));
+    ExitCode::SUCCESS
+}
+
+/// Core of [`reclassify`], factored so the Gate-0 selftest exercises the real
+/// code path rather than a re-implementation of it. Returns
+/// `(scanned, changed, before_census, after_census)`.
+#[allow(clippy::type_complexity)]
+fn reclassify_dir(
+    dir: &Path,
+    epsilon: f64,
+    verbose: bool,
+) -> (
+    usize,
+    usize,
+    BTreeMap<String, usize>,
+    BTreeMap<String, usize>,
+) {
+    let cells_dir = dir.join("cells");
+    let root = if cells_dir.is_dir() {
+        cells_dir
+    } else {
+        dir.to_path_buf()
+    };
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        eprintln!("sweep reclassify: cannot read {}", root.display());
+        return (0, 0, BTreeMap::new(), BTreeMap::new());
+    };
+    let mut paths: Vec<_> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+
+    let (mut changed, mut scanned) = (0usize, 0usize);
+    let (mut before, mut after) = (BTreeMap::new(), BTreeMap::new());
+    for p in &paths {
+        let Some(mut cell) = load_cell(p) else {
+            continue;
+        };
+        scanned += 1;
+        *before.entry(cell.class.clone()).or_insert(0usize) += 1;
+        // SKIP cells never entered the harness: nothing to re-derive.
+        let fresh = if cell.class == "SKIP" {
+            cell.class.clone()
+        } else {
+            classify_cell(
+                &cell.wall_status,
+                &cell.wall_verdict,
+                cell.size_ratio,
+                epsilon,
+            )
+            .to_string()
+        };
+        *after.entry(fresh.clone()).or_insert(0usize) += 1;
+        if fresh != cell.class {
+            if verbose {
+                println!(
+                    "reclassify: {} {} L{:02}  {} -> {}  (size_ratio={:.6} wall={} {})",
+                    cell.rival,
+                    cell.corpus,
+                    cell.level,
+                    cell.class,
+                    fresh,
+                    cell.size_ratio,
+                    cell.wall_verdict,
+                    cell.wall_status
+                );
+            }
+            cell.class = fresh;
+            if let Ok(s) = serde_json::to_string_pretty(&cell) {
+                let _ = std::fs::write(p, s);
+            }
+            changed += 1;
+        }
+    }
+    (scanned, changed, before, after)
+}
+
 pub fn cmd(args: &[String]) -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("selftest") {
         return selftest();
+    }
+    if args.first().map(|s| s.as_str()) == Some("reclassify") {
+        return reclassify(&args[1..]);
     }
 
     let Some(ours) = cli_flag(args, "--ours") else {
