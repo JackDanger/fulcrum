@@ -714,6 +714,22 @@ pub fn selftest() -> ExitCode {
             "reclassify: idempotent — a second pass changes nothing",
             changed2 == 0,
         );
+
+        // ---- census: aggregates banked cells, counts unreadable loudly -----
+        let (cells, bad) = collect_cells(&[dir.display().to_string()]);
+        check(
+            "census: collects every banked cell in a sweep dir (SKIP included)",
+            cells.len() == 2 && bad == 0,
+        );
+        // A corrupt banked cell must be COUNTED, never silently dropped — a
+        // census that quietly omits unparseable cells omits exactly the
+        // measurements most likely to have failed.
+        let _ = std::fs::write(dir.join("cells").join("ld__c__L07.json"), "{ not json");
+        let (cells2, bad2) = collect_cells(&[dir.display().to_string()]);
+        check(
+            "census: an unreadable banked cell is counted, not silently dropped",
+            cells2.len() == 2 && bad2 == 1,
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1118,12 +1134,92 @@ fn reclassify_dir(
     (scanned, changed, before, after)
 }
 
+/// `fulcrum sweep census --out DIR [--out DIR ...]` — aggregate the banked
+/// cells of one or more completed sweeps into a single class census plus the
+/// severity-sorted loss list, WITHOUT re-measuring anything.
+///
+/// A campaign-scale re-cert runs as several `--out` dirs (per phase, per thread
+/// count), and the question that matters is the census ACROSS them. Answering
+/// it by hand-rolling a script over the cell JSONs is exactly the ad-hoc
+/// tooling this module exists to replace, and it silently drops any cell the
+/// script's reader cannot parse — the failure this file already hit once (see
+/// `de_f64_nan_null`). Reuses the same `load_cell` / `render_*` path the live
+/// run uses, so a census and a run agree by construction.
+fn census(args: &[String]) -> ExitCode {
+    let dirs = cli_multi(args, "--out");
+    if dirs.is_empty() {
+        eprintln!("sweep census: at least one --out DIR is required");
+        return ExitCode::from(2);
+    }
+    let (all, unreadable) = collect_cells(&dirs);
+    print!("{}", render_loss_list(&all));
+    println!("{}", render_summary_line(&all));
+    if unreadable > 0 {
+        eprintln!("sweep census: {unreadable} UNREADABLE cell(s) — census is INCOMPLETE");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Core of [`census`], factored so the Gate-0 selftest exercises the real
+/// collection path. Returns `(cells, unreadable_count)` — an unparseable
+/// banked cell is COUNTED, never silently skipped.
+fn collect_cells(dirs: &[String]) -> (Vec<SweepCell>, usize) {
+    let mut all: Vec<SweepCell> = Vec::new();
+    let mut unreadable = 0usize;
+    for d in dirs {
+        // Accept either a sweep --out dir (which holds cells/) or a parent
+        // holding several of them (a phase tree) — walk one level down.
+        let mut roots = vec![PathBuf::from(d)];
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                if e.path().is_dir() && e.path().join("cells").is_dir() {
+                    roots.push(e.path());
+                }
+            }
+        }
+        for r in roots {
+            let cells_dir = r.join("cells");
+            if !cells_dir.is_dir() {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&cells_dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                match load_cell(&p) {
+                    Some(c) => all.push(c),
+                    // Loud, never silent: an unparseable banked cell is a
+                    // measurement we would otherwise drop from our own census.
+                    None => {
+                        eprintln!("sweep census: UNREADABLE cell {}", p.display());
+                        unreadable += 1;
+                    }
+                }
+            }
+        }
+    }
+    all.sort_by(|a, b| {
+        (&a.rival, &a.corpus, a.level)
+            .cmp(&(&b.rival, &b.corpus, b.level))
+            .then_with(|| a.class.cmp(&b.class))
+    });
+    (all, unreadable)
+}
+
 pub fn cmd(args: &[String]) -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("selftest") {
         return selftest();
     }
     if args.first().map(|s| s.as_str()) == Some("reclassify") {
         return reclassify(&args[1..]);
+    }
+    if args.first().map(|s| s.as_str()) == Some("census") {
+        return census(&args[1..]);
     }
 
     let Some(ours) = cli_flag(args, "--ours") else {

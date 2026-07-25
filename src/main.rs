@@ -2490,8 +2490,9 @@ fn cmd_sweep(args: &[String]) -> ExitCode {
             args.first().map(|s| s.as_str()),
             // `reclassify` re-derives banked cells' classes in place after a
             // classifier fix (resume reuses a cached class, so a fix never
-            // reaches already-measured runs without it).
-            Some("selftest") | Some("reclassify")
+            // reaches already-measured runs without it). `census` aggregates
+            // several completed --out dirs into one class census + loss list.
+            Some("selftest") | Some("reclassify") | Some("census")
         )
     {
         return fulcrum::levelsweep::cmd(args);
