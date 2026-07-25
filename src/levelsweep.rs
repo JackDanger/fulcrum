@@ -188,7 +188,15 @@ pub fn classify_cell(
         (CellClass::Win, false, _) => "SPEED-ONLY",
         (_, _, "SMALLER") => "SIZE-ONLY",
         (CellClass::Tie, _, "NEUTRAL") => "TIE",
-        (CellClass::Loss, _, "NEUTRAL") => "LOSS",
+        // Equal size + lost wall is NOT a both-axes LOSS: the size leg is
+        // satisfied (`size_ok` is true here — see the comment above), only the
+        // wall leg failed. Byte-identical-output cells (e.g. gzippy vs
+        // libdeflate at L6-L9, size_ratio exactly 1.0) land here. Reserving
+        // LOSS for BIGGER-and-slower keeps the census's headline number
+        // meaningful. FIXED 2026-07-25: this arm previously returned "LOSS",
+        // which misclassified every byte-identical-but-slower cell and would
+        // have reported phantom both-axes losses in the level-curve census.
+        (CellClass::Loss, _, "NEUTRAL") => "SIZE-ONLY",
         (_, _, "BIGGER") => "LOSS",
         _ => "VOID", // defensive; every (wall, sz) combo above is exhaustive
     }
@@ -635,8 +643,8 @@ pub fn selftest() -> ExitCode {
         classify_cell("OK", "RESOLVED-b-slower", 1.10, eps) == "SPEED-ONLY",
     );
     check(
-        "classify_cell: size neutral + wall slower ⇒ LOSS",
-        classify_cell("OK", "RESOLVED-a-slower", 1.0, eps) == "LOSS",
+        "classify_cell: size neutral + wall slower ⇒ SIZE-ONLY (size leg satisfied, NOT a both-axes loss)",
+        classify_cell("OK", "RESOLVED-a-slower", 1.0, eps) == "SIZE-ONLY",
     );
     check(
         "classify_cell: size bigger + wall tie ⇒ LOSS",
@@ -1097,6 +1105,20 @@ mod tests {
         let eps = DEFAULT_EPSILON;
         assert_eq!(classify_cell("OK", "NOISY", 1.0, eps), "TIE");
         assert_eq!(classify_cell("OK", "RESOLVED-b-slower", 1.0, eps), "WIN");
+        // REGRESSION GUARD (the 2026-07-25 census bug): byte-identical output
+        // with a lost wall is a SIZE-leg-satisfied cell, never a both-axes
+        // LOSS. This exact case was absent from the truth table, so the
+        // classifier shipped mapping it to LOSS and the first real census run
+        // reported phantom losses on gzippy-vs-libdeflate L6-L9.
+        assert_eq!(
+            classify_cell("OK", "RESOLVED-a-slower", 1.0, eps),
+            "SIZE-ONLY"
+        );
+        // ...and the same at the epsilon boundary, where size is still NEUTRAL.
+        assert_eq!(
+            classify_cell("OK", "RESOLVED-a-slower", 1.0 + eps / 2.0, eps),
+            "SIZE-ONLY"
+        );
         assert_eq!(classify_cell("OK", "RESOLVED-b-slower", 0.9, eps), "WIN");
         assert_eq!(classify_cell("OK", "NOISY", 0.9, eps), "SIZE-ONLY");
         assert_eq!(
@@ -1107,7 +1129,6 @@ mod tests {
             classify_cell("OK", "RESOLVED-b-slower", 1.1, eps),
             "SPEED-ONLY"
         );
-        assert_eq!(classify_cell("OK", "RESOLVED-a-slower", 1.0, eps), "LOSS");
         assert_eq!(classify_cell("OK", "NOISY", 1.1, eps), "LOSS");
         assert_eq!(classify_cell("FAIL", "RESOLVED-b-slower", 0.5, eps), "VOID");
         assert_eq!(classify_cell("VOID", "NOISY", 1.0, eps), "VOID");
