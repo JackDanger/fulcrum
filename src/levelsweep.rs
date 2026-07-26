@@ -297,6 +297,86 @@ fn placeholder_cell(
 }
 
 // ---------------------------------------------------------------------------
+// Run provenance — DIR/meta.json (which subject binary produced these cells)
+// ---------------------------------------------------------------------------
+
+/// Provenance stamp for a sweep `--out` DIR: WHICH subject binary produced the
+/// banked cells, hashed AT MEASUREMENT TIME.
+///
+/// Why this exists (2026-07-25 re-cert lesson, session 91adc9b2): a `SweepCell`
+/// records `a_cmd` — a PATH — but the file at that path changes with every
+/// rebuild, so a census read back later cannot prove which binary it measured.
+/// The campaign's "zero both-axes losses" headline decayed exactly this way:
+/// it was stitched from per-lever gates measured at different tips, stayed
+/// "true" in prose for many turns, and was refuted by the first whole-surface
+/// re-cert (2 LOSS cells, worst wall 1.486). `fulcrum goal` refuses to call
+/// PASS on cells whose provenance is missing, stale, or stitched — which
+/// requires this stamp to exist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SweepMeta {
+    /// The `--ours` template as given (or `"(attested)"` for `goal stamp`).
+    pub ours_tmpl: String,
+    /// Resolved subject binary path, when the template's first command token
+    /// resolved to a file at run time.
+    pub ours_bin: Option<String>,
+    /// sha256 of `ours_bin` at measurement time. `None` ⇒ UNPROVENANCED (the
+    /// consumer must refuse PASS, never assume).
+    pub ours_sha256: Option<String>,
+    pub created_unix: u64,
+    /// True when the stamp came from `fulcrum goal stamp` (an OPERATOR CLAIM
+    /// about a legacy run) rather than from the sweep itself. Attested
+    /// provenance caps `fulcrum goal` at PASS-WITH-WAIVERS — a human claim is
+    /// not a measured fact.
+    #[serde(default)]
+    pub attested: bool,
+}
+
+pub fn meta_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("meta.json")
+}
+
+pub fn read_meta(out_dir: &Path) -> Option<SweepMeta> {
+    serde_json::from_str(&fs::read_to_string(meta_path(out_dir)).ok()?).ok()
+}
+
+pub fn write_meta(out_dir: &Path, meta: &SweepMeta) -> Result<(), String> {
+    let js = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+    fs::write(meta_path(out_dir), js)
+        .map_err(|e| format!("write {}: {e}", meta_path(out_dir).display()))
+}
+
+/// First real command token of an `--ours` template, resolved to a file:
+/// skips `VAR=val` prefixes and bare `env`/`nice` wrappers; a token containing
+/// `/` is taken as a path, anything else is resolved through `$PATH`.
+pub fn resolve_ours_binary(tmpl: &str) -> Option<PathBuf> {
+    let tok = tmpl
+        .split_whitespace()
+        .find(|t| !t.contains('=') && *t != "env" && *t != "nice")?;
+    if tok.contains('/') {
+        let p = PathBuf::from(tok);
+        return p.is_file().then_some(p);
+    }
+    let path = std::env::var("PATH").ok()?;
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let cand = Path::new(dir).join(tok);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // The sweep driver
 // ---------------------------------------------------------------------------
 
@@ -401,6 +481,39 @@ fn run_one_cell(
 pub fn run_sweep(cfg: &SweepConfig) -> Result<Vec<SweepCell>, String> {
     let cells_dir = cfg.out_dir.join("cells");
     fs::create_dir_all(&cells_dir).map_err(|e| format!("mkdir {}: {e}", cells_dir.display()))?;
+
+    // PROVENANCE STAMP + RESUME-CONTAMINATION REFUSAL. A first run stamps
+    // DIR/meta.json with the subject binary's sha256. A resume against a DIR
+    // stamped with a DIFFERENT subject sha is REFUSED: it would mix cells from
+    // two binaries into one census — the exact mechanism by which the
+    // 2026-07 "zero losses" board decayed (per-lever gates at different tips
+    // stitched into one standing claim). Use a fresh --out DIR instead.
+    let ours_bin = resolve_ours_binary(&cfg.ours_tmpl);
+    let ours_sha = ours_bin.as_ref().and_then(|p| sha256_of_file(p).ok());
+    match read_meta(&cfg.out_dir) {
+        Some(prev) => {
+            if prev.ours_sha256.is_some() && ours_sha.is_some() && prev.ours_sha256 != ours_sha {
+                return Err(format!(
+                    "resume refused: {} was stamped ours_sha256={} but the current --ours \
+                     resolves to sha256={} — resuming would stitch cells from two different \
+                     subject binaries into one artifact; use a fresh --out DIR",
+                    cfg.out_dir.display(),
+                    prev.ours_sha256.as_deref().unwrap_or("?"),
+                    ours_sha.as_deref().unwrap_or("?"),
+                ));
+            }
+        }
+        None => {
+            let meta = SweepMeta {
+                ours_tmpl: cfg.ours_tmpl.clone(),
+                ours_bin: ours_bin.map(|p| p.display().to_string()),
+                ours_sha256: ours_sha,
+                created_unix: unix_now(),
+                attested: false,
+            };
+            write_meta(&cfg.out_dir, &meta)?;
+        }
+    }
 
     let mut all = Vec::new();
     for corpus in &cfg.corpora {
@@ -733,6 +846,18 @@ pub fn selftest() -> ExitCode {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- 5b. provenance: template → binary resolution (pure) -----------------
+    check(
+        "resolve_ours_binary: skips VAR=val + env wrappers, takes path token",
+        resolve_ours_binary("X=1 env /bin/sh -c foo")
+            .map(|p| p.ends_with("sh"))
+            .unwrap_or(false),
+    );
+    check(
+        "resolve_ours_binary: nonexistent path token resolves to None",
+        resolve_ours_binary("/nonexistent-fulcrum-tool -x").is_none(),
+    );
+
     check(
         "classify_cell: size bigger + wall tie ⇒ LOSS",
         classify_cell("OK", "NOISY", 1.10, eps) == "LOSS",
@@ -920,6 +1045,28 @@ pub fn selftest() -> ExitCode {
                 );
             }
             Err(e) => check(&format!("live resume run ({e})"), false),
+        }
+
+        // (d2) provenance: the run stamped meta.json with the subject's sha,
+        //      and a resume against a DIR stamped with a DIFFERENT sha is
+        //      REFUSED (the stitched-census refusal).
+        {
+            let stamped = read_meta(&cfg_slow.out_dir);
+            check(
+                "live provenance: run stamped meta.json with a resolved ours sha256",
+                stamped
+                    .as_ref()
+                    .map(|m| m.ours_sha256.is_some() && !m.attested)
+                    .unwrap_or(false),
+            );
+            if let Some(mut m) = stamped {
+                m.ours_sha256 = Some("deadbeef-not-the-real-binary".to_string());
+                let _ = write_meta(&cfg_slow.out_dir, &m);
+                check(
+                    "live provenance: resume with a different subject sha is REFUSED",
+                    run_sweep(&cfg_slow).is_err(),
+                );
+            }
         }
 
         // (e) an unsupported level (rival exits nonzero) ⇒ SKIP, not counted
@@ -1163,8 +1310,10 @@ fn census(args: &[String]) -> ExitCode {
 
 /// Core of [`census`], factored so the Gate-0 selftest exercises the real
 /// collection path. Returns `(cells, unreadable_count)` — an unparseable
-/// banked cell is COUNTED, never silently skipped.
-fn collect_cells(dirs: &[String]) -> (Vec<SweepCell>, usize) {
+/// banked cell is COUNTED, never silently skipped. Public so `fulcrum goal`
+/// aggregates through the SAME path a census uses (no parallel reader that
+/// could silently diverge — the `de_f64_nan_null` lesson).
+pub fn collect_cells(dirs: &[String]) -> (Vec<SweepCell>, usize) {
     let mut all: Vec<SweepCell> = Vec::new();
     let mut unreadable = 0usize;
     for d in dirs {

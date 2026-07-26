@@ -7,7 +7,9 @@
 //! (§6) is the ONLY decomposition where "each part ≤ best ⇒ whole ≤ best"
 //! follows, because for a steady-state OoO loop:
 //!
-//!     cycles/iter ≥ max( max_R REC(R), max_π PRESS(π) )
+//! ```text
+//! cycles/iter ≥ max( max_R REC(R), max_π PRESS(π) )
+//! ```
 //!
 //! so a per-recurrence AND per-port domination bounds the roofline.
 //!

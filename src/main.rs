@@ -171,6 +171,11 @@ USAGE:\n\
               + the exact re-verify command; fingerprint + ledger cross-checked)\n\
   fulcrum sweep capture|mine|--cand ...         multi-factor lever-boundary characterizer (which\n\
               corpus/T factors separate cand from base); `sweep --selftest` is the baked Gate-0\n\
+  fulcrum goal --spec goal.json --ours-bin PATH [--baseline-spec b.json] [--json OUT]\n\
+              whole-goal-surface adjudicator over banked `sweep` cells: ONE verdict\n\
+              (PASS|PASS-WITH-WAIVERS|FAIL|INCOMPLETE|STALE) that refuses narrowed scope,\n\
+              stale/unprovenanced/stitched evidence, inside-noise wins, and conflating\n\
+              non-domination with dominance; `goal selftest` covers the refusal paths\n\
   fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
               profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
               faults, per-thread occupancy; Linux)\n\
@@ -4359,6 +4364,7 @@ fn main() -> ExitCode {
         "xtool" => cmd_xtool(rest),
         "compare" => cmd_compare(rest),
         "sweep" => cmd_sweep(rest),
+        "goal" => fulcrum::goal::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),
