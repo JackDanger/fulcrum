@@ -274,6 +274,74 @@ pub fn render_gzippy_wall_human(w: &GzippyWallPhases) -> String {
     s
 }
 
+/// Print two `GzippyWallPhases` snapshots (any two names -- e.g. gzippy vs a
+/// wall-clock-instrumented rival build) as ONE region-by-region table
+/// instead of two sequential blocks. Built 2026-07-26 to close the
+/// "rival-side blind spot": `run_gzippy_wall` already ingests ANY binary
+/// that emits the `ANATOMY_WALL_RECONCILE=`/`ANATOMY_WALL=` contract (it
+/// only special-cases the name to force `-p1`, never to gate parsing), so a
+/// wall-clock-instrumented libdeflate build (or any other rival) needs ZERO
+/// changes here to be ingested -- this function is the only actual
+/// LOC-manifestation of "print ours next to theirs": a literal side-by-side
+/// table instead of two blocks a reader has to align by eye. Never
+/// re-derives conservation (each input `GzippyWallPhases` already passed
+/// [`GzippyWallPhases::parse`]'s Gate-0 check) and never computes a
+/// cross-engine ratio here silently -- `render_gzippy_wall_diff_human`'s
+/// caller decides what, if anything, to do with the numbers.
+pub fn render_gzippy_wall_side_by_side(a: &GzippyWallPhases, b: &GzippyWallPhases) -> String {
+    let mut region_names: Vec<String> = a.regions.keys().cloned().collect();
+    for k in b.regions.keys() {
+        if !region_names.contains(k) {
+            region_names.push(k.clone());
+        }
+    }
+    // Stable, human-meaningful order: named regions in the fixed REGION_NAMES
+    // sequence (falling back to alphabetical for anything unexpected), then
+    // residual last -- never sorted by magnitude, so the SAME region lands on
+    // the SAME row for both engines regardless of which one's bigger.
+    region_names.sort_by_key(|r| {
+        REGION_NAMES
+            .iter()
+            .position(|n| n == r)
+            .unwrap_or(REGION_NAMES.len())
+    });
+
+    let mut s = format!(
+        "ANATOMY-WALL SIDE-BY-SIDE {} vs {} (both Gate-0 reconciled; \
+         shares are % of EACH engine's own root_ns, not comparable in \
+         absolute ns unless root_ns is also compared)\n",
+        a.name, b.name
+    );
+    s.push_str(&format!(
+        "  {:<16} {:>16} {:>9}   {:>16} {:>9}\n",
+        "region",
+        format!("{}_ns", a.name),
+        "share",
+        format!("{}_ns", b.name),
+        "share",
+    ));
+    for region in &region_names {
+        let (a_ns, _) = a.regions.get(region).copied().unwrap_or((0, 0));
+        let (b_ns, _) = b.regions.get(region).copied().unwrap_or((0, 0));
+        let a_share = a.share_of_root.get(region).copied().unwrap_or(0.0) * 100.0;
+        let b_share = b.share_of_root.get(region).copied().unwrap_or(0.0) * 100.0;
+        s.push_str(&format!(
+            "  {region:<16} {a_ns:>16} {a_share:>8.2}%   {b_ns:>16} {b_share:>8.2}%\n"
+        ));
+    }
+    let a_resid_share = a.share_of_root.get("residual").copied().unwrap_or(0.0) * 100.0;
+    let b_resid_share = b.share_of_root.get("residual").copied().unwrap_or(0.0) * 100.0;
+    s.push_str(&format!(
+        "  {:<16} {:>16} {:>8.2}%   {:>16} {:>8.2}%\n",
+        "residual", a.residual_ns, a_resid_share, b.residual_ns, b_resid_share
+    ));
+    s.push_str(&format!(
+        "  {:<16} {:>16} {:>9}   {:>16} {:>9}\n",
+        "root", a.root_ns, "100.00%", b.root_ns, "100.00%"
+    ));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +383,64 @@ mod tests {
         assert!(
             (share_sum - 1.0).abs() < 1e-9,
             "shares must sum to 1.0, got {share_sum}"
+        );
+    }
+
+    /// Side-by-side render of two DIFFERENT, independently-reconciled
+    /// snapshots (mirrors the real gzippy-vs-libdeflate case where gzippy's
+    /// own `parse_match` region reads 0 at L5 -- a real coverage gap in its
+    /// own arm, not a libdeflate-specific artifact -- while libdeflate's
+    /// reads the bulk of its root span). The render must not panic or drop
+    /// a region just because one side's value for it is zero, and must put
+    /// the SAME region on the SAME row for both columns.
+    #[test]
+    fn side_by_side_aligns_rows_across_two_independent_snapshots() {
+        let gzippy_json = synth_json(
+            83_856_792,
+            &[
+                ("parse_match", 0, 0),
+                ("huffman_table", 245_709, 26),
+                ("huffman_encode", 5_927_254, 26),
+                ("crc", 776_125, 1),
+            ],
+        );
+        let libdeflate_json = synth_json(
+            68_087_000,
+            &[
+                ("parse_match", 63_342_000, 26),
+                ("huffman_table", 138_000, 52),
+                ("huffman_encode", 4_324_000, 26),
+                ("crc", 131_000, 1),
+            ],
+        );
+        let gz = GzippyWallPhases::parse("gzippy", &gzippy_json).expect("gzippy parse");
+        let ld = GzippyWallPhases::parse("libdeflate", &libdeflate_json).expect("libdeflate parse");
+        let table = render_gzippy_wall_side_by_side(&gz, &ld);
+
+        assert!(table.contains("gzippy"), "must name the first engine");
+        assert!(table.contains("libdeflate"), "must name the second engine");
+        for region in REGION_NAMES {
+            assert!(
+                table.contains(region),
+                "row for region {region:?} missing from side-by-side table:\n{table}"
+            );
+        }
+        assert!(table.contains("residual"), "residual row missing");
+        assert!(table.contains("83856792"), "gzippy root_ns missing");
+        assert!(table.contains("68087000"), "libdeflate root_ns missing");
+        // The zero-valued gzippy parse_match row must still render (as 0),
+        // never silently dropped because one side is zero.
+        let parse_row = table
+            .lines()
+            .find(|l| l.trim_start().starts_with("parse_match"))
+            .expect("parse_match row must exist");
+        assert!(
+            parse_row.contains('0'),
+            "gzippy's zero parse_match_ns must still appear: {parse_row}"
+        );
+        assert!(
+            parse_row.contains("63342000"),
+            "libdeflate's parse_match_ns must appear on the SAME row: {parse_row}"
         );
     }
 
