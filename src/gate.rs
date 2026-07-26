@@ -971,6 +971,7 @@ fn synth_paired(status: &str, sha_ok: bool) -> crate::paired::PairedResult {
         size_stable: false,
         roundtrip_ok: false,
         input_sha: String::new(),
+        ..Default::default()
     }
 }
 

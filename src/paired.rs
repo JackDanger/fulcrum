@@ -54,7 +54,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Stats — the paired-CI math, a faithful port of aa_ci.py / analyze_paired.py
@@ -776,6 +776,46 @@ pub struct PairedResult {
     /// The plaintext oracle sha256 (hex) both arms' roundtrips must reproduce.
     #[serde(default)]
     pub input_sha: String,
+    // -- FREEZE HALF (Gate-0 hole closed 2026-07-26) --------------------------
+    // `fulcrum freeze run --ttl-s 1800` (the old silent default) released a
+    // real freeze 30 minutes into a 62-minute sweep — boost/governor restored,
+    // llama un-paused — and the sweep kept running UNFROZEN for the rest of
+    // its life with NOTHING recording it; A/A certs still passed, spreads
+    // still looked tight. `freeze::snapshot()` is taken at cell START and
+    // cell END (see `run_paired_inner`) and compared via the pure
+    // `freeze::freeze_dropped_mid_cell` so a drop VOIDs the cell instead of
+    // producing a clean-looking-but-contaminated artifact.
+    /// True iff a freeze WAS live (per `freeze::snapshot`) at cell START. When
+    /// false, this whole FREEZE half is inapplicable (the cell was never
+    /// under a freeze to begin with — a normal, uncontaminated condition for
+    /// interactive iteration) and `freeze_dropped` is always false.
+    #[serde(default)]
+    pub freeze_checked: bool,
+    #[serde(default)]
+    pub freeze_live_start: bool,
+    #[serde(default)]
+    pub freeze_live_end: bool,
+    /// `freeze::FreezeSnapshot::remaining_s` observed at cell START.
+    #[serde(default)]
+    pub freeze_remaining_s_start: i64,
+    /// Real wall-clock seconds the cell's own A/A + A/B + RSS sampling took —
+    /// compared against `freeze_remaining_s_start` to catch a TTL that was
+    /// already too short for this cell even if the end-snapshot still (by
+    /// chance) reads live.
+    #[serde(default)]
+    pub freeze_cell_elapsed_s: f64,
+    /// Loud, machine-readable: true iff the freeze was live at cell start and
+    /// (dropped before cell end) OR (its start TTL couldn't cover the cell's
+    /// own elapsed time) OR (re-acquired/watchdog-died mid-cell). ALWAYS
+    /// checked regardless of `status`/`verdict` precedence, so downstream
+    /// tooling can `grep freeze_dropped=true` independent of what the wall
+    /// verdict says.
+    #[serde(default)]
+    pub freeze_dropped: bool,
+    /// The specific reason `freeze::freeze_dropped_mid_cell` returned, or
+    /// empty when not dropped / not checked.
+    #[serde(default)]
+    pub freeze_drop_reason: String,
 }
 
 /// Decode-mode paired run (byte-exact gate). Thin wrapper over
@@ -824,6 +864,19 @@ pub fn run_paired_inner(
 ) -> Result<PairedResult, String> {
     // -- SINK LAW (before anything spawns)
     sink_is_devnull(sink)?;
+
+    // -- FREEZE-GUARD START (Gate-0 hole closed 2026-07-26): snapshot the
+    // REAL box state before this cell does ANY work. `default_state_path()`
+    // is the well-known `freeze::DEFAULT_STATE` (or `FULCRUM_FREEZE_STATE`
+    // override) — the same path `fulcrum freeze acquire`/`run` write. If no
+    // freeze is live, `live=false` and this whole half is a no-op (a cell
+    // measured with no freeze at all is a pre-existing, different condition
+    // other gates already cover). `run_paired_inner` is the SOLE choke point
+    // `wallcensus`/`frontier`/`matrix` fall through to for every WALL claim
+    // (see their module docs), so wiring it HERE covers all of them for free.
+    let freeze_cell_t0 = std::time::Instant::now();
+    let freeze_state_path = crate::freeze::default_state_path();
+    let freeze_start = crate::freeze::snapshot(&freeze_state_path);
 
     let a_cmd = expand(a_cmd_tmpl, corpus);
     let b_cmd = expand(b_cmd_tmpl, corpus);
@@ -881,6 +934,15 @@ pub fn run_paired_inner(
             (0.0, 0.0, 0.0, 0.0, 0)
         };
 
+    // -- FREEZE-GUARD END: snapshot again after all of this cell's real work
+    // (correctness gate + A/A + A/B + RSS probes) and run the PURE decision
+    // function against the two snapshots + this cell's own elapsed wall time.
+    let freeze_cell_elapsed_s = freeze_cell_t0.elapsed().as_secs_f64();
+    let freeze_end = crate::freeze::snapshot(&freeze_state_path);
+    let freeze_drop_reason =
+        crate::freeze::freeze_dropped_mid_cell(&freeze_start, &freeze_end, freeze_cell_elapsed_s);
+    let freeze_dropped = freeze_drop_reason.is_some();
+
     let deltas = ab.deltas();
     let lrs = ab.log_ratios();
     let delta_ci = ci95(&deltas);
@@ -892,9 +954,16 @@ pub fn run_paired_inner(
         .count();
 
     // -- verdict precedence.
-    //    compress: FAIL-roundtrip (wrong bytes) > VOID-size-nondeterministic >
-    //              VOID-aa (harness bias) > wall verdict.
-    //    decode:   FAIL-sha-mismatch > VOID-aa > wall verdict.
+    //    compress: FAIL-roundtrip (wrong bytes) > VOID-freeze_dropped >
+    //              VOID-size-nondeterministic > VOID-aa (harness bias) > wall verdict.
+    //    decode:   FAIL-sha-mismatch > VOID-freeze_dropped > VOID-aa > wall verdict.
+    //    Byte-correctness stays ABOVE freeze_dropped: a wrong-bytes arm is a
+    //    real, independent finding (bytes don't depend on CPU frequency)
+    //    that shouldn't be masked by a timing-validity problem. Everything
+    //    below correctness is a WALL-timing claim, and a dropped freeze
+    //    invalidates ALL of those uniformly — checked before aa_bias/size
+    //    since those readouts are THEMSELVES untrustworthy once the box
+    //    de-froze mid-cell.
     //    NOTE: compress mode reports the WALL verdict + size_ratio; the
     //    two-objective Pareto@matched-level combination (a size regression is a
     //    LOSS even if faster) is `matrix`'s classify_compress — `paired` stays a
@@ -902,6 +971,8 @@ pub fn run_paired_inner(
     let (status, verdict) = if compress.is_some() {
         if !roundtrip_ok {
             (Status::Fail, "FAIL-roundtrip".to_string())
+        } else if let Some(reason) = &freeze_drop_reason {
+            (Status::Void, format!("VOID-freeze_dropped={reason}"))
         } else if !size_stable {
             (Status::Void, "VOID-size-nondeterministic".to_string())
         } else if !aa_brackets_1 {
@@ -911,6 +982,8 @@ pub fn run_paired_inner(
         }
     } else if !sha_ok {
         (Status::Fail, "FAIL-sha-mismatch".to_string())
+    } else if let Some(reason) = &freeze_drop_reason {
+        (Status::Void, format!("VOID-freeze_dropped={reason}"))
     } else if !aa_brackets_1 {
         (Status::Void, format!("VOID-aa_bias={:.4}", aa_bias))
     } else {
@@ -924,8 +997,8 @@ pub fn run_paired_inner(
     };
     let method = format!(
         "fulcrum-paired-v1:interleaved-order-alt,devnull-both-arms,paired-logratio-ci95(t-df),\
-         aa-certificate,{gate},peak-rss-dedicated-probe;n={n},warmup={warmup},\
-         rss_reps={rss_reps_got}"
+         aa-certificate,{gate},peak-rss-dedicated-probe,freeze-guard(start/end-snapshot);\
+         n={n},warmup={warmup},rss_reps={rss_reps_got}"
     );
 
     Ok(PairedResult {
@@ -967,6 +1040,13 @@ pub fn run_paired_inner(
         size_stable,
         roundtrip_ok,
         input_sha: compress.map(|c| c.input_sha.clone()).unwrap_or_default(),
+        freeze_checked: freeze_start.live,
+        freeze_live_start: freeze_start.live,
+        freeze_live_end: freeze_end.live,
+        freeze_remaining_s_start: freeze_start.remaining_s,
+        freeze_cell_elapsed_s,
+        freeze_dropped,
+        freeze_drop_reason: freeze_drop_reason.unwrap_or_default(),
     })
 }
 
@@ -988,6 +1068,7 @@ pub fn print_machine_line(r: &PairedResult) {
          delta_median_ms={:.3} delta_ci95=[{:.3},{:.3}] a_median={:.3} b_median={:.3} \
          n={} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] aa_bias={:.4} sha_ok={} \
          a_peak_rss_mb={:.1} b_peak_rss_mb={:.1} rss_reps={}{} \
+         freeze_checked={} freeze_dropped={}{} \
          method=\"{}\"",
         r.status,
         r.verdict,
@@ -1010,6 +1091,13 @@ pub fn print_machine_line(r: &PairedResult) {
         r.b_peak_rss_mb,
         r.rss_reps,
         compress_fields,
+        r.freeze_checked,
+        r.freeze_dropped,
+        if r.freeze_dropped {
+            format!(" freeze_drop_reason={:?}", r.freeze_drop_reason)
+        } else {
+            String::new()
+        },
         r.method,
     );
 }
@@ -1431,6 +1519,96 @@ pub fn selftest() -> ExitCode {
 
             let _ = std::fs::remove_file(&fixture);
         }
+    }
+
+    // -- FREEZE-GUARD DEMONSTRATION (Gate-0 hole closed 2026-07-26): a REAL
+    // `run_paired` cell whose freeze drops MID-CELL, showing the resulting
+    // cell comes back VOIDed with its reason — "a guard nobody has watched
+    // fire is not a guard." A fake sysfs boost knob starts at "0" (frozen);
+    // a background thread flips it to "1" partway through the cell's own
+    // A/A + A/B sampling, simulating exactly the observed bug (a live freeze
+    // quietly dropping while a measurement is still running). Uses
+    // `FULCRUM_FREEZE_STATE` to point `run_paired_inner`'s freeze check at
+    // our fake state — safe here because `selftest()` is one synchronous CLI
+    // invocation, never run concurrently inside `cargo test`'s parallel
+    // binary (regular `#[test]`s instead unit-test the PURE
+    // `freeze::freeze_dropped_mid_cell` directly, with no shared env var).
+    {
+        let demo_tmp =
+            std::env::temp_dir().join(format!("fulcrum-paired-freezedemo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&demo_tmp);
+        let _ = std::fs::create_dir_all(&demo_tmp);
+        let boost_path = demo_tmp.join("boost");
+        let _ = std::fs::write(&boost_path, "0");
+        let state_path = demo_tmp.join("state.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let state_json = format!(
+            "{{\"version\":1,\"acquired_at_unix\":{now},\"ttl_s\":1000,\"sysfs_root\":\"/\",\
+             \"boost_path\":{:?},\"boost_orig\":\"1\",\"governors\":[],\"procs\":[],\
+             \"watchdog_pid\":null,\"patterns\":[],\"ttl_expired_at_unix\":null}}",
+            boost_path.to_string_lossy(),
+        );
+        if std::fs::write(&state_path, state_json).is_ok() {
+            std::env::set_var("FULCRUM_FREEZE_STATE", &state_path);
+
+            let boost_path2 = boost_path.clone();
+            let dropper = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                let _ = std::fs::write(&boost_path2, "1");
+            });
+
+            let devnull = PathBuf::from("/dev/null");
+            let corpus = PathBuf::from("/dev/null");
+            let demo = run_paired(
+                "sleep 0.05",
+                "sleep 0.05",
+                "true",
+                &corpus,
+                9,
+                1,
+                &devnull,
+                true,
+                0,
+            );
+            let _ = dropper.join();
+            std::env::remove_var("FULCRUM_FREEZE_STATE");
+
+            match demo {
+                Ok(r) => {
+                    println!(
+                        "  DEMO cell: status={} verdict={} freeze_checked={} freeze_dropped={} reason={:?}",
+                        r.status, r.verdict, r.freeze_checked, r.freeze_dropped, r.freeze_drop_reason
+                    );
+                    check(
+                        "freeze-guard demo: freeze_checked (freeze WAS live at cell start)",
+                        r.freeze_checked,
+                    );
+                    check(
+                        "freeze-guard demo: freeze_dropped=true (the guard FIRED)",
+                        r.freeze_dropped,
+                    );
+                    check(
+                        "freeze-guard demo: status forced to VOID",
+                        r.status == "VOID",
+                    );
+                    check(
+                        "freeze-guard demo: verdict names the reason (VOID-freeze_dropped=...)",
+                        r.verdict.starts_with("VOID-freeze_dropped="),
+                    );
+                    check(
+                        "freeze-guard demo: freeze_drop_reason is non-empty",
+                        !r.freeze_drop_reason.is_empty(),
+                    );
+                }
+                Err(e) => check(&format!("freeze-guard demo run failed ({e})"), false),
+            }
+        } else {
+            check("freeze-guard demo: setup (write fake state file)", false);
+        }
+        let _ = std::fs::remove_dir_all(&demo_tmp);
     }
 
     println!(
@@ -1895,5 +2073,81 @@ mod tests {
                 println!("cpu_pct_of_arm: probe unavailable on this host — skipped");
             }
         }
+    }
+
+    // ---- freeze-guard wiring (Gate-0 hole closed 2026-07-26) — PURE, no I/O,
+    // no shared env var (the env-var-based end-to-end demo lives in
+    // `selftest()`, which runs as one synchronous CLI invocation, never
+    // concurrently inside this parallel `cargo test` binary).
+    use crate::freeze::{freeze_dropped_mid_cell, FreezeSnapshot};
+
+    fn snap(live: bool, acquired_at: u64, remaining_s: i64) -> FreezeSnapshot {
+        FreezeSnapshot {
+            live,
+            boost: if live { "0".into() } else { "1".into() },
+            governor: "performance".into(),
+            ttl_s: 100,
+            acquired_at_unix: acquired_at,
+            age_s: 100 - remaining_s,
+            remaining_s,
+            watchdog_pid: Some(1),
+            watchdog_alive: true,
+            stopped_pids: Vec::new(),
+            not_stopped_pids: Vec::new(),
+            ttl_expired: false,
+            checked_at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn freeze_dropped_mid_cell_none_when_never_frozen() {
+        assert!(freeze_dropped_mid_cell(&snap(false, 0, 50), &snap(false, 0, 50), 1.0).is_none());
+    }
+
+    #[test]
+    fn freeze_dropped_mid_cell_none_when_trustworthy_throughout() {
+        assert!(
+            freeze_dropped_mid_cell(&snap(true, 1000, 90), &snap(true, 1000, 60), 5.0).is_none()
+        );
+    }
+
+    #[test]
+    fn freeze_dropped_mid_cell_some_when_live_at_start_dead_at_end() {
+        // THE observed 2026-07-26 bug, in miniature: live when the cell
+        // began, not live by the time it ended.
+        assert!(
+            freeze_dropped_mid_cell(&snap(true, 1000, 90), &snap(false, 1000, -10), 5.0).is_some()
+        );
+    }
+
+    #[test]
+    fn freeze_dropped_mid_cell_some_when_ttl_shorter_than_elapsed() {
+        // Still "live" at both ends by the boost/governor/proc reads, but the
+        // TTL that was left at cell start couldn't possibly have covered the
+        // cell's own measured wall time — caught even without a live/dead
+        // flip (the box could have been re-armed with a fresh short TTL by
+        // something else in between).
+        assert!(
+            freeze_dropped_mid_cell(&snap(true, 1000, 3), &snap(true, 1000, -2), 5.0).is_some()
+        );
+    }
+
+    #[test]
+    fn freeze_dropped_mid_cell_some_when_reacquired_mid_cell() {
+        let mut end = snap(true, 2000, 90);
+        end.watchdog_pid = Some(2); // a genuinely different acquisition
+        assert!(freeze_dropped_mid_cell(&snap(true, 1000, 90), &end, 5.0).is_some());
+    }
+
+    #[test]
+    fn paired_result_default_has_freeze_fields_false_and_empty() {
+        // Every existing construction path that doesn't set the FREEZE half
+        // explicitly (e.g. `gate.rs`'s synthetic test helper, which uses
+        // `..Default::default()`) must land on "not checked / not dropped",
+        // never on an accidental `freeze_dropped=true`.
+        let r = PairedResult::default();
+        assert!(!r.freeze_checked);
+        assert!(!r.freeze_dropped);
+        assert_eq!(r.freeze_drop_reason, "");
     }
 }

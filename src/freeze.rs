@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default tenant-process patterns, ORDERED supervisor-first (the re-CONT hole
 /// fix depends on the supervisor being stopped before its child).
@@ -91,6 +91,15 @@ pub struct FreezeState {
     pub procs: Vec<ProcSave>,
     pub watchdog_pid: Option<i32>,
     pub patterns: Vec<String>,
+    /// Set by `run_under_freeze`'s own TTL-aware kill path (NOT the detached
+    /// watchdog) the instant it decides the wrapped child must die because the
+    /// TTL elapsed while it was still running — an UNMISSABLE breadcrumb that
+    /// outlives the state file's own deletion (see `run_under_freeze` doc: the
+    /// state file is rewritten with this set BEFORE the child is killed, and a
+    /// sibling `<state>.ttl-expired.json` marker is written too so the fact
+    /// survives `release()` deleting the main state file).
+    #[serde(default)]
+    pub ttl_expired_at_unix: Option<u64>,
 }
 
 impl FreezeState {
@@ -459,6 +468,7 @@ pub fn acquire(opts: &AcquireOpts) -> Result<FreezeState, String> {
         procs,
         watchdog_pid: None,
         patterns: opts.patterns.clone(),
+        ttl_expired_at_unix: None,
     };
 
     // -- state file BEFORE the watchdog (the watchdog reads it)
@@ -706,6 +716,22 @@ fn ignore_terminal_signals() {
     }
 }
 
+/// DESIGN CHOICE (2026-07-26, closing the silent-30-min-drop bug): when the
+/// TTL elapses with the wrapped child STILL RUNNING, `run_under_freeze` KILLS
+/// the child rather than merely letting the detached watchdog release the
+/// freeze underneath it. Justification: the whole point of `freeze run -- CMD`
+/// is "measure CMD under a freeze" — a CMD that outruns its own TTL and keeps
+/// going unfrozen isn't producing a degraded measurement, it's producing a
+/// SILENTLY WRONG one (the observed bug: a `frontier` sweep ran 32 more
+/// minutes unfrozen and nothing recorded it). Killing the child is the same
+/// convention as `timeout(1)` (exit 124) and gives the operator an immediate,
+/// unmissable, actionable signal — re-run with a bigger `--ttl-s` — instead of
+/// a clean-looking-but-contaminated artifact discovered hours later.
+///
+/// The detached watchdog spawned by `acquire()` is NOT weakened or removed —
+/// it is the no-orphan fallback for the case where THIS process itself dies
+/// (OOM-killed, SIGKILLed) before it can perform the kill+release below. Both
+/// layers race harmlessly to the same idempotent `release()`.
 pub fn run_under_freeze(opts: &AcquireOpts, cmd_argv: &[String]) -> ExitCode {
     if cmd_argv.is_empty() {
         eprintln!("freeze run: no command given after `--`");
@@ -718,19 +744,23 @@ pub fn run_under_freeze(opts: &AcquireOpts, cmd_argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    #[cfg(unix)]
-    ignore_terminal_signals();
 
-    // Guard: release even on panic between here and the explicit release.
+    // Guard: release even on panic/early-return, and best-effort TERM any
+    // still-running child so a panic never leaves the freeze released AND
+    // the child running unfrozen with nobody watching it.
     struct Guard {
         state_path: PathBuf,
         patterns: Vec<String>,
+        child_pid: Option<i32>,
         done: bool,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
             if !self.done {
                 eprintln!("freeze run: abnormal exit — releasing");
+                if let Some(pid) = self.child_pid {
+                    send_sig(pid, "TERM");
+                }
                 release(&self.state_path, &self.patterns, false);
             }
         }
@@ -738,14 +768,119 @@ pub fn run_under_freeze(opts: &AcquireOpts, cmd_argv: &[String]) -> ExitCode {
     let mut guard = Guard {
         state_path: opts.state_path.clone(),
         patterns: state.patterns.clone(),
+        child_pid: None,
         done: false,
     };
 
     println!("freeze run: + {}", cmd_argv.join(" "));
-    let status = Command::new(&cmd_argv[0]).args(&cmd_argv[1..]).status();
+    let mut child = match Command::new(&cmd_argv[0]).args(&cmd_argv[1..]).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("freeze run: could not launch {}: {e}", cmd_argv[0]);
+            release(&opts.state_path, &state.patterns, false);
+            guard.done = true;
+            return ExitCode::FAILURE;
+        }
+    };
+    guard.child_pid = Some(child.id() as i32);
+
+    // Ignore INT/TERM/HUP in THIS (parent) process only AFTER the child is
+    // forked — POSIX inherits an IGNORED disposition across exec, so calling
+    // this BEFORE spawn (the ordering this code had until 2026-07-26) would
+    // have made the CHILD ignore SIGTERM too, defeating both Ctrl-C forwarding
+    // and this file's own TTL-kill below (caught by the `freeze selftest` TTL
+    // demo: a plain `sleep 5` child rode out the 3s SIGTERM grace and needed
+    // SIGKILL every time). Spawn-then-ignore keeps the child's disposition at
+    // the normal default while still letting THIS process ignore a stray
+    // Ctrl-C/HUP long enough to run its own release path.
+    #[cfg(unix)]
+    ignore_terminal_signals();
+
+    // Poll rather than block: this process (not just the detached watchdog)
+    // must notice its OWN TTL elapsing so it can act on it.
+    let deadline = Instant::now() + Duration::from_secs(opts.ttl_s);
+    let mut ttl_fired = false;
+    let status: std::io::Result<std::process::ExitStatus> = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    ttl_fired = true;
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ttl elapsed with child still running",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    if ttl_fired {
+        let pid = child.id();
+        let now = now_unix();
+        let cmd_str = cmd_argv.join(" ");
+        eprintln!(
+            "freeze run: TTL={}s ELAPSED WITH CHILD STILL RUNNING (pid={pid}) — KILLING IT.\n\
+             freeze run: this is the fix for the 2026-07-26 bug (a sweep silently ran 32min\n\
+             freeze run: unfrozen after the watchdog force-released at 30min). Re-run with a\n\
+             freeze run: bigger --ttl-s if `{cmd_str}` legitimately needs longer.",
+            opts.ttl_s
+        );
+        println!(
+            "FREEZE_TTL_EXPIRED_KILLING_CHILD=true ttl_s={} pid={pid} cmd={cmd_str:?} at_unix={now}"
+        , opts.ttl_s);
+
+        // Stamp the state file BEFORE killing (so a concurrent `snapshot()`
+        // sees it immediately), and write a sibling breadcrumb that survives
+        // `release()` deleting the main state file — the forensic record.
+        if let Ok(body) = fs::read_to_string(&opts.state_path) {
+            if let Ok(mut st2) = serde_json::from_str::<FreezeState>(&body) {
+                st2.ttl_expired_at_unix = Some(now);
+                if let Ok(js) = serde_json::to_string_pretty(&st2) {
+                    let _ = fs::write(&opts.state_path, js);
+                }
+            }
+        }
+        let marker_path = PathBuf::from(format!("{}.ttl-expired.json", opts.state_path.display()));
+        let marker = format!(
+            "{{\"ttl_s\":{},\"pid\":{pid},\"cmd\":{cmd_str:?},\"killed_at_unix\":{now}}}",
+            opts.ttl_s
+        );
+        let _ = fs::write(&marker_path, marker);
+
+        send_sig(pid as i32, "TERM");
+        let grace = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= grace {
+                        send_sig(pid as i32, "KILL");
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
 
     let rep = release(&opts.state_path, &state.patterns, false);
     guard.done = true;
+
+    if ttl_fired {
+        eprintln!(
+            "freeze run: exiting 124 (timeout convention) — command was KILLED, not measured to completion"
+        );
+        if !rep.ok() {
+            eprintln!(
+                "freeze run: additionally RESTORE=FAIL after the TTL kill — treat the box as suspect"
+            );
+        }
+        return ExitCode::from(124);
+    }
 
     match status {
         Ok(st) => {
@@ -759,7 +894,7 @@ pub fn run_under_freeze(opts: &AcquireOpts, cmd_argv: &[String]) -> ExitCode {
             ExitCode::from(code.clamp(0, 255) as u8)
         }
         Err(e) => {
-            eprintln!("freeze run: could not launch {}: {e}", cmd_argv[0]);
+            eprintln!("freeze run: error waiting on child: {e}");
             ExitCode::FAILURE
         }
     }
@@ -829,6 +964,214 @@ pub fn status(state_path: &Path, sysfs_root: &str, patterns: &[String]) -> ExitC
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// snapshot / check — the Gate-0 hole closed 2026-07-26.
+//
+// WHY THIS EXISTS: `freeze run --ttl-s 1800` (the silent default) released a
+// real freeze 30 minutes into a 62-minute `frontier` sweep — boost back to 1,
+// governor back to `ondemand`, llama un-paused — and the sweep kept running
+// UNFROZEN for the rest of its life with NOTHING recording it. The resulting
+// artifacts looked perfectly clean: A/A certs passed, spreads were tight. The
+// only reason it was caught was a human reading `/sys/.../boost` by hand.
+//
+// `snapshot()` is the cheap, callable, ALWAYS-reads-the-real-system check
+// that closes that hole: any cell-producing subcommand (`paired`, and via its
+// single choke point `wallcensus`/`frontier`/`matrix` too — see
+// `run_paired_inner`'s doc) calls it at cell START and cell END. Reading code
+// or trusting a cached belief that "the freeze is still on" is exactly the
+// governing-policy violation this whole file exists to prevent — this
+// function performs the read, every time, no caching.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct FreezeSnapshot {
+    /// State file exists AND (boost==0 or no boost knob) AND every recorded
+    /// proc is still STOPPED (if any were recorded) AND the watchdog (if one
+    /// was spawned) is still alive. ALL FOUR must hold for `live` to be true —
+    /// a state file that merely EXISTS is not proof of anything (that was the
+    /// bug: the watchdog deletes it on release, but a caller that only checks
+    /// "does the file exist" the instant before it's deleted would miss it
+    /// anyway — this checks the REAL knobs, not the file's mere presence).
+    pub live: bool,
+    pub boost: String,
+    pub governor: String,
+    pub ttl_s: u64,
+    pub acquired_at_unix: u64,
+    /// Seconds since acquire, computed against the wall clock AT THIS CHECK.
+    pub age_s: i64,
+    /// `ttl_s - age_s`. Negative ⇒ the watchdog should already have fired.
+    pub remaining_s: i64,
+    pub watchdog_pid: Option<i32>,
+    pub watchdog_alive: bool,
+    pub stopped_pids: Vec<i32>,
+    pub not_stopped_pids: Vec<i32>,
+    /// Set iff `run_under_freeze`'s own TTL-kill path fired (see
+    /// `FreezeState::ttl_expired_at_unix`) — an unmissable "this freeze was
+    /// force-ended because the wrapped command outran its own TTL" flag.
+    pub ttl_expired: bool,
+    pub checked_at_unix: u64,
+}
+
+/// Read the REAL state file + REAL sysfs + REAL proc table. Never a cached
+/// assumption. `None` state file (or unparseable one) ⇒ `live=false` — "no
+/// freeze in effect", not an error, since most callers run with no freeze at
+/// all (interactive iteration) and that is not this function's problem.
+pub fn snapshot(state_path: &Path) -> FreezeSnapshot {
+    let checked_at = now_unix();
+    let state: Option<FreezeState> = fs::read_to_string(state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let Some(st) = state else {
+        return FreezeSnapshot {
+            live: false,
+            boost: "NA".into(),
+            governor: "NA".into(),
+            ttl_s: 0,
+            acquired_at_unix: 0,
+            age_s: 0,
+            remaining_s: 0,
+            watchdog_pid: None,
+            watchdog_alive: false,
+            stopped_pids: Vec::new(),
+            not_stopped_pids: Vec::new(),
+            ttl_expired: false,
+            checked_at_unix: checked_at,
+        };
+    };
+    let boost = st
+        .boost_path
+        .as_ref()
+        .and_then(|p| read_trim(Path::new(p)))
+        .unwrap_or_else(|| "NA".to_string());
+    let governor = st
+        .governors
+        .first()
+        .and_then(|g| read_trim(Path::new(&g.path)))
+        .unwrap_or_else(|| "NA".to_string());
+    let age_s = checked_at.saturating_sub(st.acquired_at_unix) as i64;
+    let remaining_s = st.ttl_s as i64 - age_s;
+    let watchdog_alive = st
+        .watchdog_pid
+        .map(|p| ps_stat(p).is_some())
+        .unwrap_or(false);
+    let mut stopped_pids = Vec::new();
+    let mut not_stopped_pids = Vec::new();
+    for p in &st.procs {
+        match ps_stat(p.pid) {
+            Some(s) if stat_is_stopped(&s) => stopped_pids.push(p.pid),
+            _ => not_stopped_pids.push(p.pid),
+        }
+    }
+    let boost_ok = boost == "0" || boost == "NA";
+    let watchdog_ok = st.watchdog_pid.is_none() || watchdog_alive;
+    let procs_ok = st.procs.is_empty() || not_stopped_pids.is_empty();
+    let live = boost_ok && procs_ok && watchdog_ok && st.ttl_expired_at_unix.is_none();
+    FreezeSnapshot {
+        live,
+        boost,
+        governor,
+        ttl_s: st.ttl_s,
+        acquired_at_unix: st.acquired_at_unix,
+        age_s,
+        remaining_s,
+        watchdog_pid: st.watchdog_pid,
+        watchdog_alive,
+        stopped_pids,
+        not_stopped_pids,
+        ttl_expired: st.ttl_expired_at_unix.is_some(),
+        checked_at_unix: checked_at,
+    }
+}
+
+/// The state path cell-producing tools check by default: the well-known
+/// `DEFAULT_STATE`, overridable via `FULCRUM_FREEZE_STATE` for an operator
+/// running `freeze acquire --state <custom>` (consistent with this crate's
+/// existing `FULCRUM_BIN`/`FULCRUM_TRACE`-style override env vars).
+pub fn default_state_path() -> PathBuf {
+    std::env::var_os("FULCRUM_FREEZE_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE))
+}
+
+/// PURE decision function — no I/O, unit-testable without a real box or
+/// root. Given a snapshot taken at cell START and one taken at cell END (plus
+/// the cell's own measured elapsed wall time), decide whether the freeze can
+/// be trusted for that whole window. `None` ⇒ trustworthy (or never frozen to
+/// begin with — a cell that was never under a freeze is not THIS guard's
+/// problem). `Some(reason)` ⇒ the freeze quietly dropped (or was never long
+/// enough to cover the cell) — the cell must be VOIDed.
+pub fn freeze_dropped_mid_cell(
+    start: &FreezeSnapshot,
+    end: &FreezeSnapshot,
+    elapsed_s: f64,
+) -> Option<String> {
+    if !start.live {
+        // Never frozen at cell start ⇒ this guard has nothing to say. A
+        // subject running with no freeze at all is a DIFFERENT, pre-existing
+        // condition (interactive iteration) that other gates cover.
+        return None;
+    }
+    if start.ttl_expired || end.ttl_expired {
+        return Some(format!(
+            "ttl_expired_kill(start={},end={})",
+            start.ttl_expired, end.ttl_expired
+        ));
+    }
+    if !end.live {
+        return Some(format!(
+            "freeze_live_at_start_not_at_end(remaining_s_start={})",
+            start.remaining_s
+        ));
+    }
+    if start.acquired_at_unix != end.acquired_at_unix {
+        return Some(format!(
+            "freeze_reacquired_mid_cell(start_epoch={},end_epoch={})",
+            start.acquired_at_unix, end.acquired_at_unix
+        ));
+    }
+    if !end.watchdog_alive && start.watchdog_pid.is_some() {
+        return Some("watchdog_died_mid_cell".to_string());
+    }
+    if (start.remaining_s as f64) < elapsed_s {
+        return Some(format!(
+            "ttl_remaining_at_start({}) < cell_elapsed_s({elapsed_s:.1})",
+            start.remaining_s
+        ));
+    }
+    None
+}
+
+/// `fulcrum freeze check` — the cheap CLI form of `snapshot()`. Cheaper than
+/// `status` (no per-pattern `pgrep`, just the pids already recorded in the
+/// state file), for tooling that wants a fast yes/no before trusting a long
+/// run. Exit 0 iff `live`.
+pub fn check(state_path: &Path) -> ExitCode {
+    let s = snapshot(state_path);
+    println!(
+        "FREEZE_CHECK live={} boost={} governor={} ttl_s={} age_s={} remaining_s={} \
+         watchdog={} watchdog_alive={} stopped={:?} not_stopped={:?} ttl_expired={} state={}",
+        s.live,
+        s.boost,
+        s.governor,
+        s.ttl_s,
+        s.age_s,
+        s.remaining_s,
+        s.watchdog_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".into()),
+        s.watchdog_alive,
+        s.stopped_pids,
+        s.not_stopped_pids,
+        s.ttl_expired,
+        state_path.display(),
+    );
+    if s.live {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1288,27 @@ pub fn selftest() -> ExitCode {
     );
     check("acquire: state file written", state_path.is_file());
 
+    // 1b. `snapshot()` — the cheap check other tooling (paired/wallcensus/
+    //     frontier/matrix) relies on — reports LIVE right after acquire, with
+    //     the real boost value and the real stopped-pid set (never cached).
+    let snap_live = snapshot(&state_path);
+    check("snapshot: live=true right after acquire", snap_live.live);
+    check(
+        "snapshot: boost reads 0 right after acquire",
+        snap_live.boost == "0",
+    );
+    check("snapshot: stopped_pids matches the acquired procs", {
+        let mut got = snap_live.stopped_pids.clone();
+        got.sort();
+        let mut want: Vec<i32> = state.procs.iter().map(|p| p.pid).collect();
+        want.sort();
+        got == want
+    });
+    check(
+        "snapshot: not_stopped_pids is empty right after acquire",
+        snap_live.not_stopped_pids.is_empty(),
+    );
+
     // 2. double-acquire refusal (the double-freeze trap)
     check("double-acquire refused while live", acquire(&opts).is_err());
 
@@ -982,6 +1346,10 @@ pub fn selftest() -> ExitCode {
             .all(|p| ps_stat(p.pid).map(|s| !stat_is_stopped(&s)).unwrap_or(true)),
     );
     check("release: state file removed", !state_path.exists());
+    check(
+        "snapshot: live=false after release (state file gone) — THE Gate-0 hole check",
+        !snapshot(&state_path).live,
+    );
 
     // 5. orphan sweep: stop a dummy OUTSIDE any freeze, release must still cure it
     send_sig(state.procs[1].pid, "STOP");
@@ -1019,6 +1387,179 @@ pub fn selftest() -> ExitCode {
             check(&format!("watchdog: acquire failed ({e})"), false);
         }
     }
+
+    // 7. `freeze_dropped_mid_cell` — the PURE decision logic every
+    //    cell-producing subcommand runs against its own start/end snapshots.
+    //    No I/O, no root, no real box: exactly the "synthetic fixtures" the
+    //    Gate-0 selftest requirement calls for.
+    #[allow(clippy::too_many_arguments)]
+    fn mk_snap(
+        live: bool,
+        acquired_at: u64,
+        remaining_s: i64,
+        watchdog_pid: Option<i32>,
+        watchdog_alive: bool,
+        ttl_expired: bool,
+    ) -> FreezeSnapshot {
+        FreezeSnapshot {
+            live,
+            boost: if live { "0".into() } else { "1".into() },
+            governor: "performance".into(),
+            ttl_s: 100,
+            acquired_at_unix: acquired_at,
+            age_s: 100 - remaining_s,
+            remaining_s,
+            watchdog_pid,
+            watchdog_alive,
+            stopped_pids: Vec::new(),
+            not_stopped_pids: Vec::new(),
+            ttl_expired,
+            checked_at_unix: 0,
+        }
+    }
+    check(
+        "freeze_dropped_mid_cell: never frozen at start -> None (not this guard's problem)",
+        freeze_dropped_mid_cell(
+            &mk_snap(false, 0, 50, None, false, false),
+            &mk_snap(false, 0, 50, None, false, false),
+            1.0,
+        )
+        .is_none(),
+    );
+    check(
+        "freeze_dropped_mid_cell: live start+end, same epoch, plenty of TTL left -> None (trusted)",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 90, Some(1), true, false),
+            &mk_snap(true, 1000, 60, Some(1), true, false),
+            5.0,
+        )
+        .is_none(),
+    );
+    check(
+        "freeze_dropped_mid_cell: live at start, DEAD at end -> Some (THE 2026-07-26 bug, caught)",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 90, Some(1), true, false),
+            &mk_snap(false, 1000, -10, None, false, false),
+            5.0,
+        )
+        .is_some(),
+    );
+    check(
+        "freeze_dropped_mid_cell: released-and-reacquired mid-cell (different epoch) -> Some",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 90, Some(1), true, false),
+            &mk_snap(true, 2000, 90, Some(2), true, false),
+            5.0,
+        )
+        .is_some(),
+    );
+    check(
+        "freeze_dropped_mid_cell: ttl_expired-kill flag set -> Some even though still 'live'",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 90, Some(1), true, false),
+            &mk_snap(true, 1000, 90, Some(1), true, true),
+            5.0,
+        )
+        .is_some(),
+    );
+    check(
+        "freeze_dropped_mid_cell: TTL remaining at start SHORTER than cell's own elapsed -> Some",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 3, Some(1), true, false),
+            &mk_snap(true, 1000, -2, Some(1), true, false),
+            5.0,
+        )
+        .is_some(),
+    );
+    check(
+        "freeze_dropped_mid_cell: watchdog process died mid-cell (even if sysfs still reads frozen) -> Some",
+        freeze_dropped_mid_cell(
+            &mk_snap(true, 1000, 90, Some(1), true, false),
+            &mk_snap(true, 1000, 60, Some(1), false, false),
+            5.0,
+        )
+        .is_some(),
+    );
+
+    // 8. `freeze run`'s own TTL-aware kill, exercised as a REAL CLI subprocess
+    //    (Gate: "demonstrate the guard FIRING" — a synthetic fixture would not
+    //    prove the wiring in `run_under_freeze` actually fires). Uses a fake
+    //    sysfs root + a --procs pattern matching NO real process, so it needs
+    //    no root and touches nothing on the real box.
+    let run_tmp =
+        std::env::temp_dir().join(format!("fulcrum-freeze-st-run-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&run_tmp);
+    match (make_fake_sysfs(&run_tmp), std::env::current_exe()) {
+        (Ok(()), Ok(exe)) => {
+            let run_state = run_tmp.join("run.state.json");
+            let breadcrumb = PathBuf::from(format!("{}.ttl-expired.json", run_state.display()));
+            let t0 = Instant::now();
+            let out = Command::new(&exe)
+                .args([
+                    "freeze",
+                    "run",
+                    "--ttl-s",
+                    "1",
+                    "--sysfs-root",
+                    &run_tmp.to_string_lossy(),
+                    "--state",
+                    &run_state.to_string_lossy(),
+                    "--procs",
+                    "f:no-such-fulcrum-freeze-selftest-marker",
+                    "--no-watchdog",
+                    "--",
+                    "sleep",
+                    "5",
+                ])
+                .output();
+            match out {
+                Ok(o) => {
+                    let elapsed = t0.elapsed();
+                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                    check(
+                        "run: TTL kill exits 124 (timeout convention)",
+                        o.status.code() == Some(124),
+                    );
+                    check(
+                        "run: TTL kill emits the unmissable stdout marker",
+                        stdout.contains("FREEZE_TTL_EXPIRED_KILLING_CHILD=true"),
+                    );
+                    check(
+                        &format!(
+                            "run: TTL kill actually KILLED the child (elapsed={:.2}s << `sleep 5`)",
+                            elapsed.as_secs_f64()
+                        ),
+                        elapsed.as_secs_f64() < 4.0,
+                    );
+                    check(
+                        "run: TTL kill wrote the surviving breadcrumb marker file",
+                        breadcrumb.is_file(),
+                    );
+                    check(
+                        "run: TTL kill still restored sysfs (boost back to 1)",
+                        read_trim(&boost_path(&run_tmp.to_string_lossy())).as_deref() == Some("1"),
+                    );
+                    check(
+                        "run: TTL kill still removed the state file (release ran)",
+                        !run_state.exists(),
+                    );
+                }
+                Err(e) => check(
+                    &format!("run: could not spawn `fulcrum freeze run` subprocess ({e})"),
+                    false,
+                ),
+            }
+        }
+        (Err(e), _) => check(
+            &format!("run: TTL-kill demo setup (fake sysfs): {e}"),
+            false,
+        ),
+        (_, Err(e)) => check(
+            &format!("run: TTL-kill demo setup (current_exe unavailable: {e})"),
+            false,
+        ),
+    }
+    let _ = fs::remove_dir_all(&run_tmp);
 
     // cleanup
     let _ = c1.kill();
@@ -1089,15 +1630,26 @@ fn freeze_usage() -> ExitCode {
          \x20                         [--state {DEFAULT_STATE}] [--sysfs-root /]\n\
          \x20                         [--no-watchdog] [--dry-run] [--force-stale]\n\
          \x20 fulcrum freeze release  [--state ...] [--procs ...]        idempotent; global orphan sweep\n\
-         \x20 fulcrum freeze run      [acquire flags] -- CMD ARGS...     acquire, run, release on EVERY exit path\n\
-         \x20 fulcrum freeze status   [--state ...] [--procs ...] [--sysfs-root /]\n\
+         \x20 fulcrum freeze run      --ttl-s N [acquire flags] -- CMD ARGS...\n\
+         \x20                         acquire, run, release on EVERY exit path. --ttl-s is\n\
+         \x20                         REQUIRED (no silent default — a 2026-07-26 sweep ran 32min\n\
+         \x20                         unfrozen after the OLD 1800s default silently expired mid-run).\n\
+         \x20                         If CMD outruns --ttl-s it is KILLED (exit 124, timeout\n\
+         \x20                         convention) — nothing under `freeze run` runs unfrozen.\n\
+         \x20 fulcrum freeze status   [--state ...] [--procs ...] [--sysfs-root /]   verbose (pgrep'd)\n\
+         \x20 fulcrum freeze check    [--state ...]                                 cheap: state-file pids only\n\
          \x20 fulcrum freeze selftest                                    Gate-0: fake sysfs + real dummy procs\n\
          \n\
-         MACHINE LINES: FREEZE=OK|FAIL, RESTORE=OK|FAIL, FREEZE_STATUS=..., SELFTEST=PASS|FAIL.\n\
+         MACHINE LINES: FREEZE=OK|FAIL, RESTORE=OK|FAIL, FREEZE_STATUS=..., FREEZE_CHECK ...,\n\
+         FREEZE_TTL_EXPIRED_KILLING_CHILD=true (run killed its child), SELFTEST=PASS|FAIL.\n\
          --procs order is STOP order — put the SUPERVISOR first (llama-swap before\n\
          llama-server) or it will SIGCONT its child mid-measurement (the re-CONT hole).\n\
          Tokens are exact comm matches (pgrep -x); prefix f: for full-cmdline (pgrep -f).\n\
-         The watchdog force-releases after --ttl-s even if the caller is SIGKILLed."
+         The detached watchdog force-releases after --ttl-s even if `run`'s own process is\n\
+         SIGKILLed (no-orphan fallback); `run` itself also races to kill+release at the same\n\
+         TTL so nothing runs silently unfrozen in the normal (non-SIGKILLed) case.\n\
+         Any cell-producing subcommand (paired/wallcensus/frontier/matrix, via paired's\n\
+         run_paired_inner) stamps freeze state at cell start/end — see `freeze::snapshot`."
     );
     ExitCode::from(2)
 }
@@ -1143,12 +1695,35 @@ pub fn cmd_freeze(args: &[String]) -> ExitCode {
                 eprintln!("freeze run: missing `--` before the command");
                 return freeze_usage();
             };
+            // GATE (2026-07-26): --ttl-s is REQUIRED for `run`, not defaulted.
+            // The old silent DEFAULT_TTL_S=1800 is exactly what let a 62-minute
+            // sweep run 32 minutes unfrozen with nothing recording it — a
+            // default that "cannot silently bite a real sweep" doesn't exist
+            // (any fixed number is silently wrong for SOME workload), so the
+            // flag is mandatory instead. `acquire`/`release`/`status` keep the
+            // default — they're lower-level primitives an operator drives
+            // interactively and can `status`/`check` at will; `run` is the one
+            // that unattended sweeps wrap and walk away from.
+            if cli_flag(&rest[..sep], "--ttl-s").is_none() {
+                eprintln!(
+                    "freeze run: --ttl-s is REQUIRED (no silent default — this is the fix for\n\
+                     the 2026-07-26 bug where the old 1800s default expired 30min into a\n\
+                     62min sweep and the sweep kept running 32min UNFROZEN, unrecorded).\n\
+                     Pick a --ttl-s comfortably above the command's expected wall time; if it\n\
+                     outruns --ttl-s it is KILLED (exit 124) rather than left to run unfrozen."
+                );
+                return ExitCode::from(2);
+            }
             let opts = parse_common(&rest[..sep]);
             run_under_freeze(&opts, &rest[sep + 1..])
         }
         "status" => {
             let opts = parse_common(rest);
             status(&opts.state_path, &opts.sysfs_root, &opts.patterns)
+        }
+        "check" => {
+            let opts = parse_common(rest);
+            check(&opts.state_path)
         }
         "selftest" => selftest(),
         _ => freeze_usage(),
@@ -1191,6 +1766,7 @@ mod tests {
             }],
             watchdog_pid: Some(99),
             patterns: vec!["llama-swap".into(), "llama-server".into()],
+            ttl_expired_at_unix: None,
         };
         let s = serde_json::to_string(&st).unwrap();
         let back: FreezeState = serde_json::from_str(&s).unwrap();
@@ -1222,6 +1798,7 @@ mod tests {
             procs: vec![],
             watchdog_pid: None,
             patterns: vec!["llama-swap".into(), "llama-server".into()],
+            ttl_expired_at_unix: None,
         };
         let m = st.method_string();
         assert!(m.contains("boost0"));
@@ -1265,6 +1842,7 @@ mod tests {
             }],
             watchdog_pid: None,
             patterns: vec![],
+            ttl_expired_at_unix: None,
         };
         fs::write(&sp, serde_json::to_string(&st).unwrap()).unwrap();
         assert!(check_stale_state(&sp, false).is_err());
