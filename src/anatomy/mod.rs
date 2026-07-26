@@ -67,6 +67,7 @@ use crate::ratio::{dist_code_index, len_code_index, BlockKind, Tok};
 
 pub mod exec;
 pub mod selftest;
+pub mod wall;
 
 // ───────────────────────────── token-level anatomy ──────────────────────────
 
@@ -376,9 +377,7 @@ fn run_encoder(name: &str, cmd: &str, level: u32, input: &str) -> Result<Vec<u8>
         c.arg("-p1");
     }
     c.arg("-c").arg(input).stdin(Stdio::null());
-    let out = c
-        .output()
-        .map_err(|e| format!("spawn '{cmd}': {e}"))?;
+    let out = c.output().map_err(|e| format!("spawn '{cmd}': {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "'{cmd} -{level} -c {input}' exited {:?}: {}",
@@ -444,6 +443,7 @@ struct Report<'a> {
     diffs: &'a [AnatomyDiff],
     exec: &'a [exec::ExecAnatomy],
     gzippy_counters: &'a [exec::GzippyExecCounters],
+    gzippy_wall: &'a [wall::GzippyWallPhases],
 }
 
 pub fn cmd_anatomy(args: &[String]) -> ExitCode {
@@ -466,6 +466,10 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     // isn't a gzippy-with-counters binary just gets SKIPPED for this arm,
     // same non-blocking contract `--exec`'s cachegrind pass already has).
     let want_counters_from_stderr = args.iter().any(|a| a == "--counters-from-stderr");
+    // Wall-clock phase arm (see `wall` module docs): reads gzippy's
+    // `anatomy-wall` feature output, the time-sibling of
+    // `--counters-from-stderr`'s exact work-volume counters.
+    let want_wall_from_stderr = args.iter().any(|a| a == "--wall-from-stderr");
     let top_k: usize = arg_val(args, "--top")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
@@ -537,6 +541,17 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
         }
     }
 
+    let mut gzippy_wall: Vec<wall::GzippyWallPhases> = Vec::new();
+    if want_wall_from_stderr {
+        for (name, cmd) in &encs {
+            eprintln!("  [anatomy] wall-level {name}: gzippy anatomy-wall…");
+            match wall::run_gzippy_wall(name, cmd, level, &input_path) {
+                Ok(gw) => gzippy_wall.push(gw),
+                Err(e) => eprintln!("  [anatomy] wall-level {name}: SKIPPED ({e})"),
+            }
+        }
+    }
+
     for a in &anatomies {
         println!("{}", render_human(a));
     }
@@ -554,6 +569,9 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     for gc in &gzippy_counters {
         println!("{}", exec::render_gzippy_counters_human(gc));
     }
+    for gw in &gzippy_wall {
+        println!("{}", wall::render_gzippy_wall_human(gw));
+    }
 
     if let Some(p) = &json_out {
         let rep = Report {
@@ -563,6 +581,7 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
             diffs: &diffs,
             exec: &exec_anatomies,
             gzippy_counters: &gzippy_counters,
+            gzippy_wall: &gzippy_wall,
         };
         match serde_json::to_string_pretty(&rep) {
             Ok(j) => {
@@ -579,11 +598,12 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     }
 
     println!(
-        "ANATOMY=PASS encoders={} pairs={} exec_arms={} gzippy_counter_arms={}",
+        "ANATOMY=PASS encoders={} pairs={} exec_arms={} gzippy_counter_arms={} gzippy_wall_arms={}",
         anatomies.len(),
         diffs.len(),
         exec_anatomies.len(),
         gzippy_counters.len(),
+        gzippy_wall.len(),
     );
     ExitCode::SUCCESS
 }
@@ -595,7 +615,7 @@ pub fn usage() -> String {
        fulcrum anatomy selftest\n\
        fulcrum anatomy --enc NAME=CMD [--enc NAME=CMD ...] --input FILE\n\
                        [--level N] [--top K] [--exec] [--counters-from-stderr]\n\
-                       [--json OUT.json]\n\
+                       [--wall-from-stderr] [--json OUT.json]\n\
      \n\
      CMD is invoked as `CMD -{level} -c {input}` (the gzip-CLI convention);\n\
      stdout must be the .gz bytes. Token-level structure (tokens, literals,\n\
@@ -605,12 +625,19 @@ pub fn usage() -> String {
      Ir by role (match_finder/huffman_build/huffman_encode/block_split/crc/\n\
      output_io); that arm is CALIBRATION-PENDING (see `anatomy::exec` docs)\n\
      and requires `valgrind` + `nm` on PATH. --counters-from-stderr instead\n\
-     (or additionally) reads an EXACT execution-level count straight off a\n\
-     gzippy-with-`anatomy-counters`-feature binary's stderr\n\
+     (or additionally) reads an EXACT execution-level WORK-VOLUME count\n\
+     straight off a gzippy-with-`anatomy-counters`-feature binary's stderr\n\
      (`ANATOMY_COUNTERS={json}` at process end) -- no valgrind needed, no\n\
      calibration gap, best-effort per encoder (a non-gzippy or feature-off\n\
      CMD just gets SKIPPED for this arm, same as a failed --exec cachegrind\n\
-     run).\n"
+     run). --wall-from-stderr is the TIME sibling of --counters-from-stderr:\n\
+     reads real Instant-based wall-clock phase timers off a gzippy-with-\n\
+     `anatomy-wall`-feature binary's stderr (`ANATOMY_WALL={json}`), grouped\n\
+     into match-finding/probing (fused with match evaluation+emission for\n\
+     the fast L0/L1 parser), Huffman table construction, Huffman symbol\n\
+     encoding (bitstream flush fused in), CRC, and a derived RESIDUAL\n\
+     bucket -- re-reconciled independently by this module (never trusting\n\
+     gzippy's self-report blindly), same best-effort per-encoder contract.\n"
         .to_string()
 }
 
