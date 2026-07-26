@@ -255,18 +255,94 @@ pub fn run() -> ExitCode {
         }
     }
 
+    // S7: side-by-side render (`wall::render_gzippy_wall_side_by_side`) of
+    // two INDEPENDENTLY-reconciled, DIFFERENT-shaped snapshots -- the real
+    // gzippy-vs-wall-clock-instrumented-libdeflate shape captured 2026-07-26
+    // on `dd79_text6` -L5 (`fulcrum anatomy --wall-from-stderr --enc
+    // gzippy=... --enc libdeflate=... --level 5`): gzippy's own arm reads
+    // parse_match_ns=0 at L5 (a real coverage gap -- L5 doesn't route
+    // through the L0/L1 fast parser its `anatomy_wall_time!` calls are
+    // wired into, so that time folds into gzippy's residual, NOT evidence
+    // libdeflate's parse_match maps to "no cost" on gzippy's side) while
+    // libdeflate's reads the bulk of its root span there. The render must
+    // (a) name both engines, (b) keep every named region on the SAME row
+    // for both columns, (c) never drop a region just because one side's
+    // value for it is exactly 0, (d) carry both root_ns values through
+    // verbatim (no silent re-derivation of a ratio here).
+    {
+        let gzippy_json = "{\"root_ns\":83856792,\"root_calls\":1,\
+             \"parse_match_ns\":0,\"parse_match_calls\":0,\
+             \"huffman_table_ns\":245709,\"huffman_table_calls\":26,\
+             \"huffman_encode_ns\":5927254,\"huffman_encode_calls\":26,\
+             \"crc_ns\":776125,\"crc_calls\":1,\
+             \"residual_ns\":76907704,\"conserved\":true,\
+             \"granularity\":\"per-block\"}";
+        let libdeflate_json = "{\"root_ns\":68087000,\"root_calls\":1,\
+             \"parse_match_ns\":63342000,\"parse_match_calls\":26,\
+             \"huffman_table_ns\":138000,\"huffman_table_calls\":52,\
+             \"huffman_encode_ns\":4324000,\"huffman_encode_calls\":26,\
+             \"crc_ns\":131000,\"crc_calls\":1,\
+             \"residual_ns\":152000,\"conserved\":true,\
+             \"granularity\":\"per-block\"}";
+        match (
+            wall::GzippyWallPhases::parse("gzippy", gzippy_json),
+            wall::GzippyWallPhases::parse("libdeflate", libdeflate_json),
+        ) {
+            (Ok(gz), Ok(ld)) => {
+                let table = wall::render_gzippy_wall_side_by_side(&gz, &ld);
+                if !table.contains("gzippy") || !table.contains("libdeflate") {
+                    fails.push("S7: side-by-side table must name both engines".into());
+                }
+                for region in ["parse_match", "huffman_table", "huffman_encode", "crc"] {
+                    if !table.contains(region) {
+                        fails.push(format!("S7: region row {region:?} missing from table"));
+                    }
+                }
+                if !table.contains("residual") {
+                    fails.push("S7: residual row missing from table".into());
+                }
+                if !table.contains("83856792") || !table.contains("68087000") {
+                    fails.push("S7: both root_ns values must appear verbatim".into());
+                }
+                let parse_row = table
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("parse_match"));
+                match parse_row {
+                    Some(row) if row.contains("63342000") => {}
+                    Some(row) => fails.push(format!(
+                        "S7: parse_match row must carry libdeflate's non-zero value: {row}"
+                    )),
+                    None => fails.push("S7: parse_match row missing entirely".into()),
+                }
+            }
+            (a, b) => fails.push(format!(
+                "S7: fixture parse failed: gzippy_err={:?} libdeflate_err={:?}",
+                a.err(),
+                b.err()
+            )),
+        }
+    }
+
+    let total_checks = 7;
     if fails.is_empty() {
         println!(
-            "ANATOMY_SELFTEST=PASS checks=6 (gzip-fixture reconciliation; hand-built \
+            "ANATOMY_SELFTEST=PASS checks={total_checks} (gzip-fixture reconciliation; hand-built \
              known-token-stream; determinism x3; degraded-diff sign+sort; exec-categorize \
-             reconciliation+ambiguity-refusal; wall-phase conservation pass+overshoot-refusal)"
+             reconciliation+ambiguity-refusal; wall-phase conservation pass+overshoot-refusal; \
+             side-by-side row-alignment+zero-value-retention)"
         );
+        println!("PASS pass={total_checks} fail=0");
         ExitCode::SUCCESS
     } else {
         println!("ANATOMY_SELFTEST=VOID failed={}", fails.len());
         for f in &fails {
             println!("  {f}");
         }
+        println!(
+            "FAIL pass={} fail={}",
+            total_checks - fails.len(),
+            fails.len()
+        );
         ExitCode::from(3)
     }
 }

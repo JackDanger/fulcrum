@@ -572,6 +572,16 @@ pub fn cmd_anatomy(args: &[String]) -> ExitCode {
     for gw in &gzippy_wall {
         println!("{}", wall::render_gzippy_wall_human(gw));
     }
+    // Literal side-by-side table when exactly two wall-instrumented encoders
+    // were measured (e.g. gzippy vs a wall-clock-instrumented rival build) --
+    // requires zero changes to how either binary is invoked or parsed; see
+    // `wall::render_gzippy_wall_side_by_side`'s doc comment.
+    if gzippy_wall.len() == 2 {
+        println!(
+            "{}",
+            wall::render_gzippy_wall_side_by_side(&gzippy_wall[0], &gzippy_wall[1])
+        );
+    }
 
     if let Some(p) = &json_out {
         let rep = Report {
