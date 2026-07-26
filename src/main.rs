@@ -176,6 +176,14 @@ USAGE:\n\
               (PASS|PASS-WITH-WAIVERS|FAIL|INCOMPLETE|STALE) that refuses narrowed scope,\n\
               stale/unprovenanced/stitched evidence, inside-noise wins, and conflating\n\
               non-domination with dominance; `goal selftest` covers the refusal paths\n\
+  fulcrum sizecensus --ours 'CMD -{{level}} -c {{input}}' --rival name='CMD -{{level}} -c {{input}}'\n\
+              [--rival ...] --levels 1-9 --corpus FILE [--corpus ...] --out DIR\n\
+              the deterministic SIZE-axis census: exact-integer compressed-byte-count vs matched-\n\
+              level rivals, no timing/rig/significance test needed (an integer either matches or\n\
+              doesn't). Roundtrip-gated (a non-roundtripping gzippy output is VOID, never a win);\n\
+              per-rival level support reused from `goal::rival_accepts_level`; `sizecensus report\n\
+              --out DIR [--out ...]` merges banked runs (refuses across different gzippy shas);\n\
+              `sizecensus selftest` is the Gate-0\n\
   fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
               profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
               faults, per-thread occupancy; Linux)\n\
@@ -4365,6 +4373,7 @@ fn main() -> ExitCode {
         "compare" => cmd_compare(rest),
         "sweep" => cmd_sweep(rest),
         "goal" => fulcrum::goal::cmd(rest),
+        "sizecensus" => fulcrum::sizecensus::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),

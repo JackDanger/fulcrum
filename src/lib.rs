@@ -111,6 +111,7 @@ pub mod schedule;
 pub mod scope;
 pub mod score;
 pub mod scoreboard;
+pub mod sizecensus;
 pub mod spans;
 pub mod stats;
 pub mod sweep;
