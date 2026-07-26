@@ -176,13 +176,17 @@ USAGE:\n\
               (PASS|PASS-WITH-WAIVERS|FAIL|INCOMPLETE|STALE) that refuses narrowed scope,\n\
               stale/unprovenanced/stitched evidence, inside-noise wins, and conflating\n\
               non-domination with dominance; `goal selftest` covers the refusal paths\n\
-  fulcrum sizecensus --ours 'CMD -{{level}} -c {{input}}' --rival name='CMD -{{level}} -c {{input}}'\n\
-              [--rival ...] --levels 1-9 --corpus FILE [--corpus ...] --out DIR\n\
+  fulcrum sizecensus --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' \\\n\
+              --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
+              --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus ...] --out DIR\n\
               the deterministic SIZE-axis census: exact-integer compressed-byte-count vs matched-\n\
               level rivals, no timing/rig/significance test needed (an integer either matches or\n\
-              doesn't). Roundtrip-gated (a non-roundtripping gzippy output is VOID, never a win);\n\
-              per-rival level support reused from `goal::rival_accepts_level`; `sizecensus report\n\
-              --out DIR [--out ...]` merges banked runs (refuses across different gzippy shas);\n\
+              doesn't). THREADS ARE A FIRST-CLASS AXIS (cells key on rival/corpus/level/threads,\n\
+              matching wallcensus): a T>=2 byte-identity shortcut is exploited but re-verified\n\
+              every run via a min/max witness sha comparison, and voided loudly if it ever fails.\n\
+              Roundtrip-gated (a non-roundtripping gzippy output is VOID, never a win); per-rival\n\
+              level support reused from `goal::rival_accepts_level`; `sizecensus report --out DIR\n\
+              [--out ...]` merges banked runs (refuses across different gzippy shas);\n\
               `sizecensus selftest` is the Gate-0\n\
   fulcrum wallcensus --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' \\\n\
               --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
