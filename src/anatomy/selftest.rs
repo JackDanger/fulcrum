@@ -10,7 +10,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use crate::ratio::{dist_code_index, encode, len_code_index, Tok};
 
-use super::{analyze, diff_anatomy, exec};
+use super::{analyze, diff_anatomy, exec, wall};
 
 /// A modestly compressible synthetic corpus (repeated phrases + a run), so a
 /// real `gzip` invocation is guaranteed to emit both literals and matches.
@@ -194,11 +194,72 @@ pub fn run() -> ExitCode {
         fails.push(format!("S5 exec categorize: {e}"));
     }
 
+    // S6: wall-clock phase arm (`wall::GzippyWallPhases::parse`) conservation
+    // check, boxless (no gzippy subprocess needed -- hand-built JSON strings
+    // exercise the SAME parse/reconcile path a real `ANATOMY_WALL=` line
+    // would). Two directions per the project's "a check must both PASS the
+    // good case and CATCH the bad one" convention: a consistent snapshot
+    // reconciles with shares summing to 1.0, AND a snapshot where named
+    // regions overshoot root_ns (the double-count/overlap bug class this
+    // arm exists to catch) is REFUSED, never silently clamped or averaged
+    // away -- even when the JSON's own self-reported `residual_ns`/
+    // `conserved` fields lie about it (this module re-derives from scratch,
+    // never trusts the embedded fields).
+    {
+        let good_json = "{\"root_ns\":1000000,\"root_calls\":1,\
+             \"parse_match_ns\":500000,\"parse_match_calls\":10,\
+             \"huffman_table_ns\":100000,\"huffman_table_calls\":10,\
+             \"huffman_encode_ns\":200000,\"huffman_encode_calls\":10,\
+             \"crc_ns\":50000,\"crc_calls\":1,\
+             \"residual_ns\":150000,\"conserved\":true,\
+             \"granularity\":\"per-block\"}";
+        match wall::GzippyWallPhases::parse("selftest-good", good_json) {
+            Ok(w) => {
+                let share_sum: f64 = w.share_of_root.values().sum();
+                if (share_sum - 1.0).abs() > 1e-9 {
+                    fails.push(format!(
+                        "S6: consistent snapshot's shares must sum to 1.0, got {share_sum}"
+                    ));
+                }
+                if w.residual_ns != 150000 {
+                    fails.push(format!(
+                        "S6: expected residual_ns=150000, got {}",
+                        w.residual_ns
+                    ));
+                }
+            }
+            Err(e) => fails.push(format!("S6 good-snapshot parse: {e}")),
+        }
+
+        // Overshoot: named regions (900000+900000) > root_ns (1000000), even
+        // though the embedded residual_ns/conserved fields falsely claim
+        // conservation holds -- must be REFUSED via this module's own
+        // re-derivation, not the embedded fields.
+        let bad_json = "{\"root_ns\":1000000,\"root_calls\":1,\
+             \"parse_match_ns\":900000,\"parse_match_calls\":10,\
+             \"huffman_table_ns\":900000,\"huffman_table_calls\":10,\
+             \"huffman_encode_ns\":0,\"huffman_encode_calls\":0,\
+             \"crc_ns\":0,\"crc_calls\":0,\
+             \"residual_ns\":0,\"conserved\":true,\
+             \"granularity\":\"per-block\"}";
+        match wall::GzippyWallPhases::parse("selftest-bad", bad_json) {
+            Ok(_) => fails.push(
+                "S6: an overshooting (named > root) snapshot with a LYING self-reported \
+                 residual/conserved field was accepted instead of refused"
+                    .to_string(),
+            ),
+            Err(e) if !e.contains("FAILED") => fails.push(format!(
+                "S6: overshoot was refused but for the wrong reason: {e}"
+            )),
+            Err(_) => {} // correctly refused
+        }
+    }
+
     if fails.is_empty() {
         println!(
-            "ANATOMY_SELFTEST=PASS checks=5 (gzip-fixture reconciliation; hand-built \
+            "ANATOMY_SELFTEST=PASS checks=6 (gzip-fixture reconciliation; hand-built \
              known-token-stream; determinism x3; degraded-diff sign+sort; exec-categorize \
-             reconciliation+ambiguity-refusal)"
+             reconciliation+ambiguity-refusal; wall-phase conservation pass+overshoot-refusal)"
         );
         ExitCode::SUCCESS
     } else {
