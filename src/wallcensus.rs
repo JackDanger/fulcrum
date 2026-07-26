@@ -94,7 +94,9 @@ use crate::levelsweep::{
     write_meta, Rival, SweepMeta,
 };
 use crate::matrix::{classify, Arm};
-use crate::paired::{cpu_pct_of_arm, pin_gate_ok, run_paired_inner, sha256_of_file, CompressCfg};
+use crate::paired::{
+    cpu_pct_of_arm, pin_gate_ok, run_paired_inner, sha256_of_file, CompressCfg, PinProbe,
+};
 use crate::sizecensus::{
     basename, git_commit_for_binary, host_string, rival_provenance,
     CensusProvenance as SizeCensusProvenance, CorpusProvenance, RivalProvenance,
@@ -191,9 +193,22 @@ pub struct CensusCell {
     #[serde(default = "f64_nan", deserialize_with = "de_f64_nan_null")]
     pub b_cpu_pct: f64,
     /// True iff both arms' observed CPU% fell inside `pin_gate_ok`'s window
-    /// for `threads`. False for any cell that never reached the probe.
+    /// for `threads`. False ONLY for a PROVEN wrong-concurrency arm (a
+    /// `PinProbe::Measured` outside the window) — an unmeasurable probe
+    /// (`pin_unmeasurable=true`) does NOT set this false; see that field.
     #[serde(default)]
     pub pin_ok: bool,
+    /// True iff at least one arm's concurrency probe could not establish a
+    /// real measurement (`PinProbe::Unmeasurable` — getrusage/spawn failure,
+    /// NOT a wrong-concurrency finding). 2026-07-26 fix: previously this was
+    /// conflated with `pin_ok=false` and VOIDed the cell outright, discarding
+    /// an otherwise-clean paired wall verdict merely because the probe was
+    /// too fast to time. An unmeasurable-but-otherwise-clean cell now still
+    /// reaches the paired engine and reports its real `status`/`wall_verdict`
+    /// — this flag is purely informational (grep it to find cells whose
+    /// concurrency was never independently confirmed).
+    #[serde(default)]
+    pub pin_unmeasurable: bool,
     /// Bonus (free from `paired`'s compress-mode roundtrip pass) — NOT the
     /// SIZE axis of record (that is `sizecensus`'s job); kept only so a
     /// cross-check against sizecensus's own number is possible.
@@ -274,6 +289,7 @@ fn placeholder_cell(
         a_cpu_pct: f64::NAN,
         b_cpu_pct: f64::NAN,
         pin_ok: false,
+        pin_unmeasurable: false,
         size_ratio_bonus: f64::NAN,
         n: 0,
         error: reason,
@@ -301,26 +317,69 @@ pub struct CensusConfig {
     pub ours_commit: Option<String>,
 }
 
-/// Run the pin-gate probe for one arm, `reps` times. Returns
-/// `(all_observed_pcts_ok, last_observed_pct)` — `last_observed_pct` is
-/// reported even on failure so the VOID reason names the actual number.
-fn probe_arm_pin(cmd: &str, threads: u32, reps: usize) -> (bool, f64) {
-    let mut all_ok = true;
-    let mut last = f64::NAN;
+/// Aggregate pin-probe verdict for ONE arm across `reps` independent probes.
+/// Tri-state — mirrors [`crate::paired::PinProbe`] one level up: a proven
+/// wrong-concurrency arm (`Violated`) must never be confused with an arm
+/// whose probe simply could not produce a number (`Unmeasurable`). The
+/// 2026-07-26 incident this distinction exists to close: the old two-state
+/// `(bool, f64)` shape conflated them (both read `ok=false, cpu%=NaN`),
+/// which VOIDed 28/44 real wallcensus cells for having NO signal at all
+/// rather than a CONFIRMED wrong one — discarding an otherwise-clean paired
+/// wall verdict. See `paired.rs`'s MECHANISM HISTORY comment for the root
+/// cause and fix.
+#[derive(Clone, Debug, PartialEq)]
+enum ArmPin {
+    /// Every rep that DID produce a measurement fell inside the window for
+    /// `threads`. Carries the last observed pct.
+    Ok(f64),
+    /// At least one rep measured a concurrency OUTSIDE the window — a
+    /// PROVEN violation. This wins over any co-occurring `Unmeasurable` rep:
+    /// a confirmed violation is never softened by an unrelated probe hiccup
+    /// on a different rep.
+    Violated(f64),
+    /// Not one rep (of `reps`) could establish a real measurement. NEVER a
+    /// violation — the caller must let the cell proceed to the paired wall
+    /// engine rather than auto-VOID (module doc).
+    Unmeasurable(String),
+}
+
+/// Run the pin-gate probe for one arm, `reps` times, and fold the reps into
+/// one [`ArmPin`] verdict. "ALL reps must pass" (module doc's original
+/// intent) now means: any measured-and-outside-window rep is an immediate
+/// `Violated`; otherwise at least one measured-and-inside rep yields `Ok`;
+/// only when EVERY rep came back unmeasurable is the arm `Unmeasurable`.
+fn probe_arm_pin(cmd: &str, threads: u32, reps: usize) -> ArmPin {
+    let mut last_measured = f64::NAN;
+    let mut violated: Option<f64> = None;
+    let mut reasons: Vec<String> = Vec::new();
     for _ in 0..reps.max(1) {
         match cpu_pct_of_arm(cmd) {
-            Some(pct) => {
-                last = pct;
+            PinProbe::Measured(pct) => {
+                last_measured = pct;
                 if !pin_gate_ok(pct, threads) {
-                    all_ok = false;
+                    violated = Some(pct);
                 }
             }
-            None => {
-                all_ok = false;
-            }
+            PinProbe::Unmeasurable(reason) => reasons.push(reason),
         }
     }
-    (all_ok, last)
+    if let Some(pct) = violated {
+        return ArmPin::Violated(pct);
+    }
+    if last_measured.is_nan() {
+        return ArmPin::Unmeasurable(reasons.join("; "));
+    }
+    ArmPin::Ok(last_measured)
+}
+
+/// `(numeric_pct_or_nan, human_readable_descriptor)` for a cell's
+/// `a_cpu_pct`/`b_cpu_pct` field and VOID-message text. NaN (not a
+/// fabricated number) when the probe never measured anything.
+fn arm_pin_parts(pin: &ArmPin) -> (f64, String) {
+    match pin {
+        ArmPin::Ok(pct) | ArmPin::Violated(pct) => (*pct, format!("{pct:.1}")),
+        ArmPin::Unmeasurable(reason) => (f64::NAN, format!("unmeasurable ({reason})")),
+    }
 }
 
 /// Measure ONE (rival, level, threads, corpus) cell. `rival_available` is
@@ -345,11 +404,18 @@ fn measure_cell(
     let a_cmd = expand(&cfg.ours_tmpl, level, threads, corpus);
     let b_cmd = expand(&rival.tmpl, level, threads, corpus);
 
-    // -- PIN GATE (BLOCKING, before the expensive paired run) ---------------
-    let (a_pin_ok, a_pct) = probe_arm_pin(&a_cmd, threads, cfg.pin_reps);
-    let (b_pin_ok, b_pct) = probe_arm_pin(&b_cmd, threads, cfg.pin_reps);
-    let pin_ok = a_pin_ok && b_pin_ok;
-    if !pin_ok {
+    // -- PIN GATE (BLOCKING only on a PROVEN violation, before the expensive
+    //    paired run). An `Unmeasurable` probe is explicitly NOT blocking —
+    //    see `ArmPin`'s doc and the module-level incident it fixes.
+    let a_pin = probe_arm_pin(&a_cmd, threads, cfg.pin_reps);
+    let b_pin = probe_arm_pin(&b_cmd, threads, cfg.pin_reps);
+    let a_violated = matches!(a_pin, ArmPin::Violated(_));
+    let b_violated = matches!(b_pin, ArmPin::Violated(_));
+    let pin_unmeasurable =
+        matches!(a_pin, ArmPin::Unmeasurable(_)) || matches!(b_pin, ArmPin::Unmeasurable(_));
+    let (a_pct, a_desc) = arm_pin_parts(&a_pin);
+    let (b_pct, b_desc) = arm_pin_parts(&b_pin);
+    if a_violated || b_violated {
         let status = classify_status(true, true, false, "");
         let mut c = placeholder_cell(
             &rival.name,
@@ -358,10 +424,12 @@ fn measure_cell(
             threads,
             status,
             Some(format!(
-                "pin-gate FAIL: ours cpu%={a_pct:.1} (ok={a_pin_ok}) rival cpu%={b_pct:.1} \
-                 (ok={b_pin_ok}) vs intended threads={threads} (window [{:.0},{:.0}]) — the \
-                 arm(s) named 'ok=false' did not run at the claimed concurrency; wall number \
-                 discarded, never trusted",
+                "pin-gate FAIL: ours cpu%={a_desc} (ok={}) rival cpu%={b_desc} (ok={}) \
+                 vs intended threads={threads} (window [{:.0},{:.0}]) — the arm(s) named \
+                 'ok=false' did not run at the claimed concurrency; wall number discarded, \
+                 never trusted",
+                !a_violated,
+                !b_violated,
                 threads as f64 * 100.0 * 0.5,
                 threads as f64 * 100.0 * 1.6,
             )),
@@ -369,7 +437,15 @@ fn measure_cell(
         c.a_cpu_pct = a_pct;
         c.b_cpu_pct = b_pct;
         c.pin_ok = false;
+        c.pin_unmeasurable = pin_unmeasurable;
         return c;
+    }
+    if pin_unmeasurable {
+        eprintln!(
+            "wallcensus: NOTE pin-unmeasurable (ours cpu%={a_desc}, rival cpu%={b_desc}) at \
+             threads={threads} — proceeding to the paired wall engine anyway (an unmeasurable \
+             probe is NOT a proven violation; see ArmPin doc)"
+        );
     }
 
     // -- WALL + correctness, via the SAME paired engine sweep/matrix use ----
@@ -414,6 +490,7 @@ fn measure_cell(
                 a_cpu_pct: a_pct,
                 b_cpu_pct: b_pct,
                 pin_ok: true,
+                pin_unmeasurable,
                 size_ratio_bonus: pr.size_ratio,
                 n: pr.n,
                 error: if pr.status == "OK" {
@@ -435,6 +512,7 @@ fn measure_cell(
             c.a_cpu_pct = a_pct;
             c.b_cpu_pct = b_pct;
             c.pin_ok = true; // pin gate itself passed; the paired run failed after
+            c.pin_unmeasurable = pin_unmeasurable;
             c
         }
     }
@@ -532,8 +610,8 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
                     }
                     let cell = measure_cell(cfg, rival, avail, level, threads, corpus, &input_sha);
                     eprintln!(
-                        "wallcensus: {id} -> {} (wall_ratio={:.4} pin_ok={})",
-                        cell.status, cell.wall_ratio, cell.pin_ok
+                        "wallcensus: {id} -> {} (wall_ratio={:.4} pin_ok={} pin_unmeasurable={})",
+                        cell.status, cell.wall_ratio, cell.pin_ok, cell.pin_unmeasurable
                     );
                     save_cell(&cell_path, &cell);
                     cells.push(cell);
@@ -577,11 +655,11 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
 pub fn write_tsv(cells: &[CensusCell], path: &Path) -> Result<(), String> {
     let mut s = String::from(
         "rival\tcorpus\tlevel\tthreads\tstatus\twall_class\twall_ratio\ta_cpu_pct\tb_cpu_pct\t\
-         pin_ok\ta_median_ms\tb_median_ms\tn\terror\n",
+         pin_ok\tpin_unmeasurable\ta_median_ms\tb_median_ms\tn\terror\n",
     );
     for c in cells {
         s.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.1}\t{:.1}\t{}\t{:.4}\t{:.4}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.1}\t{:.1}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\n",
             c.rival,
             c.corpus,
             c.level,
@@ -592,6 +670,7 @@ pub fn write_tsv(cells: &[CensusCell], path: &Path) -> Result<(), String> {
             c.a_cpu_pct,
             c.b_cpu_pct,
             c.pin_ok,
+            c.pin_unmeasurable,
             c.a_median_ms,
             c.b_median_ms,
             c.n,
@@ -1113,6 +1192,7 @@ pub fn selftest() -> ExitCode {
         a_cpu_pct: 100.0,
         b_cpu_pct: 100.0,
         pin_ok: true,
+        pin_unmeasurable: false,
         size_ratio_bonus: 1.0,
         n: 9,
         error: None,
@@ -1193,8 +1273,15 @@ pub fn selftest() -> ExitCode {
         let _ = fs::remove_dir_all(&base);
         let fixture = base.join("corpus.txt");
         let _ = fs::create_dir_all(&base);
+        // ~5MB — EXECUTED, not guessed: a 20,000-line (~1MB) fixture measured
+        // FLAKY under host contention (`gzip -6` read 20-42% cpu on a busy
+        // box — BELOW the T1 window's 50% floor — because a small/fast
+        // command's wall time is dominated by fork/exec+scheduling latency,
+        // which inflates wall without inflating user+sys; see paired.rs's
+        // MECHANISM HISTORY note). At ~5MB the same command measured a tight
+        // 88-94% band on the SAME loaded box.
         let mut body = String::new();
-        for i in 0..20_000 {
+        for i in 0..100_000 {
             body.push_str(&format!(
                 "the quick brown fox {i} jumps over the lazy dog {i}\n"
             ));
@@ -1206,17 +1293,19 @@ pub fn selftest() -> ExitCode {
         // exercise the pin-gate math, not to claim gzippy-specific behavior).
         let single_thread_busy =
             "i=0; while [ $i -lt 80000 ]; do i=$((i+1)); done; gzip -6 -c {input}";
-        // NOTE: probe `/usr/bin/time`'s mere EXISTENCE directly rather than via
-        // `cpu_pct_of_arm("true")` — `true` returns in <20ms, which is exactly
-        // the floor `cpu_pct_of_arm` itself refuses to trust (see its own doc),
-        // so gating availability on it would ALWAYS read "unavailable" even on
-        // a host where the probe works fine (confirmed against a real corpus
-        // during this module's own development).
-        let have_time_and_sh = Path::new("/usr/bin/time").exists();
+        // NOTE (2026-07-26, UPDATED): this used to gate on `/usr/bin/time`'s
+        // mere existence because the OLD probe returned "unmeasurable" for
+        // anything under a ~20ms floor — `cpu_pct_of_arm("true")` would
+        // ALWAYS read unavailable even on a host where the probe worked
+        // fine. The pin gate no longer shells out to `/usr/bin/time` at all
+        // (see `paired.rs`'s MECHANISM HISTORY comment: getrusage(
+        // RUSAGE_CHILDREN) + Instant replaced it), so the real dependency is
+        // just `sh` — kept as a plain existence check for parity with the
+        // rest of this module's selftest guards, not because the new probe
+        // needs it.
+        let have_time_and_sh = Path::new("/bin/sh").exists();
         if !have_time_and_sh {
-            println!(
-                "  NOTE wallcensus: /usr/bin/time unavailable — pin-gate e2e selftest skipped"
-            );
+            println!("  NOTE wallcensus: /bin/sh unavailable — pin-gate e2e selftest skipped");
         } else {
             let rival = Rival {
                 name: "gzip".to_string(),
@@ -1267,6 +1356,18 @@ pub fn selftest() -> ExitCode {
                 pin_reps: 1,
                 ours_commit: None,
             };
+            // NOTE: pre-existing test, unmodified by the 2026-07-26 pin-gate
+            // fix. On a heavily loaded shared box this occasionally VOIDs on
+            // the paired engine's OWN A/A significance gate (observed
+            // directly during this fix's development: `wall_verdict=
+            // VOID-aa_bias=...` / an occasional non-NOISY resolved sign) —
+            // the SAME pre-existing class of timing noise documented for
+            // `paired::tests::known_slower_b_end_to_end_resolves_b_slower`.
+            // That is a property of the PAIRED ENGINE's statistics under
+            // contention, unrelated to (and not introduced by) the
+            // getrusage-based pin-gate probe these selftests otherwise
+            // exercise; re-run on a quiet box before treating a failure here
+            // as a regression.
             let cell1 = measure_cell(&cfg1, &rival, true, 6, 1, &fixture, &input_sha);
             check(
                 "e2e control: the SAME command declared at its real concurrency (T1) \
@@ -1278,6 +1379,103 @@ pub fn selftest() -> ExitCode {
                 cell1.wall_verdict == "NOISY",
             );
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // -- 6b. end-to-end measure_cell: pin-UNMEASURABLE does NOT auto-VOID an
+    // otherwise-clean cell (the 2026-07-26 fix's second half — distinct from
+    // section 6's PROVEN violation). A stateful "ours" command exits nonzero
+    // on its FIRST invocation only (a counter file flips it), so the pin
+    // PROBE (exactly one call, `pin_reps=1`) sees a failure -> `Unmeasurable`
+    // — while every LATER invocation (the real paired A/A + A/B engine,
+    // which calls the same command many times) succeeds normally. This is
+    // the exact shape of the incident: a probe that couldn't get a number
+    // must not discard a wall verdict the real engine went on to establish
+    // cleanly.
+    {
+        let base = std::env::temp_dir().join(format!(
+            "fulcrum-wallcensus-unmeasurable-st-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let fixture = base.join("corpus.txt");
+        let _ = fs::create_dir_all(&base);
+        // ~5MB — EXECUTED, not guessed: a 20,000-line (~1MB) fixture measured
+        // FLAKY under host contention (`gzip -6` read 20-42% cpu on a busy
+        // box — BELOW the T1 window's 50% floor — because a small/fast
+        // command's wall time is dominated by fork/exec+scheduling latency,
+        // which inflates wall without inflating user+sys; see paired.rs's
+        // MECHANISM HISTORY note). At ~5MB the same command measured a tight
+        // 88-94% band on the SAME loaded box.
+        let mut body = String::new();
+        for i in 0..100_000 {
+            body.push_str(&format!(
+                "the quick brown fox {i} jumps over the lazy dog {i}\n"
+            ));
+        }
+        let _ = fs::write(&fixture, body.as_bytes());
+        let input_sha = sha256_of_file(&fixture).unwrap_or_default();
+
+        let ctr = base.join("probe-hiccup-ctr");
+        let _ = fs::remove_file(&ctr);
+        let ctr_s = ctr.display();
+        // First call ever (the pin probe) exits 9 -> Unmeasurable. Every
+        // subsequent call (the real paired engine) takes the gzip branch.
+        let flaky_probe_then_clean = format!(
+            "N=$(cat {ctr_s} 2>/dev/null || echo 0); echo $((N+1)) > {ctr_s}; \
+             if [ \"$N\" = \"0\" ]; then exit 9; fi; gzip -6 -c {{input}}"
+        );
+        let rival = Rival {
+            name: "gzip".to_string(),
+            tmpl: "gzip -{level} -c {input}".to_string(),
+        };
+        let cfg = CensusConfig {
+            ours_tmpl: flaky_probe_then_clean,
+            rivals: vec![rival.clone()],
+            levels: vec![6],
+            threads: vec![1],
+            corpora: vec![fixture.clone()],
+            out_dir: base.join("out"),
+            roundtrip_cmd: "gzip -dc".to_string(),
+            n: 7,
+            warmup: 1,
+            sink: PathBuf::from("/dev/null"),
+            pin_reps: 1,
+            ours_commit: None,
+        };
+        let cell = measure_cell(&cfg, &rival, true, 6, 1, &fixture, &input_sha);
+        check(
+            "e2e unmeasurable: a probe that failed ONCE (Unmeasurable) is flagged \
+             pin_unmeasurable=true",
+            cell.pin_unmeasurable,
+        );
+        check(
+            "e2e unmeasurable: pin_ok stays true (NOT a proven violation)",
+            cell.pin_ok,
+        );
+        // NOTE: asserting `cell.status == cell.wall_status` (both non-empty),
+        // NOT `cell.status == "OK"` — the latter would couple this pin-gate
+        // test to the PAIRED ENGINE's own inherent timing-noise flakiness
+        // (its A/A significance gate can legitimately VOID a fast/small
+        // fixture under host contention — the SAME pre-existing class of
+        // flake `paired::tests::known_slower_b_end_to_end_resolves_b_slower`
+        // is documented to have; observed directly here during development:
+        // `wall_verdict=VOID-aa_bias=0.0524` on a loaded box). What THIS
+        // section proves is narrower and load-INDEPENDENT: the pin gate
+        // itself did not pre-empt the cell — whatever the paired engine
+        // decides is passed straight through, never overridden to VOID
+        // merely because the probe was unmeasurable.
+        check(
+            "e2e unmeasurable: the cell reaches the PAIRED ENGINE (wall_status non-empty, \
+             cell.status == cell.wall_status) rather than being pre-emptively VOIDed by the \
+             pin gate itself",
+            !cell.wall_status.is_empty() && cell.status == cell.wall_status,
+        );
+        check(
+            "e2e unmeasurable: pin-unmeasurable is a DISTINCT state from pin-violated \
+             (section 6's cell had pin_ok=false; this one has pin_ok=true)",
+            cell.pin_ok && cell.pin_unmeasurable,
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1457,6 +1655,58 @@ mod tests {
         assert_eq!(classify_status(true, true, true, "FAIL"), "VOID");
     }
 
+    // ---- ArmPin / probe_arm_pin: pin-unmeasurable != pin-violated (2026-07-26
+    // fix; see paired.rs MECHANISM HISTORY for the root cause) --------------
+
+    #[test]
+    fn probe_arm_pin_ok_for_correctly_pinned_arm() {
+        // A genuinely single-threaded arm declared at its real concurrency
+        // (T1) must measure Ok, not Violated or Unmeasurable.
+        let busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
+        match probe_arm_pin(busy, 1, 1) {
+            ArmPin::Ok(pct) => assert!(pct.is_finite() && pct > 0.0),
+            other => panic!("expected ArmPin::Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_arm_pin_violated_for_wrong_concurrency() {
+        // The SAME genuinely single-threaded arm declared at threads=4 must
+        // measure Violated (a PROVEN wrong concurrency), not Unmeasurable —
+        // this is the worked incident's shape at the ArmPin level.
+        let busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
+        match probe_arm_pin(busy, 4, 1) {
+            ArmPin::Violated(pct) => assert!(!pin_gate_ok(pct, 4)),
+            other => panic!("expected ArmPin::Violated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_arm_pin_unmeasurable_for_failing_command_never_reads_as_ok_or_violated() {
+        // A command that cannot even complete during the probe must be
+        // Unmeasurable — structurally distinct from both Ok and Violated, so
+        // a caller can never mistake "couldn't tell" for either verdict.
+        match probe_arm_pin("exit 9", 1, 1) {
+            ArmPin::Unmeasurable(reason) => assert!(!reason.is_empty()),
+            other => panic!("expected ArmPin::Unmeasurable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_arm_pin_multi_rep_violated_wins_over_unmeasurable() {
+        // reps=1 already covered above; this exercises the fold logic
+        // directly: if ANY measured rep violates, the arm is Violated
+        // regardless of how many OTHER reps exist (module doc's "ALL reps
+        // must pass" — a single bad rep is disqualifying, mirroring the
+        // ORIGINAL "a single lucky rep is not a certificate" intent, just
+        // inverted: a single UNLUCKY rep IS disqualifying).
+        let busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
+        match probe_arm_pin(busy, 4, 3) {
+            ArmPin::Violated(_) => {}
+            other => panic!("expected ArmPin::Violated across reps, got {other:?}"),
+        }
+    }
+
     #[test]
     fn expand_substitutes_all_three_tokens() {
         let got = expand(
@@ -1492,6 +1742,7 @@ mod tests {
             a_cpu_pct: 399.0,
             b_cpu_pct: 401.0,
             pin_ok: true,
+            pin_unmeasurable: false,
             size_ratio_bonus: 1.0,
             n: 9,
             error: None,
