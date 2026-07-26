@@ -2333,6 +2333,7 @@ pub fn selftest() -> ExitCode {
                 a_cpu_pct: threads as f64 * 100.0,
                 b_cpu_pct: threads as f64 * 100.0,
                 pin_ok: true,
+                pin_unmeasurable: false,
                 size_ratio_bonus: ratio,
                 n: 9,
                 error: None,

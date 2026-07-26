@@ -490,107 +490,184 @@ pub fn rss_point_spread(reps: &[f64]) -> (f64, f64) {
 // a SEPARATE, orthogonal gate that must run before a cell's wall number is
 // trusted.
 //
-// SAME "DEDICATED PROBE, NOT THE TIMED REP" DISCIPLINE AS PEAK-RSS: cpu% needs
-// `/usr/bin/time` rusage (user+sys+real seconds), whose fork/exec would add to
-// the wall if it wrapped a timed rep. So the probe is a separate, untimed,
-// stdout→/dev/null invocation — never inside `sample_interleaved`'s loop.
+// SAME "DEDICATED PROBE, NOT THE TIMED REP" DISCIPLINE AS PEAK-RSS: cpu% is
+// measured by a separate, untimed, stdout→/dev/null spawn+wait — never inside
+// `sample_interleaved`'s loop.
 //
-// PORTABLE PARSE: Linux GNU `time -v` reports `User time (seconds):` /
-// `System time (seconds):` / `Elapsed (wall clock) time (h:mm:ss or m:ss):`
-// on separate lines; macOS BSD `time -l` reports all three on ONE line
-// (`<real> real         <user> user         <sys> sys`). cpu% is computed
-// uniformly as `(user+sys)/real*100` rather than trusting GNU's own `Percent
-// of CPU this job got:` line, so the SAME formula is used on both platforms
-// (one fewer format to parse, one fewer thing that could silently diverge
-// between the two OS code paths).
+// MECHANISM HISTORY (2026-07-26 defect + fix — the ANTI-BIAS preamble's "read
+// code is not evidence" rule applies: everything below was EXECUTED, not
+// reasoned about). The first real `wallcensus` dataset
+// (~/www/gzippy-bench/wallcensus_t1_mac/census.tsv, 189 declared cells) came
+// back with 28/44 VOIDs reading `pin-gate FAIL: ours cpu%=NaN (ok=false)` —
+// and NOT randomly: they clustered on the fastest cells (small corpus, low
+// level), which is exactly where the igzip/L0/L1 fronts live. Root cause,
+// reproduced directly (no wrapper) on `gzippy.frozen -1 -p 1 -c armexe.elf`
+// (a ~1.1 MB file, ~17ms real):
+//
+//   $ /usr/bin/time -l gzippy.frozen -1 -p 1 -c armexe.elf > /dev/null
+//           0.01 real         0.00 user         0.00 sys
+//
+// `/usr/bin/time -l`'s printed fields are TWO DECIMAL DIGITS — a ~10ms tick.
+// A ~17ms real command with sub-10ms user/sys prints "0.00 user 0.00 sys",
+// so the OLD probe's `real < 0.02` floor (itself a band-aid for exactly this)
+// rejected it as `None` → cpu%=NaN → the pin gate, unable to tell "measured
+// wrong" from "couldn't measure", VOIDed the cell outright, discarding an
+// otherwise-clean paired wall verdict.
+//
+// REJECTED FIX #1 — raise/lower the `real<0.02` floor. Tried by hand-editing
+// the floor to `0.0`: still fails, because even when real ends up >=20ms the
+// PRINTED user/sys are still rounded to 0.00 whenever the command's own CPU
+// time is under ~5ms — the floor was never the bug, the TEXT RESOLUTION was.
+//
+// CHOSEN FIX, ATTEMPT 1 — `getrusage(RUSAGE_CHILDREN)` (a POSIX syscall, not
+// a text report) bracketing a plain `Command::status()` spawn+wait, with wall
+// taken from `Instant` (nanosecond resolution) instead of `/usr/bin/time`'s
+// printed field. `ru_utime`/`ru_stime` are `timeval`s — MICROSECOND
+// resolution, not the ~10ms print tick. EXECUTED, not merely reasoned: a
+// standalone prototype (same syscalls, same `Command::status()` spawn) run
+// against the EXACT failing cell —
+//   `gzippy.frozen -1 -p 1 -c armexe.elf` (previously cpu%=NaN) now reads
+//   cpu%≈86% (10 reps, 70–89% band) — inside the T1 window, a USABLE verdict.
+// The worked incident (`pigz -3 -c` unpinned vs `pigz -3 -p 1 -c`, both on
+// `dickens`, 12 MB) was re-run against the NEW probe to prove the gate still
+// catches a real violation: unpinned reads 452–553% (OUTSIDE the T1 window,
+// still VOIDs); `-p 1` reads 98.1–98.8% (inside).
+//
+// ATTEMPT 1 DEFECT, FOUND BY EXECUTING `cargo test --release` (not by
+// reasoning about the code): `RUSAGE_CHILDREN` is a PROCESS-WIDE shared
+// accumulator — "cumulative CPU time of every child this PROCESS has
+// reaped", not scoped to one thread's own spawn. `cargo test --release` runs
+// `#[test]` functions on separate OS THREADS inside ONE process; when two
+// tests concurrently spawn+reap child processes, a probe running on thread A
+// picks up CPU time consumed by thread B's unrelated children if B's child
+// was reaped inside A's before/after window. Reproduced directly: three
+// `cargo test --release` runs failed
+// `wallcensus::tests::probe_arm_pin_ok_for_correctly_pinned_arm` and
+// `paired::tests::pin_gate_1185pct_incident_still_voids_after_the_getrusage_fix`
+// with a genuinely single-threaded busy loop reading 313%/412% cpu. A
+// standalone repro nails it down further: one thread probing a
+// single-threaded busy loop while ANOTHER thread concurrently spawns 200
+// unrelated child processes reads a contaminated 183–199% (should be ~100%)
+// under `RUSAGE_CHILDREN` — every single rep.
+//
+// CHOSEN FIX, FINAL — `wait4(pid, &status, 0, &rusage)` in place of
+// `Command::status()` + `getrusage(RUSAGE_CHILDREN)`. `wait4`'s rusage
+// out-parameter is the resource usage of THAT SPECIFIC reaped child ONLY
+// (POSIX-guaranteed; not a shared accumulator), so there is no cross-thread
+// contamination to reason about — no lock needed, no "only one thread may
+// probe at a time" invariant to maintain. Per-process rusage still covers
+// the full reaped SUBTREE (a child's own `ru_utime`/`ru_stime`, as seen by
+// `wait4`, already includes whatever it inherited from grandchildren it
+// itself reaped — the same recursive propagation `RUSAGE_CHILDREN` relied
+// on), so multi-thread/multi-process rivals (pigz) are still measured
+// correctly. EXECUTED: the SAME concurrent-noise repro above, re-run against
+// `wait4`, reads a rock-solid 99.7% every rep (vs. RUSAGE_CHILDREN's
+// 183–199% under IDENTICAL contamination) — proof, not inference.
+//
+// RESIDUAL RESOLUTION LIMIT (still real, not removed by either attempt): for
+// a command whose OWN work is far under fork+exec+shell-startup cost (a bare
+// `true`/`sleep 0.001` measured 50–72% cpu on this box — reflecting
+// `sh -c`'s own single-threaded startup, not the trivial command's
+// "concurrency"), the observed % is dominated by process-launch overhead
+// rather than the workload. This is a structural floor of ANY fork/exec-based
+// external-process probe — it is NOT resolved by a better parser or a better
+// syscall, only outgrown by a corpus large enough that the command's own
+// runtime dominates launch cost, which is true of every production
+// wallcensus cell (a real decode/encode over a real file) and false only for
+// degenerate selftest fixtures like `true`. RELATED, ALSO EXECUTED: under
+// HEAVY host contention (many competing processes), a SMALL/FAST command's
+// wall time can be inflated by scheduling-queue wait that does NOT show up
+// in user+sys (the process is off-CPU, not burning cycles) — this DEFLATES
+// the measured cpu%, and was caught directly (`gzip -6` on a ~1MB fixture
+// read 20-42% cpu on a loaded box — spuriously BELOW the T1 window's 50%
+// floor for a genuinely single-threaded command). Fix applied to every
+// selftest/test fixture in this module: use a corpus large enough (~5MB+)
+// that the command's real work dominates both launch overhead and
+// scheduling jitter — the SAME fix, for the same underlying reason, in both
+// directions.
+//
+// TRIED AND NOT NEEDED — repeating the probed command N times inside one
+// probe bracket (`for i in 1..K; do CMD; done`) to inflate wall time past a
+// print-resolution tick. Once wall comes from `Instant` and user/sys come
+// from a syscall (rusage), there is no tick left to inflate past — the
+// loop-repeat approach solves a problem the syscall-based probe does not
+// have, at the cost of K× the wall per probe rep, so it is NOT implemented.
+//
+// UNMEASURABLE vs VIOLATED (2026-07-26 fix, part 2): the old probe returned
+// `Option<f64>` — `None` meant EITHER "couldn't measure" OR "measured but
+// caller never got a chance to see the number", conflating two structurally
+// different situations. [`PinProbe`] below is the tri-state fix: a
+// [`PinProbe::Measured`] result may still fail `pin_gate_ok` (a REAL
+// violation), but a [`PinProbe::Unmeasurable`] result is NEVER treated as
+// one — `wallcensus::probe_arm_pin` (the caller) must let an unmeasurable
+// probe fall through to the paired wall engine rather than auto-VOID.
 
-/// Parse `(user_secs, sys_secs, real_secs)` from a `/usr/bin/time` rusage
-/// report. Tries the macOS BSD single-line form first, then the Linux GNU
-/// multi-line form. `None` when neither shape is found — never a fabricated
-/// triple.
-fn parse_rusage_times(stderr: &str) -> Option<(f64, f64, f64)> {
-    // BSD `time -l` (macOS): "        0.05 real         0.03 user         0.00 sys"
-    for line in stderr.lines() {
-        let line = line.trim();
-        if line.ends_with("sys") && line.contains("real") && line.contains("user") {
-            let nums: Vec<f64> = line
-                .split_whitespace()
-                .filter_map(|t| t.parse::<f64>().ok())
-                .collect();
-            if nums.len() == 3 {
-                return Some((nums[1], nums[2], nums[0])); // (user, sys, real)
-            }
-        }
-    }
-    // GNU `time -v` (Linux): three separate labeled lines.
-    let mut user = None;
-    let mut sys = None;
-    let mut elapsed = None;
-    for line in stderr.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("User time (seconds):") {
-            user = rest.trim().parse::<f64>().ok();
-        } else if let Some(rest) = line.strip_prefix("System time (seconds):") {
-            sys = rest.trim().parse::<f64>().ok();
-        } else if let Some(rest) = line.strip_prefix("Elapsed (wall clock) time (h:mm:ss or m:ss):")
-        {
-            elapsed = parse_elapsed_hms(rest.trim());
-        }
-    }
-    match (user, sys, elapsed) {
-        (Some(u), Some(s), Some(e)) => Some((u, s, e)),
-        _ => None,
-    }
+/// Outcome of a single concurrency probe for ONE arm. The 2026-07-26 fix's
+/// second half: distinguishes "a real number was measured" (which may still
+/// FAIL `pin_gate_ok` — a genuine violation) from "no number could be
+/// measured at all" (spawn/syscall failure) — see MECHANISM HISTORY above.
+/// Callers (`wallcensus::probe_arm_pin`) must never treat `Unmeasurable` as
+/// a violation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PinProbe {
+    /// A real concurrency measurement (%) was obtained.
+    Measured(f64),
+    /// No measurement could be obtained; the reason is named for the VOID/
+    /// note text, never silent. NEVER a violation on its own.
+    Unmeasurable(String),
 }
 
-/// Parse a GNU-time elapsed field: `SS`, `M:SS[.ss]`, or `H:MM:SS[.ss]`.
-fn parse_elapsed_hms(s: &str) -> Option<f64> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.is_empty() || parts.len() > 3 {
-        return None;
-    }
-    let mut vals = Vec::with_capacity(parts.len());
-    for p in &parts {
-        vals.push(p.parse::<f64>().ok()?);
-    }
-    Some(match vals.len() {
-        1 => vals[0],
-        2 => vals[0] * 60.0 + vals[1],
-        3 => vals[0] * 3600.0 + vals[1] * 60.0 + vals[2],
-        _ => return None,
-    })
-}
-
-/// Observed CPU utilization (%) of ONE arm, via a DEDICATED `/usr/bin/time`
-/// probe (stdout→/dev/null, untimed relative to the wall). `100.0` means "used
-/// one core's worth of wall time"; `400.0` means four. `None` when
-/// `/usr/bin/time` is absent, the arm exits nonzero, the rusage report can't
-/// be parsed, or the elapsed real time is under 20ms — both rusage formats
-/// round to roughly a 10ms tick, so a ratio built on a sub-20ms elapsed is
-/// noise, not a measurement, and must never be reported as a percentage.
-pub fn cpu_pct_of_arm(cmd: &str) -> Option<f64> {
-    let mut c = Command::new("/usr/bin/time");
-    if cfg!(target_os = "macos") {
-        c.arg("-l");
-    } else {
-        c.arg("-v");
-    }
-    c.arg("sh")
+/// Observed CPU utilization (%) of ONE arm: spawn `cmd` under `sh -c`
+/// (stdout/stdin → /dev/null), then reap it directly via `wait4` (NOT
+/// `Command::wait()`/`status()`) so the returned `rusage` is scoped to THAT
+/// child alone — immune to the cross-thread `RUSAGE_CHILDREN` contamination
+/// documented in the MECHANISM HISTORY comment above. Wall comes from an
+/// `Instant` bracketing the same spawn→reap span. `100.0` means "used one
+/// core's worth of wall time"; `400.0` means four.
+pub fn cpu_pct_of_arm(cmd: &str) -> PinProbe {
+    let child = match Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-    let out = c.output().ok()?;
-    if !out.status.success() {
-        return None;
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return PinProbe::Unmeasurable(format!("spawn `{cmd}` failed: {e}")),
+    };
+    let pid = child.id() as libc::pid_t;
+    let t0 = Instant::now();
+    let mut wstatus: libc::c_int = 0;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is our own just-spawned child (owned by `child`, not yet
+    // waited on by anyone else); `wait4` reaps it directly so `child` must
+    // NOT be waited on again afterward. `std::process::Child::drop` does NOT
+    // itself call wait()/waitpid() (a documented Rust stdlib property), so
+    // letting `child` drop after this point is safe and leaves no zombie —
+    // this `wait4` call is the ONE place this pid is reaped.
+    let rc = unsafe { libc::wait4(pid, &mut wstatus, 0, &mut ru) };
+    let wall = t0.elapsed().as_secs_f64();
+    drop(child); // explicit: never call .wait()/.status() on this pid again
+    if rc < 0 {
+        return PinProbe::Unmeasurable(format!("wait4 on `{cmd}` (pid {pid}) failed"));
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let (user, sys, real) = parse_rusage_times(&stderr)?;
-    if real < 0.02 {
-        return None;
+    let exited_ok = libc::WIFEXITED(wstatus) && libc::WEXITSTATUS(wstatus) == 0;
+    if !exited_ok {
+        return PinProbe::Unmeasurable(format!(
+            "`{cmd}` exited abnormally during pin probe (raw status {wstatus})"
+        ));
     }
-    Some((user + sys) / real * 100.0)
+    if wall <= 0.0 {
+        // Never observed in practice (Instant ticks even across a single
+        // fork/exec), but guarded rather than dividing by zero.
+        return PinProbe::Unmeasurable(
+            "wall time non-positive (clock resolution exhausted)".to_string(),
+        );
+    }
+    let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1_000_000.0;
+    let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1_000_000.0;
+    PinProbe::Measured((user + sys) / wall * 100.0)
 }
 
 /// PIN-GATE verdict: does `observed_pct` match `threads`-way concurrency
@@ -1611,6 +1688,112 @@ pub fn selftest() -> ExitCode {
         let _ = std::fs::remove_dir_all(&demo_tmp);
     }
 
+    // -- 9. PIN GATE (Gate-0 for the wait4-based concurrency probe,
+    // 2026-07-26 fix). See the module-level MECHANISM HISTORY comment above
+    // `cpu_pct_of_arm` for the full incident: the OLD /usr/bin/time
+    // text-parsing probe returned cpu%=NaN for anything under its ~10ms
+    // print-resolution floor, and the pin gate — unable to tell "couldn't
+    // measure" from "measured wrong" — VOIDed 28/44 real wallcensus cells on
+    // exactly the fastest (small-file/low-level) corner it most needs to
+    // measure. These three checks are the sub-millisecond regression, the
+    // unmeasurable/violated distinction, and the original 1185%-CPU incident
+    // RE-PROVEN against the new mechanism (never just re-run against the old
+    // fixed-number unit test).
+    {
+        // (a) sub-millisecond command still yields a MEASURED, finite verdict
+        //     (the exact defect: the old probe returned None here).
+        match cpu_pct_of_arm("true") {
+            PinProbe::Measured(pct) => {
+                check(
+                    "pin-gate: sub-ms command ('true') yields a finite Measured cpu% (not NaN)",
+                    pct.is_finite() && pct >= 0.0,
+                );
+            }
+            PinProbe::Unmeasurable(reason) => {
+                check(
+                    &format!(
+                        "pin-gate: sub-ms command must be Measured, not Unmeasurable ({reason})"
+                    ),
+                    false,
+                );
+            }
+        }
+
+        // (b) pin-unmeasurable != pin-violated: a command that cannot
+        //     complete (nonzero exit) must come back Unmeasurable, and that
+        //     must be a DISTINCT enum variant from Measured (so a caller can
+        //     never mistake "couldn't tell" for "confirmed wrong").
+        let unmeasurable_case = matches!(cpu_pct_of_arm("exit 7"), PinProbe::Unmeasurable(_));
+        check(
+            "pin-gate: a failing probe command -> PinProbe::Unmeasurable",
+            unmeasurable_case,
+        );
+        let violated_case =
+            match cpu_pct_of_arm("i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done") {
+                PinProbe::Measured(pct) => !pin_gate_ok(pct, 4), // busy-loop is T1-only; T4 window rejects it
+                PinProbe::Unmeasurable(_) => false,
+            };
+        check(
+            "pin-gate: a genuinely single-threaded arm measured against threads=4 -> \
+             Measured+VIOLATED (distinct code path from Unmeasurable)",
+            violated_case,
+        );
+
+        // (c) the ORIGINAL 1185%-CPU sign-flip incident, RE-EXECUTED against
+        //     the getrusage mechanism (never merely re-asserted against a
+        //     stored number): unpinned pigz defaults to all-core concurrency
+        //     and must still VOID a T1 cell; `-p 1` must still clear it.
+        let have_pigz = Command::new("sh")
+            .arg("-c")
+            .arg("pigz --version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !have_pigz {
+            println!("  NOTE pin-gate: pigz unavailable — 1185%-incident selftest skipped");
+        } else {
+            let fixture = std::env::temp_dir().join(format!(
+                "fulcrum-paired-st-pingate-incident-{}",
+                std::process::id()
+            ));
+            // ~5MB — EXECUTED, not guessed: a 213KB (4000-line) fixture was
+            // tried first and measured FLAKY (pigz's own worker-pool startup
+            // overhead dominates a file that small, so "unpinned" sometimes
+            // reads inside the T1 window purely from box load noise). At
+            // ~5MB, unpinned measured a stable 240-280% band and pinned
+            // 91-93% across repeated runs, including on a loaded box.
+            let mut body = String::new();
+            for i in 0..100_000 {
+                body.push_str(&format!(
+                    "the quick brown fox {i} jumps over the lazy dog {i}\n"
+                ));
+            }
+            let _ = std::fs::write(&fixture, body.as_bytes());
+            let path = fixture.to_string_lossy();
+
+            let unpinned_still_voids = match cpu_pct_of_arm(&format!("pigz -3 -c {path}")) {
+                PinProbe::Measured(pct) => !pin_gate_ok(pct, 1),
+                PinProbe::Unmeasurable(_) => false, // must be a real, measured violation, not a dodge
+            };
+            check(
+                "pin-gate: unpinned `pigz -3` (all-core) still VOIDs a declared-T1 cell \
+                 after the getrusage fix (the 1185%-incident, re-executed)",
+                unpinned_still_voids,
+            );
+            let pinned_clears = match cpu_pct_of_arm(&format!("pigz -3 -p 1 -c {path}")) {
+                PinProbe::Measured(pct) => pin_gate_ok(pct, 1),
+                PinProbe::Unmeasurable(_) => false,
+            };
+            check(
+                "pin-gate: `pigz -3 -p 1` (correctly pinned) clears the T1 window",
+                pinned_clears,
+            );
+            let _ = std::fs::remove_file(&fixture);
+        }
+    }
+
     println!(
         "SELFTEST={} pass={} fail={}",
         if fail.get() == 0 { "PASS" } else { "FAIL" },
@@ -1999,42 +2182,52 @@ mod tests {
         }
     }
 
-    // ---- PIN GATE: cpu% parsing + verdict (built for `fulcrum wallcensus`) ----
+    // ---- PIN GATE: wait4-based probe + verdict (built for `fulcrum
+    // wallcensus`; wait4 mechanism replaced BOTH /usr/bin/time text-parsing
+    // AND a first getrusage(RUSAGE_CHILDREN) attempt — 2026-07-26, see the
+    // module-level MECHANISM HISTORY comment for the full two-attempt story)
+    // ------------------------------------------------------------------
 
     #[test]
-    fn parse_rusage_times_bsd_single_line() {
-        let stderr = "        7.17 real         7.07 user         0.07 sys\n\
-                       2031616  maximum resident set size\n";
-        let (u, s, r) = parse_rusage_times(stderr).expect("bsd line parses");
-        assert!((u - 7.07).abs() < 1e-9);
-        assert!((s - 0.07).abs() < 1e-9);
-        assert!((r - 7.17).abs() < 1e-9);
-    }
-
-    #[test]
-    fn parse_rusage_times_gnu_multi_line() {
-        let stderr = "\tCommand being timed: \"gzip -6\"\n\
-                       \tUser time (seconds): 7.05\n\
-                       \tSystem time (seconds): 0.06\n\
-                       \tElapsed (wall clock) time (h:mm:ss or m:ss): 0:01.85\n\
-                       \tMaximum resident set size (kbytes): 1234\n";
-        let (u, s, r) = parse_rusage_times(stderr).expect("gnu lines parse");
-        assert!((u - 7.05).abs() < 1e-9);
-        assert!((s - 0.06).abs() < 1e-9);
-        assert!((r - 1.85).abs() < 1e-9); // 0:01.85 -> 1.85s
-    }
-
-    #[test]
-    fn parse_elapsed_hms_all_shapes() {
-        assert!((parse_elapsed_hms("7.05").unwrap() - 7.05).abs() < 1e-9);
-        assert!((parse_elapsed_hms("1:02.50").unwrap() - 62.5).abs() < 1e-9);
-        assert!((parse_elapsed_hms("1:02:03.00").unwrap() - 3723.0).abs() < 1e-9);
-        assert!(parse_elapsed_hms("not-a-time").is_none());
-    }
-
-    #[test]
-    fn parse_rusage_times_unparseable_is_none() {
-        assert!(parse_rusage_times("nothing recognizable here\n").is_none());
+    fn cpu_pct_of_arm_is_immune_to_concurrent_cross_thread_child_spawns() {
+        // Regression test for the ATTEMPT-1 defect found by EXECUTING
+        // `cargo test --release` (not by reasoning): `getrusage(
+        // RUSAGE_CHILDREN)` is a process-wide shared accumulator, so a probe
+        // on ONE thread was contaminated by child processes another thread
+        // concurrently spawned+reaped in the SAME test binary — a genuinely
+        // single-threaded busy loop measured 183-412% instead of ~100%
+        // whenever `cargo test`'s parallel test threads overlapped. This
+        // test reproduces that exact contention directly (a background
+        // thread hammering unrelated child spawns) and asserts the CURRENT
+        // (`wait4`-based) probe stays inside the T1 window regardless —
+        // proving the fix, not just asserting the old bug is gone by
+        // omission.
+        let noise = std::thread::spawn(|| {
+            for _ in 0..150 {
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg("i=0; while [ $i -lt 40000 ]; do i=$((i+1)); done")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        let busy = "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done";
+        for _ in 0..5 {
+            match cpu_pct_of_arm(busy) {
+                PinProbe::Measured(pct) => assert!(
+                    pin_gate_ok(pct, 1),
+                    "single-threaded arm measured {pct}% under concurrent cross-thread \
+                     child-spawn noise — expected INSIDE the T1 window (this is the exact \
+                     RUSAGE_CHILDREN contamination bug this test guards against)"
+                ),
+                PinProbe::Unmeasurable(reason) => {
+                    panic!("probe must measure under concurrent noise, got Unmeasurable: {reason}")
+                }
+            }
+        }
+        let _ = noise.join();
     }
 
     #[test]
@@ -2061,18 +2254,126 @@ mod tests {
         // itself (mirrors paired's own rss selftest pattern).
         let busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
         match cpu_pct_of_arm(busy) {
-            Some(pct) => {
+            PinProbe::Measured(pct) => {
                 assert!(pct.is_finite() && pct > 0.0, "cpu% {pct} must be positive");
                 // Generous band: a single-process busy loop should not look
                 // like it used several cores' worth of CPU time.
                 assert!(pct < 300.0, "single-process busy loop reported {pct}% cpu");
             }
-            None => {
-                // /usr/bin/time absent or the loop ran under the 20ms floor on
-                // this host — a skip, never a fabricated pass.
-                println!("cpu_pct_of_arm: probe unavailable on this host — skipped");
+            PinProbe::Unmeasurable(reason) => {
+                panic!("getrusage-based probe must always measure a real subprocess: {reason}")
             }
         }
+    }
+
+    #[test]
+    fn cpu_pct_of_arm_submillisecond_command_still_yields_measured() {
+        // THE regression this fix exists to close: the OLD /usr/bin/time
+        // text-parsing probe returned None (-> cpu%=NaN) for anything under
+        // its ~10ms print-resolution floor, which is exactly what made 28/44
+        // wallcensus VOIDs read "ours cpu%=NaN (ok=false)" on the fastest
+        // (small-file, low-level) cells. `true` is as close to zero real
+        // work as a subprocess gets; the getrusage+Instant probe must still
+        // report a finite, usable number (see the module doc's RESIDUAL
+        // RESOLUTION LIMIT note: the % here reflects sh's own launch
+        // overhead, not "true"'s workload, but it is a NUMBER, never NaN).
+        match cpu_pct_of_arm("true") {
+            PinProbe::Measured(pct) => {
+                assert!(
+                    pct.is_finite() && pct >= 0.0,
+                    "sub-ms command must yield a finite, non-negative cpu% (got {pct})"
+                );
+            }
+            PinProbe::Unmeasurable(reason) => {
+                panic!("a sub-millisecond command must still be MEASURABLE: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_pct_of_arm_failing_command_is_unmeasurable_not_a_violation() {
+        // A command that cannot even complete (nonzero exit during the pin
+        // probe itself) must come back `Unmeasurable`, NEVER `Measured` with
+        // some fabricated percentage — unmeasurable and violated are
+        // DISTINCT outcomes (module doc, part 2 of the fix).
+        match cpu_pct_of_arm("exit 7") {
+            PinProbe::Unmeasurable(reason) => {
+                assert!(
+                    reason.contains("exited"),
+                    "reason should name the exit: {reason}"
+                )
+            }
+            PinProbe::Measured(pct) => {
+                panic!("a failing command must be Unmeasurable, not Measured({pct})")
+            }
+        }
+    }
+
+    #[test]
+    fn pin_gate_1185pct_incident_still_voids_after_the_getrusage_fix() {
+        // The worked incident this whole gate exists to catch, RE-EXECUTED
+        // against the NEW probe (not just the old fixed-number regression
+        // test above): `pigz` with no `-p` flag defaults to all-core
+        // concurrency. On a real corpus this reads several hundred percent —
+        // reproduced directly against a real ~26 KiB text fixture (large
+        // enough that pigz's own decode/compress dominates fork/exec noise).
+        // Skips (never fabricated-passes) when `pigz` is not on PATH.
+        let have_pigz = Command::new("sh")
+            .arg("-c")
+            .arg("pigz --version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !have_pigz {
+            println!("pin_gate_1185pct_incident: pigz not on PATH — skipped");
+            return;
+        }
+        let fixture = std::env::temp_dir().join(format!(
+            "fulcrum-paired-pingate-incident-{}",
+            std::process::id()
+        ));
+        // ~5MB, same sizing rationale as the selftest() copy of this check
+        // (a 213KB/4000-line fixture measured FLAKY on a loaded box — pigz's
+        // own worker-pool startup overhead dominates a file that small).
+        let mut body = String::new();
+        for i in 0..100_000 {
+            body.push_str(&format!(
+                "the quick brown fox {i} jumps over the lazy dog {i}\n"
+            ));
+        }
+        let _ = std::fs::write(&fixture, body.as_bytes());
+        let path = fixture.to_string_lossy();
+
+        // UNPINNED (no -p): must measure a real, finite pct and it must be
+        // OUTSIDE the T1 window (pin_gate_ok rejects it) — a genuine
+        // violation, not an unmeasurable probe.
+        match cpu_pct_of_arm(&format!("pigz -3 -c {path}")) {
+            PinProbe::Measured(pct) => {
+                assert!(
+                    !pin_gate_ok(pct, 1),
+                    "unpinned pigz -3 measured {pct}% — expected OUTSIDE the T1 window \
+                     (this is the exact sign-flip incident the gate exists to catch)"
+                );
+            }
+            PinProbe::Unmeasurable(reason) => {
+                panic!("unpinned pigz -3 must be MEASURED (violation), not unmeasurable: {reason}")
+            }
+        }
+        // PINNED (-p 1): must measure inside the T1 window — the control.
+        match cpu_pct_of_arm(&format!("pigz -3 -p 1 -c {path}")) {
+            PinProbe::Measured(pct) => {
+                assert!(
+                    pin_gate_ok(pct, 1),
+                    "pinned pigz -3 -p 1 measured {pct}% — expected INSIDE the T1 window"
+                );
+            }
+            PinProbe::Unmeasurable(reason) => {
+                panic!("pinned pigz -3 -p 1 must be measurable: {reason}")
+            }
+        }
+        let _ = std::fs::remove_file(&fixture);
     }
 
     // ---- freeze-guard wiring (Gate-0 hole closed 2026-07-26) — PURE, no I/O,
