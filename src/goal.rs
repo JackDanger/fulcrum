@@ -986,17 +986,19 @@ pub fn render_delta(rep: &DeltaReport) {
 // surface (rivals/levels/corpora/threads) is refused at parse time exactly
 // like `parse_spec` refuses a narrowed `GoalSpec`.
 //
-// KNOWN LIMITATION (flagged, not hidden — see the caller's own UNKNOWN list):
-// `fulcrum sizecensus` carries NO thread axis (it was run at `-p1` only,
-// which is the omission `wallcensus` exists to close on the WALL side). The
-// SIZE leg of a joined cell is therefore looked up by `(rival, corpus,
-// level)` ONLY and projected across every declared `threads` value — an
-// assumption that compressed size is thread-count-invariant for that
-// (rival, corpus, level). For rivals whose parallel encoder changes block
-// boundaries with thread count (gzippy's own `-p N>1`, pigz's `-p N>1`),
-// this assumption is UNVALIDATED — sizecensus would need its own threads
-// axis to close it. This module does not paper over that: it is named here
-// and in every render/selftest label that touches the size leg.
+// RESOLVED 2026-07-26 (was a KNOWN LIMITATION): `fulcrum sizecensus` used to
+// carry NO thread axis (measured at `-p1` only) and this join projected that
+// single measurement across every declared `threads` value, on the stated
+// assumption that compressed size is thread-count-invariant. That assumption
+// was REFUTED by direct measurement (`sizecensus.rs`'s module doc has the
+// numbers: gzippy `-p4` vs `-p1` differs at nearly every level, L3 by ~60x
+// its neighbours' magnitude, and the direction isn't even always the same
+// sign). `sizecensus` now carries `threads` as a first-class part of cell
+// identity, exactly like `wallcensus` — the SIZE leg below is looked up on
+// the SAME `(rival, corpus, level, threads)` key as the WALL leg, and a
+// declared threads value with no matching sizecensus cell is
+// MISSING-SIZE-LEG (INCOMPLETE), never silently inherited from a different
+// thread count.
 
 /// One fused cell — the join's own output shape, deliberately NOT
 /// `SweepCell` (which structurally cannot represent "size measured, wall
@@ -1049,7 +1051,9 @@ fn join_cell(
         (None, Some(_)) => {
             return base(
                 "MISSING-SIZE-LEG",
-                "size leg unmeasured (no matching sizecensus cell for this rival/corpus/level)"
+                "size leg unmeasured (no matching sizecensus cell for this rival/corpus/level/\
+                 threads — a size cell missing at a declared thread count is INCOMPLETE, never \
+                 silently inherited from a different thread count)"
                     .to_string(),
             )
         }
@@ -1293,9 +1297,13 @@ pub fn evaluate_joined(
     }
 
     // -- index both artifacts on their shared keys, detecting duplicates ----
-    let mut size_idx: BTreeMap<(String, String, u32), &sizecensus::CensusCell> = BTreeMap::new();
+    // SIZE is indexed on the SAME (rival, corpus, level, threads) 4-tuple as
+    // WALL (module doc: "RESOLVED 2026-07-26" — no more (rival, corpus,
+    // level)-only projection across every declared threads value).
+    let mut size_idx: BTreeMap<(String, String, u32, u32), &sizecensus::CensusCell> =
+        BTreeMap::new();
     for c in &size.cells {
-        let k = (c.rival.clone(), c.corpus.clone(), c.level);
+        let k = (c.rival.clone(), c.corpus.clone(), c.level, c.threads);
         if size_idx.insert(k, c).is_some() {
             ev.duplicates += 1;
         }
@@ -1320,7 +1328,7 @@ pub fn evaluate_joined(
                 for &threads in &spec.threads {
                     ev.declared += 1;
                     let sc = size_idx
-                        .get(&(rival.clone(), corpus.clone(), level))
+                        .get(&(rival.clone(), corpus.clone(), level, threads))
                         .copied();
                     let wc = wall_idx
                         .get(&(rival.clone(), corpus.clone(), level, threads))
@@ -2276,6 +2284,7 @@ pub fn selftest() -> ExitCode {
             rival: &str,
             corpus: &str,
             level: u32,
+            threads: u32,
             status: &str,
             ratio: f64,
         ) -> sizecensus::CensusCell {
@@ -2283,12 +2292,15 @@ pub fn selftest() -> ExitCode {
                 rival: rival.to_string(),
                 corpus: corpus.to_string(),
                 level,
+                threads,
                 status: status.to_string(),
                 gzippy_bytes: (ratio * 100.0) as u64,
                 rival_bytes: 100,
                 ratio,
                 bigger: ratio > 1.0,
                 roundtrip_ok: status == "OK",
+                gzippy_size_source: "measured".to_string(),
+                rival_size_source: "measured".to_string(),
                 error: None,
             }
         }
@@ -2336,6 +2348,7 @@ pub fn selftest() -> ExitCode {
                 rivals: vec![],
                 corpus_files: vec![],
                 created_unix: 0,
+                thread_shortcut_voided: vec![],
             }
         }
         fn size_artifact(
@@ -2374,7 +2387,7 @@ pub fn selftest() -> ExitCode {
 
         // (a) both legs OK + WIN -> PASS.
         {
-            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
             let wall = wall_artifact(
                 "SHA-J",
                 vec![mk_wall(
@@ -2398,7 +2411,7 @@ pub fn selftest() -> ExitCode {
         //     NOT a false VOID — this is the exact defect the prior agent
         //     declined to fix (an empty wall_status silently becoming VOID).
         {
-            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
             let wall = wall_artifact("SHA-J", vec![]);
             let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
             let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
@@ -2427,7 +2440,7 @@ pub fn selftest() -> ExitCode {
         }
         // (d) wall leg VOID -> void, INCOMPLETE (never silently dropped).
         {
-            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
             let wall = wall_artifact(
                 "SHA-J",
                 vec![mk_wall(
@@ -2451,7 +2464,14 @@ pub fn selftest() -> ExitCode {
         {
             let size = size_artifact(
                 "SHA-J",
-                vec![mk_size("igzip", "c1.bin", 1, "RIVAL-UNAVAILABLE", f64::NAN)],
+                vec![mk_size(
+                    "igzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "RIVAL-UNAVAILABLE",
+                    f64::NAN,
+                )],
             );
             let wall = wall_artifact(
                 "SHA-J",
@@ -2483,7 +2503,14 @@ pub fn selftest() -> ExitCode {
         {
             let size = size_artifact(
                 "SHA-J",
-                vec![mk_size("igzip", "c1.bin", 1, "RIVAL-UNAVAILABLE", f64::NAN)],
+                vec![mk_size(
+                    "igzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "RIVAL-UNAVAILABLE",
+                    f64::NAN,
+                )],
             );
             let wall = wall_artifact(
                 "SHA-J",
@@ -2506,7 +2533,7 @@ pub fn selftest() -> ExitCode {
         }
         // (g) cross-artifact sha mismatch -> STALE (stitched evidence refusal).
         {
-            let size = size_artifact("SHA-A", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let size = size_artifact("SHA-A", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
             let wall = wall_artifact(
                 "SHA-B",
                 vec![mk_wall(
@@ -2530,7 +2557,7 @@ pub fn selftest() -> ExitCode {
         // (h) both censuses agree with each other but NOT with the candidate
         //     binary -> STALE.
         {
-            let size = size_artifact("SHA-OLD", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let size = size_artifact("SHA-OLD", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
             let wall = wall_artifact(
                 "SHA-OLD",
                 vec![mk_wall(
@@ -2555,9 +2582,9 @@ pub fn selftest() -> ExitCode {
             let size = size_artifact(
                 "SHA-J",
                 vec![
-                    mk_size("gzip", "c1.bin", 1, "OK", 0.95),
-                    mk_size("pigz", "c1.bin", 0, "OK", 0.95),
-                    mk_size("pigz", "c1.bin", 1, "OK", 0.95),
+                    mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95),
+                    mk_size("pigz", "c1.bin", 0, 1, "OK", 0.95),
+                    mk_size("pigz", "c1.bin", 1, 1, "OK", 0.95),
                 ],
             );
             let wall = wall_artifact(
@@ -2582,7 +2609,7 @@ pub fn selftest() -> ExitCode {
         // (j) a measured LOSS still blocks even with an UNRELATED waiver
         //     present (waivers excuse absence, never evidence).
         {
-            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 1.05)]);
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 1.05)]);
             let wall = wall_artifact(
                 "SHA-J",
                 vec![mk_wall(
@@ -2614,8 +2641,8 @@ pub fn selftest() -> ExitCode {
             let size = size_artifact(
                 "SHA-J",
                 vec![
-                    mk_size("gzip", "c1.bin", 1, "OK", 0.95),
-                    mk_size("gzip", "c1.bin", 1, "OK", 0.90), // duplicate key
+                    mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95),
+                    mk_size("gzip", "c1.bin", 1, 1, "OK", 0.90), // duplicate key
                 ],
             );
             let wall = wall_artifact(
@@ -2636,6 +2663,69 @@ pub fn selftest() -> ExitCode {
                 "join: duplicate (rival,corpus,level) keys within an artifact -> INCOMPLETE \
                  (double-count refusal, same conservation law as evaluate())",
                 ev.verdict == "INCOMPLETE" && ev.duplicates == 1,
+            );
+        }
+
+        // (m) THE REGRESSION TEST FOR THE PROJECTION FIX: size measured at
+        //     T1 only, wall measured at BOTH T1 and T4, join declares
+        //     threads=[1,4]. The OLD code looked up the size leg on
+        //     `(rival, corpus, level)` alone and would have happily
+        //     inherited T1's size ratio for the T4 cell too (a silent
+        //     projection). The FIX indexes size on the SAME 4-tuple as wall,
+        //     so the T4 cell must come back MISSING-SIZE-LEG (a real,
+        //     blocking gap) — never silently passing on inherited T1 bytes.
+        {
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95)]);
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![
+                    mk_wall("gzip", "c1.bin", 1, 1, "OK", "RESOLVED-b-slower", 0.9),
+                    mk_wall("gzip", "c1.bin", 1, 4, "OK", "RESOLVED-b-slower", 0.9),
+                ],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1, 4], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: size measured ONLY at T1, wall measured at T1+T4 -> the T4 cell is \
+                 MISSING-SIZE-LEG (INCOMPLETE) — NEVER inherits T1's size ratio (the exact \
+                 projection this fix removes)",
+                ev.verdict == "INCOMPLETE"
+                    && ev.missing == 1
+                    && ev.win == 1 // the T1 cell still resolves on its own merits
+                    && ev
+                        .missing_cells
+                        .iter()
+                        .any(|m| m.contains("T4") && m.contains("MISSING-SIZE-LEG")),
+            );
+        }
+
+        // (n) per-thread INDEPENDENT classification — the "ecoli shape": T1
+        //     genuinely WINS (size smaller, wall faster) while the SAME
+        //     (rival, corpus, level) at T4 genuinely LOSES (size BIGGER),
+        //     because sizecensus now measures BOTH thread counts for real
+        //     instead of projecting one ratio across both. A T1-only
+        //     projection would have silently reported T4 as a WIN too.
+        {
+            let size = size_artifact(
+                "SHA-J",
+                vec![
+                    mk_size("gzip", "c1.bin", 1, 1, "OK", 0.95), // T1: smaller -> WIN-eligible
+                    mk_size("gzip", "c1.bin", 1, 4, "OK", 1.05), // T4: BIGGER -> must FAIL
+                ],
+            );
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![
+                    mk_wall("gzip", "c1.bin", 1, 1, "OK", "RESOLVED-b-slower", 0.9),
+                    mk_wall("gzip", "c1.bin", 1, 4, "OK", "RESOLVED-a-slower", 1.1),
+                ],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1, 4], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: T1 WINS and T4 LOSES for the SAME (rival,corpus,level) — threads-aware \
+                 size lookup catches a Pareto failure a T1-only projection could not see",
+                ev.verdict == "FAIL" && ev.win == 1 && ev.loss == 1 && ev.declared == 2,
             );
         }
 

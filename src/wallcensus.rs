@@ -555,6 +555,9 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
         rivals: rival_prov,
         corpus_files: corpus_prov,
         created_unix: unix_now(),
+        // wallcensus has no size-axis witness/shortcut concept (that's
+        // sizecensus's own mechanism) — always empty here.
+        thread_shortcut_voided: vec![],
     };
     if provenance.gzippy_commit.is_none() {
         eprintln!(
@@ -1162,6 +1165,7 @@ pub fn selftest() -> ExitCode {
             }],
             corpus_files: vec![],
             created_unix: 0,
+            thread_shortcut_voided: vec![],
         },
         &synth_cells,
     );
@@ -1388,6 +1392,7 @@ pub fn selftest() -> ExitCode {
                     rivals: vec![],
                     corpus_files: vec![],
                     created_unix: 0,
+                    thread_shortcut_voided: vec![],
                 },
                 cells: vec![],
             };

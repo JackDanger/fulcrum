@@ -291,14 +291,28 @@ pub struct CompressCfg {
 /// is not supplied.
 pub fn sha256_of_file(path: &Path) -> Result<String, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let digest = crate::compare::sha256_reader(f).map_err(|e| format!("hash {}: {e}", path.display()))?;
+    let digest =
+        crate::compare::sha256_reader(f).map_err(|e| format!("hash {}: {e}", path.display()))?;
     Ok(crate::compare::hex32(&digest))
 }
 
 /// Run one arm (a COMPRESSOR) UNTIMED: buffer its compressed stdout (→ exact
-/// `size_bytes`), then feed those bytes into `roundtrip_cmd` and sha256 the
-/// decompressed output. Returns `(roundtrip_sha_hex, size_bytes)`.
-fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, u64), String> {
+/// `size_bytes` + the sha256 of the COMPRESSED bytes themselves), then feed
+/// those bytes into `roundtrip_cmd` and sha256 the decompressed output.
+/// Returns `(roundtrip_sha_hex, size_bytes, compressed_sha_hex)`.
+///
+/// `pub` (added 2026-07-26 for `sizecensus`'s T>=2 thread-invariance witness
+/// check — see that module's doc): comparing two thread counts' DECOMPRESSED
+/// content is useless (it's always the same plaintext); what needs comparing
+/// is whether the COMPRESSED bytes are byte-identical, which the original
+/// `roundtrip_and_size_of_arm` computed and threw away. Exposed as its own
+/// function (one compress spawn + one roundtrip spawn, same cost as before —
+/// no duplicate subprocess) rather than adding a second copy of this same
+/// two-pass spawn dance in `sizecensus.rs`.
+pub fn compress_arm_with_compressed_sha(
+    cmd: &str,
+    roundtrip_cmd: &str,
+) -> Result<(String, u64, String), String> {
     use std::io::Write;
     // Pass 1: run the compressor, buffer the compressed bytes (untimed).
     let out = Command::new("sh")
@@ -310,9 +324,17 @@ fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, 
         .output()
         .map_err(|e| format!("spawn `{cmd}`: {e}"))?;
     if !out.status.success() {
-        return Err(format!("`{cmd}` exited {:?} during roundtrip pass", out.status));
+        return Err(format!(
+            "`{cmd}` exited {:?} during roundtrip pass",
+            out.status
+        ));
     }
-    let size = out.stdout.len() as u64;
+    let compressed = out.stdout;
+    let size = compressed.len() as u64;
+    let compressed_sha = crate::compare::hex32(
+        &crate::compare::sha256_reader(&compressed[..])
+            .map_err(|e| format!("hash compressed bytes of `{cmd}`: {e}"))?,
+    );
     // Pass 2: decompress the buffered bytes and sha256 the plaintext. The write
     // to the child's stdin runs on its own thread so a full pipe buffer can't
     // deadlock against our read of its stdout.
@@ -332,13 +354,16 @@ fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, 
         .stdout
         .take()
         .ok_or_else(|| "no stdout pipe for roundtrip".to_string())?;
-    let compressed = out.stdout;
+    let compressed_for_write = compressed.clone();
     let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&compressed);
+        let _ = stdin.write_all(&compressed_for_write);
         // stdin drops here → EOF to the decompressor.
     });
-    let digest = crate::compare::sha256_reader(stdout).map_err(|e| format!("hash roundtrip of `{roundtrip_cmd}`: {e}"))?;
-    let status = child.wait().map_err(|e| format!("wait roundtrip `{roundtrip_cmd}`: {e}"))?;
+    let digest = crate::compare::sha256_reader(stdout)
+        .map_err(|e| format!("hash roundtrip of `{roundtrip_cmd}`: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("wait roundtrip `{roundtrip_cmd}`: {e}"))?;
     let _ = writer.join();
     if !status.success() {
         // The DECOMPRESSOR choked on this arm's output (e.g. truncated/corrupt
@@ -346,9 +371,17 @@ fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, 
         // measurement: return an empty sha (never matches the 64-hex oracle) so
         // the caller records roundtrip_ok=false → status FAIL. Only the
         // COMPRESSOR arm exiting nonzero (above) is a hard Err.
-        return Ok((String::new(), size));
+        return Ok((String::new(), size, compressed_sha));
     }
-    Ok((crate::compare::hex32(&digest), size))
+    Ok((crate::compare::hex32(&digest), size, compressed_sha))
+}
+
+/// Run one arm (a COMPRESSOR) UNTIMED: buffer its compressed stdout (→ exact
+/// `size_bytes`), then feed those bytes into `roundtrip_cmd` and sha256 the
+/// decompressed output. Returns `(roundtrip_sha_hex, size_bytes)`.
+fn roundtrip_and_size_of_arm(cmd: &str, roundtrip_cmd: &str) -> Result<(String, u64), String> {
+    let (rt_sha, size, _compressed_sha) = compress_arm_with_compressed_sha(cmd, roundtrip_cmd)?;
+    Ok((rt_sha, size))
 }
 
 /// The compress correctness+size gate for ONE arm, run `reps` times. Returns
@@ -760,7 +793,16 @@ pub fn run_paired(
     rss_reps: usize,
 ) -> Result<PairedResult, String> {
     run_paired_inner(
-        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpus, n, warmup, sink, do_sha, rss_reps, None,
+        a_cmd_tmpl,
+        b_cmd_tmpl,
+        ref_cmd_tmpl,
+        corpus,
+        n,
+        warmup,
+        sink,
+        do_sha,
+        rss_reps,
+        None,
     )
 }
 
@@ -802,7 +844,11 @@ pub fn run_paired_inner(
             compress_gate_arm(&b_cmd, &cfg.roundtrip_cmd, &cfg.input_sha, cfg.size_reps)?;
         a_size_bytes = asz;
         b_size_bytes = bsz;
-        size_ratio = if bsz > 0 { asz as f64 / bsz as f64 } else { 0.0 };
+        size_ratio = if bsz > 0 {
+            asz as f64 / bsz as f64
+        } else {
+            0.0
+        };
         size_stable = a_stable && b_stable;
         roundtrip_ok = a_rt && b_rt;
     } else if do_sha {
@@ -1031,10 +1077,16 @@ pub fn selftest() -> ExitCode {
     // 2b. wall_once (the public coarse-timer alias frontier rides) times a real
     //     command to a finite, non-negative wall and errors on a failing command.
     match wall_once("sleep 0.01") {
-        Ok(ms) => check("wall_once returns a finite non-negative wall", ms.is_finite() && ms >= 0.0),
+        Ok(ms) => check(
+            "wall_once returns a finite non-negative wall",
+            ms.is_finite() && ms >= 0.0,
+        ),
         Err(e) => check(&format!("wall_once run ({e})"), false),
     }
-    check("wall_once errors on a failing command", wall_once("false").is_err());
+    check(
+        "wall_once errors on a failing command",
+        wall_once("false").is_err(),
+    );
 
     // 3. A/A certificate brackets 1.0 (same trivial command both slots).
     //    `sleep 0.02` produces no stdout, so the byte-exact ref is `true` (empty).
@@ -1129,9 +1181,14 @@ pub fn selftest() -> ExitCode {
         let big = "python3 -c 'import sys; b=bytearray(64*1024*1024); sys.exit(0)'";
         let probe = peak_rss_mb_of_arm(big);
         match probe {
-            None => println!("  NOTE rss: /usr/bin/time or python3 unavailable — RSS selftest skipped"),
+            None => {
+                println!("  NOTE rss: /usr/bin/time or python3 unavailable — RSS selftest skipped")
+            }
             Some(one) => {
-                check("rss: single probe is non-inert (>10 MiB for a 64 MiB alloc)", one > 10.0);
+                check(
+                    "rss: single probe is non-inert (>10 MiB for a 64 MiB alloc)",
+                    one > 10.0,
+                );
                 check("rss: single probe is sane (<4096 MiB)", one < 4096.0);
 
                 // A/A rss self-test: the SAME command in both slots must yield
@@ -1140,8 +1197,14 @@ pub fn selftest() -> ExitCode {
                 match run_paired(big, big, "true", &corpus, 7, 1, &devnull, false, 3) {
                     Ok(r) => {
                         check("rss: A/A captured reps == 3", r.rss_reps == 3);
-                        check("rss: A/A a_peak non-inert (>10 MiB)", r.a_peak_rss_mb > 10.0);
-                        check("rss: A/A b_peak non-inert (>10 MiB)", r.b_peak_rss_mb > 10.0);
+                        check(
+                            "rss: A/A a_peak non-inert (>10 MiB)",
+                            r.a_peak_rss_mb > 10.0,
+                        );
+                        check(
+                            "rss: A/A b_peak non-inert (>10 MiB)",
+                            r.b_peak_rss_mb > 10.0,
+                        );
                         check(
                             "rss: A/A a_peak ≈ b_peak (same cmd both slots, within 20%)",
                             (r.a_peak_rss_mb - r.b_peak_rss_mb).abs()
@@ -1186,7 +1249,9 @@ pub fn selftest() -> ExitCode {
             let fixture = std::env::temp_dir().join(format!("fulcrum-paired-cst-{pid}"));
             let mut body = String::new();
             for i in 0..512 {
-                body.push_str(&format!("the quick brown fox {i} jumps over the lazy dog {i}\n"));
+                body.push_str(&format!(
+                    "the quick brown fox {i} jumps over the lazy dog {i}\n"
+                ));
             }
             let _ = std::fs::write(&fixture, body.as_bytes());
             let input_sha = sha256_of_file(&fixture).unwrap_or_default();
@@ -1469,7 +1534,9 @@ pub fn cmd_paired(args: &[String]) -> ExitCode {
     // input; the arms are compressors. The plaintext oracle sha is --input-sha
     // or, absent that, computed from the corpus file itself.
     let compress_cfg = if mode == "compress" {
-        let roundtrip_cmd = cli_flag(args, "--roundtrip-cmd").unwrap_or("gzip -dc").to_string();
+        let roundtrip_cmd = cli_flag(args, "--roundtrip-cmd")
+            .unwrap_or("gzip -dc")
+            .to_string();
         let size_reps: usize = cli_flag(args, "--size-reps")
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
