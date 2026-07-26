@@ -441,6 +441,138 @@ pub fn rss_point_spread(reps: &[f64]) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
+// PIN GATE — CPU% co-capture (proves an arm ran at the CONCURRENCY it claims,
+// not just that it ran). Built for `fulcrum wallcensus` (2026-07-26).
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS: a paired wall/size verdict answers "is A faster/smaller
+// than B" but says NOTHING about whether either arm actually ran at the
+// thread count the cell claims to measure. Measured receipt (2026-07-26):
+// `pigz -3 -c` (no `-p` flag — defaults to all cores) ran at 1185% CPU while
+// gzippy ran genuinely pinned at T1, producing `ratio=5.2892` (gzippy looks
+// 5.3x SLOWER); the identical cell with `pigz -3 -p 1 -c` reads `ratio=0.5849`
+// (gzippy is actually 1.7x FASTER) — a complete sign flip, and the
+// mis-pinned cell still carried a clean A/A certificate (sign 15/15).
+// Statistics inside `run_paired_inner` cannot detect a wrong COMMAND; this is
+// a SEPARATE, orthogonal gate that must run before a cell's wall number is
+// trusted.
+//
+// SAME "DEDICATED PROBE, NOT THE TIMED REP" DISCIPLINE AS PEAK-RSS: cpu% needs
+// `/usr/bin/time` rusage (user+sys+real seconds), whose fork/exec would add to
+// the wall if it wrapped a timed rep. So the probe is a separate, untimed,
+// stdout→/dev/null invocation — never inside `sample_interleaved`'s loop.
+//
+// PORTABLE PARSE: Linux GNU `time -v` reports `User time (seconds):` /
+// `System time (seconds):` / `Elapsed (wall clock) time (h:mm:ss or m:ss):`
+// on separate lines; macOS BSD `time -l` reports all three on ONE line
+// (`<real> real         <user> user         <sys> sys`). cpu% is computed
+// uniformly as `(user+sys)/real*100` rather than trusting GNU's own `Percent
+// of CPU this job got:` line, so the SAME formula is used on both platforms
+// (one fewer format to parse, one fewer thing that could silently diverge
+// between the two OS code paths).
+
+/// Parse `(user_secs, sys_secs, real_secs)` from a `/usr/bin/time` rusage
+/// report. Tries the macOS BSD single-line form first, then the Linux GNU
+/// multi-line form. `None` when neither shape is found — never a fabricated
+/// triple.
+fn parse_rusage_times(stderr: &str) -> Option<(f64, f64, f64)> {
+    // BSD `time -l` (macOS): "        0.05 real         0.03 user         0.00 sys"
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.ends_with("sys") && line.contains("real") && line.contains("user") {
+            let nums: Vec<f64> = line
+                .split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect();
+            if nums.len() == 3 {
+                return Some((nums[1], nums[2], nums[0])); // (user, sys, real)
+            }
+        }
+    }
+    // GNU `time -v` (Linux): three separate labeled lines.
+    let mut user = None;
+    let mut sys = None;
+    let mut elapsed = None;
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("User time (seconds):") {
+            user = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("System time (seconds):") {
+            sys = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("Elapsed (wall clock) time (h:mm:ss or m:ss):")
+        {
+            elapsed = parse_elapsed_hms(rest.trim());
+        }
+    }
+    match (user, sys, elapsed) {
+        (Some(u), Some(s), Some(e)) => Some((u, s, e)),
+        _ => None,
+    }
+}
+
+/// Parse a GNU-time elapsed field: `SS`, `M:SS[.ss]`, or `H:MM:SS[.ss]`.
+fn parse_elapsed_hms(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut vals = Vec::with_capacity(parts.len());
+    for p in &parts {
+        vals.push(p.parse::<f64>().ok()?);
+    }
+    Some(match vals.len() {
+        1 => vals[0],
+        2 => vals[0] * 60.0 + vals[1],
+        3 => vals[0] * 3600.0 + vals[1] * 60.0 + vals[2],
+        _ => return None,
+    })
+}
+
+/// Observed CPU utilization (%) of ONE arm, via a DEDICATED `/usr/bin/time`
+/// probe (stdout→/dev/null, untimed relative to the wall). `100.0` means "used
+/// one core's worth of wall time"; `400.0` means four. `None` when
+/// `/usr/bin/time` is absent, the arm exits nonzero, the rusage report can't
+/// be parsed, or the elapsed real time is under 20ms — both rusage formats
+/// round to roughly a 10ms tick, so a ratio built on a sub-20ms elapsed is
+/// noise, not a measurement, and must never be reported as a percentage.
+pub fn cpu_pct_of_arm(cmd: &str) -> Option<f64> {
+    let mut c = Command::new("/usr/bin/time");
+    if cfg!(target_os = "macos") {
+        c.arg("-l");
+    } else {
+        c.arg("-v");
+    }
+    c.arg("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let out = c.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (user, sys, real) = parse_rusage_times(&stderr)?;
+    if real < 0.02 {
+        return None;
+    }
+    Some((user + sys) / real * 100.0)
+}
+
+/// PIN-GATE verdict: does `observed_pct` match `threads`-way concurrency
+/// within tolerance? Window is `[threads*100*0.5, threads*100*1.6]` — wide
+/// enough to absorb scheduler/IO noise on a genuinely-pinned arm, narrow
+/// enough to reject "ran on every core instead of N" (measured receipt,
+/// 2026-07-26 macOS 10-core box: `pigz -6 -p 4` = 399.5% cpu, INSIDE the T4
+/// window `[200,640]`; `pigz -6` unpinned on the same corpus = 760% cpu,
+/// OUTSIDE it — the exact sign-flip incident this gate exists to catch).
+pub fn pin_gate_ok(observed_pct: f64, threads: u32) -> bool {
+    let want = threads.max(1) as f64 * 100.0;
+    observed_pct.is_finite() && observed_pct >= want * 0.5 && observed_pct <= want * 1.6
+}
+
+// ---------------------------------------------------------------------------
 // The interleaved paired sampler
 // ---------------------------------------------------------------------------
 
@@ -1619,6 +1751,82 @@ mod tests {
             "method",
         ] {
             assert!(js.contains(f), "JSON missing field {f}: {js}");
+        }
+    }
+
+    // ---- PIN GATE: cpu% parsing + verdict (built for `fulcrum wallcensus`) ----
+
+    #[test]
+    fn parse_rusage_times_bsd_single_line() {
+        let stderr = "        7.17 real         7.07 user         0.07 sys\n\
+                       2031616  maximum resident set size\n";
+        let (u, s, r) = parse_rusage_times(stderr).expect("bsd line parses");
+        assert!((u - 7.07).abs() < 1e-9);
+        assert!((s - 0.07).abs() < 1e-9);
+        assert!((r - 7.17).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_rusage_times_gnu_multi_line() {
+        let stderr = "\tCommand being timed: \"gzip -6\"\n\
+                       \tUser time (seconds): 7.05\n\
+                       \tSystem time (seconds): 0.06\n\
+                       \tElapsed (wall clock) time (h:mm:ss or m:ss): 0:01.85\n\
+                       \tMaximum resident set size (kbytes): 1234\n";
+        let (u, s, r) = parse_rusage_times(stderr).expect("gnu lines parse");
+        assert!((u - 7.05).abs() < 1e-9);
+        assert!((s - 0.06).abs() < 1e-9);
+        assert!((r - 1.85).abs() < 1e-9); // 0:01.85 -> 1.85s
+    }
+
+    #[test]
+    fn parse_elapsed_hms_all_shapes() {
+        assert!((parse_elapsed_hms("7.05").unwrap() - 7.05).abs() < 1e-9);
+        assert!((parse_elapsed_hms("1:02.50").unwrap() - 62.5).abs() < 1e-9);
+        assert!((parse_elapsed_hms("1:02:03.00").unwrap() - 3723.0).abs() < 1e-9);
+        assert!(parse_elapsed_hms("not-a-time").is_none());
+    }
+
+    #[test]
+    fn parse_rusage_times_unparseable_is_none() {
+        assert!(parse_rusage_times("nothing recognizable here\n").is_none());
+    }
+
+    #[test]
+    fn pin_gate_ok_windows() {
+        // T1: measured receipt ~99.6% (pigz -6 -p1, macOS 10-core box) — inside.
+        assert!(pin_gate_ok(99.6, 1));
+        // T4: measured receipt ~399.5% (pigz -6 -p4) — inside.
+        assert!(pin_gate_ok(399.5, 4));
+        // T4: measured receipt ~760% (pigz -6 unpinned, defaulted to all cores)
+        // — OUTSIDE the T4 window; this is the exact sign-flip incident.
+        assert!(!pin_gate_ok(760.0, 4));
+        // T1 measured at ~1185% (the task's own worked receipt) is rejected.
+        assert!(!pin_gate_ok(1185.0, 1));
+        // Non-finite is never accepted.
+        assert!(!pin_gate_ok(f64::NAN, 1));
+        assert!(!pin_gate_ok(f64::INFINITY, 4));
+    }
+
+    #[test]
+    fn cpu_pct_of_arm_real_subprocess_reflects_concurrency() {
+        // A CPU-bound shell loop run under `sh -c` for ~150ms of wall; cpu% for
+        // a single-threaded busy loop must land near 100 (not near 0, not near
+        // multi-hundred) — the non-inert Gate-0 sanity check for the probe
+        // itself (mirrors paired's own rss selftest pattern).
+        let busy = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
+        match cpu_pct_of_arm(busy) {
+            Some(pct) => {
+                assert!(pct.is_finite() && pct > 0.0, "cpu% {pct} must be positive");
+                // Generous band: a single-process busy loop should not look
+                // like it used several cores' worth of CPU time.
+                assert!(pct < 300.0, "single-process busy loop reported {pct}% cpu");
+            }
+            None => {
+                // /usr/bin/time absent or the loop ran under the 20ms floor on
+                // this host — a skip, never a fabricated pass.
+                println!("cpu_pct_of_arm: probe unavailable on this host — skipped");
+            }
         }
     }
 }
