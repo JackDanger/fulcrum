@@ -60,6 +60,7 @@ pub mod critpath;
 pub mod cycles;
 pub mod decide;
 pub mod decompose;
+pub mod dropin;
 pub mod dispatchgap;
 pub mod estimate;
 pub mod excess;
