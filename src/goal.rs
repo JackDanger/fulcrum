@@ -36,6 +36,23 @@
 //!   corpora, and thread counts are compile-time constants; a spec below the
 //!   minimum is refused at parse time. Absence can be WAIVED (visibly, with a
 //!   reason, capping the verdict); it cannot be silently omitted.
+//! * **THIS COMMAND HAD THE SAME DEFECT IT WAS BUILT TO PREVENT (2026-07-25)**
+//!   — the flat `MIN_LEVELS = 1..=9` doc-commented level 0 as merely
+//!   "extended... from the spec on top of these", i.e. optional. Measured on
+//!   solvency the same day: gzippy at level 0 is 5.2x-6.6x slower than pigz
+//!   (two corpus files) — the largest known wall deficit on the board, and it
+//!   sat outside this tool's own mandatory surface. `gzip` cannot even run at
+//!   L0 (`gzip -0` → `invalid option -- '0'`), so a flat re-widen to `0..=9`
+//!   would have demanded a `gzip`×L0 cell that can never exist, turning a
+//!   real verdict into permanent INCOMPLETE noise. Therefore the minimum
+//!   level set is now PER-RIVAL (`rival_supported_levels`, verified against
+//!   the actual CLI binaries, not the underlying library's documented range —
+//!   `libdeflate-gzip -0` is ALSO rejected by its own CLI parser despite the
+//!   library API supporting level 0): level 0 is mandatory for every rival
+//!   that accepts it (pigz, igzip), and a (rival, level) pair outside that
+//!   rival's real support is STRUCTURALLY ABSENT — counted, printed, and
+//!   NEVER required to exist as a cell, never blocking, and distinct from a
+//!   MISSING cell (a real, measurable gap the rival DOES support).
 //! * **FIXED VERDICT LAW (no rule knobs, no adjudicated pass)** — the
 //!   LazyGated promotion sequence invented rules until one fit: cell-flip
 //!   FAIL (`2c7f9444`) → strict-Pareto FAIL (`992c5837`) → self-tax proxy
@@ -96,7 +113,7 @@
 //! Spec shape (JSON):
 //!   {
 //!     "rivals":  ["gzip","pigz","libdeflate","igzip"],
-//!     "levels":  "1-9",
+//!     "levels":  "0-9",
 //!     "corpora": ["/corpus/dd79_text6", ...],
 //!     "surfaces": [ {"threads": 1, "dirs": ["/root/recert/t1"]}, ... ],
 //!     "waivers": [ {"rival":"igzip","corpus":"*","level":"*","threads":"*",
@@ -127,9 +144,70 @@ use std::process::ExitCode;
 /// omitting it from the spec.
 pub const MIN_RIVALS: [&str; 4] = ["gzip", "pigz", "libdeflate", "igzip"];
 
-/// Levels 1..=9 — the range every rival in the family supports. Extended
-/// levels (0, 10-12) come from the spec on top of these.
-pub const MIN_LEVELS: std::ops::RangeInclusive<u32> = 1..=9;
+/// The family's hardcoded minimum LEVEL RANGE — 0..=9. NOT every rival
+/// accepts every level in it (see [`rival_supported_levels`]); this is the
+/// ceiling a rival's OWN accepted levels are intersected against to compute
+/// its mandatory minimum ([`min_levels_for_rival`]). Extended levels (10-12)
+/// come from the spec on top of this, still gated per-rival by
+/// [`rival_accepts_level`] so an unsupported extended level is never a
+/// phantom gap either.
+pub const MIN_LEVEL_RANGE: std::ops::RangeInclusive<u32> = 0..=9;
+
+/// Per-rival accepted levels — hardcoded because `fulcrum goal` validates a
+/// spec and evaluates banked cells WITHOUT invoking any binary (unlike
+/// `levelsweep::filter_supported_levels`, which empirically probes a LIVE
+/// rival template at sweep time). Verified by directly invoking each binary
+/// and confirming exit code + gzip-roundtrip (macOS, 2026-07-25):
+///
+/// | rival        | probe            | result                                  | levels    |
+/// |--------------|------------------|-----------------------------------------|-----------|
+/// | gzip 1.14    | `gzip -0`        | exit 1 `invalid option -- '0'`          | 1-9       |
+/// | pigz 2.8     | `pigz -0 -c`     | exit 0, valid gzip, roundtrips OK       | 0-9, 11   |
+/// | pigz 2.8     | `pigz -10/-12 -c`| exit 22 `only levels 0..9 and 11 allowed`| (not 10/12) |
+/// | libdeflate-gzip (homebrew) | `libdeflate-gzip -0 -c` | exit 1 `invalid option -- '0'` | 1-12 |
+/// | igzip 2.32.0 (isa-l, `brew install isa-l`) | `igzip -0 -c` | exit 0, valid gzip, roundtrips OK | 0-3 |
+/// | igzip 2.32.0 | `igzip -4 -c`    | exit 1 `invalid compression level` (usage: "0 <= # <= 3") | (not 4+) |
+///
+/// The libdeflate row is the counterintuitive one: the libdeflate *library*
+/// API documents compression levels 0-12, but the CLI binary this repo's
+/// rival templates actually shell out to (`libdeflate-gzip -{level} -c
+/// {corpus}`, see `docs/frontier-design.md` / `src/scope.rs`) has no `-0`
+/// case in its own short-option parser and rejects it outright — so for the
+/// rival AS ACTUALLY INVOKED, level 0 is unreachable despite the library
+/// supporting it.
+pub fn rival_supported_levels(rival: &str) -> BTreeSet<u32> {
+    match rival {
+        "gzip" => (1..=9).collect(),
+        "pigz" => (0..=9).chain([11]).collect(),
+        "libdeflate" => (1..=12).collect(),
+        "igzip" => (0..=3).collect(),
+        // An unrecognized rival gets NO structural exemption — every level
+        // in the family range (and beyond, up to the extended ceiling) is
+        // required of it, same as if this table didn't exist.
+        _ => (0..=12).collect(),
+    }
+}
+
+/// True iff `rival`'s real, invoked CLI accepts `level` (see
+/// [`rival_supported_levels`]). Drives BOTH the parse-time minimum-surface
+/// check and the eval-time structural-absence exclusion, so the two can
+/// never drift apart.
+pub fn rival_accepts_level(rival: &str, level: u32) -> bool {
+    rival_supported_levels(rival).contains(&level)
+}
+
+/// The MANDATORY levels for one rival: its real accepted levels, intersected
+/// with the hardcoded family range ([`MIN_LEVEL_RANGE`]). Level 0 is
+/// mandatory wherever a rival accepts it — gzippy measured 5.2x-6.6x slower
+/// than pigz at L0 on solvency (2026-07-25, two corpus files), the largest
+/// known wall deficit on the board, invisible under the old flat `1..=9`
+/// minimum that doc-commented level 0 as merely "extended... optional".
+pub fn min_levels_for_rival(rival: &str) -> BTreeSet<u32> {
+    rival_supported_levels(rival)
+        .into_iter()
+        .filter(|l| MIN_LEVEL_RANGE.contains(l))
+        .collect()
+}
 
 /// Basename tokens the declared corpora must cover. The last two are the
 /// files that blew up precisely BECAUSE they were outside the habitual gate
@@ -267,12 +345,23 @@ pub fn parse_spec(json_text: &str) -> Result<GoalSpec, String> {
             ));
         }
     }
-    for l in MIN_LEVELS {
-        if !spec.levels.contains(&l) {
-            return Err(format!(
-                "spec omits level {l} — levels 1-9 are the hardcoded minimum (a level \
-                 dropped from the surface is a level on which a regression is invisible)"
-            ));
+    for r in MIN_RIVALS {
+        for l in min_levels_for_rival(r) {
+            if !spec.levels.contains(&l) {
+                return Err(format!(
+                    "spec omits level {l} for rival '{r}' — the minimum surface is PER-RIVAL \
+                     (module doc: THIS COMMAND HAD THE SAME DEFECT IT WAS BUILT TO PREVENT): \
+                     '{r}' accepts L{l} (verified against the real CLI, not just the library's \
+                     documented range) and the family range is {}-{}, so a level '{r}' can \
+                     actually run must never be silently dropped — gzippy measured 5.2x-6.6x \
+                     slower than pigz at L0 on solvency (2026-07-25, two corpus files), the \
+                     largest known wall deficit on the board, invisible while level 0 was \
+                     merely 'extended, optional'. Declare level {l} in the spec's levels, or \
+                     drop '{r}' from rivals if it is not being measured at all",
+                    MIN_LEVEL_RANGE.start(),
+                    MIN_LEVEL_RANGE.end(),
+                ));
+            }
         }
     }
     for tok in MIN_CORPORA {
@@ -346,6 +435,12 @@ pub struct Evaluation {
     pub skip: usize,
     pub missing: usize,
     pub waived: usize,
+    /// (rival, level) pairs the rival's OWN CLI cannot run at all (e.g.
+    /// gzip×L0) — never declared, never required to exist as a cell, never
+    /// blocking. Distinct from `missing`: a missing cell is a rival that
+    /// DOES support the level but wasn't measured (a real gap).
+    pub structurally_absent: usize,
+    pub structurally_absent_cells: Vec<String>,
     pub coverage_pct: f64,
     /// Cells measured outside the declared surface whose class blocks the
     /// goal — extra evidence is never ignorable by narrowing the spec.
@@ -474,6 +569,18 @@ pub fn evaluate(spec: &GoalSpec, candidate_sha: &str) -> Evaluation {
         for rival in &spec.rivals {
             for corpus in &declared_corpora {
                 for &level in &spec.levels {
+                    if !rival_accepts_level(rival, level) {
+                        // Structurally absent: this rival's own CLI cannot
+                        // run at this level (e.g. `gzip -0`). Never declared,
+                        // never required to exist as a cell, never blocking —
+                        // see module doc incident 2026-07-25.
+                        ev.structurally_absent += 1;
+                        ev.structurally_absent_cells.push(format!(
+                            "{} ({rival} does not accept L{level:02})",
+                            key_str(s.threads, rival, corpus, level)
+                        ));
+                        continue;
+                    }
                     ev.declared += 1;
                     let k = (rival.clone(), corpus.clone(), level);
                     match by_key.get(&k) {
@@ -546,7 +653,8 @@ pub fn evaluate(spec: &GoalSpec, candidate_sha: &str) -> Evaluation {
         for ((rival, corpus, level), c) in &by_key {
             let declared = spec.rivals.contains(rival)
                 && declared_corpora.contains(corpus)
-                && spec.levels.contains(level);
+                && spec.levels.contains(level)
+                && rival_accepts_level(rival, *level);
             if !declared {
                 let fresh = fresh_class(c);
                 if matches!(fresh.as_str(), "LOSS" | "SIZE-ONLY" | "SPEED-ONLY") {
@@ -772,6 +880,11 @@ pub fn render(ev: &Evaluation) {
         &ev.waived_cells,
         false,
     );
+    print_list(
+        "STRUCTURALLY ABSENT (rival's own CLI cannot run this level — never a gap)",
+        &ev.structurally_absent_cells,
+        false,
+    );
     if ev.distinct_shas.len() > 1 {
         println!(
             "STITCHED EVIDENCE: {} distinct subject shas across surfaces — one verdict \
@@ -788,9 +901,9 @@ pub fn render(ev: &Evaluation) {
     }
     println!(
         "GOAL={} declared={} win={} tie={} size_only={} speed_only={} loss={} void={} \
-         skip={} missing={} waived={} coverage={:.1}% unprovenanced={} stale={} \
-         distinct_shas={} attested={} unreadable={} duplicates={} reclass_drift={} \
-         extra_blockers={}",
+         skip={} missing={} waived={} structurally_absent={} coverage={:.1}% \
+         unprovenanced={} stale={} distinct_shas={} attested={} unreadable={} \
+         duplicates={} reclass_drift={} extra_blockers={}",
         ev.verdict,
         ev.declared,
         ev.win,
@@ -802,6 +915,7 @@ pub fn render(ev: &Evaluation) {
         ev.skip,
         ev.missing,
         ev.waived,
+        ev.structurally_absent,
         ev.coverage_pct,
         ev.unprovenanced.len(),
         ev.stale_dirs.len(),
@@ -1083,7 +1197,7 @@ fn full_min_spec_json() -> String {
     let corpora = r#"["/c/dd79_text6","/c/dd79_bin6","/c/sil40.bin","/c/data.sqlite","/c/ecoli.fastq","/c/weights.safetensors"]"#;
     let surfaces = r#"[{"threads":1,"dirs":["/tmp/none1"]},{"threads":4,"dirs":["/tmp/none4"]},{"threads":8,"dirs":["/tmp/none8"]},{"threads":16,"dirs":["/tmp/none16"]}]"#;
     format!(
-        r#"{{"rivals":{rivals},"levels":"1-9","corpora":{corpora},"surfaces":{surfaces},"waivers":[]}}"#
+        r#"{{"rivals":{rivals},"levels":"0-9","corpora":{corpora},"surfaces":{surfaces},"waivers":[]}}"#
     )
 }
 
@@ -1128,8 +1242,26 @@ pub fn selftest() -> ExitCode {
             .unwrap_or(false),
     );
     check(
-        "spec: levels '1-8' is REFUSED (level 9 missing)",
-        parse_spec(&full_min_spec_json().replace(r#""1-9""#, r#""1-8""#)).is_err(),
+        "spec: levels '0-8' is REFUSED (level 9 missing)",
+        parse_spec(&full_min_spec_json().replace(r#""0-9""#, r#""0-8""#)).is_err(),
+    );
+    check(
+        "spec: omitting level 0 (levels '1-9') while declaring pigz is REFUSED, naming pigz \
+         + the 5.2x-6.6x solvency deficit (per-rival L0-mandatory fix, 2026-07-25)",
+        parse_spec(&full_min_spec_json().replace(r#""0-9""#, r#""1-9""#))
+            .err()
+            .map(|e| e.contains("pigz") && e.contains("level 0") && e.contains("5.2"))
+            .unwrap_or(false),
+    );
+    check(
+        "rivals: gzip structurally does NOT accept level 0 (verified: `gzip -0` -> \
+         invalid option -- '0') — gzip's own minimum excludes L0",
+        !rival_accepts_level("gzip", 0) && !min_levels_for_rival("gzip").contains(&0),
+    );
+    check(
+        "rivals: pigz DOES accept level 0 (verified: `pigz -0` roundtrips OK) — L0 is in \
+         pigz's mandatory minimum, asymmetric with gzip's",
+        rival_accepts_level("pigz", 0) && min_levels_for_rival("pigz").contains(&0),
     );
     check(
         "spec: dropping the T16 surface is REFUSED without a wildcard waiver",
@@ -1386,6 +1518,64 @@ pub fn selftest() -> ExitCode {
             ev.verdict == "FAIL" && ev.loss == 1 && ev.reclass_drift == 1,
         );
     }
+    // -- 11b. structurally-absent (rival can't run this level) != a MISSING gap
+    {
+        let d = dir("e15");
+        synth_meta(&d, "SHA-A", false);
+        // pigz supports L0; gzip structurally does not (`gzip -0` errors).
+        // gzip@L0 is never even attempted here — no cell, no SKIP placeholder
+        // — yet it must NOT count as missing and must NOT block PASS.
+        write_synth_cell(&d, &win("pigz", "c1.bin", 0));
+        write_synth_cell(&d, &win("pigz", "c1.bin", 1));
+        write_synth_cell(&d, &win("gzip", "c1.bin", 1));
+        let spec = GoalSpec {
+            rivals: vec!["gzip".to_string(), "pigz".to_string()],
+            levels: vec![0, 1],
+            corpora: vec!["c1.bin".to_string()],
+            surfaces: vec![Surface {
+                threads: 1,
+                dirs: vec![d.display().to_string()],
+            }],
+            waivers: vec![],
+        };
+        let ev = evaluate(&spec, "SHA-A");
+        check(
+            "eval: gzip@L0 is structurally absent (gzip has no -0) — never MISSING, never \
+             blocks; PASS at 100% of the REAL (rival-capable) surface",
+            ev.verdict == "PASS"
+                && ev.missing == 0
+                && ev.structurally_absent == 1
+                && ev.structurally_absent_cells[0].contains("gzip")
+                && (ev.coverage_pct - 100.0).abs() < 1e-9,
+        );
+    }
+    {
+        let d = dir("e16");
+        synth_meta(&d, "SHA-A", false);
+        write_synth_cell(&d, &win("pigz", "c1.bin", 1));
+        write_synth_cell(&d, &win("gzip", "c1.bin", 1));
+        // pigz@L0 never measured — but pigz DOES support L0 (unlike gzip),
+        // so this IS a genuine, must-be-measured gap, not a structural one.
+        let spec = GoalSpec {
+            rivals: vec!["gzip".to_string(), "pigz".to_string()],
+            levels: vec![0, 1],
+            corpora: vec!["c1.bin".to_string()],
+            surfaces: vec![Surface {
+                threads: 1,
+                dirs: vec![d.display().to_string()],
+            }],
+            waivers: vec![],
+        };
+        let ev = evaluate(&spec, "SHA-A");
+        check(
+            "eval: pigz@L0 genuinely unmeasured (pigz DOES support L0) ⇒ still a real \
+             MISSING gap ⇒ INCOMPLETE (structural exemption never swallows a real gap)",
+            ev.verdict == "INCOMPLETE"
+                && ev.missing == 1
+                && ev.missing_cells[0].contains("pigz")
+                && ev.structurally_absent == 1,
+        );
+    }
     // -- 12. baseline delta: noise floor + trades + regressions ---------------
     {
         let tight = Some([-0.001, 0.001]);
@@ -1489,6 +1679,38 @@ mod tests {
         assert!(parse_spec(&no_weights)
             .unwrap_err()
             .contains("weights.safetensors"));
+    }
+
+    #[test]
+    fn per_rival_level_minimum_is_asymmetric() {
+        // gzip cannot run level 0 at all (`gzip -0` -> invalid option); pigz
+        // and igzip can. libdeflate's CLI (as this repo's templates invoke
+        // it, `-{level}`) also rejects -0 despite the library API supporting
+        // it. The mandatory minimum must reflect the CLI's real behavior.
+        assert!(!rival_accepts_level("gzip", 0));
+        assert!(rival_accepts_level("gzip", 1));
+        assert!(rival_accepts_level("gzip", 9));
+        assert!(!rival_accepts_level("gzip", 10));
+
+        assert!(rival_accepts_level("pigz", 0));
+        assert!(rival_accepts_level("pigz", 11));
+        assert!(!rival_accepts_level("pigz", 10));
+        assert!(!rival_accepts_level("pigz", 12));
+
+        assert!(!rival_accepts_level("libdeflate", 0));
+        assert!(rival_accepts_level("libdeflate", 12));
+
+        assert!(rival_accepts_level("igzip", 0));
+        assert!(rival_accepts_level("igzip", 3));
+        assert!(!rival_accepts_level("igzip", 4));
+
+        assert!(!min_levels_for_rival("gzip").contains(&0));
+        assert!(min_levels_for_rival("pigz").contains(&0));
+        assert!(!min_levels_for_rival("libdeflate").contains(&0));
+        assert!(min_levels_for_rival("igzip").contains(&0));
+        // igzip's mandatory minimum tops out at 3, not 9 — it structurally
+        // cannot be asked for L4-L9 either.
+        assert_eq!(min_levels_for_rival("igzip"), (0..=3).collect());
     }
 
     #[test]
