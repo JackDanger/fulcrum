@@ -199,6 +199,17 @@ USAGE:\n\
               [--out ...]` merges banked runs; `wallcensus selftest` is the Gate-0. `goal join\n\
               --size-census DIR --wall-census DIR --spec join.json --ours-bin PATH` fuses a\n\
               sizecensus artifact with a wallcensus artifact into one verdict.\n\
+  fulcrum dropin --ours PATH --rival name=CMD [--rival ...] \\\n\
+              --fixture FILE [--fixture ...] --out DIR [--oracle-gzip CMD] [--declared FILE.json]\n\
+              the executable DROP-IN COMPATIBILITY census — the missing half of the goal\n\
+              scoreboard: for a hardcoded minimum surface of REAL invocations (in-place vs -c,\n\
+              -k, -f, missing-input/refuse-without-force/corrupt-input error behaviour, -t/-l)\n\
+              diffs exit code, stdout, stderr shape, created/removed/modified files, permission\n\
+              bits, and roundtrip correctness between ours and each rival. Statuses: MATCH /\n\
+              DIVERGENT (real, unreasoned difference) / DECLARED (matches a --declared\n\
+              exception, reason required) / ERROR / OURS-UNAVAILABLE / RIVAL-UNAVAILABLE.\n\
+              `dropin report --out DIR [--out ...]` merges banked runs (refuses across\n\
+              different ours shas); `dropin selftest` is the Gate-0.\n\
   fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
               profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
               faults, per-thread occupancy; Linux)\n\
@@ -4390,6 +4401,7 @@ fn main() -> ExitCode {
         "goal" => fulcrum::goal::cmd(rest),
         "sizecensus" => fulcrum::sizecensus::cmd(rest),
         "wallcensus" => fulcrum::wallcensus::cmd(rest),
+        "dropin" => fulcrum::dropin::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),
