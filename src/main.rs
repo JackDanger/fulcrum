@@ -184,6 +184,17 @@ USAGE:\n\
               per-rival level support reused from `goal::rival_accepts_level`; `sizecensus report\n\
               --out DIR [--out ...]` merges banked runs (refuses across different gzippy shas);\n\
               `sizecensus selftest` is the Gate-0\n\
+  fulcrum wallcensus --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' \\\n\
+              --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
+              --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus ...] --out DIR\n\
+              the WALL-axis census (sizecensus's missing half): cells keyed on (corpus, level,\n\
+              rival, THREADS) via `paired::run_paired_inner` compress-mode; a PIN GATE probes\n\
+              each arm's real CPU%% and VOIDs any cell that did not run at its declared\n\
+              concurrency (catches an unpinned rival before it sign-flips a ratio). Resumable\n\
+              per cell (a cached VOID is always re-measured); `wallcensus report --out DIR\n\
+              [--out ...]` merges banked runs; `wallcensus selftest` is the Gate-0. `goal join\n\
+              --size-census DIR --wall-census DIR --spec join.json --ours-bin PATH` fuses a\n\
+              sizecensus artifact with a wallcensus artifact into one verdict.\n\
   fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
               profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
               faults, per-thread occupancy; Linux)\n\
