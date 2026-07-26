@@ -4374,6 +4374,7 @@ fn main() -> ExitCode {
         "sweep" => cmd_sweep(rest),
         "goal" => fulcrum::goal::cmd(rest),
         "sizecensus" => fulcrum::sizecensus::cmd(rest),
+        "wallcensus" => fulcrum::wallcensus::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),

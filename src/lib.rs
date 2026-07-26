@@ -122,4 +122,5 @@ pub mod validate;
 pub mod verbose_stats;
 pub mod vs;
 pub mod vs_sweep;
+pub mod wallcensus;
 pub mod xtool;

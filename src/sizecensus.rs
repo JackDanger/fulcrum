@@ -120,7 +120,10 @@ pub struct CensusCell {
     pub error: Option<String>,
 }
 
-fn basename(p: &Path) -> String {
+/// `pub(crate)` so `wallcensus` (the WALL-axis sibling census — same
+/// provenance shape, different measurement) reuses this instead of
+/// re-implementing basename extraction a second time.
+pub(crate) fn basename(p: &Path) -> String {
     p.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("?")
@@ -189,7 +192,9 @@ pub struct CensusProvenance {
     pub created_unix: u64,
 }
 
-fn host_string() -> String {
+/// `pub(crate)` — shared with `wallcensus`'s provenance block (same host
+/// string, same reasoning, no second copy).
+pub(crate) fn host_string() -> String {
     let uname = Command::new("uname")
         .arg("-sm")
         .output()
@@ -217,7 +222,8 @@ fn host_string() -> String {
 /// shared with every commit label derived after the fact) — a dirty working
 /// tree at measurement time is flagged with a `-dirty` suffix so that
 /// residual gap stays visible rather than silently assumed away.
-fn git_commit_for_binary(bin: Option<&Path>) -> Option<String> {
+/// `pub(crate)` — shared with `wallcensus`'s provenance block.
+pub(crate) fn git_commit_for_binary(bin: Option<&Path>) -> Option<String> {
     let bin = bin?;
     let mut dir = bin.parent()?;
     let git_dir = loop {
@@ -262,7 +268,8 @@ fn git_commit_for_binary(bin: Option<&Path>) -> Option<String> {
 /// accepts `-V`. The original version of this function accepted the FIRST
 /// non-empty line regardless of exit status, so it silently reported the
 /// rejection message itself as the "version" instead of trying `-V` next.
-fn capture_version(bin: &Path) -> String {
+/// `pub(crate)` — shared with `wallcensus`'s provenance block.
+pub(crate) fn capture_version(bin: &Path) -> String {
     let mut first_rejection: Option<String> = None;
     for flag in ["--version", "-V", "-v"] {
         let Ok(out) = Command::new(bin).arg(flag).output() else {
@@ -291,7 +298,10 @@ fn capture_version(bin: &Path) -> String {
     }
 }
 
-fn rival_provenance(rival: &Rival) -> RivalProvenance {
+/// `pub(crate)` — shared with `wallcensus`'s provenance block (identical
+/// per-rival version-capture logic; a second copy would be a second place for
+/// the `libdeflate-gzip --version`-rejection bug to reappear).
+pub(crate) fn rival_provenance(rival: &Rival) -> RivalProvenance {
     match resolve_ours_binary(&rival.tmpl) {
         Some(bin) => RivalProvenance {
             name: rival.name.clone(),

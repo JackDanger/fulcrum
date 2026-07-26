@@ -129,6 +129,8 @@ use crate::levelsweep::{
 };
 use crate::matrix::DEFAULT_EPSILON;
 use crate::paired::sha256_of_file;
+use crate::sizecensus;
+use crate::wallcensus;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -954,6 +956,620 @@ pub fn render_delta(rep: &DeltaReport) {
 }
 
 // ---------------------------------------------------------------------------
+// GOAL JOIN — consume BOTH censuses (fulcrum sizecensus + fulcrum wallcensus)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS SEPARATE FROM `evaluate()` ABOVE (never rips it out): the prior
+// agent declined the size integration because `evaluate`'s `fresh_class`
+// fuses a wall verdict and a size ratio from ONE `SweepCell` (produced by
+// `fulcrum sweep`, which always measures both halves together) — feeding it
+// a size-only artifact means every cell arrives with an EMPTY `wall_status`,
+// which `matrix::classify` treats as non-"OK" ⇒ VOID. That is a FALSE VOID:
+// the size leg is genuinely measured, only the wall leg is absent, and VOID
+// means "measurement failed," not "one axis wasn't attempted here." Now that
+// `fulcrum wallcensus` exists, the fix is to STOP forcing both legs through
+// one cell shape and instead JOIN two independently-measured artifacts on
+// their shared key — `(rival, corpus, level, threads)` — before classifying,
+// so a leg that is genuinely UNMEASURED is INCOMPLETE (a real gap, blocking,
+// distinct from VOID) rather than silently miscoded as a measurement
+// failure.
+//
+// REUSE, NOT REIMPLEMENTATION: the FUSION step itself is NOT reinvented —
+// `join_cell` below calls the exact same [`crate::levelsweep::classify_cell`]
+// `fresh_class` already calls, just fed from two artifacts' cells instead of
+// one `SweepCell`'s. Every existing guarantee is preserved by construction:
+// a measured LOSS is still unwaivable (only VOID/RIVAL-UNAVAILABLE/MISSING
+// legs can be waived, and the check happens strictly BEFORE `classify_cell`
+// runs), a waiver still needs a real reason (the SAME `Waiver` type, the SAME
+// `MIN_WAIVER_REASON` gate), a cross-artifact-sha mismatch is STALE (the same
+// verdict `evaluate()` gives a cross-DIR sha mismatch), and the minimum
+// surface (rivals/levels/corpora/threads) is refused at parse time exactly
+// like `parse_spec` refuses a narrowed `GoalSpec`.
+//
+// KNOWN LIMITATION (flagged, not hidden — see the caller's own UNKNOWN list):
+// `fulcrum sizecensus` carries NO thread axis (it was run at `-p1` only,
+// which is the omission `wallcensus` exists to close on the WALL side). The
+// SIZE leg of a joined cell is therefore looked up by `(rival, corpus,
+// level)` ONLY and projected across every declared `threads` value — an
+// assumption that compressed size is thread-count-invariant for that
+// (rival, corpus, level). For rivals whose parallel encoder changes block
+// boundaries with thread count (gzippy's own `-p N>1`, pigz's `-p N>1`),
+// this assumption is UNVALIDATED — sizecensus would need its own threads
+// axis to close it. This module does not paper over that: it is named here
+// and in every render/selftest label that touches the size leg.
+
+/// One fused cell — the join's own output shape, deliberately NOT
+/// `SweepCell` (which structurally cannot represent "size measured, wall
+/// leg genuinely absent" without lying about `wall_status`).
+#[derive(Clone, Debug, Serialize)]
+pub struct JoinedCell {
+    pub rival: String,
+    pub corpus: String,
+    pub level: u32,
+    pub threads: u32,
+    /// WIN / TIE / SIZE-ONLY / SPEED-ONLY / LOSS / VOID / RIVAL-UNAVAILABLE /
+    /// MISSING-SIZE-LEG / MISSING-WALL-LEG / LEG-STATUS-MISMATCH.
+    pub class: String,
+    pub size_ratio: f64,
+    pub wall_ratio: f64,
+    pub wall_verdict: String,
+    pub wall_status: String,
+    pub note: String,
+}
+
+fn join_cell(
+    rival: &str,
+    corpus: &str,
+    level: u32,
+    threads: u32,
+    size_cell: Option<&sizecensus::CensusCell>,
+    wall_cell: Option<&wallcensus::CensusCell>,
+) -> JoinedCell {
+    let base = |class: &str, note: String| JoinedCell {
+        rival: rival.to_string(),
+        corpus: corpus.to_string(),
+        level,
+        threads,
+        class: class.to_string(),
+        size_ratio: size_cell.map(|c| c.ratio).unwrap_or(f64::NAN),
+        wall_ratio: wall_cell.map(|c| c.wall_ratio).unwrap_or(f64::NAN),
+        wall_verdict: wall_cell
+            .map(|c| c.wall_verdict.clone())
+            .unwrap_or_default(),
+        wall_status: wall_cell.map(|c| c.wall_status.clone()).unwrap_or_default(),
+        note,
+    };
+    let (sc, wc) = match (size_cell, wall_cell) {
+        (None, None) => {
+            return base(
+                "MISSING-SIZE-LEG",
+                "both the size leg and the wall leg are unmeasured for this key".to_string(),
+            )
+        }
+        (None, Some(_)) => {
+            return base(
+                "MISSING-SIZE-LEG",
+                "size leg unmeasured (no matching sizecensus cell for this rival/corpus/level)"
+                    .to_string(),
+            )
+        }
+        (Some(_), None) => {
+            return base(
+                "MISSING-WALL-LEG",
+                "wall leg unmeasured (no matching wallcensus cell for this rival/corpus/level/\
+                 threads)"
+                    .to_string(),
+            )
+        }
+        (Some(sc), Some(wc)) => (sc, wc),
+    };
+    let rival_unavailable = sc.status == "RIVAL-UNAVAILABLE" || wc.status == "RIVAL-UNAVAILABLE";
+    let void = sc.status == "VOID" || wc.status == "VOID";
+    let absent_mismatch = (sc.status == "ABSENT") != (wc.status == "ABSENT");
+    if absent_mismatch {
+        return base(
+            "LEG-STATUS-MISMATCH",
+            format!(
+                "size leg status={} vs wall leg status={} disagree on structural ABSENCE for \
+                 the SAME (rival,level) — the two censuses' rival_accepts_level tables have \
+                 drifted; never silently resolved",
+                sc.status, wc.status
+            ),
+        );
+    }
+    if sc.status == "ABSENT" && wc.status == "ABSENT" {
+        return base("ABSENT", "both legs structurally absent".to_string());
+    }
+    if rival_unavailable {
+        return base(
+            "RIVAL-UNAVAILABLE",
+            format!(
+                "size leg status={} wall leg status={}",
+                sc.status, wc.status
+            ),
+        );
+    }
+    if void {
+        return base(
+            "VOID",
+            format!(
+                "size leg status={} (error={:?}) wall leg status={} (error={:?})",
+                sc.status, sc.error, wc.status, wc.error
+            ),
+        );
+    }
+    // Both legs OK: reuse the EXACT SAME fusion `evaluate()`'s `fresh_class`
+    // already calls — no second WIN/TIE/SIZE-ONLY/SPEED-ONLY/LOSS state
+    // machine.
+    let class = classify_cell(&wc.wall_status, &wc.wall_verdict, sc.ratio, DEFAULT_EPSILON);
+    base(class, String::new())
+}
+
+#[derive(Clone, Debug)]
+pub struct JoinSpec {
+    pub rivals: Vec<String>,
+    pub levels: Vec<u32>,
+    pub corpora: Vec<String>,
+    pub threads: Vec<u32>,
+    pub waivers: Vec<Waiver>,
+}
+
+#[derive(Deserialize)]
+struct RawJoinSpec {
+    rivals: Vec<String>,
+    levels: String,
+    corpora: Vec<String>,
+    threads: String,
+    #[serde(default)]
+    waivers: Vec<Waiver>,
+}
+
+/// Parse + validate a join spec. Enforces the SAME hardcoded minimum surface
+/// as [`parse_spec`] (module doc: "keep every existing guarantee... minimum
+/// surface refusal") — rivals, per-rival levels, corpora, and now `threads`
+/// as a flat declared set (no per-thread `dirs` indirection; the wall leg's
+/// thread axis lives INSIDE the wallcensus artifact's cells).
+pub fn parse_join_spec(json_text: &str) -> Result<JoinSpec, String> {
+    let raw: RawJoinSpec =
+        serde_json::from_str(json_text).map_err(|e| format!("join spec parse: {e}"))?;
+    let levels = parse_levels(&raw.levels)?;
+    let threads = parse_levels(&raw.threads)?; // same comma/range grammar
+    let spec = JoinSpec {
+        rivals: raw.rivals,
+        levels,
+        corpora: raw.corpora,
+        threads,
+        waivers: raw.waivers,
+    };
+
+    for w in &spec.waivers {
+        if w.reason.trim().len() < MIN_WAIVER_REASON {
+            return Err(format!(
+                "waiver {{rival:{},corpus:{},level:{},threads:{}}} has a {}-char reason (min {})",
+                w.rival,
+                w.corpus,
+                w.level,
+                w.threads,
+                w.reason.trim().len(),
+                MIN_WAIVER_REASON
+            ));
+        }
+    }
+    for r in MIN_RIVALS {
+        if !spec.rivals.iter().any(|x| x == r) {
+            return Err(format!(
+                "join spec omits rival '{r}' — the minimum surface is hardcoded (same rule as \
+                 `fulcrum goal`'s `parse_spec`)"
+            ));
+        }
+    }
+    for r in MIN_RIVALS {
+        for l in min_levels_for_rival(r) {
+            if !spec.levels.contains(&l) {
+                return Err(format!(
+                    "join spec omits level {l} for rival '{r}' — '{r}' accepts L{l} and the \
+                     per-rival minimum is mandatory (same rule as `fulcrum goal`'s `parse_spec`)"
+                ));
+            }
+        }
+    }
+    for tok in MIN_CORPORA {
+        if !spec.corpora.iter().any(|c| basename(c).contains(tok)) {
+            return Err(format!(
+                "join spec's corpora cover no file matching '{tok}' — the minimum corpus set \
+                 is hardcoded"
+            ));
+        }
+    }
+    let declared_threads: BTreeSet<u32> = spec.threads.iter().copied().collect();
+    for t in MIN_THREADS {
+        if !declared_threads.contains(&t) {
+            let waived = spec.waivers.iter().any(|w| {
+                w.rival == "*" && w.corpus == "*" && w.level == "*" && w.threads == t.to_string()
+            });
+            if !waived {
+                return Err(format!(
+                    "join spec has no declared threads={t} and no wildcard waiver for it — \
+                     T1/4/8/16 are the goal's own words"
+                ));
+            }
+        }
+    }
+    Ok(spec)
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct JoinEvaluation {
+    pub verdict: String,
+    pub declared: usize,
+    pub win: usize,
+    pub tie: usize,
+    pub size_only: usize,
+    pub speed_only: usize,
+    pub loss: usize,
+    pub void: usize,
+    pub rival_unavailable: usize,
+    pub missing: usize,
+    pub leg_mismatch: usize,
+    pub waived: usize,
+    pub structurally_absent: usize,
+    pub coverage_pct: f64,
+    pub losses: Vec<String>,
+    pub gaps: Vec<String>,
+    pub voids: Vec<String>,
+    pub missing_cells: Vec<String>,
+    pub waived_cells: Vec<String>,
+    pub leg_mismatch_cells: Vec<String>,
+    pub duplicates: usize,
+    pub size_candidate_sha: Option<String>,
+    pub wall_candidate_sha: Option<String>,
+    pub candidate_sha: String,
+    pub stale_reasons: Vec<String>,
+}
+
+fn joined_key_str(rival: &str, corpus: &str, level: u32, threads: u32) -> String {
+    format!("T{threads} {rival} {corpus} L{level:02}")
+}
+
+fn joined_cell_line(jc: &JoinedCell) -> String {
+    format!(
+        "class={} wall={:.3} size={:.4}",
+        jc.class, jc.wall_ratio, jc.size_ratio
+    )
+}
+
+/// Evaluate a [`JoinSpec`] against ONE sizecensus artifact + ONE wallcensus
+/// artifact. Pure over the two in-memory artifacts — no filesystem beyond
+/// what the caller already loaded.
+pub fn evaluate_joined(
+    spec: &JoinSpec,
+    size: &sizecensus::CensusArtifact,
+    wall: &wallcensus::CensusArtifact,
+    candidate_sha: &str,
+) -> JoinEvaluation {
+    let mut ev = JoinEvaluation {
+        candidate_sha: candidate_sha.to_string(),
+        size_candidate_sha: size.provenance.gzippy_sha256.clone(),
+        wall_candidate_sha: wall.provenance.gzippy_sha256.clone(),
+        ..Default::default()
+    };
+
+    // -- provenance: both artifacts must name the SAME candidate binary ------
+    let mut stale = false;
+    match (&ev.size_candidate_sha, &ev.wall_candidate_sha) {
+        (Some(s), Some(w)) if s != w => {
+            stale = true;
+            ev.stale_reasons.push(format!(
+                "STITCHED EVIDENCE: sizecensus measured sha256={} but wallcensus measured \
+                 sha256={} — one verdict cannot be joined from two different binaries",
+                sha256_hint(s),
+                sha256_hint(w)
+            ));
+        }
+        _ => {}
+    }
+    for (label, sha) in [
+        ("sizecensus", &ev.size_candidate_sha),
+        ("wallcensus", &ev.wall_candidate_sha),
+    ] {
+        match sha {
+            Some(s) if s != candidate_sha => {
+                stale = true;
+                ev.stale_reasons.push(format!(
+                    "{label} measured sha256={} but the candidate binary is sha256={}",
+                    sha256_hint(s),
+                    sha256_hint(candidate_sha)
+                ));
+            }
+            None => {
+                stale = true;
+                ev.stale_reasons.push(format!(
+                    "{label} artifact carries no gzippy_sha256 (UNPROVENANCED) — cannot verify \
+                     it measured the candidate binary"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // -- index both artifacts on their shared keys, detecting duplicates ----
+    let mut size_idx: BTreeMap<(String, String, u32), &sizecensus::CensusCell> = BTreeMap::new();
+    for c in &size.cells {
+        let k = (c.rival.clone(), c.corpus.clone(), c.level);
+        if size_idx.insert(k, c).is_some() {
+            ev.duplicates += 1;
+        }
+    }
+    let mut wall_idx: BTreeMap<(String, String, u32, u32), &wallcensus::CensusCell> =
+        BTreeMap::new();
+    for c in &wall.cells {
+        let k = (c.rival.clone(), c.corpus.clone(), c.level, c.threads);
+        if wall_idx.insert(k, c).is_some() {
+            ev.duplicates += 1;
+        }
+    }
+
+    let declared_corpora: BTreeSet<String> = spec.corpora.iter().map(|c| basename(c)).collect();
+    for rival in &spec.rivals {
+        for corpus in &declared_corpora {
+            for &level in &spec.levels {
+                if !rival_accepts_level(rival, level) {
+                    ev.structurally_absent += 1;
+                    continue;
+                }
+                for &threads in &spec.threads {
+                    ev.declared += 1;
+                    let sc = size_idx
+                        .get(&(rival.clone(), corpus.clone(), level))
+                        .copied();
+                    let wc = wall_idx
+                        .get(&(rival.clone(), corpus.clone(), level, threads))
+                        .copied();
+                    let jc = join_cell(rival, corpus, level, threads, sc, wc);
+                    let key = joined_key_str(rival, corpus, level, threads);
+                    let waiver = spec
+                        .waivers
+                        .iter()
+                        .find(|w| w.matches(rival, corpus, level, threads));
+                    match jc.class.as_str() {
+                        "WIN" => ev.win += 1,
+                        "TIE" => ev.tie += 1,
+                        "SIZE-ONLY" => {
+                            ev.size_only += 1;
+                            ev.gaps.push(format!("{key}  {}", joined_cell_line(&jc)));
+                        }
+                        "SPEED-ONLY" => {
+                            ev.speed_only += 1;
+                            ev.gaps.push(format!("{key}  {}", joined_cell_line(&jc)));
+                        }
+                        "LOSS" => {
+                            ev.loss += 1;
+                            ev.losses.push(format!("{key}  {}", joined_cell_line(&jc)));
+                        }
+                        "ABSENT" => ev.structurally_absent += 1,
+                        "LEG-STATUS-MISMATCH" => {
+                            ev.leg_mismatch += 1;
+                            ev.leg_mismatch_cells.push(format!("{key}  {}", jc.note));
+                        }
+                        "RIVAL-UNAVAILABLE" => {
+                            if let Some(w) = waiver {
+                                ev.waived += 1;
+                                ev.waived_cells.push(format!(
+                                    "{key}  (RIVAL-UNAVAILABLE; waived: {})",
+                                    w.reason
+                                ));
+                            } else {
+                                ev.rival_unavailable += 1;
+                                ev.missing_cells
+                                    .push(format!("{key}  (RIVAL-UNAVAILABLE, unwaived)"));
+                            }
+                        }
+                        "MISSING-SIZE-LEG" | "MISSING-WALL-LEG" => {
+                            if let Some(w) = waiver {
+                                ev.waived += 1;
+                                ev.waived_cells
+                                    .push(format!("{key}  ({}; waived: {})", jc.class, w.reason));
+                            } else {
+                                ev.missing += 1;
+                                ev.missing_cells
+                                    .push(format!("{key}  ({}: {})", jc.class, jc.note));
+                            }
+                        }
+                        _ => {
+                            // VOID (never a result).
+                            if let Some(w) = waiver {
+                                ev.waived += 1;
+                                ev.waived_cells
+                                    .push(format!("{key}  (VOID; waived: {})", w.reason));
+                            } else {
+                                ev.void += 1;
+                                ev.voids.push(format!("{key}  {}", jc.note));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let covered = ev.declared - ev.missing - ev.rival_unavailable;
+    ev.coverage_pct = if ev.declared == 0 {
+        0.0
+    } else {
+        100.0 * covered as f64 / ev.declared as f64
+    };
+
+    ev.verdict = if stale {
+        "STALE"
+    } else if ev.missing > 0
+        || ev.void > 0
+        || ev.rival_unavailable > 0
+        || ev.leg_mismatch > 0
+        || ev.duplicates > 0
+        || ev.declared == 0
+    {
+        "INCOMPLETE"
+    } else if ev.loss > 0 || ev.size_only > 0 || ev.speed_only > 0 {
+        "FAIL"
+    } else if ev.waived > 0 {
+        "PASS-WITH-WAIVERS"
+    } else {
+        "PASS"
+    }
+    .to_string();
+    ev
+}
+
+pub fn render_joined(ev: &JoinEvaluation) {
+    println!(
+        "GOAL JOIN: declared_cells={} coverage={:.1}% candidate_sha={} \
+         size_sha={} wall_sha={}",
+        ev.declared,
+        ev.coverage_pct,
+        sha256_hint(&ev.candidate_sha),
+        ev.size_candidate_sha
+            .as_deref()
+            .map(sha256_hint)
+            .unwrap_or_else(|| "NONE".to_string()),
+        ev.wall_candidate_sha
+            .as_deref()
+            .map(sha256_hint)
+            .unwrap_or_else(|| "NONE".to_string()),
+    );
+    for r in &ev.stale_reasons {
+        println!("STALE: {r}");
+    }
+    print_list("PARETO LOSSES (bigger AND slower)", &ev.losses, true);
+    print_list(
+        "DOMINANCE GAPS (one axis behind — the goal is BOTH axes)",
+        &ev.gaps,
+        true,
+    );
+    print_list(
+        "VOID CELLS (measurement failed — not absence of a problem)",
+        &ev.voids,
+        true,
+    );
+    print_list(
+        "MISSING/RIVAL-UNAVAILABLE CELLS (unmeasured != passing)",
+        &ev.missing_cells,
+        true,
+    );
+    print_list(
+        "LEG-STATUS-MISMATCH (the two censuses disagree on structural absence)",
+        &ev.leg_mismatch_cells,
+        true,
+    );
+    print_list(
+        "WAIVED CELLS (visible exceptions — verdict is capped)",
+        &ev.waived_cells,
+        false,
+    );
+    println!(
+        "GOAL_JOIN={} declared={} win={} tie={} size_only={} speed_only={} loss={} void={} \
+         rival_unavailable={} missing={} leg_mismatch={} waived={} structurally_absent={} \
+         duplicates={} coverage={:.1}%",
+        ev.verdict,
+        ev.declared,
+        ev.win,
+        ev.tie,
+        ev.size_only,
+        ev.speed_only,
+        ev.loss,
+        ev.void,
+        ev.rival_unavailable,
+        ev.missing,
+        ev.leg_mismatch,
+        ev.waived,
+        ev.structurally_absent,
+        ev.duplicates,
+        ev.coverage_pct,
+    );
+}
+
+/// `fulcrum goal join --size-census DIR --wall-census DIR --spec SPEC.json
+/// --ours-bin PATH [--json OUT]` — load `DIR/census.json` from each, join,
+/// and render. Kept as a SEPARATE subcommand from `fulcrum goal --spec ...`
+/// (the SweepCell-directory path) rather than replacing it — both paths stay
+/// live, and this module's own selftest covers the join without touching
+/// `evaluate()`'s existing 34 checks.
+fn join_cmd(args: &[String]) -> ExitCode {
+    let (Some(size_dir), Some(wall_dir), Some(spec_path), Some(ours_bin)) = (
+        cli_flag(args, "--size-census"),
+        cli_flag(args, "--wall-census"),
+        cli_flag(args, "--spec"),
+        cli_flag(args, "--ours-bin"),
+    ) else {
+        eprintln!(
+            "goal join: --size-census DIR --wall-census DIR --spec SPEC.json --ours-bin PATH \
+             are all required"
+        );
+        return ExitCode::from(2);
+    };
+    let read_artifact_size = |dir: &str| -> Result<sizecensus::CensusArtifact, String> {
+        let p = Path::new(dir).join("census.json");
+        serde_json::from_str(
+            &fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?,
+        )
+        .map_err(|e| format!("parse {}: {e}", p.display()))
+    };
+    let read_artifact_wall = |dir: &str| -> Result<wallcensus::CensusArtifact, String> {
+        let p = Path::new(dir).join("census.json");
+        serde_json::from_str(
+            &fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?,
+        )
+        .map_err(|e| format!("parse {}: {e}", p.display()))
+    };
+    let size = match read_artifact_size(size_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("goal join: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wall = match read_artifact_wall(wall_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("goal join: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec_text = match fs::read_to_string(spec_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("goal join: read {spec_path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let spec = match parse_join_spec(&spec_text) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("goal join: SPEC REFUSED: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let candidate_sha = match sha256_of_file(Path::new(ours_bin)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("goal join: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let ev = evaluate_joined(&spec, &size, &wall, &candidate_sha);
+    render_joined(&ev);
+    if let Some(json_out) = cli_flag(args, "--json") {
+        if let Ok(js) = serde_json::to_string_pretty(&ev) {
+            let _ = fs::write(json_out, js);
+        }
+    }
+    if ev.verdict.starts_with("PASS") {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -975,7 +1591,12 @@ fn usage() -> ExitCode {
          \x20              [--baseline-spec base.json] [--json OUT.json]\n\
          \x20 fulcrum goal stamp --out DIR --ours-bin PATH    attested provenance for a legacy dir\n\
          \x20                                                 (caps the verdict at PASS-WITH-WAIVERS)\n\
-         \x20 fulcrum goal selftest                           Gate-0 (covers the refusal paths)\n\
+         \x20 fulcrum goal join --size-census DIR --wall-census DIR --spec join.json \\\n\
+         \x20                   --ours-bin PATH [--json OUT.json]\n\
+         \x20      joins a `fulcrum sizecensus` artifact with a `fulcrum wallcensus` artifact\n\
+         \x20      on (rival, corpus, level, threads) instead of reading `fulcrum sweep` dirs.\n\
+         \x20 fulcrum goal selftest                           Gate-0 (covers the refusal paths,\n\
+         \x20                                                 including the join)\n\
          \n\
          Verdicts: PASS | PASS-WITH-WAIVERS | FAIL | INCOMPLETE | STALE. There is no\n\
          flag that weakens a leg; a measured LOSS or dominance gap cannot be waived."
@@ -1036,6 +1657,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     match args.first().map(|s| s.as_str()) {
         Some("selftest") => return selftest(),
         Some("stamp") => return stamp(&args[1..]),
+        Some("join") => return join_cmd(&args[1..]),
         _ => {}
     }
     let Some(spec_path) = cli_flag(args, "--spec") else {
@@ -1645,6 +2267,420 @@ pub fn selftest() -> ExitCode {
         check(
             "delta: an exact-size growth (100 -> 150 bytes) is a REGRESSION (integers have no noise)",
             rep.size_worse == 1 && rep.verdict == "REGRESSED",
+        );
+    }
+
+    // -- 13. GOAL JOIN: consuming BOTH censuses (sizecensus + wallcensus) ----
+    {
+        fn mk_size(
+            rival: &str,
+            corpus: &str,
+            level: u32,
+            status: &str,
+            ratio: f64,
+        ) -> sizecensus::CensusCell {
+            sizecensus::CensusCell {
+                rival: rival.to_string(),
+                corpus: corpus.to_string(),
+                level,
+                status: status.to_string(),
+                gzippy_bytes: (ratio * 100.0) as u64,
+                rival_bytes: 100,
+                ratio,
+                bigger: ratio > 1.0,
+                roundtrip_ok: status == "OK",
+                error: None,
+            }
+        }
+        fn mk_wall(
+            rival: &str,
+            corpus: &str,
+            level: u32,
+            threads: u32,
+            status: &str,
+            verdict: &str,
+            ratio: f64,
+        ) -> wallcensus::CensusCell {
+            wallcensus::CensusCell {
+                rival: rival.to_string(),
+                corpus: corpus.to_string(),
+                level,
+                threads,
+                status: status.to_string(),
+                wall_status: if status == "OK" {
+                    "OK".to_string()
+                } else {
+                    status.to_string()
+                },
+                wall_verdict: verdict.to_string(),
+                wall_class: String::new(),
+                wall_ratio: ratio,
+                slower: verdict == "RESOLVED-a-slower",
+                a_median_ms: 1.0,
+                b_median_ms: 1.0,
+                a_cpu_pct: threads as f64 * 100.0,
+                b_cpu_pct: threads as f64 * 100.0,
+                pin_ok: true,
+                size_ratio_bonus: ratio,
+                n: 9,
+                error: None,
+            }
+        }
+        fn mk_prov(sha: &str) -> sizecensus::CensusProvenance {
+            sizecensus::CensusProvenance {
+                gzippy_tmpl: "t".to_string(),
+                gzippy_bin: None,
+                gzippy_sha256: Some(sha.to_string()),
+                gzippy_commit: None,
+                host: "test".to_string(),
+                rivals: vec![],
+                corpus_files: vec![],
+                created_unix: 0,
+            }
+        }
+        fn size_artifact(
+            sha: &str,
+            cells: Vec<sizecensus::CensusCell>,
+        ) -> sizecensus::CensusArtifact {
+            sizecensus::CensusArtifact {
+                provenance: mk_prov(sha),
+                cells,
+            }
+        }
+        fn wall_artifact(
+            sha: &str,
+            cells: Vec<wallcensus::CensusCell>,
+        ) -> wallcensus::CensusArtifact {
+            wallcensus::CensusArtifact {
+                provenance: mk_prov(sha),
+                cells,
+            }
+        }
+        fn mini_join_spec(
+            rivals: &[&str],
+            levels: Vec<u32>,
+            corpora: &[&str],
+            threads: Vec<u32>,
+            waivers: Vec<Waiver>,
+        ) -> JoinSpec {
+            JoinSpec {
+                rivals: rivals.iter().map(|s| s.to_string()).collect(),
+                levels,
+                corpora: corpora.iter().map(|s| s.to_string()).collect(),
+                threads,
+                waivers,
+            }
+        }
+
+        // (a) both legs OK + WIN -> PASS.
+        {
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "OK",
+                    "RESOLVED-b-slower",
+                    0.9,
+                )],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: both legs OK + WIN -> PASS (the fused classify_cell path)",
+                ev.verdict == "PASS" && ev.win == 1 && ev.declared == 1,
+            );
+        }
+        // (b) wall leg genuinely missing (size measured only) -> INCOMPLETE,
+        //     NOT a false VOID — this is the exact defect the prior agent
+        //     declined to fix (an empty wall_status silently becoming VOID).
+        {
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let wall = wall_artifact("SHA-J", vec![]);
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: size leg measured, wall leg UNMEASURED -> INCOMPLETE (missing, never a \
+                 false VOID and never a phantom PASS)",
+                ev.verdict == "INCOMPLETE"
+                    && ev.missing == 1
+                    && ev.void == 0
+                    && ev.missing_cells[0].contains("MISSING-WALL-LEG"),
+            );
+        }
+        // (c) size leg genuinely missing (wall measured only) -> INCOMPLETE.
+        {
+            let size = size_artifact("SHA-J", vec![]);
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall("gzip", "c1.bin", 1, 1, "OK", "NOISY", 1.0)],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: wall leg measured, size leg UNMEASURED -> INCOMPLETE",
+                ev.verdict == "INCOMPLETE" && ev.missing == 1,
+            );
+        }
+        // (d) wall leg VOID -> void, INCOMPLETE (never silently dropped).
+        {
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "VOID",
+                    "VOID-aa_bias=0.05",
+                    f64::NAN,
+                )],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: wall leg VOID -> void>0, INCOMPLETE (never a result)",
+                ev.verdict == "INCOMPLETE" && ev.void == 1,
+            );
+        }
+        // (e) RIVAL-UNAVAILABLE with a wildcard waiver -> PASS-WITH-WAIVERS.
+        {
+            let size = size_artifact(
+                "SHA-J",
+                vec![mk_size("igzip", "c1.bin", 1, "RIVAL-UNAVAILABLE", f64::NAN)],
+            );
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "igzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "RIVAL-UNAVAILABLE",
+                    "",
+                    f64::NAN,
+                )],
+            );
+            let w = Waiver {
+                rival: "igzip".to_string(),
+                corpus: star(),
+                level: star(),
+                threads: star(),
+                reason: "igzip does not exist on this arch (structural)".to_string(),
+            };
+            let spec = mini_join_spec(&["igzip"], vec![1], &["c1.bin"], vec![1], vec![w]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: RIVAL-UNAVAILABLE + wildcard waiver -> PASS-WITH-WAIVERS",
+                ev.verdict == "PASS-WITH-WAIVERS" && ev.waived == 1 && ev.rival_unavailable == 0,
+            );
+        }
+        // (f) RIVAL-UNAVAILABLE WITHOUT a waiver -> blocks (INCOMPLETE).
+        {
+            let size = size_artifact(
+                "SHA-J",
+                vec![mk_size("igzip", "c1.bin", 1, "RIVAL-UNAVAILABLE", f64::NAN)],
+            );
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "igzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "RIVAL-UNAVAILABLE",
+                    "",
+                    f64::NAN,
+                )],
+            );
+            let spec = mini_join_spec(&["igzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: RIVAL-UNAVAILABLE with NO waiver -> blocks (INCOMPLETE, never silent)",
+                ev.verdict == "INCOMPLETE" && ev.rival_unavailable == 1 && ev.waived == 0,
+            );
+        }
+        // (g) cross-artifact sha mismatch -> STALE (stitched evidence refusal).
+        {
+            let size = size_artifact("SHA-A", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let wall = wall_artifact(
+                "SHA-B",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "OK",
+                    "RESOLVED-b-slower",
+                    0.9,
+                )],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-A");
+            check(
+                "join: sizecensus sha != wallcensus sha -> STALE (stitched-evidence refusal, \
+                 same law as evaluate()'s cross-dir distinct_shas)",
+                ev.verdict == "STALE" && !ev.stale_reasons.is_empty(),
+            );
+        }
+        // (h) both censuses agree with each other but NOT with the candidate
+        //     binary -> STALE.
+        {
+            let size = size_artifact("SHA-OLD", vec![mk_size("gzip", "c1.bin", 1, "OK", 0.95)]);
+            let wall = wall_artifact(
+                "SHA-OLD",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "OK",
+                    "RESOLVED-b-slower",
+                    0.9,
+                )],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-NEW");
+            check(
+                "join: both censuses agree with EACH OTHER but not the candidate binary -> STALE",
+                ev.verdict == "STALE",
+            );
+        }
+        // (i) structurally absent (gzip@L0) never counted, never blocks.
+        {
+            let size = size_artifact(
+                "SHA-J",
+                vec![
+                    mk_size("gzip", "c1.bin", 1, "OK", 0.95),
+                    mk_size("pigz", "c1.bin", 0, "OK", 0.95),
+                    mk_size("pigz", "c1.bin", 1, "OK", 0.95),
+                ],
+            );
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![
+                    mk_wall("gzip", "c1.bin", 1, 1, "OK", "RESOLVED-b-slower", 0.9),
+                    mk_wall("pigz", "c1.bin", 0, 1, "OK", "RESOLVED-b-slower", 0.9),
+                    mk_wall("pigz", "c1.bin", 1, 1, "OK", "RESOLVED-b-slower", 0.9),
+                ],
+            );
+            let spec = mini_join_spec(&["gzip", "pigz"], vec![0, 1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: gzip@L0 is structurally absent (gzip has no -0) -> never declared, \
+                 never blocks; PASS at 100% of the real surface",
+                ev.verdict == "PASS"
+                    && ev.structurally_absent == 1
+                    && ev.declared == 3
+                    && (ev.coverage_pct - 100.0).abs() < 1e-9,
+            );
+        }
+        // (j) a measured LOSS still blocks even with an UNRELATED waiver
+        //     present (waivers excuse absence, never evidence).
+        {
+            let size = size_artifact("SHA-J", vec![mk_size("gzip", "c1.bin", 1, "OK", 1.05)]);
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "OK",
+                    "RESOLVED-a-slower",
+                    1.05,
+                )],
+            );
+            let w = Waiver {
+                rival: "igzip".to_string(),
+                corpus: star(),
+                level: star(),
+                threads: star(),
+                reason: "unrelated waiver — must not suppress a measured LOSS".to_string(),
+            };
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![w]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: a measured LOSS still blocks (FAIL) even with an unrelated waiver present",
+                ev.verdict == "FAIL" && ev.loss == 1 && ev.waived == 0,
+            );
+        }
+        // (k) duplicate keys within an artifact -> INCOMPLETE (conservation).
+        {
+            let size = size_artifact(
+                "SHA-J",
+                vec![
+                    mk_size("gzip", "c1.bin", 1, "OK", 0.95),
+                    mk_size("gzip", "c1.bin", 1, "OK", 0.90), // duplicate key
+                ],
+            );
+            let wall = wall_artifact(
+                "SHA-J",
+                vec![mk_wall(
+                    "gzip",
+                    "c1.bin",
+                    1,
+                    1,
+                    "OK",
+                    "RESOLVED-b-slower",
+                    0.9,
+                )],
+            );
+            let spec = mini_join_spec(&["gzip"], vec![1], &["c1.bin"], vec![1], vec![]);
+            let ev = evaluate_joined(&spec, &size, &wall, "SHA-J");
+            check(
+                "join: duplicate (rival,corpus,level) keys within an artifact -> INCOMPLETE \
+                 (double-count refusal, same conservation law as evaluate())",
+                ev.verdict == "INCOMPLETE" && ev.duplicates == 1,
+            );
+        }
+
+        // (l) parse_join_spec: minimum-surface refusals mirror parse_spec's.
+        let full_join_json = || -> String {
+            let rivals = r#"["gzip","pigz","libdeflate","igzip"]"#;
+            let corpora = r#"["/c/dd79_text6","/c/dd79_bin6","/c/sil40.bin","/c/data.sqlite","/c/ecoli.fastq","/c/weights.safetensors"]"#;
+            format!(
+                r#"{{"rivals":{rivals},"levels":"0-9","corpora":{corpora},"threads":"1,4,8,16","waivers":[]}}"#
+            )
+        };
+        check(
+            "join spec: full-minimum spec parses",
+            parse_join_spec(&full_join_json()).is_ok(),
+        );
+        check(
+            "join spec: dropping rival 'libdeflate' is REFUSED",
+            parse_join_spec(&full_join_json().replace(r#""libdeflate","#, ""))
+                .err()
+                .map(|e| e.contains("libdeflate"))
+                .unwrap_or(false),
+        );
+        check(
+            "join spec: dropping weights.safetensors from corpora is REFUSED",
+            parse_join_spec(&full_join_json().replace(r#","/c/weights.safetensors""#, ""))
+                .err()
+                .map(|e| e.contains("weights.safetensors"))
+                .unwrap_or(false),
+        );
+        check(
+            "join spec: threads '1,4,8' (T16 missing) with no wildcard waiver is REFUSED",
+            parse_join_spec(&full_join_json().replace(r#""1,4,8,16""#, r#""1,4,8""#)).is_err(),
+        );
+        check(
+            "join spec: threads '1,4,8' + wildcard T16 waiver parses",
+            parse_join_spec(
+                &full_join_json()
+                    .replace(r#""1,4,8,16""#, r#""1,4,8""#)
+                    .replace(
+                        r#""waivers":[]"#,
+                        r#""waivers":[{"rival":"*","corpus":"*","level":"*","threads":"16",
+                           "reason":"box has 8 cores; T16 structurally unreachable here"}]"#,
+                    ),
+            )
+            .is_ok(),
         );
     }
 
