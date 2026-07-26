@@ -69,6 +69,7 @@ pub mod flow;
 pub mod freeze;
 pub mod frontier;
 pub mod gate;
+pub mod goal;
 pub mod insn;
 pub mod insn_attr;
 pub mod invariants;
