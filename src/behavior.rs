@@ -843,12 +843,36 @@ fn ratio(g: f64, l: f64) -> f64 {
     }
 }
 
+/// Find the element of `items` that maximizes `key`, deterministically: the
+/// FIRST maximum encountered in `items`' existing (already-deterministic)
+/// order wins ties, so this never depends on hash/iteration order.
+///
+/// This is the fix for the bug where every alloc/cache axis in [`diff`] was
+/// stamped with the single top-BY-BYTES (or top-BY-traffic) site regardless
+/// of which metric the axis actually reports — `alloc_count` and
+/// `alloc_lifetime` (and `peak_heap`, and cachegrind's `Ir`) named the wrong
+/// driver whenever the top-by-bytes site was not also the top site on that
+/// axis. Each axis now asks for ITS OWN top site.
+fn top_by<T>(items: &[T], key: impl Fn(&T) -> u64) -> Option<&T> {
+    items.iter().fold(None, |acc, item| match acc {
+        None => Some(item),
+        Some(best) if key(item) > key(best) => Some(item),
+        Some(best) => Some(best),
+    })
+}
+
 /// Build the ranked gzippy-vs-libdeflate diff.
 pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff> {
     let mut axes = vec![];
 
-    let g_top_alloc = g.alloc.sites.first();
+    // Per-axis top-site: each alloc axis names the site that actually DRIVES
+    // that axis, not just the top-by-bytes site (see `top_by` doc comment).
+    let g_top_bytes = g.alloc.sites.first();
+    let g_top_count = top_by(&g.alloc.sites, |s| s.count);
+    let g_top_peak = top_by(&g.alloc.sites, |s| s.peak);
+    let g_top_lifetime = top_by(&g.alloc.sites, |s| s.lifetime);
     let g_top_traffic = g.cache.fns.first();
+    let g_top_ir = top_by(&g.cache.fns, |f| f.ir);
 
     axes.push(AxisDiff {
         axis: "alloc_bytes".into(),
@@ -856,7 +880,7 @@ pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff>
         l: l.alloc.total_bytes as f64,
         ratio: ratio(g.alloc.total_bytes as f64, l.alloc.total_bytes as f64),
         abs_excess: g.alloc.total_bytes as f64 - l.alloc.total_bytes as f64,
-        site: g_top_alloc.map(|s| s.name.clone()).unwrap_or_default(),
+        site: g_top_bytes.map(|s| s.name.clone()).unwrap_or_default(),
         deterministic: true,
     });
     axes.push(AxisDiff {
@@ -865,7 +889,7 @@ pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff>
         l: l.alloc.total_count as f64,
         ratio: ratio(g.alloc.total_count as f64, l.alloc.total_count as f64),
         abs_excess: g.alloc.total_count as f64 - l.alloc.total_count as f64,
-        site: g_top_alloc.map(|s| s.name.clone()).unwrap_or_default(),
+        site: g_top_count.map(|s| s.name.clone()).unwrap_or_default(),
         deterministic: true,
     });
     axes.push(AxisDiff {
@@ -874,7 +898,7 @@ pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff>
         l: l.alloc.peak_heap as f64,
         ratio: ratio(g.alloc.peak_heap as f64, l.alloc.peak_heap as f64),
         abs_excess: g.alloc.peak_heap as f64 - l.alloc.peak_heap as f64,
-        site: g_top_alloc.map(|s| s.name.clone()).unwrap_or_default(),
+        site: g_top_peak.map(|s| s.name.clone()).unwrap_or_default(),
         deterministic: true,
     });
     axes.push(AxisDiff {
@@ -883,7 +907,7 @@ pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff>
         l: l.alloc.total_lifetime as f64,
         ratio: ratio(g.alloc.total_lifetime as f64, l.alloc.total_lifetime as f64),
         abs_excess: g.alloc.total_lifetime as f64 - l.alloc.total_lifetime as f64,
-        site: g_top_alloc.map(|s| s.name.clone()).unwrap_or_default(),
+        site: g_top_lifetime.map(|s| s.name.clone()).unwrap_or_default(),
         deterministic: true,
     });
     axes.push(AxisDiff {
@@ -911,7 +935,7 @@ pub fn diff(g: &ToolProfile, l: &ToolProfile, input_bytes: u64) -> Vec<AxisDiff>
         l: l.cache.ir as f64,
         ratio: ratio(g.cache.ir as f64, l.cache.ir as f64),
         abs_excess: g.cache.ir as f64 - l.cache.ir as f64,
-        site: g_top_traffic.map(|f| f.name.clone()).unwrap_or_default(),
+        site: g_top_ir.map(|f| f.name.clone()).unwrap_or_default(),
         deterministic: true,
     });
     // soft axes (not bit-deterministic)
@@ -1729,6 +1753,117 @@ pub fn selftest() -> ExitCode {
         }
         Err(e) => fails.push(format!("cg-sym cob-fixture parse failed: {e}")),
     }
+
+    // ---- 10. per-axis top-site: top-by-bytes must NOT be stamped onto every
+    // axis (the bug this selftest addition exists to catch). Four alloc sites,
+    // each the sole top on exactly ONE metric, plus two cachegrind fns split
+    // the same way between traffic (Dr+Dw) and Ir.
+    let multi_dhat = r#"{"dhatFileVersion":2,"pps":[
+        {"tb":4000000,"tbk":1,"gb":1000,   "eb":0,"tl":10,      "fs":[1]},
+        {"tb":10000,  "tbk":1000,"gb":500, "eb":0,"tl":20,      "fs":[2]},
+        {"tb":5000,   "tbk":2,"gb":2000000,"eb":0,"tl":30,      "fs":[3]},
+        {"tb":6000,   "tbk":3,"gb":600,    "eb":0,"tl":9000000, "fs":[4]}
+    ],"ftbl":["[root]",
+        "0x1 : site_bytes_fn (bytes.rs:1)",
+        "0x2 : site_count_fn (count.rs:2)",
+        "0x3 : site_peak_fn (peak.rs:3)",
+        "0x4 : site_life_fn (life.rs:4)"]}"#;
+    let multi_alloc = parse_dhat(multi_dhat).expect("multi dhat parse");
+    // sanity: top-by-bytes (sites[0], since sites are sorted bytes-desc) is
+    // indeed site_bytes_fn, and it does NOT also lead on count/peak/lifetime —
+    // otherwise this fixture wouldn't exercise the bug.
+    check(
+        &mut fails,
+        "multi-site fixture: top-by-bytes is site_bytes_fn",
+        multi_alloc.sites[0].name.contains("site_bytes_fn"),
+    );
+    check(
+        &mut fails,
+        "multi-site fixture: top-by-bytes is NOT top-by-count",
+        top_by(&multi_alloc.sites, |s| s.count)
+            .unwrap()
+            .name
+            .contains("site_count_fn"),
+    );
+    let cg_multi = "events: Ir Dr Dw\n\
+                    fl=(1) traffic.rs\n\
+                    fn=(1) fn_traffic\n\
+                    1 100 900000 900000\n\
+                    fl=(2) ir.rs\n\
+                    fn=(2) fn_ir\n\
+                    2 5000000 10 10\n\
+                    summary: 5000100 900010 900010\n";
+    let cache_multi = parse_cachegrind(cg_multi).expect("multi cg parse");
+    let g_multi = ToolProfile {
+        label: "gzippy".into(),
+        alloc: multi_alloc,
+        cache: cache_multi,
+        peak_rss_kb: None,
+        syscalls: BTreeMap::new(),
+    };
+    // a trivial libdeflate-side profile (values don't matter for this check —
+    // only gzippy's per-axis SITE label is under test).
+    let l_multi = ToolProfile {
+        label: "libdeflate".into(),
+        alloc: parse_dhat(
+            r#"{"dhatFileVersion":2,"pps":[{"tb":1,"tbk":1,"gb":1,"eb":0,"tl":1,"fs":[1]}],
+               "ftbl":["[root]","0x1 : ld (ld.c:1)"]}"#,
+        )
+        .unwrap(),
+        cache: parse_cachegrind("events: Ir Dr Dw\nfn=(1) x\n1 1 1 1\nsummary: 1 1 1\n").unwrap(),
+        peak_rss_kb: None,
+        syscalls: BTreeMap::new(),
+    };
+    let multi_axes = diff(&g_multi, &l_multi, 1_000_000);
+    let site_of = |axis: &str| -> String {
+        multi_axes
+            .iter()
+            .find(|a| a.axis == axis)
+            .map(|a| a.site.clone())
+            .unwrap_or_default()
+    };
+    check(
+        &mut fails,
+        "diff alloc_bytes names site_bytes_fn",
+        site_of("alloc_bytes").contains("site_bytes_fn"),
+    );
+    check(
+        &mut fails,
+        "diff alloc_count names site_count_fn (NOT site_bytes_fn — the bug)",
+        site_of("alloc_count").contains("site_count_fn"),
+    );
+    check(
+        &mut fails,
+        "diff peak_heap names site_peak_fn (NOT site_bytes_fn — the bug)",
+        site_of("peak_heap").contains("site_peak_fn"),
+    );
+    check(
+        &mut fails,
+        "diff alloc_lifetime names site_life_fn (NOT site_bytes_fn — the bug)",
+        site_of("alloc_lifetime").contains("site_life_fn"),
+    );
+    check(
+        &mut fails,
+        "diff traffic_Dr+Dw names fn_traffic",
+        site_of("traffic_Dr+Dw").contains("fn_traffic"),
+    );
+    check(
+        &mut fails,
+        "diff Ir names fn_ir (NOT fn_traffic — the bug)",
+        site_of("Ir").contains("fn_ir"),
+    );
+    // the four alloc-axis sites must not all collapse to one name (the exact
+    // symptom of the bug: every axis stamped with the single top-by-bytes site)
+    let alloc_axis_sites: std::collections::BTreeSet<String> =
+        ["alloc_bytes", "alloc_count", "peak_heap", "alloc_lifetime"]
+            .iter()
+            .map(|a| site_of(a))
+            .collect();
+    check(
+        &mut fails,
+        "diff: 4 alloc axes name 4 DISTINCT sites, not 1 stamped everywhere",
+        alloc_axis_sites.len() == 4,
+    );
 
     // ---- report ----
     if fails.is_empty() {
