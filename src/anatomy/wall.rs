@@ -67,7 +67,16 @@ pub struct GzippyWallPhases {
 /// module derives which keys are "named regions" from this fixed list
 /// rather than sniffing every `_ns`-suffixed key, so an unrelated future
 /// `_ns` field can't silently get folded into the reconciliation sum.
-const REGION_NAMES: &[&str] = &["parse_match", "huffman_table", "huffman_encode", "crc"];
+// `mf_new` (matchfinder construction) is emitted by gzippy's anatomy-wall feature but
+// was missing here, so it silently folded into the DERIVED residual and skewed every
+// reconciliation. Found by a capability audit, 2026-07-27.
+const REGION_NAMES: &[&str] = &[
+    "parse_match",
+    "huffman_table",
+    "huffman_encode",
+    "crc",
+    "mf_new",
+];
 
 /// Parse the flat `{"key":value,...}` object `anatomy_wall::AnatomyWall::
 /// to_json` emits. Values are unsigned integers, `true`/`false`, or a
@@ -130,12 +139,30 @@ impl GzippyWallPhases {
         let mut regions = BTreeMap::new();
         let mut named_sum: u64 = 0;
         for region in REGION_NAMES {
+            // A region ABSENT from the snapshot is legitimate, not an error: producers
+            // emit different subsets (the instrumented libdeflate has no `mf_new`; older
+            // gzippy builds predate it). Absent => skip entirely, so it neither errors nor
+            // contributes a phantom zero row. A region that IS present must still parse,
+            // and conservation is still re-derived over whatever was present.
+            if !raw.contains_key(&format!("{region}_ns")) {
+                continue;
+            }
             let ns = as_u64(&raw, &format!("{region}_ns"))?;
             let calls = as_u64(&raw, &format!("{region}_calls"))?;
             named_sum = named_sum
                 .checked_add(ns)
                 .ok_or_else(|| format!("{region}_ns overflow summing named regions"))?;
             regions.insert((*region).to_string(), (ns, calls));
+        }
+
+        // A snapshot carrying NO named region at all is degenerate — a truncated or
+        // corrupt line, not a producer emitting a smaller subset. Absent-region
+        // tolerance above must not become "accept anything with a root_ns".
+        if regions.is_empty() {
+            return Err(format!(
+                "no named regions present in snapshot for {name:?} — expected at least one of \
+                 {REGION_NAMES:?}; a snapshot with only root_ns is truncated, not a subset"
+            ));
         }
 
         // RE-DERIVE the conservation check independently of gzippy's own
@@ -419,12 +446,28 @@ mod tests {
 
         assert!(table.contains("gzippy"), "must name the first engine");
         assert!(table.contains("libdeflate"), "must name the second engine");
-        for region in REGION_NAMES {
+        // Every region present in EITHER snapshot must get a row in BOTH columns —
+        // that is the alignment property under test. A region in NEITHER snapshot
+        // (e.g. `mf_new`, which the instrumented libdeflate does not emit) correctly
+        // gets no row; asserting over all of REGION_NAMES only passed while that list
+        // happened to equal the fixture set.
+        let present: std::collections::BTreeSet<&str> = gz
+            .regions
+            .keys()
+            .chain(ld.regions.keys())
+            .map(|k| k.as_str())
+            .collect();
+        assert!(!present.is_empty(), "fixtures must contain at least one region");
+        for region in &present {
             assert!(
                 table.contains(region),
                 "row for region {region:?} missing from side-by-side table:\n{table}"
             );
         }
+        assert!(
+            !table.contains("mf_new"),
+            "a region absent from BOTH snapshots must not get a phantom row:\n{table}"
+        );
         assert!(table.contains("residual"), "residual row missing");
         assert!(table.contains("83856792"), "gzippy root_ns missing");
         assert!(table.contains("68087000"), "libdeflate root_ns missing");
