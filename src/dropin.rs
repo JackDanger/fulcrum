@@ -588,7 +588,30 @@ fn compute_checks(
                 }
             };
             if compressed.is_empty() {
-                return Ok((Some(false), None));
+                // A SUCCESSFUL exit with NO compressed bytes anywhere (empty
+                // stdout, and no `<name>.gz` written into the sandbox) is not
+                // "produced garbage that fails to roundtrip" — it means the
+                // tool correctly declined to do anything at all (e.g. real
+                // gzip's own "already has .gz suffix -- unchanged" no-op on
+                // `gzip already.gz`, or pigz's "skipping: X ends with .gz").
+                // Roundtrip correctness isn't APPLICABLE to a no-op, so this
+                // reports `None`, not `Some(false)`. Forcing `Some(false)`
+                // here previously made `observation_diffs` synthesize "BOTH
+                // arms produced output that fails to roundtrip" whenever both
+                // tools correctly did nothing — a harness false positive
+                // (`dropin-coverage-gap` census: fixture `already-named.gz`
+                // x `compress_inplace`/`compress_inplace_keep`, both gzip AND
+                // pigz rivals — confirmed by direct execution: `gzip
+                // already-named.gz` and `pigz already-named.gz` both print a
+                // no-op notice, exit 0, and touch nothing).
+                //
+                // This does NOT mask a real asymmetric bug: if only one arm
+                // declined while the other actually compressed, that arm's
+                // `roundtrip_ok` is `Some(_)` and this arm's is `None` — the
+                // `!=` check in `observation_diffs` still flags the
+                // difference (see e.g. `compress_stdout`/`already-named.gz`
+                // vs pigz, where gzippy compresses through and pigz skips).
+                return Ok((None, None));
             }
             let plain = oracle_decompress(oracle_gzip, &compressed)?;
             Ok((Some(plain == fx.bytes), None))
@@ -1973,6 +1996,67 @@ pub fn selftest() -> ExitCode {
         .is_err(),
     );
 
+    // -- 3b. Declared PRECISION guard: an over-broad (wildcarded) entry is
+    // DETECTABLY over-broad by a straightforward match-count assertion — the
+    // technique `declared.json`'s own review must apply so a future edit that
+    // accidentally widens a field (e.g. `fixture` narrowed to one name,
+    // loosened back to "*") doesn't silently start absorbing real,
+    // unrelated divergences it was never meant to cover ("a declared entry
+    // that silently absorbs a future real divergence is worse than no gate
+    // at all", per the task brief).
+    {
+        let all_fixtures = [
+            "empty-0B",
+            "one-1B",
+            "page-4095B",
+            "rand-8192B",
+            "small-256B",
+            "text-65536B",
+            "dropin naive file 名前 with spaces.txt",
+        ];
+        let exact = Declared {
+            rival: "pigz".to_string(),
+            scenario: "refuse_overwrite_without_force".to_string(),
+            fixture: "empty-0B".to_string(),
+            reason: "pigz exits 1 \"skipping\"; gzip (primary drop-in target) exits 2".to_string(),
+        };
+        let exact_matches = all_fixtures
+            .iter()
+            .filter(|f| exact.matches("pigz", "refuse_overwrite_without_force", f))
+            .count();
+        check(
+            "Declared precision: an EXACT (non-wildcard) fixture field matches only that ONE fixture",
+            exact_matches == 1,
+        );
+
+        let mut broadened = exact.clone();
+        broadened.fixture = star();
+        let broad_matches = all_fixtures
+            .iter()
+            .filter(|f| broadened.matches("pigz", "refuse_overwrite_without_force", f))
+            .count();
+        check(
+            "Declared precision: wildcarding `fixture` is DETECTABLY over-broad — matches ALL \
+             fixtures, not just the intended one, and matches strictly more than the exact entry",
+            broad_matches == all_fixtures.len() && broad_matches > exact_matches,
+        );
+
+        // Same guard on the `rival` axis: our real declared.json entries are
+        // all pigz-specific (gzip's two divergences are FIXED, not declared)
+        // — an entry accidentally wildcarding `rival` would also match gzip,
+        // which must never happen for these scenarios.
+        check(
+            "Declared precision: an exact `rival` field does NOT also match a different rival",
+            !exact.matches("gzip", "refuse_overwrite_without_force", "empty-0B"),
+        );
+        let mut rival_broadened = exact.clone();
+        rival_broadened.rival = star();
+        check(
+            "Declared precision: wildcarding `rival` is DETECTABLY over-broad — now matches gzip too",
+            rival_broadened.matches("gzip", "refuse_overwrite_without_force", "empty-0B"),
+        );
+    }
+
     // -- 4. shq(): real shell round-trip for a name with a space + a quote ----
     {
         let tricky = "a b'c.txt";
@@ -2208,6 +2292,113 @@ pub fn selftest() -> ExitCode {
                         diffs.is_empty(),
                     );
                 }
+            }
+
+            // -- Task-3 fix: "both arms correctly produce NO output" must be
+            // MATCH, not a manufactured "fails to roundtrip" false positive
+            // (dropin-coverage-gap census: fixture `already-named.gz` x
+            // `compress_inplace`/`compress_inplace_keep`, BOTH gzip and pigz
+            // rivals — established by direct execution that real gzip prints
+            // "already has .gz suffix -- unchanged", exit 0, touches nothing).
+            {
+                let gz_fixture = synth_already_gz_fixture();
+                for scen_name in ["compress_inplace", "compress_inplace_keep"] {
+                    let s = by_name(scen_name);
+                    let o = capture(&gzip_abs, s, &gz_fixture, &tmp_root, &gzip_bin).unwrap();
+                    let r = capture(&gzip_abs, s, &gz_fixture, &tmp_root, &gzip_bin).unwrap();
+                    check(
+                        &format!(
+                            "e2e: {scen_name} on an already-.gz fixture — real gzip declines \
+                             (no-op, exit 0, touches nothing)"
+                        ),
+                        o.success && o.created.is_empty() && o.removed.is_empty() && o.modified.is_empty(),
+                    );
+                    check(
+                        &format!(
+                            "e2e: {scen_name} no-op on already-.gz fixture — roundtrip_ok is \
+                             N/A (None), NOT Some(false)"
+                        ),
+                        o.roundtrip_ok.is_none(),
+                    );
+                    let diffs = observation_diffs(s.kind, &o, &r);
+                    check(
+                        &format!(
+                            "e2e: {scen_name}, gzip vs itself on already-.gz fixture -> zero \
+                             diffs (both-decline is MATCH, not a harness false positive)"
+                        ),
+                        diffs.is_empty(),
+                    );
+                }
+                // Same contract holds against pigz (which ALSO declines,
+                // "skipping: X ends with .gz", confirmed by execution) — the
+                // fix is rival-agnostic because it lives in the pure
+                // classification core, not in any gzip-specific special case.
+                if let Some(pigz_bin) = resolve_ours_binary("pigz") {
+                    let pigz_abs = pigz_bin.display().to_string();
+                    for scen_name in ["compress_inplace", "compress_inplace_keep"] {
+                        let s = by_name(scen_name);
+                        let o = capture(&pigz_abs, s, &gz_fixture, &tmp_root, &gzip_bin).unwrap();
+                        let r = capture(&pigz_abs, s, &gz_fixture, &tmp_root, &gzip_bin).unwrap();
+                        check(
+                            &format!(
+                                "e2e: {scen_name} on an already-.gz fixture — real pigz ALSO \
+                                 declines (no-op, exit 0, touches nothing)"
+                            ),
+                            o.success
+                                && o.created.is_empty()
+                                && o.removed.is_empty()
+                                && o.modified.is_empty(),
+                        );
+                        let diffs = observation_diffs(s.kind, &o, &r);
+                        check(
+                            &format!(
+                                "e2e: {scen_name}, pigz vs itself on already-.gz fixture -> zero \
+                                 diffs (both-decline is MATCH against pigz too)"
+                            ),
+                            diffs.is_empty(),
+                        );
+                    }
+                } else {
+                    println!("  NOTE dropin: pigz-side already-.gz no-op checks skipped (no `pigz` on PATH)");
+                }
+            }
+
+            // compute_checks(Kind::Compress, ...) unit-level guard: a
+            // SUCCESSFUL compress with truly empty output (no stdout, no
+            // `<name>.gz` written) is a legitimate no-op -> (None, None).
+            // This must NOT be over-corrected into masking a real defect:
+            // a claimed failure, or a claimed SUCCESS with non-empty GARBAGE
+            // output, must both still report Some(false).
+            {
+                let s = by_name("compress_inplace");
+                let cc_tmp = std::env::temp_dir().join(format!(
+                    "fulcrum-dropin-cc-st-{}-{}",
+                    std::process::id(),
+                    SANDBOX_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = fs::remove_dir_all(&cc_tmp);
+                let _ = fs::create_dir_all(&cc_tmp);
+                let (rt_noop, _) = compute_checks(s, &fx, &cc_tmp, b"", true, &gzip_bin).unwrap();
+                check(
+                    "compute_checks: success=true + truly empty output -> roundtrip_ok=None \
+                     (no-op), not Some(false)",
+                    rt_noop.is_none(),
+                );
+                let (rt_fail, _) = compute_checks(s, &fx, &cc_tmp, b"", false, &gzip_bin).unwrap();
+                check(
+                    "compute_checks: success=false -> still Some(false) (a real failure is \
+                     never masked as N/A)",
+                    rt_fail == Some(false),
+                );
+                let (rt_garbage, _) =
+                    compute_checks(s, &fx, &cc_tmp, b"not a real gzip stream", true, &gzip_bin)
+                        .unwrap();
+                check(
+                    "compute_checks: success=true + non-empty GARBAGE output -> still \
+                     Some(false), never masked",
+                    rt_garbage == Some(false),
+                );
+                let _ = fs::remove_dir_all(&cc_tmp);
             }
 
             let _ = fs::remove_dir_all(&tmp_root);
