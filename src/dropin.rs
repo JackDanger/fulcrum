@@ -82,7 +82,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -111,6 +111,40 @@ fn load_fixture(path: &Path) -> Result<Fixture, String> {
 /// A stable, deliberately-invalid gzip stream — used to test "refuse without
 /// `-f`" / "overwrite with `-f`" without depending on any tool to produce it.
 const STALE_GZ_GARBAGE: &[u8] = b"NOT-A-VALID-GZIP-STREAM-STALE-FIXTURE\n";
+
+/// Fixed embedded payload backing the fully TOOL-CONSTRUCTED synthetic
+/// fixtures below — self-contained (not derived from any `--fixture` the
+/// caller passed) so the census reproduces on any box with zero extra setup.
+const SYNTHETIC_UNIT: &[u8] =
+    b"dropin synthetic fixture payload: the quick brown fox jumps over the lazy dog.\n";
+
+/// Fixture kind 4 — a filename with a SPACE and a non-ASCII character.
+/// Crossed against every EXISTING scenario (zero new scenario code needed)
+/// this exercises `shq()` for real across actual scenario invocations, not
+/// just the one synthetic case `selftest` already covered.
+fn synth_spaces_unicode_fixture() -> Fixture {
+    let bytes = SYNTHETIC_UNIT.repeat(3);
+    let name = "dropin naive file 名前 with spaces.txt".to_string();
+    Fixture {
+        sha256: hex32(&sha256(&bytes)),
+        name,
+        bytes,
+    }
+}
+
+/// Fixture kind 5 — plain (non-gzip) content in a file already named `*.gz`.
+/// Crossed against the existing `compress_*` scenarios this is exactly what
+/// exposes the real "gzip -c already.gz" / "gzip already.gz (no -f)"
+/// already-has-.gz-suffix divergence class.
+fn synth_already_gz_fixture() -> Fixture {
+    let bytes = SYNTHETIC_UNIT.repeat(5);
+    let name = "already-named.gz".to_string();
+    Fixture {
+        sha256: hex32(&sha256(&bytes)),
+        name,
+        bytes,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scenario kind + table — the hardcoded minimum surface
@@ -211,6 +245,89 @@ fn setup_none(_sandbox: &Path, _fx: &Fixture, _oracle: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// Fixture kind 1 — a DIRECTORY as the sole input. No `--fixture FILE` can
+/// represent this (`fs::read` on a dir fails), so it must be tool-constructed
+/// directly. `fx.bytes` is ignored; only `fx.name` names the directory.
+fn setup_directory(sandbox: &Path, fx: &Fixture, _oracle: &Path) -> Result<(), String> {
+    let dest = sandbox.join(&fx.name);
+    fs::create_dir(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))
+}
+
+/// Fixture kind 2 — a symlink whose target does not exist.
+fn setup_broken_symlink(sandbox: &Path, fx: &Fixture, _oracle: &Path) -> Result<(), String> {
+    let dest = sandbox.join(&fx.name);
+    let target = sandbox.join("dropin-broken-symlink-target-does-not-exist");
+    symlink(&target, &dest).map_err(|e| format!("symlink {}: {e}", dest.display()))
+}
+
+/// Fixture kind 3 — mode 000 (unreadable, unwritable, even by the owner
+/// beyond metadata ops). Exercises "permission denied" on read.
+fn setup_mode000(sandbox: &Path, fx: &Fixture, _oracle: &Path) -> Result<(), String> {
+    let dest = sandbox.join(&fx.name);
+    fs::write(&dest, &fx.bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    let mut perm = fs::metadata(&dest)
+        .map_err(|e| format!("stat {}: {e}", dest.display()))?
+        .permissions();
+    perm.set_mode(0o000);
+    fs::set_permissions(&dest, perm).map_err(|e| format!("chmod000 {}: {e}", dest.display()))
+}
+
+/// Fixture kind 9 — a hard-linked file (nlink > 1): a second directory entry
+/// pointing at the same inode as the primary fixture file, constructed
+/// alongside it so gzip's real "N has 1 other link -- file ignored" /
+/// gzippy's existing nlink-skip logic actually gets exercised.
+fn setup_hardlink(sandbox: &Path, fx: &Fixture, oracle: &Path) -> Result<(), String> {
+    setup_plain(sandbox, fx, oracle)?;
+    let dest = sandbox.join(&fx.name);
+    let link = sandbox.join(format!("{}.hardlink-sibling", fx.name));
+    fs::hard_link(&dest, &link).map_err(|e| format!("hardlink {}: {e}", link.display()))
+}
+
+/// Fixture kind 6 — a MULTI-MEMBER `.gz`: two real gzip members concatenated,
+/// built via the independent oracle twice (each member encodes `fx.bytes`).
+/// Per gzip's actual multi-member semantics, the correct decompressed output
+/// is the CONCATENATION of both members' plaintext — `compute_checks` special-
+/// cases scenario name `"multi_member_decompress"` to expect `fx.bytes` TWICE
+/// rather than once, so this reuses the generic fixture set without needing
+/// a dedicated Fixture whose `.bytes` field disagrees with what setup writes.
+fn setup_multi_member_gz(sandbox: &Path, fx: &Fixture, oracle: &Path) -> Result<(), String> {
+    let member = canonical_gz_bytes(oracle, &fx.bytes)?;
+    let mut bytes = member.clone();
+    bytes.extend_from_slice(&member);
+    let dest = sandbox.join(format!("{}.gz", fx.name));
+    fs::write(&dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
+/// Fixture kind 7 — a TRUNCATED `.gz`: a valid stream with its trailing bytes
+/// (at minimum the whole CRC32+ISIZE trailer, usually more) cut off.
+fn setup_truncated_gz(sandbox: &Path, fx: &Fixture, oracle: &Path) -> Result<(), String> {
+    let bytes = canonical_gz_bytes(oracle, &fx.bytes)?;
+    let cut = (bytes.len() * 2 / 3).min(bytes.len());
+    let dest = sandbox.join(format!("{}.gz", fx.name));
+    fs::write(&dest, &bytes[..cut]).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
+/// Fixture kind 8 — a `.gz` with a CORRUPTED CRC32 trailer field ONLY: flips
+/// one byte inside the last-8-bytes trailer's FIRST 4 bytes (CRC32), leaving
+/// the DEFLATE body and the ISIZE (trailer's last 4 bytes) intact. A decoder
+/// that doesn't independently verify CRC32 against the trailer will decompress
+/// this fine and only a real CRC check catches it — a different bug class
+/// than `setup_corrupt_gz`, which flips a byte in the body and likely breaks
+/// the DEFLATE stream itself mid-decode.
+fn setup_corrupt_gz_crc_only(sandbox: &Path, fx: &Fixture, oracle: &Path) -> Result<(), String> {
+    let mut bytes = canonical_gz_bytes(oracle, &fx.bytes)?;
+    let len = bytes.len();
+    if len >= 8 {
+        let crc_field_start = len - 8; // trailer = CRC32 (4 bytes) then ISIZE (4 bytes)
+        bytes[crc_field_start] ^= 0xFF;
+    } else if !bytes.is_empty() {
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+    }
+    let dest = sandbox.join(format!("{}.gz", fx.name));
+    fs::write(&dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
 fn cmd_compress_stdout(tool: &str, fx: &Fixture) -> String {
     format!("{} -c {}", shq(tool), shq(&fx.name))
 }
@@ -278,6 +395,16 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "test_corrupt", kind: Kind::ErrorExpected, setup: setup_corrupt_gz, build_cmd: cmd_test, doc: "gzip -t file.gz on a CORRUPTED stream: must fail loudly" },
         Scenario { name: "decompress_corrupt", kind: Kind::ErrorExpected, setup: setup_corrupt_gz, build_cmd: cmd_decompress_stdout, doc: "gzip -dc file.gz on a CORRUPTED stream: must fail loudly, never silently emit wrong plaintext" },
         Scenario { name: "list_mode", kind: Kind::Inspect, setup: setup_gz, build_cmd: cmd_list, doc: "gzip -l file.gz: exit 0, stdout reports the CORRECT uncompressed size (format may legitimately differ)" },
+        // -- Real-world drop-in classes added 2026-07-26 (dropin-coverage-gap) --
+        Scenario { name: "directory_input", kind: Kind::ErrorExpected, setup: setup_directory, build_cmd: cmd_compress_inplace, doc: "gzip DIR (no -r): real gzip exits 2 (WARNING), touches nothing — must fail loudly, never crash or silently succeed" },
+        Scenario { name: "broken_symlink_input", kind: Kind::ErrorExpected, setup: setup_broken_symlink, build_cmd: cmd_compress_inplace, doc: "gzip on a symlink whose target does not exist: must fail loudly, create nothing" },
+        Scenario { name: "mode000_input", kind: Kind::ErrorExpected, setup: setup_mode000, build_cmd: cmd_compress_inplace, doc: "gzip on a mode-000 (unreadable) file: must fail loudly with permission denied, create nothing" },
+        Scenario { name: "hardlink_input", kind: Kind::ErrorExpected, setup: setup_hardlink, build_cmd: cmd_compress_inplace, doc: "gzip file when a second hardlink (nlink>1) exists: real gzip refuses ('N has 1 other link -- file ignored'), leaves both links untouched" },
+        Scenario { name: "multi_member_decompress", kind: Kind::Decompress, setup: setup_multi_member_gz, build_cmd: cmd_decompress_stdout, doc: "gzip -dc on TWO concatenated gzip members: correct output is the CONCATENATION of both members' plaintext (fx.bytes twice)" },
+        Scenario { name: "test_truncated", kind: Kind::ErrorExpected, setup: setup_truncated_gz, build_cmd: cmd_test, doc: "gzip -t on a stream missing its trailing bytes: must fail loudly" },
+        Scenario { name: "decompress_truncated", kind: Kind::ErrorExpected, setup: setup_truncated_gz, build_cmd: cmd_decompress_stdout, doc: "gzip -dc on a stream missing its trailing bytes: must fail loudly, never silently emit wrong/partial output as if it were complete" },
+        Scenario { name: "test_corrupt_crc", kind: Kind::ErrorExpected, setup: setup_corrupt_gz_crc_only, build_cmd: cmd_test, doc: "gzip -t on a stream with ONLY the CRC32 trailer field corrupted (body+ISIZE intact): must fail loudly — a decoder that skips CRC verification will wrongly pass this" },
+        Scenario { name: "decompress_corrupt_crc", kind: Kind::ErrorExpected, setup: setup_corrupt_gz_crc_only, build_cmd: cmd_decompress_stdout, doc: "gzip -dc on a stream with ONLY the CRC32 trailer field corrupted: must fail loudly even though the DEFLATE body decodes to the right bytes" },
     ]
 }
 
@@ -367,11 +494,20 @@ fn snapshot_dir(dir: &Path) -> Result<BTreeMap<String, FileSnap>, String> {
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let mode = meta.permissions().mode() & 0o777;
-        let data = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        // A mode that denies the OWNER read access (the mode-000 fixture)
+        // cannot be hashed by content — `fs::read` returns EACCES. Fall back
+        // to a mode+size sentinel rather than aborting the whole capture: a
+        // legitimate mode-000 fixture must not turn into a hard ERROR cell.
+        // Both arms compute the same sentinel given the same mode+len, so no
+        // phantom diff is introduced when nothing actually changed.
+        let content_sha = match fs::read(&path) {
+            Ok(data) => hex32(&sha256(&data)),
+            Err(_) => format!("<unreadable mode={:o} len={}>", mode, meta.len()),
+        };
         out.insert(
             name,
             FileSnap {
-                sha256: hex32(&sha256(&data)),
+                sha256: content_sha,
                 mode,
             },
         );
@@ -401,6 +537,32 @@ pub struct Observation {
 }
 
 static SANDBOX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Defensive permission restore before `remove_dir_all`. POSIX only requires
+/// write+exec on a file's PARENT dir to unlink it — a mode-000 FILE is
+/// already removable — so the real hazard this guards is a mode-000
+/// DIRECTORY (nothing here creates one today, but any future addition must
+/// not leave one behind). Best-effort: every entry gets a mode that is at
+/// least owner-rw(x), recursively; failures are ignored (e.g. chmod on a
+/// dangling symlink target) since the goal is "never BLOCK cleanup", not to
+/// perfectly restore original modes.
+fn harden_permissions_for_removal(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = entry.metadata() {
+            let is_dir = meta.is_dir();
+            let mut perm = meta.permissions();
+            perm.set_mode(if is_dir { 0o755 } else { 0o644 });
+            let _ = fs::set_permissions(&path, perm);
+            if is_dir {
+                harden_permissions_for_removal(&path);
+            }
+        }
+    }
+}
 
 fn compute_checks(
     scenario: &Scenario,
@@ -435,7 +597,20 @@ fn compute_checks(
             if !success {
                 return Ok((Some(false), None));
             }
-            let produced: Vec<u8> = if !stdout.is_empty() || fx.bytes.is_empty() {
+            // `multi_member_decompress`'s setup writes TWO real gzip members,
+            // each encoding `fx.bytes` — per gzip's actual multi-member
+            // semantics the correct decompressed output is the
+            // CONCATENATION of both members' plaintext (`fx.bytes` twice),
+            // not `fx.bytes` once. Special-cased by scenario name, same
+            // pattern `Kind::Inspect` already uses for `list_mode` below.
+            let expected: Vec<u8> = if scenario.name == "multi_member_decompress" {
+                let mut e = fx.bytes.clone();
+                e.extend_from_slice(&fx.bytes);
+                e
+            } else {
+                fx.bytes.clone()
+            };
+            let produced: Vec<u8> = if !stdout.is_empty() || expected.is_empty() {
                 stdout.to_vec()
             } else {
                 let plain_path = sandbox.join(&fx.name);
@@ -446,7 +621,7 @@ fn compute_checks(
                     Vec::new()
                 }
             };
-            Ok((Some(produced == fx.bytes), None))
+            Ok((Some(produced == expected), None))
         }
         Kind::Inspect => {
             if scenario.name == "list_mode" {
@@ -545,6 +720,11 @@ fn capture(
             semantic_ok,
         })
     })();
+    // Mode-000 cleanup gate: harden any restrictive mode left by a fixture
+    // (or by the tool under test) BEFORE removal — see
+    // `harden_permissions_for_removal` doc for why this is defensive rather
+    // than strictly required by POSIX for a lone mode-000 file.
+    harden_permissions_for_removal(&sandbox);
     let _ = fs::remove_dir_all(&sandbox);
     result
 }
@@ -562,6 +742,17 @@ pub fn observation_diffs(kind: Kind, ours: &Observation, rival: &Observation) ->
         diffs.push(format!(
             "exit-code class differs: ours={:?} (success={}) rival={:?} (success={})",
             ours.exit_code, ours.success, rival.exit_code, rival.success
+        ));
+    } else if ours.exit_code != rival.exit_code {
+        // Same success/failure CLASS but a different exact code — e.g. real
+        // gzip's WARNING class (exit 2, `gzip: X is a directory -- ignored`)
+        // vs its ERROR class (exit 1). The success-bool check above cannot
+        // see this (both are "failure"); this is what makes that distinction
+        // observable at all, per the module's stated goal of diffing
+        // "everything observable — exit code, stdout...".
+        diffs.push(format!(
+            "exit code differs despite same success class: ours={:?} rival={:?}",
+            ours.exit_code, rival.exit_code
         ));
     }
     if ours.stderr_empty != rival.stderr_empty {
@@ -944,6 +1135,18 @@ pub fn run_dropin(cfg: &DropinConfig) -> Result<DropinArtifact, String> {
             return Err(format!("dropin: fixture {} does not exist", path.display()));
         }
         let fx = load_fixture(path)?;
+        fixture_prov.push(CorpusProvenance {
+            name: fx.name.clone(),
+            sha256: fx.sha256.clone(),
+            bytes: fx.bytes.len() as u64,
+        });
+        fixtures.push(fx);
+    }
+    // Fixture kinds 4 + 5 — fully TOOL-CONSTRUCTED, unconditional, no new CLI
+    // flag: reuse the EXISTING scenarios() x fixtures cross-product to
+    // exercise `shq()` for real (space + non-ASCII filename) and the
+    // already-.gz-suffix divergence class, with zero new scenario code.
+    for fx in [synth_spaces_unicode_fixture(), synth_already_gz_fixture()] {
         fixture_prov.push(CorpusProvenance {
             name: fx.name.clone(),
             sha256: fx.sha256.clone(),
@@ -1531,6 +1734,209 @@ pub fn selftest() -> ExitCode {
             d.iter().any(|s| s.contains("semantic content check differs")),
         );
     }
+    {
+        // Same success CLASS (both nonzero) but a DIFFERENT exact exit code —
+        // e.g. real gzip's WARNING(2) on a directory input vs an ERROR(1)
+        // class — must still be flagged even though the boolean-success
+        // check above cannot see it.
+        let mut o = base();
+        o.success = false;
+        o.exit_code = Some(2);
+        let mut r = base();
+        r.success = false;
+        r.exit_code = Some(1);
+        let d = observation_diffs(Kind::ErrorExpected, &o, &r);
+        check(
+            "diffs: same success class, DIFFERENT exact exit code -> flagged",
+            d.iter().any(|s| s.contains("exit code differs despite same success class")),
+        );
+        let mut r2 = base();
+        r2.success = false;
+        r2.exit_code = Some(2);
+        let mut o2 = base();
+        o2.success = false;
+        o2.exit_code = Some(2);
+        let d2 = observation_diffs(Kind::ErrorExpected, &o2, &r2);
+        check(
+            "diffs: same success class, SAME exact exit code -> not flagged by exit-code check",
+            !d2.iter().any(|s| s.contains("exit code differs despite same success class")),
+        );
+    }
+
+    // -- 2b. New fixture-kind construction checks (real I/O, no process spawn) -
+    {
+        let sf = synth_spaces_unicode_fixture();
+        check(
+            "synth fixture (kind 4): name has a space",
+            sf.name.contains(' '),
+        );
+        check(
+            "synth fixture (kind 4): name has a non-ASCII character",
+            !sf.name.is_ascii(),
+        );
+        let gf = synth_already_gz_fixture();
+        check(
+            "synth fixture (kind 5): name already ends in .gz",
+            gf.name.ends_with(".gz"),
+        );
+        check(
+            "synth fixture (kind 5): content is PLAIN (not a real gzip stream — no 1f8b magic)",
+            !(gf.bytes.len() >= 2 && gf.bytes[0] == 0x1f && gf.bytes[1] == 0x8b),
+        );
+    }
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "fulcrum-dropin-fixturekind-st-{}-{}",
+            std::process::id(),
+            SANDBOX_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::create_dir_all(&tmp);
+        let dummy = Fixture {
+            name: "kindprobe".to_string(),
+            bytes: b"hello dropin fixture kinds\n".to_vec(),
+            sha256: String::new(),
+        };
+        let oracle = resolve_ours_binary("gzip");
+
+        // kind 1: directory.
+        let ok_dir = setup_directory(&tmp, &dummy, Path::new("gzip")).is_ok();
+        check(
+            "setup_directory: succeeds and creates an actual directory",
+            ok_dir && tmp.join(&dummy.name).is_dir(),
+        );
+        let _ = fs::remove_dir_all(tmp.join(&dummy.name));
+
+        // kind 2: broken symlink.
+        let symfx = Fixture {
+            name: "kindprobe-symlink".to_string(),
+            ..dummy.clone()
+        };
+        let ok_sym = setup_broken_symlink(&tmp, &symfx, Path::new("gzip")).is_ok();
+        let sym_path = tmp.join(&symfx.name);
+        let is_symlink = fs::symlink_metadata(&sym_path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let target_resolves = fs::metadata(&sym_path).is_ok();
+        check(
+            "setup_broken_symlink: creates a real symlink whose target does NOT resolve",
+            ok_sym && is_symlink && !target_resolves,
+        );
+        let _ = fs::remove_file(&sym_path);
+
+        // kind 3: mode 000.
+        let m0fx = Fixture {
+            name: "kindprobe-mode000".to_string(),
+            ..dummy.clone()
+        };
+        let ok_m0 = setup_mode000(&tmp, &m0fx, Path::new("gzip")).is_ok();
+        let m0_path = tmp.join(&m0fx.name);
+        let mode_is_zero = fs::metadata(&m0_path)
+            .map(|m| m.permissions().mode() & 0o777 == 0)
+            .unwrap_or(false);
+        check(
+            "setup_mode000: creates a file whose mode really is 0",
+            ok_m0 && mode_is_zero,
+        );
+        // Mode-000 cleanup gate: harden-then-remove must succeed without
+        // sudo/chmod from outside, on a sandbox actually containing a
+        // mode-000 leaf file.
+        harden_permissions_for_removal(&tmp);
+        let removed_ok = fs::remove_dir_all(&tmp).is_ok();
+        check(
+            "mode-000 cleanup: harden_permissions_for_removal + remove_dir_all succeeds on a real mode-000 file",
+            removed_ok,
+        );
+        let _ = fs::create_dir_all(&tmp); // recreate for the checks below
+
+        match &oracle {
+            None => println!("  NOTE dropin: oracle-dependent fixture-kind checks skipped (no `gzip` on PATH)"),
+            Some(gzip_bin) => {
+                // kind 9: hardlink.
+                let hlfx = Fixture {
+                    name: "kindprobe-hardlink".to_string(),
+                    ..dummy.clone()
+                };
+                let ok_hl = setup_hardlink(&tmp, &hlfx, gzip_bin).is_ok();
+                let hl_nlink = fs::metadata(tmp.join(&hlfx.name)).map(|m| m.nlink()).unwrap_or(0);
+                check(
+                    "setup_hardlink: the fixture file really has nlink() > 1",
+                    ok_hl && hl_nlink > 1,
+                );
+
+                // kind 6: multi-member.
+                let mmfx = Fixture {
+                    name: "kindprobe-multimember".to_string(),
+                    ..dummy.clone()
+                };
+                let ok_mm = setup_multi_member_gz(&tmp, &mmfx, gzip_bin).is_ok();
+                let mm_bytes = fs::read(tmp.join(format!("{}.gz", mmfx.name))).unwrap_or_default();
+                let magic_count = mm_bytes
+                    .windows(2)
+                    .filter(|w| w[0] == 0x1f && w[1] == 0x8b)
+                    .count();
+                let mm_decoded = oracle_decompress(gzip_bin, &mm_bytes).unwrap_or_default();
+                let mut mm_expected = mmfx.bytes.clone();
+                mm_expected.extend_from_slice(&mmfx.bytes);
+                check(
+                    "setup_multi_member_gz: really has (at least) two gzip magic headers",
+                    ok_mm && magic_count >= 2,
+                );
+                check(
+                    "setup_multi_member_gz: oracle decompresses to the DOUBLED (concatenated) plaintext",
+                    mm_decoded == mm_expected,
+                );
+
+                // kind 7: truncated.
+                let trfx = Fixture {
+                    name: "kindprobe-truncated".to_string(),
+                    ..dummy.clone()
+                };
+                let full_len = canonical_gz_bytes(gzip_bin, &trfx.bytes).map(|b| b.len()).unwrap_or(0);
+                let ok_tr = setup_truncated_gz(&tmp, &trfx, gzip_bin).is_ok();
+                let tr_bytes = fs::read(tmp.join(format!("{}.gz", trfx.name))).unwrap_or_default();
+                check(
+                    "setup_truncated_gz: really shorter than a valid stream",
+                    ok_tr && !tr_bytes.is_empty() && tr_bytes.len() < full_len,
+                );
+                let tr_test_ok = Command::new(gzip_bin)
+                    .arg("-t")
+                    .arg(tmp.join(format!("{}.gz", trfx.name)))
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(true);
+                check(
+                    "setup_truncated_gz: the real oracle gzip actually FAILS -t on it",
+                    !tr_test_ok,
+                );
+
+                // kind 8: corrupted CRC only.
+                let crcfx = Fixture {
+                    name: "kindprobe-corruptcrc".to_string(),
+                    ..dummy.clone()
+                };
+                let ok_crc = setup_corrupt_gz_crc_only(&tmp, &crcfx, gzip_bin).is_ok();
+                let crc_path = tmp.join(format!("{}.gz", crcfx.name));
+                let crc_bytes = fs::read(&crc_path).unwrap_or_default();
+                let crc_decoded = oracle_decompress(gzip_bin, &crc_bytes).unwrap_or_default();
+                let crc_test_ok = Command::new(gzip_bin)
+                    .arg("-t")
+                    .arg(&crc_path)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(true);
+                check(
+                    "setup_corrupt_gz_crc_only: body-only decode still yields the RIGHT plaintext",
+                    ok_crc && crc_decoded == crcfx.bytes,
+                );
+                check(
+                    "setup_corrupt_gz_crc_only: the real oracle gzip's CRC check actually FAILS -t on it",
+                    !crc_test_ok,
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     // -- 3. Declared: wildcard matching + MIN_DECLARED_REASON gate -----------
     let long_reason = "known: pigz -l column format legitimately differs from gzippy's".to_string();
@@ -1733,6 +2139,75 @@ pub fn selftest() -> ExitCode {
                     "e2e DIVERGENCE: a matching Declared entry caps it to DECLARED (visible, not hidden)",
                     matched && status_with_decl == "DECLARED",
                 );
+            }
+
+            // -- New fixture kinds, e2e via real gzip vs itself: proves the
+            // "shared incumbent failure is MATCH, not a bug" contract for
+            // each new scenario, same pattern as `test_corrupt` above.
+            {
+                let s = by_name("directory_input");
+                let o = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                let r = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                check(
+                    "e2e: directory_input — real gzip actually fails on a bare directory arg",
+                    !o.success,
+                );
+                check(
+                    "e2e: directory_input — nothing created/removed/modified (gzip touches nothing)",
+                    o.created.is_empty() && o.removed.is_empty() && o.modified.is_empty(),
+                );
+                let diffs = observation_diffs(s.kind, &o, &r);
+                check(
+                    "e2e: directory_input, gzip vs itself -> zero diffs (shared behavior is MATCH)",
+                    diffs.is_empty(),
+                );
+            }
+            {
+                let s = by_name("hardlink_input");
+                let o = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                let r = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                check(
+                    "e2e: hardlink_input — real gzip actually refuses a file with nlink()>1",
+                    !o.success,
+                );
+                let diffs = observation_diffs(s.kind, &o, &r);
+                check(
+                    "e2e: hardlink_input, gzip vs itself -> zero diffs (shared refuse-behavior is MATCH)",
+                    diffs.is_empty(),
+                );
+            }
+            {
+                let s = by_name("multi_member_decompress");
+                let o = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                let r = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                check(
+                    "e2e: multi_member_decompress — real gzip succeeds and produces the DOUBLED plaintext",
+                    o.success && o.roundtrip_ok == Some(true),
+                );
+                let diffs = observation_diffs(s.kind, &o, &r);
+                check(
+                    "e2e: multi_member_decompress, gzip vs itself -> zero diffs",
+                    diffs.is_empty(),
+                );
+            }
+            {
+                // Both test_truncated AND test_corrupt_crc are real error
+                // classes a real gzip ALSO hits — the "shared incumbent
+                // failure is MATCH, not a bug" contract, exercised twice more.
+                for scen_name in ["test_truncated", "test_corrupt_crc"] {
+                    let s = by_name(scen_name);
+                    let o = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                    let r = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
+                    check(
+                        &format!("e2e: {scen_name} — real gzip actually fails -t on it"),
+                        !o.success,
+                    );
+                    let diffs = observation_diffs(s.kind, &o, &r);
+                    check(
+                        &format!("e2e: {scen_name}, gzip vs itself -> zero diffs (shared failure is MATCH)"),
+                        diffs.is_empty(),
+                    );
+                }
             }
 
             let _ = fs::remove_dir_all(&tmp_root);
