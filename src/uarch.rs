@@ -61,16 +61,47 @@ pub fn portable_batches() -> Vec<Batch> {
     vec![
         b(
             "core",
-            &["instructions", "cycles", "task-clock", "branches", "branch-misses"],
+            &[
+                "instructions",
+                "cycles",
+                "task-clock",
+                "branches",
+                "branch-misses",
+            ],
         ),
-        b("l1", &["instructions", "cycles", "L1-dcache-loads", "L1-dcache-load-misses"]),
-        b("tlb", &["instructions", "cycles", "dTLB-loads", "dTLB-load-misses"]),
-        b("llc_load", &["instructions", "cycles", "LLC-loads", "LLC-load-misses"]),
-        b("llc_store", &["instructions", "cycles", "LLC-stores", "LLC-store-misses"]),
-        b("refs", &["instructions", "cycles", "cache-references", "cache-misses"]),
+        b(
+            "l1",
+            &[
+                "instructions",
+                "cycles",
+                "L1-dcache-loads",
+                "L1-dcache-load-misses",
+            ],
+        ),
+        b(
+            "tlb",
+            &["instructions", "cycles", "dTLB-loads", "dTLB-load-misses"],
+        ),
+        b(
+            "llc_load",
+            &["instructions", "cycles", "LLC-loads", "LLC-load-misses"],
+        ),
+        b(
+            "llc_store",
+            &["instructions", "cycles", "LLC-stores", "LLC-store-misses"],
+        ),
+        b(
+            "refs",
+            &["instructions", "cycles", "cache-references", "cache-misses"],
+        ),
         b(
             "stalls",
-            &["instructions", "cycles", "stalled-cycles-frontend", "stalled-cycles-backend"],
+            &[
+                "instructions",
+                "cycles",
+                "stalled-cycles-frontend",
+                "stalled-cycles-backend",
+            ],
         ),
     ]
 }
@@ -139,7 +170,11 @@ pub fn intel_fill_batches() -> Vec<Batch> {
         ),
         b(
             "fill_src_b",
-            &["instructions", "cycles", "mem_load_l3_miss_retired.local_dram"],
+            &[
+                "instructions",
+                "cycles",
+                "mem_load_l3_miss_retired.local_dram",
+            ],
         ),
     ]
 }
@@ -360,7 +395,10 @@ fn run_arm_sha(bin: &str, args: &[String], corpus: &str) -> Result<(String, usiz
         .output()
         .map_err(|e| format!("cannot spawn arm '{bin}': {e}"))?;
     if !out.status.success() {
-        return Err(format!("arm '{bin}' exited {:?} on {corpus}", out.status.code()));
+        return Err(format!(
+            "arm '{bin}' exited {:?} on {corpus}",
+            out.status.code()
+        ));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len()))
 }
@@ -480,7 +518,7 @@ fn measure_arm(
 #[derive(Debug, Clone)]
 pub struct UarchConfig {
     pub subject_bin: String,
-    pub subject_args: Vec<String>, // with {t}
+    pub subject_args: Vec<String>,   // with {t}
     pub comparator_cmd: Vec<String>, // with {t}
     pub corpora: Vec<String>,
     pub threads: Vec<usize>,
@@ -543,7 +581,10 @@ fn run_oracle(oracle_cmd: &[String], corpus: &str) -> Result<(String, f64), Stri
         .output()
         .map_err(|e| format!("cannot spawn oracle '{prog}': {e}"))?;
     if !out.status.success() {
-        return Err(format!("oracle '{prog}' exited {:?} on {corpus}", out.status.code()));
+        return Err(format!(
+            "oracle '{prog}' exited {:?} on {corpus}",
+            out.status.code()
+        ));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len() as f64))
 }
@@ -609,11 +650,17 @@ fn run_cell(cfg: &UarchConfig, corpus: &str, thread: usize) -> Result<CellProfil
     let mut pass = true;
     // byte-exact
     if gz.sha != reference_sha {
-        notes.push(format!("GZ SHA MISMATCH {} != oracle {}", gz.sha, reference_sha));
+        notes.push(format!(
+            "GZ SHA MISMATCH {} != oracle {}",
+            gz.sha, reference_sha
+        ));
         pass = false;
     }
     if rg.sha != reference_sha {
-        notes.push(format!("RG SHA MISMATCH {} != oracle {}", rg.sha, reference_sha));
+        notes.push(format!(
+            "RG SHA MISMATCH {} != oracle {}",
+            rg.sha, reference_sha
+        ));
         pass = false;
     }
     // IPC sanity
@@ -646,7 +693,11 @@ fn run_cell(cfg: &UarchConfig, corpus: &str, thread: usize) -> Result<CellProfil
             }
         }
         if !a.unavailable.is_empty() {
-            notes.push(format!("{} unavailable events: {}", a.label, a.unavailable.join(",")));
+            notes.push(format!(
+                "{} unavailable events: {}",
+                a.label,
+                a.unavailable.join(",")
+            ));
         }
     }
 
@@ -682,7 +733,10 @@ fn run_cell(cfg: &UarchConfig, corpus: &str, thread: usize) -> Result<CellProfil
         }
         aa_max_dev = maxdev;
         if maxdev > 0.05 {
-            notes.push(format!("A/A max deviation {:.1}% > 5% (box unstable)", maxdev * 100.0));
+            notes.push(format!(
+                "A/A max deviation {:.1}% > 5% (box unstable)",
+                maxdev * 100.0
+            ));
             pass = false;
         }
     }
@@ -826,16 +880,20 @@ fn render_box(bp: &BoxProfile) {
 /// Fill-source fractions for gz vs rg (fraction of TOTAL classified fills from
 /// each source) — the direct chiplet test.
 fn render_fill_breakdown(c: &CellProfile) {
-    let classes: Vec<(&String, &'static str)> = c
-        .gz
-        .raw
-        .keys()
-        .filter_map(|k| fill_source_class(k).map(|cl| (k, cl)))
-        .collect();
+    let classes: Vec<(&String, &'static str)> =
+        c.gz.raw
+            .keys()
+            .filter_map(|k| fill_source_class(k).map(|cl| (k, cl)))
+            .collect();
     if classes.is_empty() {
         return;
     }
-    let sum = |arm: &ArmProfile| -> f64 { classes.iter().map(|(k, _)| arm.raw.get(*k).copied().unwrap_or(0.0)).sum() };
+    let sum = |arm: &ArmProfile| -> f64 {
+        classes
+            .iter()
+            .map(|(k, _)| arm.raw.get(*k).copied().unwrap_or(0.0))
+            .sum()
+    };
     let gz_tot = sum(&c.gz).max(1.0);
     let rg_tot = sum(&c.rg).max(1.0);
     println!("   fill-source breakdown (share of classified demand fills):");
@@ -854,8 +912,8 @@ fn render_fill_breakdown(c: &CellProfile) {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrossRow {
     pub event: String,
-    pub ratio_a: f64, // gz/rg on box A (the "lose" box)
-    pub ratio_b: f64, // gz/rg on box B (the "win" box)
+    pub ratio_a: f64,    // gz/rg on box A (the "lose" box)
+    pub ratio_b: f64,    // gz/rg on box B (the "win" box)
     pub divergence: f64, // ratio_a / ratio_b
 }
 
@@ -953,7 +1011,9 @@ fn cmd_cross(losing: &str, winning: &str) -> ExitCode {
         }
     }
     if any_refused {
-        eprintln!("\nuarch cross: REFUSED — one or more cells failed Gate-0 (see above); exit non-zero.");
+        eprintln!(
+            "\nuarch cross: REFUSED — one or more cells failed Gate-0 (see above); exit non-zero."
+        );
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -979,10 +1039,23 @@ pub fn selftest() -> ExitCode {
     println!("=== fulcrum uarch selftest ===");
 
     // 1. event-name normalization (Intel hybrid ↔ AMD bare)
-    check!(normalize_event("cpu_core/cycles/") == "cycles", "normalize cpu_core/cycles/ → cycles");
-    check!(normalize_event("cpu_atom/instructions/") == "instructions", "normalize cpu_atom prefix");
-    check!(normalize_event("ls_refills_from_sys.ls_mabresp_rmt_cache") == "ls_refills_from_sys.ls_mabresp_rmt_cache", "bare AMD event unchanged");
-    check!(is_atom("cpu_atom/cycles/") && !is_atom("cpu_core/cycles/"), "is_atom detects atom PMU copy");
+    check!(
+        normalize_event("cpu_core/cycles/") == "cycles",
+        "normalize cpu_core/cycles/ → cycles"
+    );
+    check!(
+        normalize_event("cpu_atom/instructions/") == "instructions",
+        "normalize cpu_atom prefix"
+    );
+    check!(
+        normalize_event("ls_refills_from_sys.ls_mabresp_rmt_cache")
+            == "ls_refills_from_sys.ls_mabresp_rmt_cache",
+        "bare AMD event unchanged"
+    );
+    check!(
+        is_atom("cpu_atom/cycles/") && !is_atom("cpu_core/cycles/"),
+        "is_atom detects atom PMU copy"
+    );
 
     // 2. perf CSV parse keeps value + pct-running, drops <not counted>
     let sample = "903558,,cpu_core/cycles/,206225,100.00,4.381,GHz\n\
@@ -991,21 +1064,51 @@ pub fn selftest() -> ExitCode {
                   # a comment\n\
                   0.21,msec,task-clock,206225,100.00,,";
     let rows = parse_perf_rows(sample);
-    check!(rows.len() == 3, "parse drops <not counted> + comment (3 rows)");
-    check!(rows[0].event == "cycles" && (rows[0].value - 903558.0).abs() < 1.0, "cpu_core cycles value parsed");
-    check!(rows[0].pct_running.map(|v| (v - 100.0).abs() < 0.01).unwrap_or(false), "pct-running 100 parsed");
-    check!(rows[1].pct_running.map(|v| (v - 55.30).abs() < 0.01).unwrap_or(false), "multiplexed pct-running 55.30 parsed");
+    check!(
+        rows.len() == 3,
+        "parse drops <not counted> + comment (3 rows)"
+    );
+    check!(
+        rows[0].event == "cycles" && (rows[0].value - 903558.0).abs() < 1.0,
+        "cpu_core cycles value parsed"
+    );
+    check!(
+        rows[0]
+            .pct_running
+            .map(|v| (v - 100.0).abs() < 0.01)
+            .unwrap_or(false),
+        "pct-running 100 parsed"
+    );
+    check!(
+        rows[1]
+            .pct_running
+            .map(|v| (v - 55.30).abs() < 0.01)
+            .unwrap_or(false),
+        "multiplexed pct-running 55.30 parsed"
+    );
     check!(rows[2].event == "task-clock", "task-clock parsed");
 
     // 2b. P0b: a MISSING run%-column ⇒ None, NEVER a fabricated 100.0.
     let no_pct = "1234,,cycles,50000\n5678,,instructions"; // only 4 / 3 fields, no run% col
     let rows_np = parse_perf_rows(no_pct);
-    check!(rows_np.len() == 2, "P0b: rows without run%-column still parse (2 rows)");
-    check!(rows_np.iter().all(|r| r.pct_running.is_none()), "P0b: missing run%-column ⇒ pct_running None (not 100.0)");
+    check!(
+        rows_np.len() == 2,
+        "P0b: rows without run%-column still parse (2 rows)"
+    );
+    check!(
+        rows_np.iter().all(|r| r.pct_running.is_none()),
+        "P0b: missing run%-column ⇒ pct_running None (not 100.0)"
+    );
 
     // 3. implied GHz
-    check!((implied_ghz(2_800_000_000.0, 1000.0) - 2.8).abs() < 1e-6, "implied GHz = cycles/(ms*1e6)");
-    check!(implied_ghz(1.0, 0.0) == 0.0, "implied GHz guards div-by-zero");
+    check!(
+        (implied_ghz(2_800_000_000.0, 1000.0) - 2.8).abs() < 1e-6,
+        "implied GHz = cycles/(ms*1e6)"
+    );
+    check!(
+        implied_ghz(1.0, 0.0) == 0.0,
+        "implied GHz guards div-by-zero"
+    );
 
     // 4. cross-machine ranking picks the high-on-A / parity-on-B counter
     let mut a = BTreeMap::new();
@@ -1015,12 +1118,24 @@ pub fn selftest() -> ExitCode {
     b.insert("rmt_cache".to_string(), 1.03);
     b.insert("instructions".to_string(), 1.01);
     let cr = cross_rows(&a, &b);
-    check!(cr[0].event == "rmt_cache", "cross_rows ranks divergent counter first");
-    check!((cr[0].divergence - 2.4 / 1.03).abs() < 1e-6, "divergence = ratioA/ratioB");
+    check!(
+        cr[0].event == "rmt_cache",
+        "cross_rows ranks divergent counter first"
+    );
+    check!(
+        (cr[0].divergence - 2.4 / 1.03).abs() < 1e-6,
+        "divergence = ratioA/ratioB"
+    );
 
     // 5. fill-source classification
-    check!(fill_source_class("ls_refills_from_sys.ls_mabresp_rmt_cache") == Some("REMOTE_CCX_cache"), "rmt_cache → REMOTE_CCX_cache");
-    check!(fill_source_class("instructions").is_none(), "non-fill event unclassified");
+    check!(
+        fill_source_class("ls_refills_from_sys.ls_mabresp_rmt_cache") == Some("REMOTE_CCX_cache"),
+        "rmt_cache → REMOTE_CCX_cache"
+    );
+    check!(
+        fill_source_class("instructions").is_none(),
+        "non-fill event unclassified"
+    );
 
     // 6. default mask spans CCX at T8
     check!(default_mask(4) == "8-11", "T4 mask one CCX");
@@ -1029,20 +1144,44 @@ pub fn selftest() -> ExitCode {
     // 7. curated batches are all ≤6 events (no forced multiplexing)
     for vend in [Vendor::Amd, Vendor::Intel] {
         for batch in curated_batches(vend) {
-            if batch.name == "user_faults" { continue; }
+            if batch.name == "user_faults" {
+                continue;
+            }
             if batch.events.len() > 5 {
-                println!("  FAIL  batch {} has {} events (>5)", batch.name, batch.events.len());
+                println!(
+                    "  FAIL  batch {} has {} events (>5)",
+                    batch.name,
+                    batch.events.len()
+                );
                 ok = false;
             }
         }
     }
-    check!(true, "curated batches ≤5 events each (100%-scheduled, no multiplexing)");
+    check!(
+        true,
+        "curated batches ≤5 events each (100%-scheduled, no multiplexing)"
+    );
 
     // 7b. P0b: pct_estimate — the multiplexing/unknown gate.
-    check!(pct_estimate(&[Some(100.0), Some(99.5)]) == (Some(99.75), false), "P0b: fully-scheduled ⇒ not an estimate");
-    check!({ let (m, e) = pct_estimate(&[Some(55.0), Some(60.0)]); m == Some(57.5) && e }, "P0b: pct<80 ⇒ estimate=true");
-    check!(pct_estimate(&[Some(100.0), None]) == (None, true), "P0b: any missing run%-column ⇒ null median + estimate");
-    check!(pct_estimate(&[]) == (None, true), "P0b: no samples ⇒ null + estimate");
+    check!(
+        pct_estimate(&[Some(100.0), Some(99.5)]) == (Some(99.75), false),
+        "P0b: fully-scheduled ⇒ not an estimate"
+    );
+    check!(
+        {
+            let (m, e) = pct_estimate(&[Some(55.0), Some(60.0)]);
+            m == Some(57.5) && e
+        },
+        "P0b: pct<80 ⇒ estimate=true"
+    );
+    check!(
+        pct_estimate(&[Some(100.0), None]) == (None, true),
+        "P0b: any missing run%-column ⇒ null median + estimate"
+    );
+    check!(
+        pct_estimate(&[]) == (None, true),
+        "P0b: no samples ⇒ null + estimate"
+    );
 
     // 7c. P0b: `uarch cross` REFUSES (non-zero exit) when a source cell failed Gate-0.
     {
@@ -1056,19 +1195,33 @@ pub fn selftest() -> ExitCode {
         let _ = std::fs::write(&gb, &bad);
         // B (win box) has a gate0-FAILED cell ⇒ cross must REFUSE with FAILURE.
         let ec = cmd_cross(ga.to_str().unwrap(), gb.to_str().unwrap());
-        check!(ec == ExitCode::FAILURE, "P0b: cross REFUSES (non-zero) on a Gate-0-failed source cell");
+        check!(
+            ec == ExitCode::FAILURE,
+            "P0b: cross REFUSES (non-zero) on a Gate-0-failed source cell"
+        );
         // both PASS ⇒ SUCCESS.
         let _ = std::fs::write(&gb, mk_box_json("boxB", true));
         let ec2 = cmd_cross(ga.to_str().unwrap(), gb.to_str().unwrap());
-        check!(ec2 == ExitCode::SUCCESS, "P0b: cross ranks (SUCCESS) when both cells pass Gate-0");
+        check!(
+            ec2 == ExitCode::SUCCESS,
+            "P0b: cross ranks (SUCCESS) when both cells pass Gate-0"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 8. LIVE perf A/A check when perf is present — the real Gate-0.
-    if Command::new("perf").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+    if Command::new("perf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
         match live_aa_check() {
             Ok(dev) => {
-                check!(dev < 0.10, &format!("LIVE perf A/A max-dev {:.2}% < 10%", dev * 100.0));
+                check!(
+                    dev < 0.10,
+                    &format!("LIVE perf A/A max-dev {:.2}% < 10%", dev * 100.0)
+                );
             }
             Err(e) => {
                 println!("  WARN  live perf A/A skipped: {e}");
@@ -1078,7 +1231,10 @@ pub fn selftest() -> ExitCode {
         println!("  SKIP  live perf A/A (no `perf` on this host — pure-logic checks only)");
     }
 
-    println!("\n=== uarch selftest: {} ===", if ok { "PASS" } else { "FAIL" });
+    println!(
+        "\n=== uarch selftest: {} ===",
+        if ok { "PASS" } else { "FAIL" }
+    );
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -1175,7 +1331,10 @@ fn live_aa_check() -> Result<f64, String> {
         }
     }
     if !cell.gate0_pass {
-        return Err(format!("selftest cell gate0 failed: {:?}", cell.gate0_notes));
+        return Err(format!(
+            "selftest cell gate0 failed: {:?}",
+            cell.gate0_notes
+        ));
     }
     Ok(maxdev)
 }
@@ -1311,7 +1470,8 @@ pub fn cmd_uarch(args: &[String]) -> ExitCode {
 /// Deserialize to keep the hot structs Serialize-only).
 fn load_box_de(path: &str) -> Result<BoxProfile, String> {
     let txt = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("parse {path}: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("parse {path}: {e}"))?;
     let arm = |a: &serde_json::Value| -> ArmProfile {
         let mapf = |k: &str| -> BTreeMap<String, f64> {
             a.get(k)
@@ -1326,18 +1486,18 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
         let vecs = |k: &str| -> Vec<String> {
             a.get(k)
                 .and_then(|m| m.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         // scheduled_pct is Option<f64> per event (null ⇒ unknown run%-column).
         let sched = |k: &str| -> BTreeMap<String, Option<f64>> {
             a.get(k)
                 .and_then(|m| m.as_object())
-                .map(|o| {
-                    o.iter()
-                        .map(|(k, v)| (k.clone(), v.as_f64()))
-                        .collect()
-                })
+                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_f64())).collect())
                 .unwrap_or_default()
         };
         let estmap = |k: &str| -> BTreeMap<String, bool> {
@@ -1351,9 +1511,21 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
                 .unwrap_or_default()
         };
         ArmProfile {
-            label: a.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            bin: a.get("bin").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            sha: a.get("sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            label: a
+                .get("label")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            bin: a
+                .get("bin")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            sha: a
+                .get("sha")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             bytes: a.get("bytes").and_then(|x| x.as_f64()).unwrap_or(0.0),
             ipc: a.get("ipc").and_then(|x| x.as_f64()).unwrap_or(0.0),
             implied_ghz: a.get("implied_ghz").and_then(|x| x.as_f64()).unwrap_or(0.0),
@@ -1377,25 +1549,55 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
                     let gz_over_rg = c
                         .get("gz_over_rg")
                         .and_then(|m| m.as_object())
-                        .map(|o| o.iter().filter_map(|(k, x)| x.as_f64().map(|f| (k.clone(), f))).collect())
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|(k, x)| x.as_f64().map(|f| (k.clone(), f)))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     CellProfile {
-                        corpus: c.get("corpus").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                        corpus_basename: c.get("corpus_basename").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        corpus: c
+                            .get("corpus")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        corpus_basename: c
+                            .get("corpus_basename")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         threads: c.get("threads").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-                        mask: c.get("mask").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        mask: c
+                            .get("mask")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         bytes: c.get("bytes").and_then(|x| x.as_f64()).unwrap_or(0.0),
-                        reference_sha: c.get("reference_sha").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        reference_sha: c
+                            .get("reference_sha")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         n: c.get("n").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
                         gz,
                         rg,
                         gz_over_rg,
-                        aa_max_dev: c.get("aa_max_dev").and_then(|x| x.as_f64()).unwrap_or(f64::NAN),
-                        gate0_pass: c.get("gate0_pass").and_then(|x| x.as_bool()).unwrap_or(false),
+                        aa_max_dev: c
+                            .get("aa_max_dev")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(f64::NAN),
+                        gate0_pass: c
+                            .get("gate0_pass")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                         gate0_notes: c
                             .get("gate0_notes")
                             .and_then(|m| m.as_array())
-                            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     }
                 })
@@ -1403,11 +1605,31 @@ fn load_box_de(path: &str) -> Result<BoxProfile, String> {
         })
         .unwrap_or_default();
     Ok(BoxProfile {
-        box_name: v.get("box_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        host: v.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        arch: v.get("arch").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        vendor: v.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        timestamp: v.get("timestamp").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        box_name: v
+            .get("box_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        host: v
+            .get("host")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        arch: v
+            .get("arch")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        vendor: v
+            .get("vendor")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        timestamp: v
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         cells,
     })
 }
@@ -1420,7 +1642,10 @@ mod tests {
     fn normalize_strips_hybrid_pmu() {
         assert_eq!(normalize_event("cpu_core/cycles/"), "cycles");
         assert_eq!(normalize_event("cpu_atom/instructions/"), "instructions");
-        assert_eq!(normalize_event("cpu/mem_load_retired.l3_miss/"), "mem_load_retired.l3_miss");
+        assert_eq!(
+            normalize_event("cpu/mem_load_retired.l3_miss/"),
+            "mem_load_retired.l3_miss"
+        );
         assert_eq!(normalize_event("branch-misses"), "branch-misses");
     }
 
@@ -1444,7 +1669,10 @@ mod tests {
 
     #[test]
     fn pct_estimate_flags_multiplexed_and_unknown() {
-        assert_eq!(pct_estimate(&[Some(100.0), Some(100.0)]), (Some(100.0), false));
+        assert_eq!(
+            pct_estimate(&[Some(100.0), Some(100.0)]),
+            (Some(100.0), false)
+        );
         assert_eq!(pct_estimate(&[Some(50.0)]), (Some(50.0), true));
         assert_eq!(pct_estimate(&[Some(100.0), None]), (None, true));
         assert_eq!(pct_estimate(&[]), (None, true));
@@ -1471,8 +1699,14 @@ mod tests {
 
     #[test]
     fn fill_classes() {
-        assert_eq!(fill_source_class("ls_refills_from_sys.ls_mabresp_rmt_cache"), Some("REMOTE_CCX_cache"));
-        assert_eq!(fill_source_class("mem_load_retired.l3_miss"), Some("L3_miss"));
+        assert_eq!(
+            fill_source_class("ls_refills_from_sys.ls_mabresp_rmt_cache"),
+            Some("REMOTE_CCX_cache")
+        );
+        assert_eq!(
+            fill_source_class("mem_load_retired.l3_miss"),
+            Some("L3_miss")
+        );
         assert!(fill_source_class("cycles").is_none());
     }
 
@@ -1488,7 +1722,9 @@ mod tests {
         for v in [Vendor::Amd, Vendor::Intel, Vendor::Unknown] {
             for b in curated_batches(v) {
                 // user_faults is mostly software events (no PMU slot); exempt.
-                if b.name == "user_faults" { continue; }
+                if b.name == "user_faults" {
+                    continue;
+                }
                 assert!(b.events.len() <= 5, "batch {} too big", b.name);
             }
         }

@@ -235,7 +235,16 @@ fn run_cli(args: &[String]) -> ExitCode {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&label, &env, &sink, interval_ms, do_strace, madvise_detail, &out, &argv);
+        let _ = (
+            &label,
+            &env,
+            &sink,
+            interval_ms,
+            do_strace,
+            madvise_detail,
+            &out,
+            &argv,
+        );
         eprintln!("memprofile: Linux-only (needs /proc). This host is not Linux.");
         return ExitCode::from(3);
     }
@@ -297,7 +306,9 @@ fn profile(opts: &RunOpts) -> Result<MemProfile, String> {
         cmd.env(k, v);
     }
     let start = Instant::now();
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", opts.argv[0]))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", opts.argv[0]))?;
     let pid = child.id();
 
     let mut rss_samples: Vec<(f64, f64)> = Vec::with_capacity(1024); // (t_s, rss_mb)
@@ -352,7 +363,11 @@ fn profile(opts: &RunOpts) -> Result<MemProfile, String> {
         .iter()
         .map(|(tid, (first, last))| {
             let busy_ticks = last - first.unwrap_or(*last);
-            let busy_s = if clk_tck > 0.0 { busy_ticks / clk_tck } else { 0.0 };
+            let busy_s = if clk_tck > 0.0 {
+                busy_ticks / clk_tck
+            } else {
+                0.0
+            };
             ThreadOcc {
                 tid: *tid,
                 busy_s,
@@ -373,8 +388,16 @@ fn profile(opts: &RunOpts) -> Result<MemProfile, String> {
         0.0
     };
 
-    let minflt_per_s = if wall_s > 0.0 { last_minflt as f64 / wall_s } else { 0.0 };
-    let majflt_per_s = if wall_s > 0.0 { last_majflt as f64 / wall_s } else { 0.0 };
+    let minflt_per_s = if wall_s > 0.0 {
+        last_minflt as f64 / wall_s
+    } else {
+        0.0
+    };
+    let majflt_per_s = if wall_s > 0.0 {
+        last_majflt as f64 / wall_s
+    } else {
+        0.0
+    };
 
     // ── strace turnover pass (separate spawn; wall is perturbed, counts are not) ──
     let strace = if opts.do_strace {
@@ -386,11 +409,7 @@ fn profile(opts: &RunOpts) -> Result<MemProfile, String> {
     Ok(MemProfile {
         label: opts.label.clone(),
         argv: opts.argv.clone(),
-        env: opts
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect(),
+        env: opts.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
         threads_flag: parse_threads_flag(&opts.argv),
         exit_code,
         wall_s,
@@ -419,7 +438,9 @@ fn profile(opts: &RunOpts) -> Result<MemProfile, String> {
 fn read_statm_resident(pid: u32) -> Option<f64> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
     // fields: size resident shared text lib data dt  (in pages)
-    s.split_whitespace().nth(1).and_then(|f| f.parse::<f64>().ok())
+    s.split_whitespace()
+        .nth(1)
+        .and_then(|f| f.parse::<f64>().ok())
 }
 
 /// Sample every task: update per-tid busy ticks (utime+stime), count R-state
@@ -446,7 +467,9 @@ fn sample_tasks(
             Err(_) => continue,
         };
         // comm is parenthesized and may contain spaces/parens: split after last ')'
-        let Some(rparen) = stat.rfind(')') else { continue };
+        let Some(rparen) = stat.rfind(')') else {
+            continue;
+        };
         let rest = &stat[rparen + 1..];
         let toks: Vec<&str> = rest.split_whitespace().collect();
         // toks[0]=state, [7]=minflt(f10), [9]=majflt(f12), [11]=utime(f14), [12]=stime(f15)
@@ -533,7 +556,11 @@ fn strace_pass(opts: &RunOpts, _clean_wall: f64) -> Option<StraceSummary> {
     }
 
     let recycle = (s.munmap_calls + s.madvise_calls) as f64;
-    s.recycle_per_s = if _clean_wall > 0.0 { recycle / _clean_wall } else { 0.0 };
+    s.recycle_per_s = if _clean_wall > 0.0 {
+        recycle / _clean_wall
+    } else {
+        0.0
+    };
     Some(s)
 }
 
@@ -572,18 +599,10 @@ fn madvise_detail_counts(opts: &RunOpts) -> (Option<u64>, Option<u64>) {
         Err(_) => return (None, None),
     };
     let mut cmd = Command::new("strace");
-    cmd.args([
-        "-f",
-        "-e",
-        "trace=madvise",
-        "-e",
-        "signal=none",
-        "-o",
-        &tmp,
-    ])
-    .args(&opts.argv)
-    .stdout(Stdio::from(sink_file))
-    .stderr(Stdio::null());
+    cmd.args(["-f", "-e", "trace=madvise", "-e", "signal=none", "-o", &tmp])
+        .args(&opts.argv)
+        .stdout(Stdio::from(sink_file))
+        .stderr(Stdio::null());
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
@@ -638,11 +657,7 @@ fn downsample(v: &[f64], target: usize) -> Vec<f64> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn print_report(p: &MemProfile) {
     eprintln!("── memprofile [{}] ──", p.label);
-    eprintln!(
-        "argv: {}   env: {}",
-        p.argv.join(" "),
-        p.env.join(",")
-    );
+    eprintln!("argv: {}   env: {}", p.argv.join(" "), p.env.join(","));
     eprintln!(
         "exit={} wall={:.3}s samples={} (interval {}ms)",
         p.exit_code, p.wall_s, p.sample_count, p.interval_ms

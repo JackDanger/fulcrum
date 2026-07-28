@@ -336,18 +336,21 @@ pub fn parse_cachegrind(text: &str) -> Result<CacheProfile, String> {
             }
             if let Some(fname) = &cur_fn {
                 let file_key = cur_file.clone().unwrap_or_default();
-                let e = per_fn
-                    .entry((file_key, fname.clone()))
-                    .or_insert(FnCost {
-                        name: fname.clone(),
-                        file: cur_file.clone(),
-                        ir: 0,
-                        dr: 0,
-                        dw: 0,
-                        d1_miss: 0,
-                        ll_miss: 0,
-                    });
-                let g = |name: &str| col(&ev_idx, name).and_then(|i| nums.get(i)).copied().unwrap_or(0);
+                let e = per_fn.entry((file_key, fname.clone())).or_insert(FnCost {
+                    name: fname.clone(),
+                    file: cur_file.clone(),
+                    ir: 0,
+                    dr: 0,
+                    dw: 0,
+                    d1_miss: 0,
+                    ll_miss: 0,
+                });
+                let g = |name: &str| {
+                    col(&ev_idx, name)
+                        .and_then(|i| nums.get(i))
+                        .copied()
+                        .unwrap_or(0)
+                };
                 e.ir += g("Ir");
                 e.dr += g("Dr");
                 e.dw += g("Dw");
@@ -358,7 +361,12 @@ pub fn parse_cachegrind(text: &str) -> Result<CacheProfile, String> {
     }
 
     let mut prof = if let Some(s) = summary {
-        let g = |name: &str| col(&ev_idx, name).and_then(|i| s.get(i)).copied().unwrap_or(0);
+        let g = |name: &str| {
+            col(&ev_idx, name)
+                .and_then(|i| s.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
         CacheProfile {
             ir: g("Ir"),
             dr: g("Dr"),
@@ -401,7 +409,10 @@ fn register_named(rest: &str, table: &mut BTreeMap<u64, String>) -> String {
             let num: u64 = after[..close].parse().unwrap_or(0);
             let name = after[close + 1..].trim();
             if name.is_empty() {
-                return table.get(&num).cloned().unwrap_or_else(|| format!("({num})"));
+                return table
+                    .get(&num)
+                    .cloned()
+                    .unwrap_or_else(|| format!("({num})"));
             } else {
                 table.insert(num, name.to_string());
                 return name.to_string();
@@ -761,10 +772,7 @@ pub fn parse_strace(text: &str) -> BTreeMap<String, u64> {
         // Find the calls column: it's the last purely-numeric column before name
         // when there are >=5 numeric-ish columns. Robust approach: scan numeric
         // tokens; the layout is %time seconds usecs calls [errors].
-        let nums: Vec<u64> = cols
-            .iter()
-            .filter_map(|t| t.parse::<u64>().ok())
-            .collect();
+        let nums: Vec<u64> = cols.iter().filter_map(|t| t.parse::<u64>().ok()).collect();
         // usecs/call and calls are integers; %time & seconds have dots.
         // 'calls' is the first pure-integer with a plausible small magnitude:
         // take the max integer token as calls (calls dominates usecs typically
@@ -1009,7 +1017,9 @@ fn run_dhat(spec: &RunSpec) -> Result<AllocProfile, String> {
         .arg(format!("--dhat-out-file={}", out.display()));
     push_workload(&mut c, spec);
     let status = c.stdout(std::process::Stdio::null());
-    let o = status.output().map_err(|e| format!("spawn valgrind dhat: {e}"))?;
+    let o = status
+        .output()
+        .map_err(|e| format!("spawn valgrind dhat: {e}"))?;
     if !out.exists() {
         return Err(format!(
             "DHAT produced no out-file ({}). stderr:\n{}",
@@ -1351,12 +1361,7 @@ fn report(
     }
     println!("\ngzippy top traffic functions (Dr+Dw):");
     for f in g.cache.fns.iter().take(6) {
-        println!(
-            "  Dr+Dw={:>14}  Ir={:>14}  {}",
-            f.dr + f.dw,
-            f.ir,
-            f.name
-        );
+        println!("  Dr+Dw={:>14}  Ir={:>14}  {}", f.dr + f.dw, f.ir, f.name);
     }
     // Comparator top functions. For a symbol-blind (nasm) comparator these names
     // come from the callgrind+nm pass and are Ir-only (Dr+Dw==0).
@@ -1514,7 +1519,11 @@ pub fn selftest() -> ExitCode {
     check(&mut fails, "dhat no-leak", p.leaked == 0);
     // conservation: Σ site bytes == total
     let site_sum: u64 = p.sites.iter().map(|s| s.bytes).sum();
-    check(&mut fails, "dhat conservation Σsites==total", site_sum == p.total_bytes);
+    check(
+        &mut fails,
+        "dhat conservation Σsites==total",
+        site_sum == p.total_bytes,
+    );
     // top site by bytes is the 4MB compress_block
     check(
         &mut fails,
@@ -1635,12 +1644,20 @@ pub fn selftest() -> ExitCode {
                   100.00    0.001700                   180         2 total\n";
     let sc = parse_strace(strace);
     check(&mut fails, "strace mmap==100", sc.get("mmap") == Some(&100));
-    check(&mut fails, "strace munmap==50", sc.get("munmap") == Some(&50));
+    check(
+        &mut fails,
+        "strace munmap==50",
+        sc.get("munmap") == Some(&50),
+    );
     check(&mut fails, "strace brk==30", sc.get("brk") == Some(&30));
 
     // ---- 7. /usr/bin/time -v parser ----
     let tv = "\tCommand being timed: \"gzippy\"\n\tMaximum resident set size (kbytes): 8452\n";
-    check(&mut fails, "time -v peak_rss", parse_time_v(tv) == Some(8452));
+    check(
+        &mut fails,
+        "time -v peak_rss",
+        parse_time_v(tv) == Some(8452),
+    );
 
     // ---- 8. callgrind+nm symbolization (the nasm st_size=0 fix) ----
     // nm table: three keepable globals + one nasm-local `..@` label that MUST be
@@ -1688,12 +1705,28 @@ pub fn selftest() -> ExitCode {
     );
     let ir_of = |name: &str| sym.fns.iter().find(|f| f.name == name).map(|f| f.ir);
     // 0x1000 (100) + relative +16→0x1010 (50) both fall in func_alpha.
-    check(&mut fails, "cg-sym relative addr → alpha=150", ir_of("func_alpha") == Some(150));
-    check(&mut fails, "cg-sym beta=200", ir_of("func_beta") == Some(200));
+    check(
+        &mut fails,
+        "cg-sym relative addr → alpha=150",
+        ir_of("func_alpha") == Some(150),
+    );
+    check(
+        &mut fails,
+        "cg-sym beta=200",
+        ir_of("func_beta") == Some(200),
+    );
     // 0x3000 (300) + `*` same-addr (5) both fall in func_weak.
-    check(&mut fails, "cg-sym same-addr(*) → weak=305", ir_of("func_weak") == Some(305));
+    check(
+        &mut fails,
+        "cg-sym same-addr(*) → weak=305",
+        ir_of("func_weak") == Some(305),
+    );
     // second object's 40 Ir must NOT be attributed to a target symbol.
-    check(&mut fails, "cg-sym other-obj bucket=40", ir_of("[other-obj]") == Some(40));
+    check(
+        &mut fails,
+        "cg-sym other-obj bucket=40",
+        ir_of("[other-obj]") == Some(40),
+    );
     // hottest is func_weak (305), sorted first.
     check(
         &mut fails,

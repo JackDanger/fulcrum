@@ -76,13 +76,25 @@ pub struct GateResult {
 
 impl GateResult {
     pub fn pass(name: &str, detail: impl Into<String>) -> Self {
-        GateResult { name: name.into(), status: GateStatus::Pass, detail: detail.into() }
+        GateResult {
+            name: name.into(),
+            status: GateStatus::Pass,
+            detail: detail.into(),
+        }
     }
     pub fn fail(name: &str, detail: impl Into<String>) -> Self {
-        GateResult { name: name.into(), status: GateStatus::Fail, detail: detail.into() }
+        GateResult {
+            name: name.into(),
+            status: GateStatus::Fail,
+            detail: detail.into(),
+        }
     }
     pub fn warn(name: &str, detail: impl Into<String>) -> Self {
-        GateResult { name: name.into(), status: GateStatus::Warn, detail: detail.into() }
+        GateResult {
+            name: name.into(),
+            status: GateStatus::Warn,
+            detail: detail.into(),
+        }
     }
     pub fn is_fail(&self) -> bool {
         self.status == GateStatus::Fail
@@ -181,7 +193,10 @@ pub fn gate_encode_fingerprint(subject_cmd: &str, encode_flavor: Option<&str>) -
     if !out.status.success() {
         return GateResult::fail(
             "ENCODE-FINGERPRINT",
-            format!("subject exited {:?} under GZIPPY_DEBUG=1", out.status.code()),
+            format!(
+                "subject exited {:?} under GZIPPY_DEBUG=1",
+                out.status.code()
+            ),
         );
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -265,8 +280,17 @@ pub fn gate_rival(
     // (b) A/A wall ratio brackets 1.0. Timing always uses /dev/null internally,
     //     so this is independent of GATE 1's sink verdict (pass /dev/null here).
     let devnull = PathBuf::from("/dev/null");
-    match run_paired(comparator_tmpl, comparator_tmpl, "true", corpus, n, warmup, &devnull, false, 0)
-    {
+    match run_paired(
+        comparator_tmpl,
+        comparator_tmpl,
+        "true",
+        corpus,
+        n,
+        warmup,
+        &devnull,
+        false,
+        0,
+    ) {
         Ok(r) => {
             let ci = r.aa_ratio_ci;
             if ci[0] <= 1.0 && ci[1] >= 1.0 {
@@ -593,7 +617,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let a = CPreflightArgs {
         a_cmd: a_cmd.to_string(),
         b_cmd: b_cmd.to_string(),
-        roundtrip_cmd: flag(args, "--roundtrip-cmd").unwrap_or("gzip -dc").to_string(),
+        roundtrip_cmd: flag(args, "--roundtrip-cmd")
+            .unwrap_or("gzip -dc")
+            .to_string(),
         corpus,
         input_sha,
         level,
@@ -605,9 +631,13 @@ pub fn run(args: &[String]) -> ExitCode {
         wall_floor_ms: flag(args, "--wall-floor-ms")
             .and_then(|s| s.parse().ok())
             .unwrap_or(WALL_FLOOR_MS),
-        size_reps: flag(args, "--size-reps").and_then(|s| s.parse().ok()).unwrap_or(2),
+        size_reps: flag(args, "--size-reps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2),
         n: flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(5),
-        warmup: flag(args, "--warmup").and_then(|s| s.parse().ok()).unwrap_or(1),
+        warmup: flag(args, "--warmup")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1),
     };
 
     println!(
@@ -629,13 +659,24 @@ pub fn emit(results: &[GateResult]) -> ExitCode {
     for r in results {
         println!("{}", r.line());
     }
-    let failed: Vec<&str> = results.iter().filter(|r| r.is_fail()).map(|r| r.name.as_str()).collect();
+    let failed: Vec<&str> = results
+        .iter()
+        .filter(|r| r.is_fail())
+        .map(|r| r.name.as_str())
+        .collect();
     if failed.is_empty() {
-        let warns = results.iter().filter(|r| r.status == GateStatus::Warn).count();
+        let warns = results
+            .iter()
+            .filter(|r| r.status == GateStatus::Warn)
+            .count();
         println!("CPREFLIGHT=OK gates={} warn={}", results.len(), warns);
         ExitCode::SUCCESS
     } else {
-        println!("CPREFLIGHT=FAIL failed={} gates={}", failed.len(), failed.join(","));
+        println!(
+            "CPREFLIGHT=FAIL failed={} gates={}",
+            failed.len(),
+            failed.join(",")
+        );
         ExitCode::FAILURE
     }
 }
@@ -688,9 +729,15 @@ pub fn selftest() -> ExitCode {
         let f = std::env::temp_dir().join(format!("fulcrum-cpf-sink-{}", std::process::id()));
         let _ = std::fs::write(&f, b"x");
         let bad = gate_sink_law(&f);
-        check("gate1: file sink ⇒ SINK-LAW FAIL", bad.is_fail() && bad.name == "SINK-LAW");
+        check(
+            "gate1: file sink ⇒ SINK-LAW FAIL",
+            bad.is_fail() && bad.name == "SINK-LAW",
+        );
         let good = gate_sink_law(Path::new("/dev/null"));
-        check("gate1: /dev/null ⇒ SINK-LAW PASS", good.status == GateStatus::Pass);
+        check(
+            "gate1: /dev/null ⇒ SINK-LAW PASS",
+            good.status == GateStatus::Pass,
+        );
         let _ = std::fs::remove_file(&f);
     }
 
@@ -701,7 +748,10 @@ pub fn selftest() -> ExitCode {
         let badp = gate_env_hygiene_from(None, Some("-p8".to_string()));
         check("gate9: PIGZ set ⇒ ENV-HYGIENE FAIL", badp.is_fail());
         let good = gate_env_hygiene_from(None, Some(String::new()));
-        check("gate9: both unset/empty ⇒ ENV-HYGIENE PASS", good.status == GateStatus::Pass);
+        check(
+            "gate9: both unset/empty ⇒ ENV-HYGIENE PASS",
+            good.status == GateStatus::Pass,
+        );
     }
 
     // GATE 8 — a busy-spin control FAILs; a sleep PASSes.
@@ -714,7 +764,10 @@ pub fn selftest() -> ExitCode {
             "gate8: sleep control ⇒ CONTROL PASS",
             gate_control(Some("sleep 0.05")).status == GateStatus::Pass,
         );
-        check("gate8: no control ⇒ PASS", gate_control(None).status == GateStatus::Pass);
+        check(
+            "gate8: no control ⇒ PASS",
+            gate_control(None).status == GateStatus::Pass,
+        );
     }
 
     // GATE 6 — box matches neither arch nor host ⇒ FAIL; matches ⇒ PASS; none ⇒ WARN.
@@ -722,15 +775,27 @@ pub fn selftest() -> ExitCode {
         let bad = box_identity_verdict(Some("totally-different-box"), "x86_64", "solvency");
         check("gate6: wrong box ⇒ BOX-IDENTITY FAIL", bad.is_fail());
         let good_host = box_identity_verdict(Some("solvency-amd"), "x86_64", "solvency");
-        check("gate6: host-substring box ⇒ PASS", good_host.status == GateStatus::Pass);
+        check(
+            "gate6: host-substring box ⇒ PASS",
+            good_host.status == GateStatus::Pass,
+        );
         let good_arch = box_identity_verdict(Some("intel-trainer"), "x86_64", "somehost");
-        check("gate6: arch-alias box ⇒ PASS", good_arch.status == GateStatus::Pass);
-        check("gate6: no box ⇒ WARN", box_identity_verdict(None, "x86_64", "h").status == GateStatus::Warn);
+        check(
+            "gate6: arch-alias box ⇒ PASS",
+            good_arch.status == GateStatus::Pass,
+        );
+        check(
+            "gate6: no box ⇒ WARN",
+            box_identity_verdict(None, "x86_64", "h").status == GateStatus::Warn,
+        );
     }
 
     // GATE 7 — pure method selection at the floor.
     {
-        check("gate7: sub-floor ⇒ paired-diff only", admissible_method(35.0, 60.0) == "paired-diff");
+        check(
+            "gate7: sub-floor ⇒ paired-diff only",
+            admissible_method(35.0, 60.0) == "paired-diff",
+        );
         check(
             "gate7: above-floor ⇒ either admissible",
             admissible_method(120.0, 60.0) == "paired-diff-or-best-of-N",
@@ -750,7 +815,9 @@ pub fn selftest() -> ExitCode {
         let fixture = std::env::temp_dir().join(format!("fulcrum-cpf-fx-{pid}"));
         let mut body = String::new();
         for i in 0..512 {
-            body.push_str(&format!("the quick brown fox {i} jumps over the lazy dog {i}\n"));
+            body.push_str(&format!(
+                "the quick brown fox {i} jumps over the lazy dog {i}\n"
+            ));
         }
         let _ = std::fs::write(&fixture, body.as_bytes());
         let input_sha = sha256_of_file(&fixture).unwrap_or_default();
@@ -792,7 +859,10 @@ pub fn selftest() -> ExitCode {
         // GATE 4 — plain gzip emits no `encode-path=` line ⇒ ENCODE-FINGERPRINT
         //          FAIL (this is exactly what a non-fingerprint gzippy build does).
         let fp = gate_encode_fingerprint(&good, None);
-        check("gate4: no encode-path= ⇒ ENCODE-FINGERPRINT FAIL", fp.is_fail());
+        check(
+            "gate4: no encode-path= ⇒ ENCODE-FINGERPRINT FAIL",
+            fp.is_fail(),
+        );
         check(
             "gate4: FAIL detail points at the fingerprint branch",
             fp.detail.contains("feat/compress-encode-fingerprint"),
@@ -827,7 +897,10 @@ mod tests {
         let f = std::env::temp_dir().join(format!("fulcrum-cpf-ut-sink-{}", std::process::id()));
         std::fs::write(&f, b"x").unwrap();
         assert!(gate_sink_law(&f).is_fail());
-        assert_eq!(gate_sink_law(Path::new("/dev/null")).status, GateStatus::Pass);
+        assert_eq!(
+            gate_sink_law(Path::new("/dev/null")).status,
+            GateStatus::Pass
+        );
         let _ = std::fs::remove_file(&f);
     }
 
@@ -835,10 +908,7 @@ mod tests {
     fn env_hygiene_flags_set_vars() {
         assert!(gate_env_hygiene_from(Some("-9".into()), None).is_fail());
         assert!(gate_env_hygiene_from(None, Some("-p8".into())).is_fail());
-        assert_eq!(
-            gate_env_hygiene_from(None, None).status,
-            GateStatus::Pass
-        );
+        assert_eq!(gate_env_hygiene_from(None, None).status, GateStatus::Pass);
         // empty-string vars are treated as unset.
         assert_eq!(
             gate_env_hygiene_from(Some(String::new()), Some(String::new())).status,
@@ -871,7 +941,10 @@ mod tests {
             box_identity_verdict(Some("apple-m1"), "aarch64", "h").status,
             GateStatus::Pass
         );
-        assert_eq!(box_identity_verdict(None, "x86_64", "h").status, GateStatus::Warn);
+        assert_eq!(
+            box_identity_verdict(None, "x86_64", "h").status,
+            GateStatus::Warn
+        );
     }
 
     #[test]

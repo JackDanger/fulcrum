@@ -227,8 +227,7 @@ pub fn run() -> ExitCode {
                 d.a_name, d.region_count
             ));
         }
-        if d
-            .decision_pattern_regions
+        if d.decision_pattern_regions
             .get(crate::ratio::diff::DecisionPattern::BothLitOnly.label())
             .is_some()
         {

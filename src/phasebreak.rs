@@ -610,8 +610,8 @@ fn run_once(
     // KIND-DISPATCH the emitter lines — never "the last non-empty line". One
     // decode writes one phasebreak line and (on a build that emits it) one
     // pathaccount line; grabbing the last line would silently keep only one.
-    let (phases, paths) = split_by_kind(&content)
-        .map_err(|e| format!("phasebreak: run {run_idx}: {e}"))?;
+    let (phases, paths) =
+        split_by_kind(&content).map_err(|e| format!("phasebreak: run {run_idx}: {e}"))?;
     let phase = phases.into_iter().next_back().ok_or_else(|| {
         format!(
             "phasebreak: run {run_idx}: GZIPPY_PHASE_OUT file had no phasebreak line — the \
@@ -921,7 +921,12 @@ pub fn run(args: &PhasebreakArgs) -> Result<Report, String> {
         records.push(record);
     }
 
-    Ok(build_report(args.threads, &records, &path_records, warnings))
+    Ok(build_report(
+        args.threads,
+        &records,
+        &path_records,
+        warnings,
+    ))
 }
 
 /// Render `HELP` with the leading blank line `chainlat`-style callers expect
@@ -1353,8 +1358,14 @@ mod tests {
         // A foreign-but-legitimate kind (e.g. the emitter's "outerbreak") is
         // SKIPPED, not refused — else a real run would abort over a line we
         // simply don't consume.
-        assert!(parse_line_by_kind(r#"{"kind":"outerbreak","protocol":1,"x":1}"#).unwrap().is_none());
-        assert!(parse_line_by_kind(r#"{"kind":"somethingelse"}"#).unwrap().is_none());
+        assert!(
+            parse_line_by_kind(r#"{"kind":"outerbreak","protocol":1,"x":1}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_line_by_kind(r#"{"kind":"somethingelse"}"#)
+            .unwrap()
+            .is_none());
         assert_eq!(parse_line_by_kind("   ").unwrap().is_none(), true);
         // Malformed JSON still REFUSES (a corrupt line must be noticed).
         assert!(parse_line_by_kind("{not json").is_err());
@@ -1377,10 +1388,9 @@ mod tests {
         // pathaccount line has a deliberately broken byte count (contig off by
         // 1000). This must REFUSE at RUNTIME via run() — the exact hole P0a
         // fixed (the check formerly lived only in #[cfg(test)]).
-        let broken = QWEN_T4_PATHACCOUNT.replace("\"contig_bytes\":956183883", "\"contig_bytes\":956182883");
-        let jsonl = format!(
-            "{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{broken}\n"
-        );
+        let broken =
+            QWEN_T4_PATHACCOUNT.replace("\"contig_bytes\":956183883", "\"contig_bytes\":956182883");
+        let jsonl = format!("{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{broken}\n");
         let dir = std::env::temp_dir().join(format!("fulcrum-pb-selftest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("phases.jsonl");
@@ -1404,10 +1414,10 @@ mod tests {
 
     #[test]
     fn from_file_conserving_pathaccount_passes_and_surfaces_marker_fraction() {
-        let jsonl = format!(
-            "{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n"
-        );
-        let dir = std::env::temp_dir().join(format!("fulcrum-pb-selftest-ok-{}", std::process::id()));
+        let jsonl =
+            format!("{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n{PHASE_LINE}\n{QWEN_T4_PATHACCOUNT}\n");
+        let dir =
+            std::env::temp_dir().join(format!("fulcrum-pb-selftest-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("phases.jsonl");
         std::fs::write(&path, jsonl).unwrap();
@@ -1422,7 +1432,9 @@ mod tests {
         };
         let r = run(&args).expect("conserving pathaccount should pass Gate-0");
         // Marker byte-fraction surfaced (qwen literal-heavy: ~2-3%).
-        let bf = r.marker_byte_fraction.expect("marker byte fraction present");
+        let bf = r
+            .marker_byte_fraction
+            .expect("marker byte fraction present");
         assert!(bf < 0.035, "marker byte fraction {bf} should be tiny");
         assert!(r.n_pathaccount >= 1);
         let _ = std::fs::remove_dir_all(&dir);

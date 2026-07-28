@@ -74,10 +74,18 @@ pub struct Tiered {
 
 impl Tiered {
     pub fn new(value: f64, tier: &str) -> Self {
-        Tiered { value, tier: tier.to_string(), ci: None }
+        Tiered {
+            value,
+            tier: tier.to_string(),
+            ci: None,
+        }
     }
     pub fn with_ci(value: f64, tier: &str, ci: [f64; 2]) -> Self {
-        Tiered { value, tier: tier.to_string(), ci: Some(ci) }
+        Tiered {
+            value,
+            tier: tier.to_string(),
+            ci: Some(ci),
+        }
     }
 }
 
@@ -199,7 +207,9 @@ pub fn self_domination_flags(points: &[SweptPoint]) -> Vec<Flag> {
             }
             if points[j].size_bytes <= points[i].size_bytes
                 && points[j].coarse_wall_ms < points[i].coarse_wall_ms
-                && dom.map_or(true, |d| points[j].coarse_wall_ms < points[d].coarse_wall_ms)
+                && dom.map_or(true, |d| {
+                    points[j].coarse_wall_ms < points[d].coarse_wall_ms
+                })
             {
                 dom = Some(j);
             }
@@ -259,12 +269,15 @@ pub fn self_domination_flags(points: &[SweptPoint]) -> Vec<Flag> {
 /// Returns the index into `ours`, or `None` ⇒ NO-STORAGE-COVERAGE (a real curve
 /// hole at the tight end). ε is directional: shrinking it only ever excludes
 /// MORE candidates, so a witness can only make the gated verdict CONSERVATIVE.
-pub fn select_witness(ours: &[SweptPoint], ours_flags: &[bool], size_v: u64, eps: f64) -> Option<usize> {
+pub fn select_witness(
+    ours: &[SweptPoint],
+    ours_flags: &[bool],
+    size_v: u64,
+    eps: f64,
+) -> Option<usize> {
     let thr = (size_v as f64) * (1.0 + eps);
     let cands: Vec<usize> = (0..ours.len())
-        .filter(|&i| {
-            ours[i].usable() && ours_flags[i] && (ours[i].size_bytes as f64) <= thr
-        })
+        .filter(|&i| ours[i].usable() && ours_flags[i] && (ours[i].size_bytes as f64) <= thr)
         .collect();
     cands.into_iter().min_by(|&a, &b| {
         f_cmp(ours[a].coarse_wall_ms, ours[b].coarse_wall_ms)
@@ -585,7 +598,12 @@ pub fn curve_verdict(points: &[PointVerdict], tie_pareto: bool) -> CurveVerdict 
 
 /// Conservation self-test: every vendor level lands in exactly one of
 /// verdicts ∪ derived ∪ dropped.
-pub fn conservation_ok(total_levels: usize, verdicts: usize, derived: usize, dropped: usize) -> bool {
+pub fn conservation_ok(
+    total_levels: usize,
+    verdicts: usize,
+    derived: usize,
+    dropped: usize,
+) -> bool {
     verdicts + derived + dropped == total_levels
 }
 
@@ -822,7 +840,11 @@ pub fn frontier_companion_matrices(res: &FrontierResult) -> Vec<MatrixResult> {
             epsilon: m.size_eps,
             roundtrip_cmd: m.roundtrip_cmd.clone(),
         };
-        out.push(MatrixResult { manifest, cells, summary });
+        out.push(MatrixResult {
+            manifest,
+            cells,
+            summary,
+        });
     }
     out
 }

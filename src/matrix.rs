@@ -554,7 +554,14 @@ impl MatrixResult {
         }
         let total = cells.len();
         let status = if void == 0 { "OK" } else { "PARTIAL" }.to_string();
-        MatrixSummary { win, tie, loss, void, total, status }
+        MatrixSummary {
+            win,
+            tie,
+            loss,
+            void,
+            total,
+            status,
+        }
     }
 }
 
@@ -664,8 +671,20 @@ pub fn run_matrix(
     timestamp: &str,
 ) -> MatrixResult {
     run_matrix_gated(
-        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpora, threads, n, warmup, sink, do_sha, ours,
-        box_name, sha_pins, timestamp, None,
+        a_cmd_tmpl,
+        b_cmd_tmpl,
+        ref_cmd_tmpl,
+        corpora,
+        threads,
+        n,
+        warmup,
+        sink,
+        do_sha,
+        ours,
+        box_name,
+        sha_pins,
+        timestamp,
+        None,
     )
 }
 
@@ -692,8 +711,22 @@ pub fn run_matrix_gated(
     gate: Option<&mut dyn CellGate>,
 ) -> MatrixResult {
     run_matrix_gated_pinned(
-        a_cmd_tmpl, b_cmd_tmpl, ref_cmd_tmpl, corpora, threads, n, warmup, sink, do_sha, ours,
-        box_name, sha_pins, timestamp, &Pin::None, 0, gate,
+        a_cmd_tmpl,
+        b_cmd_tmpl,
+        ref_cmd_tmpl,
+        corpora,
+        threads,
+        n,
+        warmup,
+        sink,
+        do_sha,
+        ours,
+        box_name,
+        sha_pins,
+        timestamp,
+        &Pin::None,
+        0,
+        gate,
     )
 }
 
@@ -758,7 +791,9 @@ pub fn run_matrix_gated_pinned(
         // reference decode is NOT pinned (it never enters the wall).
         let (a_t, b_t) = cell_cmds(a_cmd_tmpl, b_cmd_tmpl, t, pin);
         let ref_t = expand_threads(ref_cmd_tmpl, t);
-        let result = run_paired(&a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha, rss_reps);
+        let result = run_paired(
+            &a_t, &b_t, &ref_t, &corpus, n, warmup, sink, do_sha, rss_reps,
+        );
         // Release THIS cell's freeze on EVERY path, before recording the result.
         if let Some(g) = gate.as_deref_mut() {
             g.exit(&corpus, t);
@@ -833,7 +868,11 @@ pub fn run_matrix_gated_pinned(
         epsilon: 0.0,
         roundtrip_cmd: String::new(),
     };
-    MatrixResult { manifest, cells, summary }
+    MatrixResult {
+        manifest,
+        cells,
+        summary,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -938,7 +977,16 @@ pub fn run_matrix_compress_pinned(
         };
         // ref_cmd is unused in compress mode; "true" is a harmless placeholder.
         let result = run_paired_inner(
-            &a_t, &b_t, "true", &corpus, n, warmup, sink, false, rss_reps, Some(&cfg),
+            &a_t,
+            &b_t,
+            "true",
+            &corpus,
+            n,
+            warmup,
+            sink,
+            false,
+            rss_reps,
+            Some(&cfg),
         );
         if let Some(g) = gate.as_deref_mut() {
             g.exit(&corpus, t);
@@ -999,7 +1047,11 @@ pub fn run_matrix_compress_pinned(
         epsilon,
         roundtrip_cmd: roundtrip_cmd.to_string(),
     };
-    Ok(MatrixResult { manifest, cells, summary })
+    Ok(MatrixResult {
+        manifest,
+        cells,
+        summary,
+    })
 }
 
 /// A VOID compress cell (freeze-acquire failure or a per-cell run error).
@@ -1111,7 +1163,11 @@ pub fn synth_compress_result(cells: Vec<MatrixCell>, levels: Vec<u32>) -> Matrix
         epsilon: DEFAULT_EPSILON,
         roundtrip_cmd: "gzip -dc".to_string(),
     };
-    MatrixResult { manifest, cells, summary }
+    MatrixResult {
+        manifest,
+        cells,
+        summary,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1193,11 @@ pub fn render_grid(r: &MatrixResult) -> String {
         r.manifest.warmup,
         r.manifest.box_name,
         r.manifest.timestamp,
-        if r.manifest.pin.is_empty() { "pin=?" } else { &r.manifest.pin },
+        if r.manifest.pin.is_empty() {
+            "pin=?"
+        } else {
+            &r.manifest.pin
+        },
     ));
     out.push_str(&format!("  a(ours-if-a)= {}\n", r.manifest.a_cmd));
     out.push_str(&format!("  b(ours-if-b)= {}\n", r.manifest.b_cmd));
@@ -1214,7 +1274,12 @@ pub fn render_grid(r: &MatrixResult) -> String {
     }
     out.push_str(&format!(
         "summary: WIN={} TIE={} LOSS={} VOID={} total={}  MATRIX={}\n",
-        r.summary.win, r.summary.tie, r.summary.loss, r.summary.void, r.summary.total, r.summary.status
+        r.summary.win,
+        r.summary.tie,
+        r.summary.loss,
+        r.summary.void,
+        r.summary.total,
+        r.summary.status
     ));
     out
 }
@@ -1260,7 +1325,11 @@ pub fn render_grid_compress(r: &MatrixResult) -> String {
         r.manifest.epsilon,
         r.manifest.box_name,
         r.manifest.timestamp,
-        if r.manifest.pin.is_empty() { "pin=?" } else { &r.manifest.pin },
+        if r.manifest.pin.is_empty() {
+            "pin=?"
+        } else {
+            &r.manifest.pin
+        },
     ));
     out.push_str(&format!("  a(ours-if-a)= {}\n", r.manifest.a_cmd));
     out.push_str(&format!("  b(ours-if-b)= {}\n", r.manifest.b_cmd));
@@ -1322,7 +1391,9 @@ pub fn render_grid_compress(r: &MatrixResult) -> String {
     if losers.is_empty() {
         out.push_str("\nLOSS LIST: none\n");
     } else {
-        out.push_str("\nLOSS LIST (severity = max(wall_deficit, size_deficit); axis SPEED|RATIO):\n");
+        out.push_str(
+            "\nLOSS LIST (severity = max(wall_deficit, size_deficit); axis SPEED|RATIO):\n",
+        );
         for c in losers {
             let sev = wall_deficit(c).max(size_deficit(c));
             let axis = if !c.loss_axis.is_empty() {
@@ -1354,7 +1425,12 @@ pub fn render_grid_compress(r: &MatrixResult) -> String {
 
     out.push_str(&format!(
         "summary: WIN={} TIE={} LOSS={} VOID={} total={}  MATRIX={}\n",
-        r.summary.win, r.summary.tie, r.summary.loss, r.summary.void, r.summary.total, r.summary.status
+        r.summary.win,
+        r.summary.tie,
+        r.summary.loss,
+        r.summary.void,
+        r.summary.total,
+        r.summary.status
     ));
     out
 }
@@ -1471,8 +1547,19 @@ pub fn selftest() -> ExitCode {
     // truth-table above; end-to-end CLASS correctness is pinned by the
     // decisive-signal slower-B grid below.
     let m1 = run_matrix(
-        "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true, Arm::A,
-        "selftest-box", &pins, "1970-01-01T00:00:00Z",
+        "sleep 0.02",
+        "sleep 0.02",
+        "true",
+        &corpora,
+        &threads,
+        n,
+        warmup,
+        &devnull,
+        true,
+        Arm::A,
+        "selftest-box",
+        &pins,
+        "1970-01-01T00:00:00Z",
     );
     check("grid1: 4 cells present", m1.cells.len() == 4);
     check(
@@ -1507,7 +1594,9 @@ pub fn selftest() -> ExitCode {
         Ok(js) => {
             check(
                 "grid1: JSON has manifest+cells+summary",
-                js.contains("\"manifest\"") && js.contains("\"cells\"") && js.contains("\"summary\""),
+                js.contains("\"manifest\"")
+                    && js.contains("\"cells\"")
+                    && js.contains("\"summary\""),
             );
             match serde_json::from_str::<MatrixResult>(&js) {
                 Ok(rt) => {
@@ -1541,8 +1630,19 @@ pub fn selftest() -> ExitCode {
     let one = [PathBuf::from("/tmp/cA.gz")];
     let one_t = [1u32];
     let m2 = run_matrix(
-        "sleep 0.05", "sleep 0.25", "true", &one, &one_t, n, warmup, &devnull, true, Arm::A,
-        "selftest-box", &pins, "1970-01-01T00:00:00Z",
+        "sleep 0.05",
+        "sleep 0.25",
+        "true",
+        &one,
+        &one_t,
+        n,
+        warmup,
+        &devnull,
+        true,
+        Arm::A,
+        "selftest-box",
+        &pins,
+        "1970-01-01T00:00:00Z",
     );
     check("grid2: cell present", m2.cells.len() == 1);
     // The A/B margin GUARANTEES the direction (b decisively slower): the cell can
@@ -1559,7 +1659,10 @@ pub fn selftest() -> ExitCode {
         check("grid2: scored WIN ⇒ ratio<1 (ours faster)", c2.ratio < 1.0);
         check(
             "grid2: scored WIN ⇒ verdict RESOLVED-b-slower",
-            c2.paired.as_ref().map(|p| p.verdict == "RESOLVED-b-slower").unwrap_or(false),
+            c2.paired
+                .as_ref()
+                .map(|p| p.verdict == "RESOLVED-b-slower")
+                .unwrap_or(false),
         );
         check("grid2: scored WIN ⇒ MATRIX=OK", m2.summary.status == "OK");
     } else {
@@ -1569,8 +1672,19 @@ pub fn selftest() -> ExitCode {
     // Orientation flip: SAME data scored with --ours b ⇒ LOSS (or VOID from the
     // cert). Same margin ⇒ never WIN/TIE.
     let m2b = run_matrix(
-        "sleep 0.05", "sleep 0.25", "true", &one, &one_t, n, warmup, &devnull, true, Arm::B,
-        "selftest-box", &pins, "1970-01-01T00:00:00Z",
+        "sleep 0.05",
+        "sleep 0.25",
+        "true",
+        &one,
+        &one_t,
+        n,
+        warmup,
+        &devnull,
+        true,
+        Arm::B,
+        "selftest-box",
+        &pins,
+        "1970-01-01T00:00:00Z",
     );
     let c2b = &m2b.cells[0];
     check(
@@ -1578,9 +1692,14 @@ pub fn selftest() -> ExitCode {
         c2b.class == "LOSS" || c2b.class == "VOID",
     );
     if c2b.class == "LOSS" {
-        check("grid2b: scored ⇒ orientation flips WIN→LOSS", m2b.summary.loss == 1);
+        check(
+            "grid2b: scored ⇒ orientation flips WIN→LOSS",
+            m2b.summary.loss == 1,
+        );
     } else {
-        println!("  NOTE grid2b cell VOID (A/A cert false-resolve, inherent ~5%) — flip check skipped");
+        println!(
+            "  NOTE grid2b cell VOID (A/A cert false-resolve, inherent ~5%) — flip check skipped"
+        );
     }
 
     // -- DRY-RUN plan (composes under `fulcrum freeze run --dry-run`) --------
@@ -1621,18 +1740,41 @@ pub fn selftest() -> ExitCode {
             }
         }
 
-        let mut g = RecordingGate { log: vec![], fail_on: None };
+        let mut g = RecordingGate {
+            log: vec![],
+            fail_on: None,
+        };
         let m = run_matrix_gated(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", Some(&mut g),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &devnull,
+            true,
+            Arm::A,
+            "selftest-box",
+            &pins,
+            "1970-01-01T00:00:00Z",
+            Some(&mut g),
         );
         let enters = g.log.iter().filter(|l| l.starts_with("enter")).count();
         let exits = g.log.iter().filter(|l| l.starts_with("exit")).count();
-        check("freeze-each: enter fired once per cell", enters == m.cells.len());
-        check("freeze-each: exit fired once per cell (balanced)", exits == enters);
+        check(
+            "freeze-each: enter fired once per cell",
+            enters == m.cells.len(),
+        );
+        check(
+            "freeze-each: exit fired once per cell (balanced)",
+            exits == enters,
+        );
         check(
             "freeze-each: strictly interleaved enter,exit,enter,exit…",
-            g.log.chunks(2).all(|w| w.len() == 2 && w[0].starts_with("enter") && w[1].starts_with("exit")),
+            g.log
+                .chunks(2)
+                .all(|w| w.len() == 2 && w[0].starts_with("enter") && w[1].starts_with("exit")),
         );
         check(
             "freeze-each: banked method records freeze-per-cell provenance",
@@ -1641,8 +1783,19 @@ pub fn selftest() -> ExitCode {
         check(
             "ungated run does NOT claim freeze-per-cell",
             !run_matrix(
-                "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-                Arm::A, "b", &pins, "ts",
+                "sleep 0.02",
+                "sleep 0.02",
+                "true",
+                &corpora,
+                &threads,
+                n,
+                warmup,
+                &devnull,
+                true,
+                Arm::A,
+                "b",
+                &pins,
+                "ts",
             )
             .manifest
             .method
@@ -1655,8 +1808,20 @@ pub fn selftest() -> ExitCode {
             fail_on: Some((corpora[0].display().to_string(), threads[0])),
         };
         let mf = run_matrix_gated(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "b", &pins, "ts", Some(&mut gf),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &devnull,
+            true,
+            Arm::A,
+            "b",
+            &pins,
+            "ts",
+            Some(&mut gf),
         );
         let failed = mf
             .cells
@@ -1668,7 +1833,10 @@ pub fn selftest() -> ExitCode {
                 .map(|c| {
                     c.class == "VOID"
                         && c.paired.is_none()
-                        && c.error.as_deref().map(|e| e.contains("freeze-each acquire FAILED")).unwrap_or(false)
+                        && c.error
+                            .as_deref()
+                            .map(|e| e.contains("freeze-each acquire FAILED"))
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false),
         );
@@ -1737,9 +1905,10 @@ pub fn selftest() -> ExitCode {
             impl CellGate for AssertFrozenGate {
                 fn enter(&mut self, c: &Path, t: u32) -> Result<(), String> {
                     self.inner.enter(c, t)?;
-                    let boost = std::fs::read_to_string(crate::freeze::boost_path(&self.sysfs_root))
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_default();
+                    let boost =
+                        std::fs::read_to_string(crate::freeze::boost_path(&self.sysfs_root))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
                     if boost == "0" {
                         self.saw_boost0 = true;
                     }
@@ -1770,11 +1939,26 @@ pub fn selftest() -> ExitCode {
             let one = [PathBuf::from("/tmp/cA.gz")];
             let one_t = [1u32];
             let _ = run_matrix_gated(
-                "sleep 0.02", "sleep 0.02", "true", &one, &one_t, n, warmup, &devnull, true,
-                Arm::A, "frz-box", &pins, "ts", Some(&mut ag),
+                "sleep 0.02",
+                "sleep 0.02",
+                "true",
+                &one,
+                &one_t,
+                n,
+                warmup,
+                &devnull,
+                true,
+                Arm::A,
+                "frz-box",
+                &pins,
+                "ts",
+                Some(&mut ag),
             );
             check("freeze-each e2e: box boost==0 AT cell time", ag.saw_boost0);
-            check("freeze-each e2e: tenant SIGSTOPped AT cell time", ag.saw_stopped);
+            check(
+                "freeze-each e2e: tenant SIGSTOPped AT cell time",
+                ag.saw_stopped,
+            );
             // dropping ag runs no release (already exited); assert post-state.
             drop(ag);
             check(
@@ -1787,7 +1971,11 @@ pub fn selftest() -> ExitCode {
                 "freeze-each e2e: tenant RUNNING again after the cell",
                 crate::freeze::pgrep(&format!("f:{marker}"))
                     .iter()
-                    .all(|&p| crate::freeze::ps_stat(p).map(|s| !crate::freeze::stat_is_stopped(&s)).unwrap_or(true)),
+                    .all(|&p| {
+                        crate::freeze::ps_stat(p)
+                            .map(|s| !crate::freeze::stat_is_stopped(&s))
+                            .unwrap_or(true)
+                    }),
             );
             check(
                 "freeze-each e2e: per-cell state file removed (no orphan lock)",
@@ -1809,9 +1997,18 @@ pub fn selftest() -> ExitCode {
     // pinned-paired equivalence, the stable classification, and the provenance.
     {
         // (a) canonical per-T mask convention: T=1→"0", else "0-(T-1)".
-        check("pin: PerThread mask T1 == 0", Pin::PerThread.mask(1).as_deref() == Some("0"));
-        check("pin: PerThread mask T4 == 0-3", Pin::PerThread.mask(4).as_deref() == Some("0-3"));
-        check("pin: PerThread mask T16 == 0-15", Pin::PerThread.mask(16).as_deref() == Some("0-15"));
+        check(
+            "pin: PerThread mask T1 == 0",
+            Pin::PerThread.mask(1).as_deref() == Some("0"),
+        );
+        check(
+            "pin: PerThread mask T4 == 0-3",
+            Pin::PerThread.mask(4).as_deref() == Some("0-3"),
+        );
+        check(
+            "pin: PerThread mask T16 == 0-15",
+            Pin::PerThread.mask(16).as_deref() == Some("0-15"),
+        );
         check("pin: None mask is None", Pin::None.mask(8).is_none());
         check(
             "pin: Tmpl substitutes {Tm1}/{T}",
@@ -1873,15 +2070,23 @@ pub fn selftest() -> ExitCode {
             a == format!("taskset -c {mask} {}", expand_threads(a_tmpl, t))
                 && b == format!("taskset -c {mask} {}", expand_threads(b_tmpl, t))
         });
-        check("pin: matrix cell command == hand-pinned paired (all T)", equal_all_t);
+        check(
+            "pin: matrix cell command == hand-pinned paired (all T)",
+            equal_all_t,
+        );
 
         // (d) CLASSIFICATION is STABLE under pinning: a fixed synthetic paired
         //     log-ratio vector (CI excludes 0, hi<0 ⇒ RESOLVED-b-slower) classifies
         //     the SAME as pinned paired — WIN for ours=a, flipping to LOSS for
         //     ours=b — with NO drift-induced sign flip.
-        let lr = [-0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11];
+        let lr = [
+            -0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11,
+        ];
         let verdict = crate::paired::ab_verdict(&crate::paired::ci95(&lr));
-        check("pin: fixed vector → paired RESOLVED-b-slower", verdict == "RESOLVED-b-slower");
+        check(
+            "pin: fixed vector → paired RESOLVED-b-slower",
+            verdict == "RESOLVED-b-slower",
+        );
         check(
             "pin: pinned matrix classify == paired verdict (ours=a → WIN)",
             classify("OK", verdict, Arm::A) == CellClass::Win,
@@ -1896,8 +2101,22 @@ pub fn selftest() -> ExitCode {
         let corpora = vec![PathBuf::from("/tmp/cA.gz")];
         let threads = vec![1u32];
         let pinned = run_matrix_gated_pinned(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, 0, None,
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &devnull,
+            true,
+            Arm::A,
+            "selftest-box",
+            &pins,
+            "1970-01-01T00:00:00Z",
+            &Pin::PerThread,
+            0,
+            None,
         );
         check(
             "pin: pinned manifest records taskset-per-thread provenance",
@@ -1905,23 +2124,53 @@ pub fn selftest() -> ExitCode {
                 && pinned.manifest.method.contains("pin=taskset-per-thread"),
         );
         let unpinned = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &devnull,
+            true,
+            Arm::A,
+            "selftest-box",
+            &pins,
+            "1970-01-01T00:00:00Z",
         );
-        check("pin: ungated entry banks pin=none", unpinned.manifest.pin == "pin=none");
+        check(
+            "pin: ungated entry banks pin=none",
+            unpinned.manifest.pin == "pin=none",
+        );
 
         // (f) COMPOSES with freeze-each: pin + a per-cell gate both fire; the
         //     banked method carries BOTH provenances (pin prefixes the command,
         //     freeze wraps the cell — orthogonal).
         struct NopGate;
         impl CellGate for NopGate {
-            fn enter(&mut self, _c: &Path, _t: u32) -> Result<(), String> { Ok(()) }
+            fn enter(&mut self, _c: &Path, _t: u32) -> Result<(), String> {
+                Ok(())
+            }
             fn exit(&mut self, _c: &Path, _t: u32) {}
         }
         let mut g = NopGate;
         let both = run_matrix_gated_pinned(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, n, warmup, &devnull, true,
-            Arm::A, "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::PerThread, 0, Some(&mut g),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &devnull,
+            true,
+            Arm::A,
+            "selftest-box",
+            &pins,
+            "1970-01-01T00:00:00Z",
+            &Pin::PerThread,
+            0,
+            Some(&mut g),
         );
         check(
             "pin: composes with freeze-each (method carries pin AND freeze-per-cell)",
@@ -1947,9 +2196,12 @@ pub fn selftest() -> ExitCode {
         if !gzip_ok {
             println!("  NOTE compress e2e skipped (gzip unavailable)");
         } else {
-            let fx = std::env::temp_dir().join(format!("fulcrum-matrix-cm-{}.raw", std::process::id()));
+            let fx =
+                std::env::temp_dir().join(format!("fulcrum-matrix-cm-{}.raw", std::process::id()));
             // A compressible-but-nontrivial fixture (repeated but not all-zero).
-            let body: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            let body: Vec<u8> = (0..200_000u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect();
             let fx_ok = std::fs::write(&fx, &body).is_ok();
             if !fx_ok {
                 println!("  NOTE compress e2e skipped (could not write fixture)");
@@ -1961,13 +2213,29 @@ pub fn selftest() -> ExitCode {
                     "gzip -{level} -c {corpus}",
                     "gzip -{level} -c {corpus}",
                     "gzip -dc",
-                    &corpora, &levels, &one_t, 7, 1, &devnull, 2, Arm::A, DEFAULT_EPSILON,
-                    "selftest-box", &pins, "1970-01-01T00:00:00Z", &Pin::None, 0, &HashMap::new(),
+                    &corpora,
+                    &levels,
+                    &one_t,
+                    7,
+                    1,
+                    &devnull,
+                    2,
+                    Arm::A,
+                    DEFAULT_EPSILON,
+                    "selftest-box",
+                    &pins,
+                    "1970-01-01T00:00:00Z",
+                    &Pin::None,
+                    0,
+                    &HashMap::new(),
                     None,
                 );
                 match r {
                     Ok(r) => {
-                        check("compress e2e: 2 cells present (levels 1,6 × T1)", r.cells.len() == 2);
+                        check(
+                            "compress e2e: 2 cells present (levels 1,6 × T1)",
+                            r.cells.len() == 2,
+                        );
                         check(
                             "compress e2e: manifest mode=compress + levels + ε + roundtrip",
                             r.manifest.mode == "compress"
@@ -1977,7 +2245,9 @@ pub fn selftest() -> ExitCode {
                         );
                         check(
                             "compress e2e: A/A ⇒ size_ratio≈1.0 every cell",
-                            r.cells.iter().all(|c| (c.size_ratio - 1.0).abs() < DEFAULT_EPSILON),
+                            r.cells
+                                .iter()
+                                .all(|c| (c.size_ratio - 1.0).abs() < DEFAULT_EPSILON),
                         );
                         check(
                             "compress e2e: A/A ⇒ size_class NEUTRAL every cell",
@@ -1985,11 +2255,14 @@ pub fn selftest() -> ExitCode {
                         );
                         check(
                             "compress e2e: exact equal byte counts (>0) both arms",
-                            r.cells.iter().all(|c| c.a_size_bytes == c.b_size_bytes && c.a_size_bytes > 0),
+                            r.cells
+                                .iter()
+                                .all(|c| c.a_size_bytes == c.b_size_bytes && c.a_size_bytes > 0),
                         );
                         check(
                             "compress e2e: cells carry the LEVEL axis (1 and 6)",
-                            r.cells.iter().any(|c| c.level == 1) && r.cells.iter().any(|c| c.level == 6),
+                            r.cells.iter().any(|c| c.level == 1)
+                                && r.cells.iter().any(|c| c.level == 6),
                         );
                         // JSON round-trips with the new fields.
                         match serde_json::to_string(&r).and_then(|js| {
@@ -2019,7 +2292,9 @@ pub fn selftest() -> ExitCode {
                         let g = render_grid(&r);
                         check(
                             "compress e2e: render has per-level grid + LOSS LIST",
-                            g.contains("level 1") && g.contains("level 6") && g.contains("LOSS LIST"),
+                            g.contains("level 1")
+                                && g.contains("level 6")
+                                && g.contains("LOSS LIST"),
                         );
                     }
                     Err(e) => check(&format!("compress e2e: runner errored ({e})"), false),
@@ -2036,26 +2311,44 @@ pub fn selftest() -> ExitCode {
     {
         let e = DEFAULT_EPSILON;
         // RATIO loss: faster but 2% bigger output.
-        let ratio_loss = synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
+        let ratio_loss =
+            synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
         // SPEED loss: size-neutral but slower.
-        let speed_loss = synth_compress_cell("silesia", 6, 4, "OK", "RESOLVED-a-slower", 1.0, Arm::A, e);
+        let speed_loss =
+            synth_compress_cell("silesia", 6, 4, "OK", "RESOLVED-a-slower", 1.0, Arm::A, e);
         // WIN: size-neutral + faster.
         let win = synth_compress_cell("weights", 6, 1, "OK", "RESOLVED-b-slower", 1.0, Arm::A, e);
 
-        check("synth: RATIO-loss cell classes LOSS/axis=RATIO",
-            ratio_loss.class == "LOSS" && ratio_loss.loss_axis == "RATIO");
-        check("synth: SPEED-loss cell classes LOSS/axis=SPEED",
-            speed_loss.class == "LOSS" && speed_loss.loss_axis == "SPEED");
-        check("synth: WIN cell classes WIN/no axis", win.class == "WIN" && win.loss_axis.is_empty());
+        check(
+            "synth: RATIO-loss cell classes LOSS/axis=RATIO",
+            ratio_loss.class == "LOSS" && ratio_loss.loss_axis == "RATIO",
+        );
+        check(
+            "synth: SPEED-loss cell classes LOSS/axis=SPEED",
+            speed_loss.class == "LOSS" && speed_loss.loss_axis == "SPEED",
+        );
+        check(
+            "synth: WIN cell classes WIN/no axis",
+            win.class == "WIN" && win.loss_axis.is_empty(),
+        );
 
         let mixed = synth_compress_result(vec![ratio_loss, speed_loss, win.clone()], vec![6]);
         let gm = render_grid(&mixed);
-        check("synth: render LOSS LIST labels axis=RATIO", gm.contains("axis=RATIO"));
-        check("synth: render LOSS LIST labels axis=SPEED", gm.contains("axis=SPEED"));
+        check(
+            "synth: render LOSS LIST labels axis=RATIO",
+            gm.contains("axis=RATIO"),
+        );
+        check(
+            "synth: render LOSS LIST labels axis=SPEED",
+            gm.contains("axis=SPEED"),
+        );
 
         let all_win = synth_compress_result(vec![win.clone()], vec![6]);
         let gw = render_grid(&all_win);
-        check("synth: all-WIN render prints `LOSS LIST: none`", gw.contains("LOSS LIST: none"));
+        check(
+            "synth: all-WIN render prints `LOSS LIST: none`",
+            gw.contains("LOSS LIST: none"),
+        );
     }
 
     println!(
@@ -2140,7 +2433,11 @@ fn cli_multi(args: &[String], name: &str) -> Vec<String> {
 fn parse_threads(s: &str) -> Result<Vec<u32>, String> {
     s.split(',')
         .filter(|x| !x.trim().is_empty())
-        .map(|x| x.trim().parse::<u32>().map_err(|e| format!("bad thread count '{x}': {e}")))
+        .map(|x| {
+            x.trim()
+                .parse::<u32>()
+                .map_err(|e| format!("bad thread count '{x}': {e}"))
+        })
         .collect()
 }
 
@@ -2389,7 +2686,9 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
     let freeze_state = cli_flag(args, "--freeze-state")
         .unwrap_or("/tmp/fulcrum-freeze.matrix-cell.state.json")
         .to_string();
-    let freeze_sysfs_root = cli_flag(args, "--freeze-sysfs-root").unwrap_or("/").to_string();
+    let freeze_sysfs_root = cli_flag(args, "--freeze-sysfs-root")
+        .unwrap_or("/")
+        .to_string();
     let freeze_force_stale = cli_has(args, "--freeze-force-stale");
 
     if n < 7 {
@@ -2511,9 +2810,25 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
 
     let r = if is_compress {
         match run_matrix_compress_pinned(
-            &a_cmd, &b_cmd, &roundtrip_cmd, &corpora, &levels, &threads, n, warmup, &sink,
-            size_reps, ours, epsilon, &box_name, &sha_pins, &timestamp, &pin, rss_reps,
-            &input_sha_map, gate.as_mut().map(|g| g as &mut dyn CellGate),
+            &a_cmd,
+            &b_cmd,
+            &roundtrip_cmd,
+            &corpora,
+            &levels,
+            &threads,
+            n,
+            warmup,
+            &sink,
+            size_reps,
+            ours,
+            epsilon,
+            &box_name,
+            &sha_pins,
+            &timestamp,
+            &pin,
+            rss_reps,
+            &input_sha_map,
+            gate.as_mut().map(|g| g as &mut dyn CellGate),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2525,8 +2840,21 @@ pub fn cmd_matrix(args: &[String]) -> ExitCode {
         }
     } else {
         run_matrix_gated_pinned(
-            &a_cmd, &b_cmd, &ref_cmd, &corpora, &threads, n, warmup, &sink, do_sha, ours, &box_name,
-            &sha_pins, &timestamp, &pin, rss_reps,
+            &a_cmd,
+            &b_cmd,
+            &ref_cmd,
+            &corpora,
+            &threads,
+            n,
+            warmup,
+            &sink,
+            do_sha,
+            ours,
+            &box_name,
+            &sha_pins,
+            &timestamp,
+            &pin,
+            rss_reps,
             gate.as_mut().map(|g| g as &mut dyn CellGate),
         )
     };
@@ -2571,8 +2899,14 @@ mod tests {
         assert_eq!(classify("OK", "RESOLVED-b-slower", Arm::B), CellClass::Loss);
         assert_eq!(classify("OK", "RESOLVED-a-slower", Arm::A), CellClass::Loss);
         assert_eq!(classify("OK", "RESOLVED-a-slower", Arm::B), CellClass::Win);
-        assert_eq!(classify("VOID", "VOID-aa_bias=0.1", Arm::A), CellClass::Void);
-        assert_eq!(classify("FAIL", "FAIL-sha-mismatch", Arm::A), CellClass::Void);
+        assert_eq!(
+            classify("VOID", "VOID-aa_bias=0.1", Arm::A),
+            CellClass::Void
+        );
+        assert_eq!(
+            classify("FAIL", "FAIL-sha-mismatch", Arm::A),
+            CellClass::Void
+        );
     }
 
     #[test]
@@ -2585,8 +2919,8 @@ mod tests {
     #[test]
     fn classify_compress_truth_table() {
         let e = DEFAULT_EPSILON; // 0.001
-        // ours = A (subject is the a-cmd). size_ratio is a/b (ours/theirs here).
-        // size NEUTRAL (within ε) + faster ⇒ WIN.
+                                 // ours = A (subject is the a-cmd). size_ratio is a/b (ours/theirs here).
+                                 // size NEUTRAL (within ε) + faster ⇒ WIN.
         assert_eq!(
             classify_compress("OK", "RESOLVED-b-slower", 1.0005, Arm::A, e),
             CellClass::Win
@@ -2721,13 +3055,17 @@ mod tests {
         let win = synth_compress_cell("weights", 6, 1, "OK", "RESOLVED-b-slower", 1.0, Arm::A, e);
         let r = synth_compress_result(vec![win], vec![6]);
         let g = render_grid(&r);
-        assert!(g.contains("LOSS LIST: none"), "expected empty LOSS LIST:\n{g}");
+        assert!(
+            g.contains("LOSS LIST: none"),
+            "expected empty LOSS LIST:\n{g}"
+        );
     }
 
     #[test]
     fn compress_result_json_round_trips_with_new_fields() {
         let e = DEFAULT_EPSILON;
-        let cell = synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
+        let cell =
+            synth_compress_cell("nasa.raw", 6, 1, "OK", "RESOLVED-b-slower", 1.02, Arm::A, e);
         let r = synth_compress_result(vec![cell], vec![1, 6, 9]);
         let js = serde_json::to_string(&r).unwrap();
         for f in [
@@ -2758,8 +3096,19 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let r = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
         );
         assert_eq!(r.manifest.mode, "decode");
         assert!(r.manifest.levels.is_empty());
@@ -2785,7 +3134,10 @@ mod tests {
         assert_eq!(Pin::PerThread.mask(4).as_deref(), Some("0-3"));
         assert_eq!(Pin::PerThread.mask(16).as_deref(), Some("0-15"));
         assert!(Pin::None.mask(8).is_none());
-        assert_eq!(Pin::Tmpl("2-{Tm1},{T}".into()).mask(4).as_deref(), Some("2-3,4"));
+        assert_eq!(
+            Pin::Tmpl("2-{Tm1},{T}".into()).mask(4).as_deref(),
+            Some("2-3,4")
+        );
     }
 
     #[test]
@@ -2827,8 +3179,14 @@ mod tests {
         for &t in &[1u32, 2, 4, 8, 16] {
             let (a, b) = cell_cmds(a_tmpl, b_tmpl, t, &Pin::PerThread);
             let mask = Pin::PerThread.mask(t).unwrap();
-            assert_eq!(a, format!("taskset -c {mask} {}", expand_threads(a_tmpl, t)));
-            assert_eq!(b, format!("taskset -c {mask} {}", expand_threads(b_tmpl, t)));
+            assert_eq!(
+                a,
+                format!("taskset -c {mask} {}", expand_threads(a_tmpl, t))
+            );
+            assert_eq!(
+                b,
+                format!("taskset -c {mask} {}", expand_threads(b_tmpl, t))
+            );
         }
     }
 
@@ -2838,7 +3196,9 @@ mod tests {
         // RESOLVED-b-slower), matrix's classification agrees with the pinned
         // paired verdict — WIN for ours=a, LOSS for ours=b — deterministically,
         // with NO drift-induced sign flip.
-        let lr = [-0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11];
+        let lr = [
+            -0.10, -0.11, -0.09, -0.12, -0.10, -0.11, -0.10, -0.09, -0.11,
+        ];
         let verdict = crate::paired::ab_verdict(&crate::paired::ci95(&lr));
         assert_eq!(verdict, "RESOLVED-b-slower");
         assert_eq!(classify("OK", verdict, Arm::A), CellClass::Win);
@@ -2850,17 +3210,49 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let pinned = run_matrix_gated_pinned(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", &Pin::PerThread, 0, None,
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
+            &Pin::PerThread,
+            0,
+            None,
         );
         assert_eq!(pinned.manifest.pin, "pin=taskset-per-thread(0-(T-1))");
         assert!(pinned.manifest.method.contains("pin=taskset-per-thread"));
 
         // pin composes with freeze-each (orthogonal: pin the command, freeze the cell).
-        let mut g = RecGate { enters: vec![], exits: vec![], fail_on: None };
+        let mut g = RecGate {
+            enters: vec![],
+            exits: vec![],
+            fail_on: None,
+        };
         let both = run_matrix_gated_pinned(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", &Pin::PerThread, 0, Some(&mut g),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
+            &Pin::PerThread,
+            0,
+            Some(&mut g),
         );
         assert!(both.manifest.method.contains("pin=taskset-per-thread"));
         assert!(both.manifest.method.contains("freeze-per-cell"));
@@ -2906,8 +3298,19 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz"), PathBuf::from("/tmp/b.gz")];
         let threads = vec![1u32, 4u32];
         let r = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 8, 1, Path::new("/dev/null"),
-            true, Arm::A, "test", &[], "ts0",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            8,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "test",
+            &[],
+            "ts0",
         );
         assert_eq!(r.cells.len(), 4);
         assert_eq!(
@@ -2927,8 +3330,19 @@ mod tests {
         // The 200 ms A/B margin fixes the DIRECTION; a cell can only be WIN or a
         // VOID from its own A/A certificate (inherent ~5%), never LOSS/TIE.
         let win = run_matrix(
-            "sleep 0.05", "sleep 0.25", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "test", &[], "ts0",
+            "sleep 0.05",
+            "sleep 0.25",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "test",
+            &[],
+            "ts0",
         );
         for c in &win.cells {
             assert!(c.class == "WIN" || c.class == "VOID", "unexpected {c:?}");
@@ -2938,8 +3352,19 @@ mod tests {
         }
 
         let loss = run_matrix(
-            "sleep 0.05", "sleep 0.25", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::B, "test", &[], "ts0",
+            "sleep 0.05",
+            "sleep 0.25",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::B,
+            "test",
+            &[],
+            "ts0",
         );
         for c in &loss.cells {
             assert!(c.class == "LOSS" || c.class == "VOID", "unexpected {c:?}");
@@ -2955,12 +3380,27 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32, 4u32];
         let r = run_matrix(
-            "true", "true", "true", &corpora, &threads, 7, 1, &f, true, Arm::A, "test", &[], "ts0",
+            "true",
+            "true",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            &f,
+            true,
+            Arm::A,
+            "test",
+            &[],
+            "ts0",
         );
         let _ = std::fs::remove_file(&f);
         assert_eq!(r.cells.len(), 2);
         assert!(r.cells.iter().all(|c| c.class == "VOID"));
-        assert!(r.cells.iter().all(|c| c.error.is_some() && c.paired.is_none()));
+        assert!(r
+            .cells
+            .iter()
+            .all(|c| c.error.is_some() && c.paired.is_none()));
         assert_eq!(r.summary.void, 2);
         assert_eq!(r.summary.status, "PARTIAL");
     }
@@ -2970,11 +3410,29 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let r = run_matrix(
-            "true", "true", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"), true,
-            Arm::A, "boxN", &["gz:abc".into()], "ts0",
+            "true",
+            "true",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "boxN",
+            &["gz:abc".into()],
+            "ts0",
         );
         let js = serde_json::to_string(&r).unwrap();
-        for f in ["\"manifest\"", "\"cells\"", "\"summary\"", "sha_pins", "timestamp", "method"] {
+        for f in [
+            "\"manifest\"",
+            "\"cells\"",
+            "\"summary\"",
+            "sha_pins",
+            "timestamp",
+            "method",
+        ] {
             assert!(js.contains(f), "missing {f}");
         }
         let rt: MatrixResult = serde_json::from_str(&js).unwrap();
@@ -3006,10 +3464,26 @@ mod tests {
     fn gated_loop_enters_and_exits_every_cell() {
         let corpora = vec![PathBuf::from("/tmp/a.gz"), PathBuf::from("/tmp/b.gz")];
         let threads = vec![1u32, 4u32];
-        let mut g = RecGate { enters: vec![], exits: vec![], fail_on: None };
+        let mut g = RecGate {
+            enters: vec![],
+            exits: vec![],
+            fail_on: None,
+        };
         let r = run_matrix_gated(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", Some(&mut g),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
+            Some(&mut g),
         );
         assert_eq!(r.cells.len(), 4);
         assert_eq!(g.enters.len(), 4, "enter once per cell");
@@ -3028,14 +3502,30 @@ mod tests {
             fail_on: Some(("/tmp/a.gz".to_string(), 1)),
         };
         let r = run_matrix_gated(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts", Some(&mut g),
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
+            Some(&mut g),
         );
         assert_eq!(r.cells.len(), 2, "fail-soft: both cells recorded");
         let failed = r.cells.iter().find(|c| c.threads == 1).unwrap();
         assert_eq!(failed.class, "VOID");
         assert!(failed.paired.is_none());
-        assert!(failed.error.as_deref().unwrap().contains("freeze-each acquire FAILED"));
+        assert!(failed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("freeze-each acquire FAILED"));
         // only the entered cell (t=4) got an exit
         assert_eq!(g.enters, vec![("/tmp/a.gz".to_string(), 4u32)]);
         assert_eq!(g.exits, vec![("/tmp/a.gz".to_string(), 4u32)]);
@@ -3046,8 +3536,19 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let r = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
         );
         // Back-compat entry is UNPINNED: method is METHOD + the pin provenance
         // (pin=none), and carries no freeze-per-cell marker.
@@ -3075,8 +3576,22 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let r = run_matrix_gated_pinned(
-            big, big, "true", &corpora, &threads, 7, 1, Path::new("/dev/null"), false, Arm::A,
-            "t", &[], "ts", &Pin::None, 3, None,
+            big,
+            big,
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            false,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
+            &Pin::None,
+            3,
+            None,
         );
         assert_eq!(r.manifest.rss_reps, 3);
         assert!(r.manifest.method.contains("rss_reps=3"));
@@ -3100,11 +3615,25 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/a.gz")];
         let threads = vec![1u32];
         let r = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "t", &[], "ts",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "t",
+            &[],
+            "ts",
         );
         assert_eq!(r.manifest.rss_reps, 0);
-        assert!(r.cells.iter().all(|c| c.a_peak_rss_mb == 0.0 && c.b_peak_rss_mb == 0.0));
+        assert!(r
+            .cells
+            .iter()
+            .all(|c| c.a_peak_rss_mb == 0.0 && c.b_peak_rss_mb == 0.0));
         assert!(!render_grid(&r).contains("peak-RSS MiB"));
     }
 
@@ -3137,8 +3666,19 @@ mod tests {
         let corpora = vec![PathBuf::from("/tmp/silesia.tar.gz")];
         let threads = vec![1u32, 4u32];
         let r = run_matrix(
-            "sleep 0.02", "sleep 0.02", "true", &corpora, &threads, 7, 1, Path::new("/dev/null"),
-            true, Arm::A, "test", &[], "ts0",
+            "sleep 0.02",
+            "sleep 0.02",
+            "true",
+            &corpora,
+            &threads,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            Arm::A,
+            "test",
+            &[],
+            "ts0",
         );
         let g = render_grid(&r);
         assert!(g.contains("silesia.tar.gz"));

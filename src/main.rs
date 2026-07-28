@@ -4402,6 +4402,7 @@ fn main() -> ExitCode {
         "sizecensus" => fulcrum::sizecensus::cmd(rest),
         "wallcensus" => fulcrum::wallcensus::cmd(rest),
         "dropin" => fulcrum::dropin::cmd(rest),
+        "verify" => fulcrum::verify::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),

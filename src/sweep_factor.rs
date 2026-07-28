@@ -153,7 +153,10 @@ fn scan_stored_bytes(buf: &[u8]) -> (u64, bool) {
     let mut p = 10usize;
     if flg & 0x04 != 0 {
         // FEXTRA
-        let Some(xlen) = buf.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize) else {
+        let Some(xlen) = buf
+            .get(p..p + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        else {
             return (0, false);
         };
         p += 2 + xlen;
@@ -228,7 +231,9 @@ fn static_params(path: &Path) -> Result<StaticParams, String> {
     } else {
         0.0
     };
-    let chunk_count = (comp_bytes as f64 / NOMINAL_CHUNK_COMP_BYTES).ceil().max(1.0) as u64;
+    let chunk_count = (comp_bytes as f64 / NOMINAL_CHUNK_COMP_BYTES)
+        .ceil()
+        .max(1.0) as u64;
     let (stored_bytes, complete) = scan_stored_bytes(&buf);
     let stored_frac = if out_bytes > 0 {
         (stored_bytes as f64 / out_bytes as f64).min(1.0)
@@ -385,7 +390,11 @@ fn best_stump(param: &str, values: &[f64], labels: &[bool]) -> Stump {
                 min_gap = min_gap.min((tv - fv).abs());
             }
         }
-        best.margin = if min_gap.is_finite() { min_gap } else { f64::NAN };
+        best.margin = if min_gap.is_finite() {
+            min_gap
+        } else {
+            f64::NAN
+        };
         best.clean = true;
     }
     best
@@ -402,11 +411,7 @@ pub struct PairRule {
 
 /// Search axis-aligned 2-parameter rules (AND / OR of two thresholds, all
 /// orientations) for a clean separation. Cheap brute force (N cells small).
-fn best_pair(
-    names: &[&'static str],
-    cols: &[Vec<f64>],
-    labels: &[bool],
-) -> Option<PairRule> {
+fn best_pair(names: &[&'static str], cols: &[Vec<f64>], labels: &[bool]) -> Option<PairRule> {
     let n = labels.len();
     if n == 0 {
         return None;
@@ -433,8 +438,16 @@ fn best_pair(
                             for combine in ["AND", "OR"] {
                                 let mut correct = 0usize;
                                 for k in 0..n {
-                                    let pi = if oi == ">" { cols[i][k] > ti } else { cols[i][k] < ti };
-                                    let pj = if oj == ">" { cols[j][k] > tj } else { cols[j][k] < tj };
+                                    let pi = if oi == ">" {
+                                        cols[i][k] > ti
+                                    } else {
+                                        cols[i][k] < ti
+                                    };
+                                    let pj = if oj == ">" {
+                                        cols[j][k] > tj
+                                    } else {
+                                        cols[j][k] < tj
+                                    };
                                     let pred = if combine == "AND" { pi && pj } else { pi || pj };
                                     if pred == labels[k] {
                                         correct += 1;
@@ -591,7 +604,12 @@ fn assess_confidence(
     let minority_is_true = n_true <= n_false;
     let minority_count = n_true.min(n_false);
     let minority_label = if minority_is_true { pos } else { neg }.to_string();
-    let level = if minority_count <= MIN_SUPPORT { "LOW" } else { "HIGH" }.to_string();
+    let level = if minority_count <= MIN_SUPPORT {
+        "LOW"
+    } else {
+        "HIGH"
+    }
+    .to_string();
 
     // ── leave-one-out robustness (only meaningful for a clean single separator) ──
     let orig_param = best_single
@@ -604,11 +622,9 @@ fn assess_confidence(
 
     if single_sufficient && orig_param.is_some() {
         let orig_param = orig_param.unwrap();
-        let minority_idxs: Vec<usize> =
-            (0..n).filter(|&k| labels[k] == minority_is_true).collect();
+        let minority_idxs: Vec<usize> = (0..n).filter(|&k| labels[k] == minority_is_true).collect();
         for &m in &minority_idxs {
-            let sub_rows: Vec<&FactorRow> =
-                (0..n).filter(|&k| k != m).map(|k| rows[k]).collect();
+            let sub_rows: Vec<&FactorRow> = (0..n).filter(|&k| k != m).map(|k| rows[k]).collect();
             let sub_labels: Vec<bool> = (0..n).filter(|&k| k != m).map(|k| labels[k]).collect();
             let st = sub_labels.iter().filter(|b| **b).count();
             let sf = sub_labels.len() - st;
@@ -638,7 +654,8 @@ fn assess_confidence(
         }
         robust = fragile_cells.is_empty();
         robustness_note = if robust {
-            "leave-one-out stable — no single minority-cell removal breaks the separator".to_string()
+            "leave-one-out stable — no single minority-cell removal breaks the separator"
+                .to_string()
         } else {
             "single-point-dependent — a lone minority cell manufactures the split".to_string()
         };
@@ -688,11 +705,7 @@ fn assess_confidence(
 }
 
 /// Run the separation analysis for one binary labeling of the rows.
-fn separate(
-    label: &str,
-    rows: &[&FactorRow],
-    labels: &[bool],
-) -> FactorVerdict {
+fn separate(label: &str, rows: &[&FactorRow], labels: &[bool]) -> FactorVerdict {
     let n_true = labels.iter().filter(|b| **b).count();
     let n_false = labels.len() - n_true;
     let names: Vec<&'static str> = predictors(rows[0]).into_iter().map(|(n, _)| n).collect();
@@ -768,8 +781,7 @@ fn separate(
         }
     };
 
-    let confidence =
-        assess_confidence(label, rows, labels, &best_single, single_sufficient);
+    let confidence = assess_confidence(label, rows, labels, &best_single, single_sufficient);
 
     // Never let a bare "accuracy 1.0" stand un-priced: fold the overfit verdict
     // into the summary so a downstream reader can't quote the clean split alone.
@@ -824,8 +836,20 @@ pub struct SweepReport {
 fn print_table(rows: &[FactorRow]) {
     println!(
         "{:<14} {:>2} {:>6} {:>9} {:>7} {:>7} {:>8} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>9}",
-        "corpus", "T", "ratio", "out_MB", "chunks", "stored", "wbusy", "dwait", "chunk_us",
-        "rssBase", "rssCand", "rssΔ%", "wallR", "verdict"
+        "corpus",
+        "T",
+        "ratio",
+        "out_MB",
+        "chunks",
+        "stored",
+        "wbusy",
+        "dwait",
+        "chunk_us",
+        "rssBase",
+        "rssCand",
+        "rssΔ%",
+        "wallR",
+        "verdict"
     );
     for r in rows {
         println!(
@@ -887,7 +911,10 @@ fn print_verdict(v: &FactorVerdict) {
             }
         );
     }
-    println!("  n_factors={}  minimal_set={:?}", v.n_factors, v.minimal_set);
+    println!(
+        "  n_factors={}  minimal_set={:?}",
+        v.n_factors, v.minimal_set
+    );
 
     // ── self-confidence / overfit guard ──
     let c = &v.confidence;
@@ -898,7 +925,10 @@ fn print_verdict(v: &FactorVerdict) {
             v.n_true, v.excluded_ties, v.n_false
         );
     } else {
-        println!("  CLASS BALANCE: {} {} / {} {}", v.n_true, pos, v.n_false, neg);
+        println!(
+            "  CLASS BALANCE: {} {} / {} {}",
+            v.n_true, pos, v.n_false, neg
+        );
     }
     if c.level == "N/A" {
         println!("  CONFIDENCE=N/A ({})", c.robustness_note);
@@ -922,10 +952,7 @@ fn print_verdict(v: &FactorVerdict) {
         if c.robustness_note.contains("N/A") {
             println!("  LEAVE-ONE-OUT: N/A — {}", c.robustness_note);
         } else if c.robust {
-            println!(
-                "  LEAVE-ONE-OUT: ROBUST — {}",
-                c.robustness_note
-            );
+            println!("  LEAVE-ONE-OUT: ROBUST — {}", c.robustness_note);
         } else {
             println!("  LEAVE-ONE-OUT: NOT ROBUST — {}", c.robustness_note);
             for fc in &c.fragile_cells {
@@ -979,7 +1006,10 @@ pub fn analyze_rows(rows: &[FactorRow]) -> (FactorVerdict, FactorVerdict) {
 
     // rss-cost: all rows, label = cand peak exceeds base by >= RSS_COST_PCT.
     let rss_rows: Vec<&FactorRow> = rows.iter().collect();
-    let rss_labels: Vec<bool> = rss_rows.iter().map(|r| r.rss_delta_pct >= RSS_COST_PCT).collect();
+    let rss_labels: Vec<bool> = rss_rows
+        .iter()
+        .map(|r| r.rss_delta_pct >= RSS_COST_PCT)
+        .collect();
     let rss_cost = separate("rss-cost", &rss_rows, &rss_labels);
 
     (win_vs_regress, rss_cost)
@@ -1002,7 +1032,11 @@ pub fn analyze_json(path: &Path) -> Result<(), String> {
     if rows.is_empty() {
         return Err(format!("{}: rows array is empty", path.display()));
     }
-    println!("── RE-ANALYSIS of banked sweep: {} ({} rows) ──", path.display(), rows.len());
+    println!(
+        "── RE-ANALYSIS of banked sweep: {} ({} rows) ──",
+        path.display(),
+        rows.len()
+    );
     print_table(&rows);
     let (wvr, rss) = analyze_rows(&rows);
     print_verdict(&wvr);
@@ -1025,20 +1059,17 @@ pub fn run(cfg: &FactorCfg) -> Result<SweepReport, String> {
     for corpus in &cfg.corpora {
         let sp = static_params(corpus)?;
         for &t in &cfg.threads {
-            eprintln!("[sweep] {} T{} …", trunc(&corpus.display().to_string(), 40), t);
+            eprintln!(
+                "[sweep] {} T{} …",
+                trunc(&corpus.display().to_string(), 40),
+                t
+            );
             let cand_tmpl = mk_tmpl(&cfg.cand, t);
             let base_tmpl = mk_tmpl(&cfg.base, t);
 
             // -- OUTCOME: paired cand-vs-base (a=cand, b=base, ref=base) --
             let pr = paired::run_paired(
-                &cand_tmpl,
-                &base_tmpl,
-                &base_tmpl,
-                corpus,
-                cfg.n,
-                cfg.warmup,
-                &sink,
-                true,
+                &cand_tmpl, &base_tmpl, &base_tmpl, corpus, cfg.n, cfg.warmup, &sink, true,
                 0, // RSS handled separately below via memprofile
             )?;
             // ratio = a/b = cand/base. verdict token → outcome.
@@ -1160,7 +1191,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
         return selftest();
     }
     let get = |k: &str| -> Option<String> {
-        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1).cloned())
     };
     // --analyze <json>: re-characterize a banked sweep (no box, no walls).
     if let Some(p) = get("--analyze") {
@@ -1172,8 +1205,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             }
         };
     }
-    let (Some(cand), Some(base), Some(run_tmpl)) =
-        (get("--cand"), get("--base"), get("--run"))
+    let (Some(cand), Some(base), Some(run_tmpl)) = (get("--cand"), get("--base"), get("--run"))
     else {
         eprintln!(
             "usage: fulcrum sweep --cand <bin> --base <bin> --run '<tmpl {{bin}} {{threads}} {{corpus}}>' \\\n\
@@ -1186,7 +1218,11 @@ pub fn cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let corpora: Vec<PathBuf> = match get("--corpora") {
-        Some(s) => s.split(',').filter(|s| !s.is_empty()).map(PathBuf::from).collect(),
+        Some(s) => s
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
         None => {
             eprintln!("sweep: --corpora required (comma-separated .gz paths)");
             return ExitCode::from(2);
@@ -1198,7 +1234,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
     };
     let n: usize = get("--n").and_then(|s| s.parse().ok()).unwrap_or(51);
     let warmup: usize = get("--warmup").and_then(|s| s.parse().ok()).unwrap_or(2);
-    let interval_ms: u64 = get("--interval-ms").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let interval_ms: u64 = get("--interval-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let out = get("--out").map(PathBuf::from);
     let rg = get("--rg");
 
@@ -1334,7 +1372,10 @@ pub fn selftest() -> ExitCode {
         );
         check(
             "1-factor: best_single is ratio, clean",
-            v.best_single.as_ref().map(|s| s.param == "ratio" && s.clean).unwrap_or(false),
+            v.best_single
+                .as_ref()
+                .map(|s| s.param == "ratio" && s.clean)
+                .unwrap_or(false),
         );
         check(
             "1-factor: threshold in (1.5,1.7)",
@@ -1345,7 +1386,10 @@ pub fn selftest() -> ExitCode {
         );
         // 4 win / 4 regress ⇒ minority 4 > MIN_SUPPORT(3): HIGH + robust.
         check("1-factor: CONFIDENCE=HIGH", v.confidence.level == "HIGH");
-        check("1-factor: ROBUST (leave-one-out stable)", v.confidence.robust);
+        check(
+            "1-factor: ROBUST (leave-one-out stable)",
+            v.confidence.robust,
+        );
         check(
             "1-factor: no NEXT-MEASUREMENT when HIGH+robust",
             v.confidence.next_measurement.is_none(),
@@ -1382,10 +1426,15 @@ pub fn selftest() -> ExitCode {
         let v = separate("selftest-2factor", &refs, &labels);
         check("2-factor: single-param INSUFFICIENT", !v.single_sufficient);
         check("2-factor: n_factors==2", v.n_factors == 2);
-        check("2-factor: summary says '2 factors'", v.summary.contains("2 factors"));
+        check(
+            "2-factor: summary says '2 factors'",
+            v.summary.contains("2 factors"),
+        );
         let ms: std::collections::BTreeSet<String> = v.minimal_set.iter().cloned().collect();
         let want: std::collections::BTreeSet<String> =
-            ["ratio".to_string(), "worker_busy".to_string()].into_iter().collect();
+            ["ratio".to_string(), "worker_busy".to_string()]
+                .into_iter()
+                .collect();
         check("2-factor: minimal_set=={ratio,worker_busy}", ms == want);
         check(
             "2-factor: best_pair clean",
@@ -1419,15 +1468,15 @@ pub fn selftest() -> ExitCode {
 
     // -- Case D: DEGENERATE (all one class) must be reported, not crash.
     {
-        let rows_owned = vec![
-            synth_row(1.0, 0.5, true),
-            synth_row(2.0, 0.5, true),
-        ];
+        let rows_owned = vec![synth_row(1.0, 0.5, true), synth_row(2.0, 0.5, true)];
         let refs: Vec<&FactorRow> = rows_owned.iter().collect();
         let labels: Vec<bool> = refs.iter().map(|r| r.outcome == Outcome::Win).collect();
         let v = separate("selftest-degenerate", &refs, &labels);
         check("degenerate: n_factors==0", v.n_factors == 0);
-        check("degenerate: summary flags DEGENERATE", v.summary.contains("DEGENERATE"));
+        check(
+            "degenerate: summary flags DEGENERATE",
+            v.summary.contains("DEGENERATE"),
+        );
     }
 
     // -- Case E: the stored-block scanner is exact on a hand-built fully-stored
@@ -1435,7 +1484,7 @@ pub fn selftest() -> ExitCode {
     {
         let payload = b"hello stored world";
         let mut g: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff]; // 10-byte hdr
-        // one final stored block: first byte carries BFINAL(1)+BTYPE(00) in bits 0..2.
+                                                                                // one final stored block: first byte carries BFINAL(1)+BTYPE(00) in bits 0..2.
         g.push(0x01); // bit0=BFINAL=1, bits1-2=BTYPE=00
         let len = payload.len() as u16;
         g.extend_from_slice(&len.to_le_bytes());
@@ -1445,7 +1494,10 @@ pub fn selftest() -> ExitCode {
         g.extend_from_slice(&[0, 0, 0, 0]);
         g.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         let (stored, complete) = scan_stored_bytes(&g);
-        check("stored-scan: exact byte count", stored == payload.len() as u64);
+        check(
+            "stored-scan: exact byte count",
+            stored == payload.len() as u64,
+        );
         check("stored-scan: complete", complete);
     }
 
@@ -1471,10 +1523,16 @@ pub fn selftest() -> ExitCode {
         // …but the guard must refuse to trust it.
         check("bug: CONFIDENCE=LOW", v.confidence.level == "LOW");
         check("bug: minority_count==1", v.confidence.minority_count == 1);
-        check("bug: NOT ROBUST (single-point-dependent)", !v.confidence.robust);
+        check(
+            "bug: NOT ROBUST (single-point-dependent)",
+            !v.confidence.robust,
+        );
         check(
             "bug: names the fragile regress cell",
-            v.confidence.fragile_cells.iter().any(|c| c.contains("regress-x")),
+            v.confidence
+                .fragile_cells
+                .iter()
+                .any(|c| c.contains("regress-x")),
         );
         check(
             "bug: NEXT-MEASUREMENT recommends more points near boundary",
@@ -1515,9 +1573,15 @@ pub fn selftest() -> ExitCode {
         let v = separate("win-vs-regress", &refs, &labels);
         check(
             "flip: original clean separator is ratio",
-            v.best_single.as_ref().map(|s| s.param == "ratio" && s.clean).unwrap_or(false),
+            v.best_single
+                .as_ref()
+                .map(|s| s.param == "ratio" && s.clean)
+                .unwrap_or(false),
         );
-        check("flip: CONFIDENCE=HIGH (minority=4 > MIN_SUPPORT)", v.confidence.level == "HIGH");
+        check(
+            "flip: CONFIDENCE=HIGH (minority=4 > MIN_SUPPORT)",
+            v.confidence.level == "HIGH",
+        );
         check("flip: minority_count==4", v.confidence.minority_count == 4);
         check("flip: NOT ROBUST", !v.confidence.robust);
         check(
@@ -1546,10 +1610,19 @@ pub fn selftest() -> ExitCode {
         ];
         let refs: Vec<&FactorRow> = rows_owned.iter().collect();
         // no row exceeds RSS_COST_PCT ⇒ all-false labeling.
-        let labels: Vec<bool> = refs.iter().map(|r| r.rss_delta_pct >= RSS_COST_PCT).collect();
+        let labels: Vec<bool> = refs
+            .iter()
+            .map(|r| r.rss_delta_pct >= RSS_COST_PCT)
+            .collect();
         let v = separate("rss-cost", &refs, &labels);
-        check("rss-degenerate: CONFIDENCE=N/A", v.confidence.level == "N/A");
-        check("rss-degenerate: no NEXT-MEASUREMENT", v.confidence.next_measurement.is_none());
+        check(
+            "rss-degenerate: CONFIDENCE=N/A",
+            v.confidence.level == "N/A",
+        );
+        check(
+            "rss-degenerate: no NEXT-MEASUREMENT",
+            v.confidence.next_measurement.is_none(),
+        );
     }
 
     let total = pass + fail;

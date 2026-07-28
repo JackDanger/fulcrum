@@ -735,7 +735,8 @@ fn encode_partition_closes_no_double_count() {
         tol_pct: DEFAULT_TOL_PCT,
         threshold_pct: 5.0,
     };
-    let led = encode_from_text(STAT_1000, ENCODE_REPORT_CLEAN, Some("gzippy"), Some(10), th).unwrap();
+    let led =
+        encode_from_text(STAT_1000, ENCODE_REPORT_CLEAN, Some("gzippy"), Some(10), th).unwrap();
 
     // per-role insns exact (role-matched, single bucket each).
     assert_eq!(cat_row(&led, "match_finder").insns, 400);
@@ -803,7 +804,9 @@ fn encode_unknown_symbol_flagged_uncategorized() {
     let led = encode_from_text(STAT_1000, report, None, None, Thresholds::default()).unwrap();
     assert!(led.flagged);
     assert_eq!(led.uncategorized, 200);
-    assert!(led.uncategorized_symbols[0].0.contains("some_mystery_helper"));
+    assert!(led.uncategorized_symbols[0]
+        .0
+        .contains("some_mystery_helper"));
     assert!(led.flag_reason.is_some());
     // still CLOSES despite the gap (conservation).
     assert_eq!(

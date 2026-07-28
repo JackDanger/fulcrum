@@ -365,7 +365,9 @@ pub fn diff_streams(
         *class_bits.entry(cname.to_string()).or_default() += r.delta_bits;
         let pname = r.decision_pattern.label();
         *decision_pattern_bits.entry(pname.to_string()).or_default() += r.delta_bits;
-        *decision_pattern_regions.entry(pname.to_string()).or_default() += 1;
+        *decision_pattern_regions
+            .entry(pname.to_string())
+            .or_default() += 1;
         let max_len = r.b_toks.iter().filter(|t| t.2 > 0).map(|t| t.1).max();
         let lb = match max_len {
             None => "lit",

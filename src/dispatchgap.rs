@@ -298,7 +298,9 @@ pub fn cmd_dispatchgap(args: &[String]) -> ExitCode {
         }
     };
     let a = analyze(&text);
-    let workers_ok = expect_workers.map(|n| n == a.worker_ids.len()).unwrap_or(true);
+    let workers_ok = expect_workers
+        .map(|n| n == a.worker_ids.len())
+        .unwrap_or(true);
     print_report(&a, &label, workers_ok, json_out.as_deref());
     if a.selftest_pass(workers_ok) {
         ExitCode::SUCCESS
@@ -337,10 +339,7 @@ fn analyze(text: &str) -> Analysis {
         match e.k {
             1 => {
                 n_start += 1;
-                per_worker_open
-                    .entry(e.w)
-                    .or_default()
-                    .insert(e.key, e.t);
+                per_worker_open.entry(e.w).or_default().insert(e.key, e.t);
             }
             2 => {
                 n_finish += 1;
@@ -545,7 +544,11 @@ fn print_report(a: &Analysis, label: &str, workers_ok: bool, json_out: Option<&s
         ("H-DECODEWAIT(prefetch-horizon self-stall)", tb.decodewait),
         ("H-OTHER     (submit lat/write/bookkeep)", tb.other),
     ] {
-        println!("  {name:42}  {:>8.2}ms  {:>5.1}%", ms(val), pct(val, gap_sum));
+        println!(
+            "  {name:42}  {:>8.2}ms  {:>5.1}%",
+            ms(val),
+            pct(val, gap_sum)
+        );
     }
     // Named dominant cause.
     let dom = a.dominant();
@@ -591,11 +594,17 @@ fn print_report(a: &Analysis, label: &str, workers_ok: bool, json_out: Option<&s
         s.push_str(&format!("    \"H_QUEUE\": {:.3},\n", ms(tb.queue)));
         s.push_str(&format!("    \"H_BLOCKFIND\": {:.3},\n", ms(tb.blockfind)));
         s.push_str(&format!("    \"H_WINDOWDEP\": {:.3},\n", ms(tb.windowdep)));
-        s.push_str(&format!("    \"H_DECODEWAIT\": {:.3},\n", ms(tb.decodewait)));
+        s.push_str(&format!(
+            "    \"H_DECODEWAIT\": {:.3},\n",
+            ms(tb.decodewait)
+        ));
         s.push_str(&format!("    \"H_OTHER\": {:.3}\n", ms(tb.other)));
         s.push_str("  },\n");
         s.push_str("  \"gap_blocked_on_pct\": {\n");
-        s.push_str(&format!("    \"H_QUEUE\": {:.2},\n", pct(tb.queue, gap_sum)));
+        s.push_str(&format!(
+            "    \"H_QUEUE\": {:.2},\n",
+            pct(tb.queue, gap_sum)
+        ));
         s.push_str(&format!(
             "    \"H_BLOCKFIND\": {:.2},\n",
             pct(tb.blockfind, gap_sum)
@@ -653,7 +662,7 @@ fn synth_log() -> String {
     // submits
     push(&mut l, 0, 0, 100, -1, 0); // submit A
     push(&mut l, 0, 0, 101, -1, 0); // submit C
-    // worker 0: A [10..110], gap (blockfind 120..180), B [200..300]
+                                    // worker 0: A [10..110], gap (blockfind 120..180), B [200..300]
     push(&mut l, 10, 1, 100, 0, 1);
     push(&mut l, 110, 2, 100, 0, 1);
     push(&mut l, 120, 3, 5, -1, 0); // BF enter
@@ -688,7 +697,10 @@ pub fn selftest() -> ExitCode {
     {
         let a = analyze(&synth_log());
         check("synth: all Gate-0 gates pass", a.selftest_pass(true));
-        check("synth: 2 workers, 4 chunks", a.worker_ids == vec![0, 1] && a.total_chunks == 4);
+        check(
+            "synth: 2 workers, 4 chunks",
+            a.worker_ids == vec![0, 1] && a.total_chunks == 4,
+        );
         check("synth: no dropped lines", a.dropped_lines == 0);
         check("synth: no unknown-submit gaps", a.unknown_submit_gaps == 0);
         // Worker 0's starve window [110,150] overlaps BF [120,180] for 30ns;
@@ -706,7 +718,10 @@ pub fn selftest() -> ExitCode {
             "synth: buckets conserve to the total gap",
             a.total_buckets.total() == a.gap_sum && a.gap_sum == 100,
         );
-        check("synth: dominant cause is H-QUEUE", a.dominant().0 == "H-QUEUE");
+        check(
+            "synth: dominant cause is H-QUEUE",
+            a.dominant().0 == "H-QUEUE",
+        );
         check(
             "synth: --workers mismatch fails the gate",
             !a.selftest_pass(false),
@@ -718,7 +733,10 @@ pub fn selftest() -> ExitCode {
         let mut log = synth_log();
         log.push_str("{\"t\":400,\"k\":1,\"key\":999,\"w\":0,\"f\":0}\n");
         let a = analyze(&log);
-        check("pairing: unmatched START refuses", !a.pairing_ok && !a.selftest_pass(true));
+        check(
+            "pairing: unmatched START refuses",
+            !a.pairing_ok && !a.selftest_pass(true),
+        );
     }
 
     // -- REFUSAL: a FINISH with no START refuses too.
@@ -726,13 +744,19 @@ pub fn selftest() -> ExitCode {
         let mut log = synth_log();
         log.push_str("{\"t\":400,\"k\":2,\"key\":999,\"w\":0,\"f\":0}\n");
         let a = analyze(&log);
-        check("pairing: unmatched FINISH refuses", !a.pairing_ok && !a.selftest_pass(true));
+        check(
+            "pairing: unmatched FINISH refuses",
+            !a.pairing_ok && !a.selftest_pass(true),
+        );
     }
 
     // -- REFUSAL: an empty / eventless log is inert.
     {
         let a = analyze("");
-        check("inert: empty log refuses", !a.non_inert && !a.selftest_pass(true));
+        check(
+            "inert: empty log refuses",
+            !a.non_inert && !a.selftest_pass(true),
+        );
         let a = analyze("not json at all\n");
         check(
             "inert: garbage-only log refuses (dropped + inert)",

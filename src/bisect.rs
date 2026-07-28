@@ -174,7 +174,13 @@ pub struct Transition {
 
 impl Transition {
     /// Build a transition from a completed paired run (A = older, B = newer).
-    pub fn from_paired(from: &str, to: &str, r: PairedResult, do_sha: bool, min_effect: f64) -> Self {
+    pub fn from_paired(
+        from: &str,
+        to: &str,
+        r: PairedResult,
+        do_sha: bool,
+        min_effect: f64,
+    ) -> Self {
         // The correctness guard is A-vs-B byte identity (not A/B-vs-reference).
         let sha_ok = if do_sha { r.a_sha == r.b_sha } else { true };
         let ratio_ba = oriented_ratio_ba(r.ratio);
@@ -248,7 +254,12 @@ pub fn roll_up(transitions: &[Transition]) -> RollUp {
             _ => r.flagged.push(e), // SHA-DIFF / VOID / REF-DIFF / ERROR
         }
     }
-    r.status = if r.flagged.is_empty() { "OK" } else { "PARTIAL" }.to_string();
+    r.status = if r.flagged.is_empty() {
+        "OK"
+    } else {
+        "PARTIAL"
+    }
+    .to_string();
     r
 }
 
@@ -307,9 +318,11 @@ pub fn run_bisect(
         let a_tmpl = pin.apply(&expand_run(run_tmpl, from_path, threads), threads);
         let b_tmpl = pin.apply(&expand_run(run_tmpl, to_path, threads), threads);
         let ref_cmd = expand_run(ref_tmpl, from_path, threads); // {bin} rarely used in ref
-        // RSS off (0): bisect scores adjacent-commit WALL transitions; the memory
-        // half is not part of a bisect verdict, so we skip the extra RSS probes.
-        let t = match run_paired(&a_tmpl, &b_tmpl, &ref_cmd, corpus, n, warmup, sink, do_sha, 0) {
+                                                                // RSS off (0): bisect scores adjacent-commit WALL transitions; the memory
+                                                                // half is not part of a bisect verdict, so we skip the extra RSS probes.
+        let t = match run_paired(
+            &a_tmpl, &b_tmpl, &ref_cmd, corpus, n, warmup, sink, do_sha, 0,
+        ) {
             Ok(r) => Transition::from_paired(from_lbl, to_lbl, r, do_sha, min_effect),
             Err(e) => Transition::errored(from_lbl, to_lbl, e),
         };
@@ -589,19 +602,23 @@ pub fn selftest() -> ExitCode {
     let ru2 = roll_up(&[mk("a", "b", "TIE"), mk("b", "c", "SHA-DIFF")]);
     check(
         "roll_up: SHA-DIFF flagged → PARTIAL, no regressor",
-        ru2.regressors.is_empty() && ru2.flagged == vec!["b→c".to_string()] && ru2.status == "PARTIAL",
+        ru2.regressors.is_empty()
+            && ru2.flagged == vec!["b→c".to_string()]
+            && ru2.status == "PARTIAL",
     );
 
     // -- build-template expansion (pure) ------------------------------------
     check(
         "expand_run substitutes {bin} and {threads}, leaves {corpus}",
-        expand_run("{bin} -d -c -p {threads} {corpus}", "/b/x", 8)
-            == "/b/x -d -c -p 8 {corpus}",
+        expand_run("{bin} -d -c -p {threads} {corpus}", "/b/x", 8) == "/b/x -d -c -p 8 {corpus}",
     );
     check(
         "expand_build substitutes {sha} and {out}",
-        expand_build("git checkout {sha} && build -o {out}", "abc123", Path::new("/tmp/o"))
-            == "git checkout abc123 && build -o /tmp/o",
+        expand_build(
+            "git checkout {sha} && build -o {out}",
+            "abc123",
+            Path::new("/tmp/o"),
+        ) == "git checkout abc123 && build -o /tmp/o",
     );
 
     // -- END-TO-END with synthetic temp-script "binaries" (portable) --------
@@ -651,7 +668,16 @@ pub fn selftest() -> ExitCode {
                     ("s4".to_string(), s4.to_string_lossy().to_string()),
                 ];
                 let r = run_bisect(
-                    &bins, run, "cat {corpus}", &corpus, 1, n, warmup, &devnull, true, min_effect,
+                    &bins,
+                    run,
+                    "cat {corpus}",
+                    &corpus,
+                    1,
+                    n,
+                    warmup,
+                    &devnull,
+                    true,
+                    min_effect,
                     &pin,
                 );
                 check("step: 3 transitions", r.transitions.len() == 3);
@@ -659,19 +685,27 @@ pub fn selftest() -> ExitCode {
                     "step: every transition byte-identical (sha_ok)",
                     r.transitions.iter().all(|t| t.sha_ok),
                 );
-                let s2s3 = r.transitions.iter().find(|t| t.from == "s2" && t.to == "s3").unwrap();
+                let s2s3 = r
+                    .transitions
+                    .iter()
+                    .find(|t| t.from == "s2" && t.to == "s3")
+                    .unwrap();
                 check(
                     "step: s2→s3 is MOVED-slower or VOID (never TIE/faster — decisive 5× margin)",
                     s2s3.verdict == "MOVED-slower" || s2s3.verdict == "VOID",
                 );
                 if s2s3.verdict == "MOVED-slower" {
-                    check("step: scored s2→s3 ratio(B/A) > 1 (newer slower)", s2s3.ratio_ba > 1.0);
+                    check(
+                        "step: scored s2→s3 ratio(B/A) > 1 (newer slower)",
+                        s2s3.ratio_ba > 1.0,
+                    );
                 } else {
                     println!("  NOTE step s2→s3 VOID (A/A cert false-resolve, inherent ~5%) — positive check skipped");
                 }
                 check(
                     "step: NO false regressor — regressors ⊆ {s2→s3} (localized)",
-                    r.rollup.regressors.is_empty() || r.rollup.regressors == vec!["s2→s3".to_string()],
+                    r.rollup.regressors.is_empty()
+                        || r.rollup.regressors == vec!["s2→s3".to_string()],
                 );
                 check(
                     "step: NO improver anywhere (a 5× slowdown cannot manufacture one)",
@@ -686,13 +720,19 @@ pub fn selftest() -> ExitCode {
                 );
                 // render + machine line do not panic and carry the verdict.
                 let g = render(&r);
-                check("step: render carries VERDICT + s2→s3", g.contains("VERDICT") && g.contains("s2→s3"));
+                check(
+                    "step: render carries VERDICT + s2→s3",
+                    g.contains("VERDICT") && g.contains("s2→s3"),
+                );
                 // JSON round-trips.
                 match serde_json::to_string(&r)
                     .ok()
                     .and_then(|js| serde_json::from_str::<BisectResult>(&js).ok())
                 {
-                    Some(rt) => check("step: JSON round-trips (3 transitions)", rt.transitions.len() == 3),
+                    Some(rt) => check(
+                        "step: JSON round-trips (3 transitions)",
+                        rt.transitions.len() == 3,
+                    ),
                     None => check("step: JSON round-trips", false),
                 }
             }
@@ -713,7 +753,16 @@ pub fn selftest() -> ExitCode {
                     ("e3".to_string(), e3.to_string_lossy().to_string()),
                 ];
                 let r = run_bisect(
-                    &bins, run, "cat {corpus}", &corpus, 1, n, warmup, &devnull, true, min_effect,
+                    &bins,
+                    run,
+                    "cat {corpus}",
+                    &corpus,
+                    1,
+                    n,
+                    warmup,
+                    &devnull,
+                    true,
+                    min_effect,
                     &pin,
                 );
                 check(
@@ -743,7 +792,16 @@ pub fn selftest() -> ExitCode {
                     ("b2".to_string(), b2.to_string_lossy().to_string()),
                 ];
                 let r = run_bisect(
-                    &bins, run, "cat {corpus}", &corpus, 1, n, warmup, &devnull, true, min_effect,
+                    &bins,
+                    run,
+                    "cat {corpus}",
+                    &corpus,
+                    1,
+                    n,
+                    warmup,
+                    &devnull,
+                    true,
+                    min_effect,
                     &pin,
                 );
                 let t = &r.transitions[0];
@@ -753,7 +811,10 @@ pub fn selftest() -> ExitCode {
                     "byte-diff: NOT named a regressor (guard beats timing)",
                     r.rollup.regressors.is_empty() && r.rollup.flagged == vec!["b1→b2".to_string()],
                 );
-                check("byte-diff: chain status PARTIAL", r.rollup.status == "PARTIAL");
+                check(
+                    "byte-diff: chain status PARTIAL",
+                    r.rollup.status == "PARTIAL",
+                );
             }
             _ => check("byte-diff: could not write fake bins", false),
         }
@@ -861,7 +922,9 @@ pub fn cmd_bisect(args: &[String]) -> ExitCode {
             return usage();
         }
     };
-    let n: usize = cli_flag(args, "--n").and_then(|v| v.parse().ok()).unwrap_or(51);
+    let n: usize = cli_flag(args, "--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(51);
     let warmup: usize = cli_flag(args, "--warmup")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
@@ -921,11 +984,17 @@ pub fn cmd_bisect(args: &[String]) -> ExitCode {
         }
     };
     if bins.len() < 2 {
-        eprintln!("BISECT=FAIL need >=2 bins to have an adjacent transition (got {})", bins.len());
+        eprintln!(
+            "BISECT=FAIL need >=2 bins to have an adjacent transition (got {})",
+            bins.len()
+        );
         return ExitCode::FAILURE;
     }
     if !corpus_path.exists() {
-        eprintln!("BISECT=FAIL corpus {} does not exist", corpus_path.display());
+        eprintln!(
+            "BISECT=FAIL corpus {} does not exist",
+            corpus_path.display()
+        );
         return ExitCode::FAILURE;
     }
     for (label, path) in &bins {
@@ -936,7 +1005,17 @@ pub fn cmd_bisect(args: &[String]) -> ExitCode {
     }
 
     let r = run_bisect(
-        &bins, run_tmpl, ref_cmd, &corpus_path, threads, n, warmup, &sink, do_sha, min_effect, &pin,
+        &bins,
+        run_tmpl,
+        ref_cmd,
+        &corpus_path,
+        threads,
+        n,
+        warmup,
+        &sink,
+        do_sha,
+        min_effect,
+        &pin,
     );
 
     print!("{}", render(&r));
@@ -999,7 +1078,10 @@ mod tests {
         );
         // harness bias / ref mismatch
         assert_eq!(transition_verdict(true, "VOID", "NOISY", 1.0, 0.02), "VOID");
-        assert_eq!(transition_verdict(true, "FAIL", "NOISY", 1.0, 0.02), "REF-DIFF");
+        assert_eq!(
+            transition_verdict(true, "FAIL", "NOISY", 1.0, 0.02),
+            "REF-DIFF"
+        );
     }
 
     #[test]
@@ -1024,7 +1106,11 @@ mod tests {
     #[test]
     fn expand_build_substitutes_sha_and_out() {
         assert_eq!(
-            expand_build("co {sha}; cargo build -o {out}", "deadbee", Path::new("/tmp/o")),
+            expand_build(
+                "co {sha}; cargo build -o {out}",
+                "deadbee",
+                Path::new("/tmp/o")
+            ),
             "co deadbee; cargo build -o /tmp/o"
         );
     }
@@ -1105,7 +1191,8 @@ mod tests {
 
     #[test]
     fn step_chain_localizes_regressor_end_to_end() {
-        let tmp = std::env::temp_dir().join(format!("fulcrum-bisect-ut-step-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("fulcrum-bisect-ut-step-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let corpus = tmp.join("c.bin");
@@ -1117,13 +1204,26 @@ mod tests {
             write_bin(&tmp, "s4", 0.25, ""),
         ];
         let r = run_bisect(
-            &bins, "{bin} {corpus}", "cat {corpus}", &corpus, 1, 7, 1, Path::new("/dev/null"), true,
-            0.15, &Pin::None,
+            &bins,
+            "{bin} {corpus}",
+            "cat {corpus}",
+            &corpus,
+            1,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            0.15,
+            &Pin::None,
         );
         assert_eq!(r.transitions.len(), 3);
         // Load-robust (mirrors matrix): the decisive 5× step is MOVED-slower or a
         // VOID from its own A/A certificate (inherent ~5%); it is NEVER TIE/faster.
-        let s2s3 = r.transitions.iter().find(|t| t.from == "s2" && t.to == "s3").unwrap();
+        let s2s3 = r
+            .transitions
+            .iter()
+            .find(|t| t.from == "s2" && t.to == "s3")
+            .unwrap();
         assert!(
             s2s3.verdict == "MOVED-slower" || s2s3.verdict == "VOID",
             "s2→s3 was {}",
@@ -1138,9 +1238,17 @@ mod tests {
             "regressors {:?}",
             r.rollup.regressors
         );
-        assert!(r.rollup.improvers.is_empty(), "improvers {:?}", r.rollup.improvers);
+        assert!(
+            r.rollup.improvers.is_empty(),
+            "improvers {:?}",
+            r.rollup.improvers
+        );
         // adjacent controls never falsely resolve to a MOVE (TIE or a cert VOID).
-        for t in r.transitions.iter().filter(|t| !(t.from == "s2" && t.to == "s3")) {
+        for t in r
+            .transitions
+            .iter()
+            .filter(|t| !(t.from == "s2" && t.to == "s3"))
+        {
             assert!(
                 t.verdict == "TIE" || t.verdict == "VOID",
                 "control {}→{} was {}",
@@ -1154,7 +1262,8 @@ mod tests {
 
     #[test]
     fn byte_different_pair_is_flagged() {
-        let tmp = std::env::temp_dir().join(format!("fulcrum-bisect-ut-byte-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("fulcrum-bisect-ut-byte-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let corpus = tmp.join("c.bin");
@@ -1164,8 +1273,17 @@ mod tests {
             write_bin(&tmp, "b2", 0.05, "EXTRA"),
         ];
         let r = run_bisect(
-            &bins, "{bin} {corpus}", "cat {corpus}", &corpus, 1, 7, 1, Path::new("/dev/null"), true,
-            0.10, &Pin::None,
+            &bins,
+            "{bin} {corpus}",
+            "cat {corpus}",
+            &corpus,
+            1,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            0.10,
+            &Pin::None,
         );
         let t = &r.transitions[0];
         assert!(!t.sha_ok);
@@ -1177,18 +1295,38 @@ mod tests {
 
     #[test]
     fn json_round_trips_with_all_fields() {
-        let tmp = std::env::temp_dir().join(format!("fulcrum-bisect-ut-json-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("fulcrum-bisect-ut-json-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let corpus = tmp.join("c.bin");
         std::fs::write(&corpus, vec![b'q'; 1024]).unwrap();
-        let bins = vec![write_bin(&tmp, "a", 0.03, ""), write_bin(&tmp, "b", 0.03, "")];
+        let bins = vec![
+            write_bin(&tmp, "a", 0.03, ""),
+            write_bin(&tmp, "b", 0.03, ""),
+        ];
         let r = run_bisect(
-            &bins, "{bin} {corpus}", "cat {corpus}", &corpus, 1, 7, 1, Path::new("/dev/null"), true,
-            0.10, &Pin::None,
+            &bins,
+            "{bin} {corpus}",
+            "cat {corpus}",
+            &corpus,
+            1,
+            7,
+            1,
+            Path::new("/dev/null"),
+            true,
+            0.10,
+            &Pin::None,
         );
         let js = serde_json::to_string(&r).unwrap();
-        for f in ["\"bins\"", "\"transitions\"", "\"rollup\"", "ratio_ba", "logratio_ci_ba", "method"] {
+        for f in [
+            "\"bins\"",
+            "\"transitions\"",
+            "\"rollup\"",
+            "ratio_ba",
+            "logratio_ci_ba",
+            "method",
+        ] {
             assert!(js.contains(f), "missing {f}");
         }
         let rt: BisectResult = serde_json::from_str(&js).unwrap();

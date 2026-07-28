@@ -457,7 +457,10 @@ mod tests {
             .chain(ld.regions.keys())
             .map(|k| k.as_str())
             .collect();
-        assert!(!present.is_empty(), "fixtures must contain at least one region");
+        assert!(
+            !present.is_empty(),
+            "fixtures must contain at least one region"
+        );
         for region in &present {
             assert!(
                 table.contains(region),

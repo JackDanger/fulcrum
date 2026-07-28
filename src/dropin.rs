@@ -432,9 +432,7 @@ fn canonical_gz_bytes(oracle_gzip: &Path, plain: &[u8]) -> Result<Vec<u8>, Strin
     stdout
         .read_to_end(&mut out)
         .map_err(|e| format!("read oracle -c stdout: {e}"))?;
-    let status = child
-        .wait()
-        .map_err(|e| format!("wait oracle -c: {e}"))?;
+    let status = child.wait().map_err(|e| format!("wait oracle -c: {e}"))?;
     let _ = writer.join();
     if !status.success() {
         return Err(format!(
@@ -1260,7 +1258,10 @@ pub fn write_tsv(cells: &[DropinCell], path: &Path) -> Result<(), String> {
             c.status,
             c.ours_exit.map(|e| e.to_string()).unwrap_or_default(),
             c.rival_exit.map(|e| e.to_string()).unwrap_or_default(),
-            c.declared_reason.clone().unwrap_or_default().replace('\t', " "),
+            c.declared_reason
+                .clone()
+                .unwrap_or_default()
+                .replace('\t', " "),
             c.diffs.join("; ").replace('\t', " ").replace('\n', " "),
             c.error.clone().unwrap_or_default().replace('\t', " "),
         ));
@@ -1477,7 +1478,9 @@ fn run_cmd(args: &[String]) -> ExitCode {
         eprintln!("dropin: --out DIR is required");
         return usage();
     };
-    let oracle_gzip = cli_flag(args, "--oracle-gzip").unwrap_or("gzip").to_string();
+    let oracle_gzip = cli_flag(args, "--oracle-gzip")
+        .unwrap_or("gzip")
+        .to_string();
     let declared = match load_declared(cli_flag(args, "--declared")) {
         Ok(d) => d,
         Err(e) => {
@@ -1587,7 +1590,10 @@ fn report_cmd(args: &[String]) -> ExitCode {
             dirs.len()
         );
         for (d, sha) in &shas {
-            eprintln!("  {d}: ours_sha256={}", sha.as_deref().unwrap_or("UNPROVENANCED"));
+            eprintln!(
+                "  {d}: ours_sha256={}",
+                sha.as_deref().unwrap_or("UNPROVENANCED")
+            );
         }
         return ExitCode::FAILURE;
     }
@@ -1727,7 +1733,8 @@ pub fn selftest() -> ExitCode {
         let d = observation_diffs(Kind::Compress, &base(), &r);
         check(
             "diffs (Compress): roundtrip correctness differs -> flagged",
-            d.iter().any(|s| s.contains("roundtrip correctness differs")),
+            d.iter()
+                .any(|s| s.contains("roundtrip correctness differs")),
         );
         let d2 = observation_diffs(Kind::Decompress, &base(), &r);
         check(
@@ -1754,7 +1761,8 @@ pub fn selftest() -> ExitCode {
         let d = observation_diffs(Kind::Inspect, &o, &r);
         check(
             "diffs (Inspect): semantic check differs (e.g. -l wrong size) -> flagged",
-            d.iter().any(|s| s.contains("semantic content check differs")),
+            d.iter()
+                .any(|s| s.contains("semantic content check differs")),
         );
     }
     {
@@ -1771,7 +1779,8 @@ pub fn selftest() -> ExitCode {
         let d = observation_diffs(Kind::ErrorExpected, &o, &r);
         check(
             "diffs: same success class, DIFFERENT exact exit code -> flagged",
-            d.iter().any(|s| s.contains("exit code differs despite same success class")),
+            d.iter()
+                .any(|s| s.contains("exit code differs despite same success class")),
         );
         let mut r2 = base();
         r2.success = false;
@@ -1782,7 +1791,8 @@ pub fn selftest() -> ExitCode {
         let d2 = observation_diffs(Kind::ErrorExpected, &o2, &r2);
         check(
             "diffs: same success class, SAME exact exit code -> not flagged by exit-code check",
-            !d2.iter().any(|s| s.contains("exit code differs despite same success class")),
+            !d2.iter()
+                .any(|s| s.contains("exit code differs despite same success class")),
         );
     }
 
@@ -1873,7 +1883,9 @@ pub fn selftest() -> ExitCode {
         let _ = fs::create_dir_all(&tmp); // recreate for the checks below
 
         match &oracle {
-            None => println!("  NOTE dropin: oracle-dependent fixture-kind checks skipped (no `gzip` on PATH)"),
+            None => println!(
+                "  NOTE dropin: oracle-dependent fixture-kind checks skipped (no `gzip` on PATH)"
+            ),
             Some(gzip_bin) => {
                 // kind 9: hardlink.
                 let hlfx = Fixture {
@@ -1881,7 +1893,9 @@ pub fn selftest() -> ExitCode {
                     ..dummy.clone()
                 };
                 let ok_hl = setup_hardlink(&tmp, &hlfx, gzip_bin).is_ok();
-                let hl_nlink = fs::metadata(tmp.join(&hlfx.name)).map(|m| m.nlink()).unwrap_or(0);
+                let hl_nlink = fs::metadata(tmp.join(&hlfx.name))
+                    .map(|m| m.nlink())
+                    .unwrap_or(0);
                 check(
                     "setup_hardlink: the fixture file really has nlink() > 1",
                     ok_hl && hl_nlink > 1,
@@ -1915,7 +1929,9 @@ pub fn selftest() -> ExitCode {
                     name: "kindprobe-truncated".to_string(),
                     ..dummy.clone()
                 };
-                let full_len = canonical_gz_bytes(gzip_bin, &trfx.bytes).map(|b| b.len()).unwrap_or(0);
+                let full_len = canonical_gz_bytes(gzip_bin, &trfx.bytes)
+                    .map(|b| b.len())
+                    .unwrap_or(0);
                 let ok_tr = setup_truncated_gz(&tmp, &trfx, gzip_bin).is_ok();
                 let tr_bytes = fs::read(tmp.join(format!("{}.gz", trfx.name))).unwrap_or_default();
                 check(
@@ -2077,10 +2093,7 @@ pub fn selftest() -> ExitCode {
     // -- 5. resume contract: DIVERGENT/ERROR always re-measured, MATCH reused
     {
         let would_reuse = |status: &str| status != "DIVERGENT" && status != "ERROR";
-        check(
-            "resume contract: MATCH is reused",
-            would_reuse("MATCH"),
-        );
+        check("resume contract: MATCH is reused", would_reuse("MATCH"));
         check(
             "resume contract: DECLARED is reused",
             would_reuse("DECLARED"),
@@ -2129,7 +2142,8 @@ pub fn selftest() -> ExitCode {
                 );
                 check(
                     "e2e: compress_inplace actually removed the original and created the .gz",
-                    o.removed == vec![fx.name.clone()] && o.created == vec![format!("{}.gz", fx.name)],
+                    o.removed == vec![fx.name.clone()]
+                        && o.created == vec![format!("{}.gz", fx.name)],
                 );
                 check(
                     "e2e: compress_inplace output roundtrips to the original plaintext",
@@ -2177,7 +2191,10 @@ pub fn selftest() -> ExitCode {
                 let s = by_name("test_corrupt");
                 let o = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
                 let r = capture(&gzip_abs, s, &fx, &tmp_root, &gzip_bin).unwrap();
-                check("e2e: test_corrupt — real gzip -t fails on a corrupted stream", !o.success);
+                check(
+                    "e2e: test_corrupt — real gzip -t fails on a corrupted stream",
+                    !o.success,
+                );
                 let diffs = observation_diffs(s.kind, &o, &r);
                 check(
                     "e2e: test_corrupt, gzip vs itself -> zero diffs",
@@ -2215,7 +2232,8 @@ pub fn selftest() -> ExitCode {
                     rival: "broken".to_string(),
                     scenario: "decompress_stdout".to_string(),
                     fixture: fx.name.clone(),
-                    reason: "synthetic selftest fixture — deliberately broken decompressor".to_string(),
+                    reason: "synthetic selftest fixture — deliberately broken decompressor"
+                        .to_string(),
                 };
                 let matched = decl.matches("broken", s.name, &fx.name);
                 let status_with_decl = classify_status(true, true, false, matched, diffs.len());
@@ -2311,7 +2329,10 @@ pub fn selftest() -> ExitCode {
                             "e2e: {scen_name} on an already-.gz fixture — real gzip declines \
                              (no-op, exit 0, touches nothing)"
                         ),
-                        o.success && o.created.is_empty() && o.removed.is_empty() && o.modified.is_empty(),
+                        o.success
+                            && o.created.is_empty()
+                            && o.removed.is_empty()
+                            && o.modified.is_empty(),
                     );
                     check(
                         &format!(
@@ -2507,7 +2528,10 @@ pub fn selftest() -> ExitCode {
 
     let p = pass.get();
     let f = fail.get();
-    println!("DROPIN_SELFTEST={} pass={p} fail={f}", if f == 0 { "PASS" } else { "FAIL" });
+    println!(
+        "DROPIN_SELFTEST={} pass={p} fail={f}",
+        if f == 0 { "PASS" } else { "FAIL" }
+    );
     if f == 0 {
         ExitCode::SUCCESS
     } else {
@@ -2522,8 +2546,14 @@ mod tests {
     #[test]
     fn classify_status_exhaustive() {
         assert_eq!(classify_status(true, true, true, false, 5), "ERROR");
-        assert_eq!(classify_status(true, false, false, false, 0), "RIVAL-UNAVAILABLE");
-        assert_eq!(classify_status(false, true, false, false, 0), "OURS-UNAVAILABLE");
+        assert_eq!(
+            classify_status(true, false, false, false, 0),
+            "RIVAL-UNAVAILABLE"
+        );
+        assert_eq!(
+            classify_status(false, true, false, false, 0),
+            "OURS-UNAVAILABLE"
+        );
         assert_eq!(classify_status(true, true, false, false, 0), "MATCH");
         assert_eq!(classify_status(true, true, false, false, 1), "DIVERGENT");
         assert_eq!(classify_status(true, true, false, true, 1), "DECLARED");

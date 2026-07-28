@@ -390,10 +390,11 @@ pub fn run_gzippy_counters(
     if super::is_gzippy_name(name) {
         gc_cmd.arg("-p1");
     }
-    gc_cmd.arg("-c").arg(input).stdin(std::process::Stdio::null());
-    let out = gc_cmd
-        .output()
-        .map_err(|e| format!("spawn '{cmd}': {e}"))?;
+    gc_cmd
+        .arg("-c")
+        .arg(input)
+        .stdin(std::process::Stdio::null());
+    let out = gc_cmd.output().map_err(|e| format!("spawn '{cmd}': {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "'{cmd} -{level} -c {input}' exited {:?}: {}",

@@ -346,10 +346,16 @@ pub fn print_report(r: &GateResult) {
         println!("\ncross-arch scope: {v}");
     }
     if !r.unrecovered.is_empty() {
-        println!("UNRECOVERED (cand not WIN/TIE vs rg): {}", r.unrecovered.join(", "));
+        println!(
+            "UNRECOVERED (cand not WIN/TIE vs rg): {}",
+            r.unrecovered.join(", ")
+        );
     }
     if !r.regressions.is_empty() {
-        println!("REGRESSIONS (cand LOSS vs base): {}", r.regressions.join(", "));
+        println!(
+            "REGRESSIONS (cand LOSS vs base): {}",
+            r.regressions.join(", ")
+        );
     }
     print_machine_line(r);
 }
@@ -434,7 +440,10 @@ fn parse_threads(s: &str) -> Result<Vec<u32>, String> {
     s.split(',')
         .map(|x| x.trim())
         .filter(|x| !x.is_empty())
-        .map(|x| x.parse::<u32>().map_err(|e| format!("bad thread '{x}': {e}")))
+        .map(|x| {
+            x.parse::<u32>()
+                .map_err(|e| format!("bad thread '{x}': {e}"))
+        })
         .collect()
 }
 
@@ -597,12 +606,20 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
         None => vec![],
     };
 
-    let n: usize = cli_flag(args, "--n").and_then(|v| v.parse().ok()).unwrap_or(51);
-    let warmup: usize = cli_flag(args, "--warmup").and_then(|v| v.parse().ok()).unwrap_or(2);
-    let rss_reps: usize = cli_flag(args, "--rss-reps").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let n: usize = cli_flag(args, "--n")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(51);
+    let warmup: usize = cli_flag(args, "--warmup")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let rss_reps: usize = cli_flag(args, "--rss-reps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let box_name = cli_flag(args, "--box").unwrap_or("unknown").to_string();
     let sha_pins = cli_multi(args, "--sha-pin");
-    let ref_tmpl = cli_flag(args, "--ref-cmd").unwrap_or("gunzip -c {corpus}").to_string();
+    let ref_tmpl = cli_flag(args, "--ref-cmd")
+        .unwrap_or("gunzip -c {corpus}")
+        .to_string();
     let timestamp = cli_flag(args, "--timestamp")
         .map(String::from)
         .unwrap_or_else(now_epoch_string);
@@ -647,11 +664,16 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            ttl_s: cli_flag(args, "--freeze-ttl-s").and_then(|v| v.parse().ok()).unwrap_or(600),
+            ttl_s: cli_flag(args, "--freeze-ttl-s")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
             state_path: PathBuf::from(
-                cli_flag(args, "--freeze-state").unwrap_or("/tmp/fulcrum-freeze.gate-cell.state.json"),
+                cli_flag(args, "--freeze-state")
+                    .unwrap_or("/tmp/fulcrum-freeze.gate-cell.state.json"),
             ),
-            sysfs_root: cli_flag(args, "--freeze-sysfs-root").unwrap_or("/").to_string(),
+            sysfs_root: cli_flag(args, "--freeze-sysfs-root")
+                .unwrap_or("/")
+                .to_string(),
             spawn_watchdog: true,
             dry_run: false,
             force_stale: cli_has(args, "--freeze-force-stale"),
@@ -663,31 +685,73 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
     };
 
     // -- (1) breadth: cand(a) vs base(b), ours=a — the no-regress surface.
-    eprintln!("gate: [1/3] breadth cand-vs-base ({} corpora × {} T)…",
-        breadth_corpora.len(), breadth_threads.len());
+    eprintln!(
+        "gate: [1/3] breadth cand-vs-base ({} corpora × {} T)…",
+        breadth_corpora.len(),
+        breadth_threads.len()
+    );
     let breadth = if breadth_corpora.is_empty() || breadth_threads.is_empty() {
         // Empty breadth is allowed (target-only gate); synthesize an empty matrix.
         empty_matrix(&cand_tmpl, &base_tmpl, &ref_tmpl, &box_name, &timestamp)
     } else {
         run_matrix_gated_pinned(
-            &cand_tmpl, &base_tmpl, &ref_tmpl, &breadth_corpora, &breadth_threads, n, warmup,
-            std::path::Path::new("/dev/null"), true, Arm::A, &box_name, &sha_pins, &timestamp,
-            &pin, rss_reps, gate_obj.as_mut().map(|g| g as &mut dyn CellGate),
+            &cand_tmpl,
+            &base_tmpl,
+            &ref_tmpl,
+            &breadth_corpora,
+            &breadth_threads,
+            n,
+            warmup,
+            std::path::Path::new("/dev/null"),
+            true,
+            Arm::A,
+            &box_name,
+            &sha_pins,
+            &timestamp,
+            &pin,
+            rss_reps,
+            gate_obj.as_mut().map(|g| g as &mut dyn CellGate),
         )
     };
 
     // -- (2) target cand-vs-rg — the recovery surface (+ cand/rg RSS).
-    eprintln!("gate: [2/3] target cand-vs-rg ({} cells)…", target_cells.len());
+    eprintln!(
+        "gate: [2/3] target cand-vs-rg ({} cells)…",
+        target_cells.len()
+    );
     let target_cand_rg = run_target_matrix(
-        &cand_tmpl, &rg_tmpl, &ref_tmpl, &target_cells, n, warmup, rss_reps, &box_name, &sha_pins,
-        &timestamp, &pin, gate_obj.as_mut(),
+        &cand_tmpl,
+        &rg_tmpl,
+        &ref_tmpl,
+        &target_cells,
+        n,
+        warmup,
+        rss_reps,
+        &box_name,
+        &sha_pins,
+        &timestamp,
+        &pin,
+        gate_obj.as_mut(),
     );
 
     // -- (3) target base-vs-rg — the gap base had (+ base RSS at the targets).
-    eprintln!("gate: [3/3] target base-vs-rg ({} cells)…", target_cells.len());
+    eprintln!(
+        "gate: [3/3] target base-vs-rg ({} cells)…",
+        target_cells.len()
+    );
     let target_base_rg = run_target_matrix(
-        &base_tmpl, &rg_tmpl, &ref_tmpl, &target_cells, n, warmup, rss_reps, &box_name, &sha_pins,
-        &timestamp, &pin, gate_obj.as_mut(),
+        &base_tmpl,
+        &rg_tmpl,
+        &ref_tmpl,
+        &target_cells,
+        n,
+        warmup,
+        rss_reps,
+        &box_name,
+        &sha_pins,
+        &timestamp,
+        &pin,
+        gate_obj.as_mut(),
     );
 
     // -- optional cross-arch merge via scope::evaluate over banked artifacts.
@@ -701,7 +765,14 @@ pub fn cmd_gate(args: &[String]) -> ExitCode {
     };
 
     let r = evaluate_gate(
-        cand, base, rg, &breadth, &target_cand_rg, &target_base_rg, cross.as_ref(), cross_void,
+        cand,
+        base,
+        rg,
+        &breadth,
+        &target_cand_rg,
+        &target_base_rg,
+        cross.as_ref(),
+        cross_void,
     );
 
     print_report(&r);
@@ -805,7 +876,10 @@ fn build_cross_arch(args: &[String]) -> CrossArch {
     let Some(manifest_path) = cli_flag(args, "--scope-manifest") else {
         return CrossArch::NotRequested;
     };
-    let banked: Vec<PathBuf> = cli_multi(args, "--arch-json").into_iter().map(PathBuf::from).collect();
+    let banked: Vec<PathBuf> = cli_multi(args, "--arch-json")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
     if banked.is_empty() {
         return CrossArch::Void(format!(
             "--scope-manifest {manifest_path} given but no --arch-json artifacts — cross-arch \
@@ -844,7 +918,7 @@ fn build_cross_arch(args: &[String]) -> CrossArch {
 /// An empty MatrixResult (no cells) with a valid manifest — used when the gate is
 /// target-only (no breadth requested).
 fn empty_matrix(a: &str, b: &str, ref_c: &str, box_name: &str, ts: &str) -> MatrixResult {
-    use crate::matrix::{RunManifest, MatrixSummary};
+    use crate::matrix::{MatrixSummary, RunManifest};
     MatrixResult {
         manifest: RunManifest {
             a_cmd: a.to_string(),
@@ -867,7 +941,14 @@ fn empty_matrix(a: &str, b: &str, ref_c: &str, box_name: &str, ts: &str) -> Matr
             roundtrip_cmd: String::new(),
         },
         cells: vec![],
-        summary: MatrixSummary { win: 0, tie: 0, loss: 0, void: 0, total: 0, status: "OK".into() },
+        summary: MatrixSummary {
+            win: 0,
+            tie: 0,
+            loss: 0,
+            void: 0,
+            total: 0,
+            status: "OK".into(),
+        },
     }
 }
 
@@ -1027,18 +1108,33 @@ pub fn selftest() -> ExitCode {
     // cand-vs-rg: both targets WIN. base-vs-rg: base was LOSS (worse than rg) ⇒
     // cand narrowed. breadth cand-vs-base: all WIN/TIE ⇒ no regression.
     {
-        let breadth = mk("a", "cand", "base", &[
-            ("silesia.gz", 8, "WIN", 0.90, 120.0, 180.0, "OK", true),
-            ("silesia.gz", 16, "TIE", 1.00, 120.0, 175.0, "OK", true),
-        ]);
-        let c_rg = mk("a", "cand", "rg", &[
-            ("weights.gz", 4, "WIN", 0.88, 130.0, 300.0, "OK", true),
-            ("bigbuck.gz", 8, "TIE", 0.99, 140.0, 260.0, "OK", true),
-        ]);
-        let b_rg = mk("a", "base", "rg", &[
-            ("weights.gz", 4, "LOSS", 1.20, 210.0, 300.0, "OK", true),
-            ("bigbuck.gz", 8, "LOSS", 1.15, 220.0, 260.0, "OK", true),
-        ]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[
+                ("silesia.gz", 8, "WIN", 0.90, 120.0, 180.0, "OK", true),
+                ("silesia.gz", 16, "TIE", 1.00, 120.0, 175.0, "OK", true),
+            ],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[
+                ("weights.gz", 4, "WIN", 0.88, 130.0, 300.0, "OK", true),
+                ("bigbuck.gz", 8, "TIE", 0.99, 140.0, 260.0, "OK", true),
+            ],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[
+                ("weights.gz", 4, "LOSS", 1.20, 210.0, 300.0, "OK", true),
+                ("bigbuck.gz", 8, "LOSS", 1.15, 220.0, 260.0, "OK", true),
+            ],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("PASS: verdict PASS", r.verdict == "PASS");
         check("PASS: all targets recovered", r.unrecovered.is_empty());
@@ -1049,49 +1145,113 @@ pub fn selftest() -> ExitCode {
         );
         check(
             "PASS: per-cell RSS cand/base/rg all populated",
-            r.targets.iter().all(|t| t.cand_peak_rss_mb > 0.0 && t.base_peak_rss_mb > 0.0 && t.rg_peak_rss_mb > 0.0),
+            r.targets.iter().all(|t| {
+                t.cand_peak_rss_mb > 0.0 && t.base_peak_rss_mb > 0.0 && t.rg_peak_rss_mb > 0.0
+            }),
         );
         // JSON round-trips.
         let js = serde_json::to_string(&r).unwrap();
-        check("PASS: JSON has targets+breadth+verdict", js.contains("\"targets\"") && js.contains("\"breadth\"") && js.contains("\"verdict\""));
-        check("PASS: JSON round-trips", serde_json::from_str::<GateResult>(&js).map(|x| x.verdict == "PASS").unwrap_or(false));
+        check(
+            "PASS: JSON has targets+breadth+verdict",
+            js.contains("\"targets\"") && js.contains("\"breadth\"") && js.contains("\"verdict\""),
+        );
+        check(
+            "PASS: JSON round-trips",
+            serde_json::from_str::<GateResult>(&js)
+                .map(|x| x.verdict == "PASS")
+                .unwrap_or(false),
+        );
     }
 
     // -- OPEN: one target NOT recovered (cand still LOSS vs rg) ---------------
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
-        let c_rg = mk("a", "cand", "rg", &[
-            ("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true),
-            ("qwen.gz", 8, "LOSS", 1.10, 1.0, 1.0, "OK", true),
-        ]);
-        let b_rg = mk("a", "base", "rg", &[
-            ("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true),
-            ("qwen.gz", 8, "LOSS", 1.3, 1.0, 1.0, "OK", true),
-        ]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[
+                ("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true),
+                ("qwen.gz", 8, "LOSS", 1.10, 1.0, 1.0, "OK", true),
+            ],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[
+                ("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true),
+                ("qwen.gz", 8, "LOSS", 1.3, 1.0, 1.0, "OK", true),
+            ],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
-        check("OPEN: verdict OPEN (unrecovered target)", r.verdict == "OPEN");
-        check("OPEN: qwen listed unrecovered", r.unrecovered.iter().any(|u| u.contains("qwen")));
+        check(
+            "OPEN: verdict OPEN (unrecovered target)",
+            r.verdict == "OPEN",
+        );
+        check(
+            "OPEN: qwen listed unrecovered",
+            r.unrecovered.iter().any(|u| u.contains("qwen")),
+        );
     }
 
     // -- OPEN: a breadth REGRESSION blocks the gate even if targets recovered -
     {
-        let breadth = mk("a", "cand", "base", &[
-            ("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true),
-            ("movie.gz", 16, "LOSS", 1.08, 1.0, 1.0, "OK", true),
-        ]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[
+                ("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true),
+                ("movie.gz", 16, "LOSS", 1.08, 1.0, 1.0, "OK", true),
+            ],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("REGRESS: verdict OPEN", r.verdict == "OPEN");
-        check("REGRESS: movie listed as a regression", r.regressions.iter().any(|u| u.contains("movie")));
+        check(
+            "REGRESS: movie listed as a regression",
+            r.regressions.iter().any(|u| u.contains("movie")),
+        );
     }
 
     // -- FAIL: a byte-exact mismatch anywhere beats everything ----------------
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
         // cand-vs-rg cell WINS but its bytes are WRONG (sha_ok=false).
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.5, 1.0, 1.0, "FAIL", false)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.5, 1.0, 1.0, "FAIL", false)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("FAIL: wrong-bytes arm ⇒ verdict FAIL", r.verdict == "FAIL");
         check("FAIL: any_byte_fail set", r.any_byte_fail);
@@ -1099,9 +1259,24 @@ pub fn selftest() -> ExitCode {
 
     // -- VOID: an A/A harness bias (VOID class, bytes OK) voids the gate ------
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "VOID", f64::NAN, 1.0, 1.0, "VOID", true)]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "VOID", f64::NAN, 1.0, 1.0, "VOID", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
         check("VOID: A/A harness bias ⇒ verdict VOID", r.verdict == "VOID");
         check("VOID: any_void set", r.any_void);
@@ -1109,9 +1284,24 @@ pub fn selftest() -> ExitCode {
 
     // -- CROSS-ARCH: a PASS-on-this-box is held OPEN when scope is not WIN ----
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         // A scope with an UNMEASURED cell ⇒ OPEN verdict.
         let manifest = ScopeManifest {
             goal: Some("x".into()),
@@ -1127,20 +1317,56 @@ pub fn selftest() -> ExitCode {
             require_method: None,
         };
         let scope_open = scope::evaluate(&manifest, &[]); // nothing banked ⇒ all UNMEASURED
-        let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, Some(&scope_open), false);
-        check("CROSS: local PASS held OPEN by a non-WIN scope", r.verdict == "OPEN");
-        check("CROSS: cross_arch_verdict recorded", r.cross_arch_verdict.as_deref() == Some("OPEN"));
+        let r = evaluate_gate(
+            "cand",
+            "base",
+            "rg",
+            &breadth,
+            &c_rg,
+            &b_rg,
+            Some(&scope_open),
+            false,
+        );
+        check(
+            "CROSS: local PASS held OPEN by a non-WIN scope",
+            r.verdict == "OPEN",
+        );
+        check(
+            "CROSS: cross_arch_verdict recorded",
+            r.cross_arch_verdict.as_deref() == Some("OPEN"),
+        );
     }
 
     // -- P0d: a REQUESTED-but-unparseable cross-arch input ⇒ VOID, not skip ----
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         // Would be PASS locally; cross_arch_void forces VOID (numbers can't merge).
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, true);
-        check("P0d: requested-but-unparseable cross-arch ⇒ VOID", r.verdict == "VOID");
-        check("P0d: cross_arch_verdict recorded VOID", r.cross_arch_verdict.as_deref() == Some("VOID"));
+        check(
+            "P0d: requested-but-unparseable cross-arch ⇒ VOID",
+            r.verdict == "VOID",
+        );
+        check(
+            "P0d: cross_arch_verdict recorded VOID",
+            r.cross_arch_verdict.as_deref() == Some("VOID"),
+        );
         // build_cross_arch: bad manifest PATH ⇒ CrossArch::Void (not NotRequested).
         let void_args = vec![
             "--scope-manifest".to_string(),
@@ -1153,7 +1379,10 @@ pub fn selftest() -> ExitCode {
             matches!(build_cross_arch(&void_args), CrossArch::Void(_)),
         );
         // --scope-manifest with NO --arch-json ⇒ Void (can't evaluate the requirement).
-        let no_art = vec!["--scope-manifest".to_string(), "/tmp/whatever.json".to_string()];
+        let no_art = vec![
+            "--scope-manifest".to_string(),
+            "/tmp/whatever.json".to_string(),
+        ];
         check(
             "P0d: --scope-manifest with no --arch-json ⇒ CrossArch::Void",
             matches!(build_cross_arch(&no_art), CrossArch::Void(_)),
@@ -1170,11 +1399,27 @@ pub fn selftest() -> ExitCode {
     //    shape scope --banked / gate --arch-json consume for the cross-arch
     //    merge — a gate run must never be a dead end for another box).
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
-        let dir = std::env::temp_dir().join(format!("fulcrum-gate-selftest-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fulcrum-gate-selftest-{}", std::process::id()));
         let banked = bank_artifacts(&dir, &r, &breadth, &c_rg, &b_rg);
         check(
             "BANK: --out-dir writes gate.json + 3 matrix artifacts",
@@ -1203,14 +1448,32 @@ pub fn selftest() -> ExitCode {
     // -- narrowing edge: base already beat rg, cand slightly worse-than-base but
     //    still WIN vs rg ⇒ recovered=true, narrowed=false (honest).
     {
-        let breadth = mk("a", "cand", "base", &[("silesia.gz", 8, "TIE", 1.0, 1.0, 1.0, "OK", true)]);
-        let c_rg = mk("a", "cand", "rg", &[("weights.gz", 4, "WIN", 0.95, 1.0, 1.0, "OK", true)]);
-        let b_rg = mk("a", "base", "rg", &[("weights.gz", 4, "WIN", 0.90, 1.0, 1.0, "OK", true)]);
+        let breadth = mk(
+            "a",
+            "cand",
+            "base",
+            &[("silesia.gz", 8, "TIE", 1.0, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = mk(
+            "a",
+            "cand",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.95, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = mk(
+            "a",
+            "base",
+            "rg",
+            &[("weights.gz", 4, "WIN", 0.90, 1.0, 1.0, "OK", true)],
+        );
         let r = evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false);
-        check("NARROW: recovered yes, narrowed no (cand 0.95 > base 0.90)", {
-            let t = &r.targets[0];
-            t.recovered && !t.narrowed
-        });
+        check(
+            "NARROW: recovered yes, narrowed no (cand 0.95 > base 0.90)",
+            {
+                let t = &r.targets[0];
+                t.recovered && !t.narrowed
+            },
+        );
     }
 
     println!(
@@ -1246,9 +1509,24 @@ mod tests {
 
     #[test]
     fn verdict_pass_requires_recovery_and_no_regress() {
-        let breadth = sm("a", "cand", "base", &[("s.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)]);
-        let c_rg = sm("a", "cand", "rg", &[("w.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)]);
-        let b_rg = sm("a", "base", "rg", &[("w.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)]);
+        let breadth = sm(
+            "a",
+            "cand",
+            "base",
+            &[("s.gz", 8, "WIN", 0.9, 1.0, 1.0, "OK", true)],
+        );
+        let c_rg = sm(
+            "a",
+            "cand",
+            "rg",
+            &[("w.gz", 4, "WIN", 0.88, 1.0, 1.0, "OK", true)],
+        );
+        let b_rg = sm(
+            "a",
+            "base",
+            "rg",
+            &[("w.gz", 4, "LOSS", 1.2, 1.0, 1.0, "OK", true)],
+        );
         assert_eq!(
             evaluate_gate("cand", "base", "rg", &breadth, &c_rg, &b_rg, None, false).verdict,
             "PASS"

@@ -96,10 +96,7 @@ pub fn perturb_spec(taxonomy: &str) -> String {
              chunk Vec)",
             "1.0,1.5,2.0×",
         ),
-        "output-write" => (
-            "the consumer drain / writer path",
-            "1.0,1.5,2.0×",
-        ),
+        "output-write" => ("the consumer drain / writer path", "1.0,1.5,2.0×"),
         RESIDUAL => (
             "the UNNAMED remainder — first instrument it (extend phasebreak / \
              scaling coverage) so it lands in a named bucket",
@@ -256,7 +253,10 @@ pub fn join_and_rank(
         .filter(|r| r.ran && !r.gate0_pass)
         .collect();
     if !voided.is_empty() {
-        let names: Vec<String> = voided.iter().map(|r| format!("{}({})", r.name, r.note)).collect();
+        let names: Vec<String> = voided
+            .iter()
+            .map(|r| format!("{}({})", r.name, r.note))
+            .collect();
         return base(
             "REFUSE",
             format!(
@@ -350,15 +350,26 @@ pub fn join_and_rank(
     candidates.push(Candidate {
         taxonomy: RESIDUAL.to_string(),
         wall_ms: residual_ms,
-        gap_share: if gap_ms != 0.0 { residual_ms / gap_ms } else { 0.0 },
+        gap_share: if gap_ms != 0.0 {
+            residual_ms / gap_ms
+        } else {
+            0.0
+        },
         sources: vec![],
         perturb_spec: perturb_spec(RESIDUAL),
     });
     // Rank by wall_ms desc (dominant cost first). Stable — RESIDUAL sorts by its
     // own ms like any other bucket.
-    candidates.sort_by(|a, b| b.wall_ms.partial_cmp(&a.wall_ms).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.wall_ms
+            .partial_cmp(&a.wall_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    let top = candidates.first().map(|c| c.taxonomy.clone()).unwrap_or_default();
+    let top = candidates
+        .first()
+        .map(|c| c.taxonomy.clone())
+        .unwrap_or_default();
     base(
         "OK",
         format!(
@@ -409,7 +420,10 @@ impl CellWhyResult {
                 "NOLOSS — {}:T{} is not a loss vs rg; nothing to localize.",
                 self.corpus, self.threads
             ),
-            "REFUSE" => format!("REFUSE — {}. Fix the instrument/coverage and re-run.", self.reason),
+            "REFUSE" => format!(
+                "REFUSE — {}. Fix the instrument/coverage and re-run.",
+                self.reason
+            ),
             _ => {
                 let top = self.candidates.first();
                 match top {
@@ -492,7 +506,9 @@ pub fn parse_args(args: &[String]) -> Result<CellWhyArgs, String> {
         let a = args[i].as_str();
         macro_rules! val {
             () => {{
-                let v = args.get(i + 1).ok_or_else(|| format!("cellwhy: {a} needs a value"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("cellwhy: {a} needs a value"))?;
                 i += 2;
                 v.clone()
             }};
@@ -502,12 +518,28 @@ pub fn parse_args(args: &[String]) -> Result<CellWhyArgs, String> {
             "--gz" => gz = Some(val!()),
             "--rg" => rg = Some(val!()),
             "--instrumented" => instrumented = Some(val!()),
-            "--n" => n = val!().parse().map_err(|_| "cellwhy: --n wants an integer".to_string())?,
-            "--warmup" => warmup = val!().parse().map_err(|_| "cellwhy: --warmup wants an integer".to_string())?,
-            "--budget-s" => budget_s = Some(val!().parse().map_err(|_| "cellwhy: --budget-s wants a number".to_string())?),
+            "--n" => {
+                n = val!()
+                    .parse()
+                    .map_err(|_| "cellwhy: --n wants an integer".to_string())?
+            }
+            "--warmup" => {
+                warmup = val!()
+                    .parse()
+                    .map_err(|_| "cellwhy: --warmup wants an integer".to_string())?
+            }
+            "--budget-s" => {
+                budget_s = Some(
+                    val!()
+                        .parse()
+                        .map_err(|_| "cellwhy: --budget-s wants a number".to_string())?,
+                )
+            }
             "--box" => box_name = val!(),
             "--out" => out = Some(val!()),
-            other if other.starts_with("--") => return Err(format!("cellwhy: unknown flag '{other}'")),
+            other if other.starts_with("--") => {
+                return Err(format!("cellwhy: unknown flag '{other}'"))
+            }
             other => {
                 if cell.is_some() {
                     return Err(format!("cellwhy: unexpected positional '{other}'"));
@@ -555,7 +587,10 @@ fn sha256_file(path: &Path) -> Option<String> {
 fn preflight(a: &CellWhyArgs) -> Result<Vec<String>, String> {
     let mut witness = Vec::new();
     if !a.corpus.exists() {
-        return Err(format!("PREFLIGHT: corpus {} does not exist", a.corpus.display()));
+        return Err(format!(
+            "PREFLIGHT: corpus {} does not exist",
+            a.corpus.display()
+        ));
     }
     // Pin the corpus + binaries at launch (provenance).
     let corpus_pin = sha256_file(&a.corpus).unwrap_or_else(|| "unreadable".to_string());
@@ -599,7 +634,13 @@ fn preflight(a: &CellWhyArgs) -> Result<Vec<String>, String> {
         .stderr(Stdio::null())
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
         .unwrap_or_default();
     witness.push(format!("gz_flavor={flavor}"));
     Ok(witness)
@@ -607,7 +648,10 @@ fn preflight(a: &CellWhyArgs) -> Result<Vec<String>, String> {
 
 /// The gz/rg command templates the paired runner expects ({corpus} substituted).
 fn gz_tmpl(a: &CellWhyArgs) -> String {
-    format!("GZIPPY_FORCE_PARALLEL_SM=1 {} -d -c -p {} {{corpus}}", a.gz, a.threads)
+    format!(
+        "GZIPPY_FORCE_PARALLEL_SM=1 {} -d -c -p {} {{corpus}}",
+        a.gz, a.threads
+    )
 }
 fn rg_tmpl(a: &CellWhyArgs) -> String {
     format!("{} -d -c -f -P {} {{corpus}}", a.rg, a.threads)
@@ -651,21 +695,32 @@ fn magnitude(a: &CellWhyArgs) -> Result<(String, f64, f64, String), String> {
         class.to_string(),
         res.a_median,
         res.b_median,
-        format!("ratio={:.3} logratio_ci=[{:.3},{:.3}] {}", res.ratio, lr[0], lr[1], res.verdict),
+        format!(
+            "ratio={:.3} logratio_ci=[{:.3},{:.3}] {}",
+            res.ratio, lr[0], lr[1], res.verdict
+        ),
     ))
 }
 
 /// STAGE 2 — the budgeted instrument suite. Each instrument that cannot run on
 /// the supplied inputs is UNAVAILABLE (noted), not a refusal.
-fn instrument_suite(a: &CellWhyArgs, deadline: Option<std::time::Instant>) -> Vec<InstrumentReport> {
+fn instrument_suite(
+    a: &CellWhyArgs,
+    deadline: Option<std::time::Instant>,
+) -> Vec<InstrumentReport> {
     let mut reports = Vec::new();
-    let over_budget = |dl: Option<std::time::Instant>| dl.map(|d| std::time::Instant::now() >= d).unwrap_or(false);
+    let over_budget = |dl: Option<std::time::Instant>| {
+        dl.map(|d| std::time::Instant::now() >= d).unwrap_or(false)
+    };
 
     // (1) phasebreak — the primary wall-ms partition. Needs a --features
     //     phase-timing binary (the --instrumented one, or the subject if it
     //     already emits phase lines).
     if over_budget(deadline) {
-        reports.push(InstrumentReport::unavailable("phasebreak", "Stage-2 budget exhausted before phasebreak"));
+        reports.push(InstrumentReport::unavailable(
+            "phasebreak",
+            "Stage-2 budget exhausted before phasebreak",
+        ));
     } else {
         let native = a.instrumented.clone().unwrap_or_else(|| a.gz.clone());
         reports.push(run_phasebreak(&native, &a.corpus, a.threads));
@@ -781,14 +836,21 @@ fn print_report(r: &CellWhyResult, witness: &[String]) {
     );
     println!("status: {}  — {}", r.status, r.reason);
     if !r.candidates.is_empty() {
-        println!("\n  {:<22} {:>10} {:>8}  sources", "taxonomy", "wall_ms", "gap%");
+        println!(
+            "\n  {:<22} {:>10} {:>8}  sources",
+            "taxonomy", "wall_ms", "gap%"
+        );
         for c in &r.candidates {
             println!(
                 "  {:<22} {:>10.2} {:>7.0}%  {}",
                 c.taxonomy,
                 c.wall_ms,
                 c.gap_share * 100.0,
-                if c.sources.is_empty() { "—".to_string() } else { c.sources.join(",") }
+                if c.sources.is_empty() {
+                    "—".to_string()
+                } else {
+                    c.sources.join(",")
+                }
             );
         }
         println!("\n  Gate-2 perturb specs (top 3):");
@@ -848,18 +910,34 @@ pub fn cmd_cellwhy(args: &[String]) -> ExitCode {
 
     // NOLOSS short-circuit (no instrument suite needed).
     if class == "WIN" || class == "TIE" {
-        let r = join_and_rank(&a.corpus.display().to_string(), a.threads, &class, gz_ms, rg_ms, vec![]);
+        let r = join_and_rank(
+            &a.corpus.display().to_string(),
+            a.threads,
+            &class,
+            gz_ms,
+            rg_ms,
+            vec![],
+        );
         print_report(&r, &witness);
         write_out(&a, &r);
         return ExitCode::SUCCESS;
     }
 
     // STAGE 2 — budgeted instrument suite.
-    let deadline = a.budget_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
+    let deadline = a
+        .budget_s
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
     let instruments = instrument_suite(&a, deadline);
 
     // STAGE 3 — join + rank.
-    let r = join_and_rank(&a.corpus.display().to_string(), a.threads, &class, gz_ms, rg_ms, instruments);
+    let r = join_and_rank(
+        &a.corpus.display().to_string(),
+        a.threads,
+        &class,
+        gz_ms,
+        rg_ms,
+        instruments,
+    );
     print_report(&r, &witness);
     write_out(&a, &r);
     match r.status.as_str() {
@@ -914,14 +992,31 @@ pub fn selftest() -> ExitCode {
     //    marker=20, output=8; Σnamed=98, residual=2 (2% ≤ 40% cap) ⇒ OK.
     {
         let insts = vec![
-            synth("phasebreak", true, true, &[("kernel-compute", 70.0), ("output-write", 8.0)]),
+            synth(
+                "phasebreak",
+                true,
+                true,
+                &[("kernel-compute", 70.0), ("output-write", 8.0)],
+            ),
             synth("dispatchgap", true, true, &[("marker-machinery", 20.0)]),
         ];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
         check!(r.status == "OK", "planted dominant ⇒ status OK");
-        check!(r.candidates.first().map(|c| c.taxonomy.as_str()) == Some("kernel-compute"), "planted dominant kernel-compute ranks #1");
-        check!(r.candidates.first().map(|c| c.perturb_spec.contains("Huffman")).unwrap_or(false), "top candidate carries its Gate-2 perturb spec");
-        check!(r.residual_ms.abs() < 3.0, "residual small (taxonomy closes)");
+        check!(
+            r.candidates.first().map(|c| c.taxonomy.as_str()) == Some("kernel-compute"),
+            "planted dominant kernel-compute ranks #1"
+        );
+        check!(
+            r.candidates
+                .first()
+                .map(|c| c.perturb_spec.contains("Huffman"))
+                .unwrap_or(false),
+            "top candidate carries its Gate-2 perturb spec"
+        );
+        check!(
+            r.residual_ms.abs() < 3.0,
+            "residual small (taxonomy closes)"
+        );
     }
 
     // 2. UNCLOSED TAXONOMY refuses. gap=100ms but named only 10ms ⇒ residual 90%
@@ -930,13 +1025,21 @@ pub fn selftest() -> ExitCode {
         let insts = vec![synth("phasebreak", true, true, &[("blockfind", 10.0)])];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
         check!(r.status == "REFUSE", "unclosed taxonomy ⇒ REFUSE");
-        check!(r.reason.contains("CONSERVATION-OR-NO-LOCATE"), "refusal names CONSERVATION-OR-NO-LOCATE");
+        check!(
+            r.reason.contains("CONSERVATION-OR-NO-LOCATE"),
+            "refusal names CONSERVATION-OR-NO-LOCATE"
+        );
         check!(r.candidates.is_empty(), "unclosed ⇒ no ranking emitted");
     }
 
     // 2b. OVER-COUNT (named ≫ gap) also refuses.
     {
-        let insts = vec![synth("phasebreak", true, true, &[("kernel-compute", 500.0)])];
+        let insts = vec![synth(
+            "phasebreak",
+            true,
+            true,
+            &[("kernel-compute", 500.0)],
+        )];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
         check!(r.status == "REFUSE", "over-count (Σnamed ≫ gap) ⇒ REFUSE");
     }
@@ -949,7 +1052,10 @@ pub fn selftest() -> ExitCode {
         ];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
         check!(r.status == "REFUSE", "void sub-instrument ⇒ REFUSE");
-        check!(r.reason.contains("self-invalidated"), "refusal names the self-invalidated instrument");
+        check!(
+            r.reason.contains("self-invalidated"),
+            "refusal names the self-invalidated instrument"
+        );
     }
 
     // 3b. An UNAVAILABLE (ran==false) instrument is NOT a refusal.
@@ -959,12 +1065,22 @@ pub fn selftest() -> ExitCode {
             InstrumentReport::unavailable("scaling", "no traces"),
         ];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
-        check!(r.status == "OK", "unavailable instrument does NOT refuse (closes on the rest)");
+        check!(
+            r.status == "OK",
+            "unavailable instrument does NOT refuse (closes on the rest)"
+        );
     }
 
     // 4. NOLOSS stops at Stage 1 — a WIN/TIE never localizes.
     {
-        let r = join_and_rank("weights", 4, "WIN", 20.0, 30.0, vec![synth("phasebreak", true, true, &[("kernel-compute", 50.0)])]);
+        let r = join_and_rank(
+            "weights",
+            4,
+            "WIN",
+            20.0,
+            30.0,
+            vec![synth("phasebreak", true, true, &[("kernel-compute", 50.0)])],
+        );
         check!(r.status == "NOLOSS", "WIN ⇒ NOLOSS");
         check!(r.candidates.is_empty(), "NOLOSS ⇒ no candidates");
         let rt = join_and_rank("weights", 4, "TIE", 30.5, 30.0, vec![]);
@@ -972,14 +1088,27 @@ pub fn selftest() -> ExitCode {
     }
 
     // 5. taxonomy validity + perturb spec coverage.
-    check!(is_valid_taxonomy("kernel-compute") && is_valid_taxonomy(RESIDUAL) && !is_valid_taxonomy("bogus"), "taxonomy membership");
-    check!(NAMED_TAXONOMY.iter().all(|t| perturb_spec(t).contains("fulcrum perturb")), "every named bucket has a fulcrum-perturb Gate-2 spec");
+    check!(
+        is_valid_taxonomy("kernel-compute")
+            && is_valid_taxonomy(RESIDUAL)
+            && !is_valid_taxonomy("bogus"),
+        "taxonomy membership"
+    );
+    check!(
+        NAMED_TAXONOMY
+            .iter()
+            .all(|t| perturb_spec(t).contains("fulcrum perturb")),
+        "every named bucket has a fulcrum-perturb Gate-2 spec"
+    );
 
     // 6. an attribution outside the taxonomy is a mapping bug ⇒ REFUSE.
     {
         let insts = vec![synth("phasebreak", true, true, &[("not-a-bucket", 95.0)])];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
-        check!(r.status == "REFUSE" && r.reason.contains("not in the fixed taxonomy"), "off-taxonomy attribution ⇒ REFUSE");
+        check!(
+            r.status == "REFUSE" && r.reason.contains("not in the fixed taxonomy"),
+            "off-taxonomy attribution ⇒ REFUSE"
+        );
     }
 
     // 7. JSON round-trips (artifact is well-formed).
@@ -987,11 +1116,22 @@ pub fn selftest() -> ExitCode {
         let insts = vec![synth("phasebreak", true, true, &[("kernel-compute", 95.0)])];
         let r = join_and_rank("weights", 4, "LOSS", 130.0, 30.0, insts);
         let js = serde_json::to_string(&r).unwrap();
-        check!(js.contains("\"CELLWHY") == false && js.contains("candidates") && js.contains("perturb_spec"), "cellwhy.json carries candidates + perturb specs");
-        check!(r.machine_line().starts_with("CELLWHY=OK"), "machine line CELLWHY=OK");
+        check!(
+            js.contains("\"CELLWHY") == false
+                && js.contains("candidates")
+                && js.contains("perturb_spec"),
+            "cellwhy.json carries candidates + perturb specs"
+        );
+        check!(
+            r.machine_line().starts_with("CELLWHY=OK"),
+            "machine line CELLWHY=OK"
+        );
     }
 
-    println!("\n=== cellwhy selftest: {} ===", if ok { "PASS" } else { "FAIL" });
+    println!(
+        "\n=== cellwhy selftest: {} ===",
+        if ok { "PASS" } else { "FAIL" }
+    );
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -1027,6 +1167,13 @@ mod tests {
 
     #[test]
     fn parse_rejects_missing_thread() {
-        assert!(parse_args(&["weights.gz".into(), "--gz".into(), "a".into(), "--rg".into(), "b".into()]).is_err());
+        assert!(parse_args(&[
+            "weights.gz".into(),
+            "--gz".into(),
+            "a".into(),
+            "--rg".into(),
+            "b".into()
+        ])
+        .is_err());
     }
 }

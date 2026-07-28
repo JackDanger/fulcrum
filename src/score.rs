@@ -892,8 +892,7 @@ pub fn run_wall_capture(args: &ScoreArgs) -> Result<CaptureResult, ScoreError> {
         let best_isal = isal_walls.iter().cloned().fold(f64::INFINITY, f64::min);
         let worst_isal = isal_walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let isal_med = crate::paired::median(&isal_walls);
-        let (ratio_isal, mut verdict_isal, isal_lr) =
-            paired_arm_verdict(&isal_walls, &rg_walls);
+        let (ratio_isal, mut verdict_isal, isal_lr) = paired_arm_verdict(&isal_walls, &rg_walls);
         if isal_aa_void {
             verdict_isal = "VOID";
         }
@@ -998,14 +997,26 @@ pub fn emit_cell(args: &ScoreArgs, capture: &CaptureResult) -> String {
     // best-of-N min-fold, so the ratio is the comparator/subject point estimate.
     fn arm_phrase(name: &str, ratio: f64, verdict: &str) -> String {
         match verdict {
-            "PASS" => format!("{name} PASSES the 0.99x bar ({ratio:.2}x rg — paired CI clear of parity)"),
-            "FAIL" => format!("{name} FAILS the 0.99x bar ({ratio:.2}x rg — paired CI shows it slower)"),
-            "TIE" => format!("{name} TIES rg within noise ({ratio:.2}x — paired CI brackets parity, Δ<spread)"),
-            "VOID" => format!("{name} is VOID ({ratio:.2}x — A/A harness bias; cell noise-dominated, NOT a pass)"),
+            "PASS" => {
+                format!("{name} PASSES the 0.99x bar ({ratio:.2}x rg — paired CI clear of parity)")
+            }
+            "FAIL" => {
+                format!("{name} FAILS the 0.99x bar ({ratio:.2}x rg — paired CI shows it slower)")
+            }
+            "TIE" => format!(
+                "{name} TIES rg within noise ({ratio:.2}x — paired CI brackets parity, Δ<spread)"
+            ),
+            "VOID" => format!(
+                "{name} is VOID ({ratio:.2}x — A/A harness bias; cell noise-dominated, NOT a pass)"
+            ),
             other => format!("{name} {other} ({ratio:.2}x rg)"),
         }
     }
-    let native_phrase = arm_phrase("gzippy-native", capture.native.ratio, capture.native.verdict);
+    let native_phrase = arm_phrase(
+        "gzippy-native",
+        capture.native.ratio,
+        capture.native.verdict,
+    );
     let verdict_prose = match &capture.isal {
         Some(isal) => format!(
             "{native_phrase}. {}. Distribution: {}.",
@@ -1985,7 +1996,9 @@ pub fn selftest() -> ExitCode {
     //    native dip (lucky best-of-N min) + a paired-slower body ⇒ paired FAIL.
     {
         let native_walls = vec![95.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0];
-        let rg_walls = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+        let rg_walls = vec![
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+        ];
         let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
         let best_rg = rg_walls.iter().cloned().fold(f64::INFINITY, f64::min);
         let best_of_n_pass = best_rg / best_native >= 0.99;
@@ -2378,7 +2391,9 @@ mod tests {
         // round 0: one deep native dip (the lucky best-of-N min); rounds 1..8:
         // native consistently ~12% slower than a tight rg.
         let native_walls = vec![95.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0, 112.0];
-        let rg_walls = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+        let rg_walls = vec![
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+        ];
 
         // BEST-OF-N (the OLD verdict) would PASS: min_rg/min_native = 100/95 = 1.05 >= 0.99.
         let best_native = native_walls.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -2401,7 +2416,12 @@ mod tests {
             "score ratio (rg/native) must be <0.99 for a paired FAIL, got {ratio:.3}"
         );
         // ln(native/rg) CI must exclude 0 on the SLOWER side (lo > 0).
-        assert!(lr.lo > 0.0, "log-ratio CI must be clear of 0 (native slower): [{:.4},{:.4}]", lr.lo, lr.hi);
+        assert!(
+            lr.lo > 0.0,
+            "log-ratio CI must be clear of 0 (native slower): [{:.4},{:.4}]",
+            lr.lo,
+            lr.hi
+        );
     }
 
     #[test]
@@ -2436,7 +2456,10 @@ mod tests {
         let b2 = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
         let (void2, bias2) = aa_control_void(&b1, &b2);
         assert!(void2, "biased A/A must VOID (bias={bias2:.4})");
-        assert!(bias2 > 0.02, "reported A/A bias must be material: {bias2:.4}");
+        assert!(
+            bias2 > 0.02,
+            "reported A/A bias must be material: {bias2:.4}"
+        );
     }
 
     // ── 2-way mode (native vs rg only, --isal omitted) ─────────────────────────
@@ -2954,7 +2977,10 @@ mod tests {
         assert!(sl.starts_with("SCORE: amd-zen2 t8 silesia |"), "{sl}");
         assert!(sl.contains("native=0.796 WIN"), "{sl}");
         assert!(sl.contains("method=paired"), "{sl}");
-        assert!(sl.contains("rss=120/260MiB"), "score_line missing RSS: {sl}");
+        assert!(
+            sl.contains("rss=120/260MiB"),
+            "score_line missing RSS: {sl}"
+        );
         let ml = r.machine_line();
         assert!(ml.starts_with("SCORE=OK class=WIN"), "{ml}");
         assert!(ml.contains("flavor_n=0"), "{ml}");
