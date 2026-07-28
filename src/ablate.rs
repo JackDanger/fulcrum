@@ -294,8 +294,7 @@ pub fn run(
             geomean: f64::NAN,
             worst_cell: f64::NAN,
             byte_identical: true,
-            verdict: "VOID (NO-OP: both arms compile to the SAME BINARY —                       the change has no effect on generated code)"
-                .to_string(),
+            verdict: "VOID (NO-OP: both arms compile to the SAME BINARY — the change has no effect on generated code)".to_string(),
         };
     }
 
