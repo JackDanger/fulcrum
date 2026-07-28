@@ -4403,6 +4403,7 @@ fn main() -> ExitCode {
         "wallcensus" => fulcrum::wallcensus::cmd(rest),
         "dropin" => fulcrum::dropin::cmd(rest),
         "verify" => fulcrum::verify::cmd(rest),
+        "explain" => fulcrum::explain::cmd(rest),
         "coz-jsonl" => cmd_coz_jsonl(rest),
         "audit" => cmd_audit(rest),
         "comparability" => cmd_comparability(rest),

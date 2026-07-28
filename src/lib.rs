@@ -64,6 +64,7 @@ pub mod dispatchgap;
 pub mod dropin;
 pub mod estimate;
 pub mod excess;
+pub mod explain;
 pub mod finding;
 pub mod fingerprint;
 pub mod flow;
