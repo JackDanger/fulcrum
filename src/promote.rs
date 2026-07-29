@@ -270,7 +270,7 @@ pub fn adjudicate(
         clauses.push(format!("clause 7 OK: all required arch(s) covered: {}", archs_covered.join(", ")));
     } else {
         clauses.push(format!(
-            "clause 7 PENDING: measured on [{}]; still required: [{}] — merge those runs with `fulcrum try merge`",
+            "clause 7 PENDING: measured on [{}]; still required: [{}] — run `fulcrum try` with the same refs on each missing box (the try.json artifacts carry the per-arch verdicts)",
             archs_covered.join(", "),
             missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         ));
