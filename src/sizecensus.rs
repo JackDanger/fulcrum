@@ -293,6 +293,13 @@ pub struct CensusProvenance {
     /// every time, never banked as a standing fact).
     #[serde(default)]
     pub thread_shortcut_voided: Vec<String>,
+    /// The measuring instrument's own provenance (selfver): a banked cell can
+    /// always be traced to the exact fulcrum commit that produced it, so a
+    /// stale instrument is detectable AFTER the fact, not only at run time.
+    #[serde(default)]
+    pub fulcrum_commit: Option<String>,
+    #[serde(default)]
+    pub fulcrum_dirty: Option<bool>,
 }
 
 /// `pub(crate)` — shared with `wallcensus`'s provenance block (same host
@@ -962,6 +969,8 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
         corpus_files: corpus_prov,
         created_unix: unix_now(),
         thread_shortcut_voided: voided_log,
+        fulcrum_commit: Some(crate::selfver::COMMIT.to_string()),
+        fulcrum_dirty: Some(crate::selfver::is_dirty()),
     };
     if provenance.gzippy_commit.is_none() {
         eprintln!(
@@ -1829,6 +1838,8 @@ pub fn selftest() -> ExitCode {
             corpus_files: vec![],
             created_unix: 0,
             thread_shortcut_voided: vec!["ours L03 dickens: witness T4 != T16".to_string()],
+            fulcrum_commit: None,
+            fulcrum_dirty: None,
         },
         &synth_cells,
     );
@@ -1872,6 +1883,8 @@ pub fn selftest() -> ExitCode {
                 corpus_files: vec![],
                 created_unix: 0,
                 thread_shortcut_voided: vec![],
+                fulcrum_commit: None,
+                fulcrum_dirty: None,
             },
             cells: vec![],
         };

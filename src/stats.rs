@@ -10,16 +10,97 @@
 //!
 //! ## Unification (don't fork)
 //!
-//! [`sample_stats`], [`bimodal`], and [`SampleStats`] already had a canonical,
-//! battle-tested implementation in [`crate::perturb`] (the keystone gate). To
-//! keep ONE impl, this module RE-EXPORTS them rather than forking a second copy
-//! — `crate::stats` is the unified namespace mirroring `core/stats.py`, while
-//! the arithmetic stays in one place. The two functions that were missing from
-//! the Rust surface ([`resolution`] and [`dist_health_str`]) live here, plus
-//! [`read_samples`] (the canonical whitespace-float loader the perturb sweep
-//! consumes).
+//! [`sample_stats`], [`bimodal`], and [`SampleStats`] historically lived in
+//! the decode-campaign `perturb` module and were re-exported here. When the
+//! 2026-07 command consolidation retired `perturb`, the canonical
+//! implementations MOVED here verbatim — `crate::stats` is now their one
+//! home, still mirroring `core/stats.py`.
 
-pub use crate::perturb::{bimodal, sample_stats, SampleStats};
+/// Min / median / iqr / max over wall samples (seconds). `None` for empty input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleStats {
+    pub n: usize,
+    pub min: f64,
+    pub med: f64,
+    pub max: f64,
+    pub iqr: f64,
+    pub spread_pct: f64,
+}
+
+fn sorted(xs: &[f64]) -> Vec<f64> {
+    let mut s: Vec<f64> = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s
+}
+
+pub fn sample_stats(xs: &[f64]) -> Option<SampleStats> {
+    if xs.is_empty() {
+        return None;
+    }
+    let s = sorted(xs);
+    let n = s.len();
+    let q = |p: f64| -> f64 {
+        // linear-interpolation percentile (matches numpy default / stats.py)
+        let k = (n as f64 - 1.0) * p;
+        let lo = k.floor() as usize;
+        let hi = k.ceil() as usize;
+        if lo == hi {
+            s[lo]
+        } else {
+            s[lo] + (s[hi] - s[lo]) * (k - lo as f64)
+        }
+    };
+    let med = q(0.5);
+    let iqr = q(0.75) - q(0.25);
+    let spread_pct = if s[0] > 0.0 {
+        (s[n - 1] - s[0]) / s[0] * 100.0
+    } else {
+        0.0
+    };
+    Some(SampleStats {
+        n,
+        min: s[0],
+        med,
+        max: s[n - 1],
+        iqr,
+        spread_pct,
+    })
+}
+
+/// Largest-gap bimodality heuristic. Flag iff the largest internal gap >
+/// k×median of the remaining gaps AND each side keeps ≥2 samples.
+pub fn bimodal(xs: &[f64], k: f64) -> bool {
+    let s = sorted(xs);
+    if s.len() < 5 {
+        return false;
+    }
+    // gaps[i] = (s[i+1]-s[i], i); pick the max gap (ties: largest index, to
+    // mirror Python's max() on (gap, i) tuples).
+    let mut best = (f64::NEG_INFINITY, 0usize);
+    for i in 0..s.len() - 1 {
+        let g = s[i + 1] - s[i];
+        if g > best.0 || (g == best.0 && i > best.1) {
+            best = (g, i);
+        }
+    }
+    let (g, i) = best;
+    let mut others: Vec<f64> = (0..s.len() - 1)
+        .filter(|&j| j != i)
+        .map(|j| s[j + 1] - s[j])
+        .collect();
+    if others.is_empty() {
+        return false;
+    }
+    others.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med_other = others[others.len() / 2];
+    let left = i + 1;
+    let right = s.len() - (i + 1);
+    if med_other <= 0.0 {
+        // Degenerate: all other gaps zero. A single-sample "mode" is not bimodal.
+        return g > 0.0 && left >= 2 && right >= 2;
+    }
+    g > k * med_other && left >= 2 && right >= 2
+}
 
 use std::path::Path;
 

@@ -2350,6 +2350,8 @@ pub fn selftest() -> ExitCode {
                 corpus_files: vec![],
                 created_unix: 0,
                 thread_shortcut_voided: vec![],
+                fulcrum_commit: None,
+                fulcrum_dirty: None,
             }
         }
         fn size_artifact(

@@ -519,7 +519,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
 
 /// Gate-0. An explainer that cannot detect a lying knob is decoration, so this
 /// feeds it a declared/observed pair that MUST be flagged.
-fn selftest() -> ExitCode {
+pub fn selftest() -> ExitCode {
     let mut fails = 0;
     let mut check_it = |cond: bool, label: &str| {
         if !cond {

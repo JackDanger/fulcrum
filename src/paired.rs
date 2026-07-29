@@ -420,13 +420,12 @@ pub fn compress_gate_arm(
 // `Command...status()` with `Stdio::null()` and `Instant` — pristine, no wrapper.
 // Peak RSS needs `/usr/bin/time` rusage, whose fork/exec would ADD to the wall if
 // it wrapped the timed rep. So RSS is measured on its OWN dedicated reps AFTER the
-// A/B walls (mirroring `runner::subject_rss`, which takes RSS from a dedicated
-// probe for exactly this reason). The timed passes never touch `/usr/bin/time`, so
-// the wall verdict is provably un-perturbed by the RSS capture. Both probe reps
-// sink stdout to /dev/null (SINK LAW), like the wall.
+// A/B walls (a dedicated probe, for exactly this reason). The timed passes never
+// touch `/usr/bin/time`, so the wall verdict is provably un-perturbed by the RSS
+// capture. Both probe reps sink stdout to /dev/null (SINK LAW), like the wall.
 //
 // PORTABLE: Linux `/usr/bin/time -v` (RSS in KiB) and macOS `/usr/bin/time -l`
-// (RSS in bytes) are both parsed by the shared `runner::parse_max_rss_mb`.
+// (RSS in bytes) are both parsed by `parse_max_rss_mb` below.
 
 /// Capture peak RSS (MiB) of ONE arm via `/usr/bin/time` rusage, stdout→/dev/null.
 ///   Linux: `/usr/bin/time -v sh -c "<cmd>"` → `Maximum resident set size (kbytes)`.
@@ -452,7 +451,29 @@ pub fn peak_rss_mb_of_arm(cmd: &str) -> Option<f64> {
         return None;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    crate::runner::parse_max_rss_mb(&stderr)
+    parse_max_rss_mb(&stderr)
+}
+
+/// Parse peak RSS (MiB) out of `/usr/bin/time` rusage stderr. (Inlined from
+/// the retired decode-campaign `runner` module when that module was deleted
+/// in the 2026-07 command consolidation.)
+///   GNU `time -v`: `Maximum resident set size (kbytes): N` (KiB).
+///   BSD `time -l`: `N  maximum resident set size` (bytes).
+pub fn parse_max_rss_mb(stderr: &str) -> Option<f64> {
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            if let Ok(kib) = rest.trim().parse::<f64>() {
+                return Some(kib / 1024.0);
+            }
+        }
+        if let Some(n) = line.strip_suffix("maximum resident set size") {
+            if let Ok(bytes) = n.trim().parse::<f64>() {
+                return Some(bytes / (1024.0 * 1024.0));
+            }
+        }
+    }
+    None
 }
 
 /// Run `reps` dedicated peak-RSS probes for one arm, returning every captured
@@ -782,6 +803,11 @@ pub fn ab_verdict(lr_ci: &Ci) -> &'static str {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairedResult {
+    /// The measuring instrument's own provenance (selfver stamp,
+    /// `<sha12>[-dirty]`) — a banked wall can always be traced to the exact
+    /// fulcrum commit that produced it.
+    #[serde(default)]
+    pub fulcrum_commit: String,
     pub status: String,
     pub verdict: String,
     pub method: String,
@@ -1079,6 +1105,7 @@ pub fn run_paired_inner(
     );
 
     Ok(PairedResult {
+        fulcrum_commit: crate::selfver::stamp(),
         status: status.token().to_string(),
         verdict,
         method,

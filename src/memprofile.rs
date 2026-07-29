@@ -761,7 +761,7 @@ fn hog_main(args: &[String]) -> ExitCode {
 
 // ───────────────────────── Gate-0 selftest ─────────────────────────
 
-fn selftest() -> ExitCode {
+pub fn selftest() -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     {
         println!("SELFTEST=SKIP memprofile is Linux-only (needs /proc + strace)");

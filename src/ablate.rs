@@ -97,6 +97,9 @@ impl Cell {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    /// selfver stamp of the fulcrum that ran the gate.
+    #[serde(default)]
+    pub fulcrum_commit: String,
     pub base: ArmProvenance,
     pub after: ArmProvenance,
     pub gate: Gate,
@@ -134,7 +137,7 @@ fn sha_file(p: &Path) -> String {
 /// This is the whole point of the module: the arm cannot be a binary somebody
 /// left lying around. It is built, here, from a named commit, and the commit is
 /// recorded next to the number it produced.
-fn build_arm(
+pub fn build_arm(
     repo: &Path,
     git_ref: &str,
     workdir: &Path,
@@ -287,6 +290,7 @@ pub fn run(
     // this check existed. Detected from the binary hashes, before any timing.
     if base_prov_sha == after_prov_sha {
         return Report {
+            fulcrum_commit: crate::selfver::stamp(),
             base: base_prov,
             after: after_prov,
             gate,
@@ -310,6 +314,7 @@ pub fn run(
     };
 
     Report {
+        fulcrum_commit: crate::selfver::stamp(),
         base: base_prov,
         after: after_prov,
         gate,
@@ -481,7 +486,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
 /// Gate-0. The checks that matter are the ones encoding the failure this module
 /// exists to prevent: a gate that passes a regression, and a verdict that reads
 /// PASS when nothing ran.
-fn selftest() -> ExitCode {
+pub fn selftest() -> ExitCode {
     let mut fails = 0;
     let mut check = |c: bool, label: &str| {
         if !c {
@@ -518,6 +523,7 @@ fn selftest() -> ExitCode {
             "FAIL"
         };
         Report {
+            fulcrum_commit: crate::selfver::stamp(),
             base: prov("base"),
             after: prov("after"),
             gate,

@@ -641,8 +641,8 @@ fn local_smoke_runs_full_orchestration() {
     }
 
     // shas
-    let pin = super::super::score::sha256_file_hex(&gz).unwrap();
-    let decomp = super::super::score::sha256_file_hex(&raw).unwrap();
+    let pin = crate::compare::hex32(&crate::compare::sha256(&std::fs::read(&gz).unwrap()));
+    let decomp = crate::compare::hex32(&crate::compare::sha256(&std::fs::read(&raw).unwrap()));
 
     let spec = Spec {
         n: 4,

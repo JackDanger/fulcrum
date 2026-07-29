@@ -1,131 +1,87 @@
 # FULCRUM — Claude Code guide
 
+Fulcrum is the gzippy campaign's measurement harness. It finds where the time
+goes and proves a change worked; **it is never the deliverable**. The surface
+is ~13 commands organised by the question each answers —
+`docs/command-taxonomy.md` is the authoritative map (including the complete
+old→new migration table from the 2026-07 consolidation of ~90 subcommands).
+
 ## Build and test
 
 ```bash
-make build           # cargo build --release --examples
+make build           # cargo build --release --bin fulcrum --examples
 cargo test           # unit + integration tests (fast, no binary)
-make test            # unit tests + end-to-end pipeline integration
-make check-pipeline  # build → run toy → assert ranking on real output
-make check-robustness  # same ranking assertions at 2 and 8 workers
-make demo            # show the full pretty output for the toy pipeline
+make test            # cargo test + end-to-end toy-pipeline integration
+make demo            # show trace critpath/consumer on the toy pipeline
+make deploy BOX=root@10.0.2.240 DIR=/root/fulcrum   # push main to a box, verify, Gate-0
 ```
 
-`make test` is the right command to run after any change. It runs `cargo test`
-first (fast, synthetic traces), then builds release and asserts on live output
-from the real toy pipeline.
+`make test` is the right command after any change. Run `cargo clippy` too and
+add no new warnings.
 
-## File map
+## The command surface (see docs/command-taxonomy.md for detail)
 
 ```
-src/probe.rs      instrumentation library: probe::scope("name") + probe::progress("name")
-                  Two backends: Chrome-trace (FULCRUM_TRACE env var, always on) and Coz
-                  (--features coz, dlsym-resolved). Don't change the trace wire format
-                  without updating trace.rs.
-
-src/trace.rs      Chrome-trace JSON parser. B/E span pairing. Repairs unclosed arrays
-                  (intentional crash-tolerance — the writer never closes the array).
-
-src/critpath.rs   Layer 2: consumer-anchored critical path. Finds the in-order consumer
-                  thread (looks for consumer.* spans), then attributes each consumer wait
-                  to the worker span producing the awaited item. Avoids the CPU-sum lie
-                  by construction.
-
-src/coz.rs        Layer 1: Coz profile.coz parser → per-region wall-elasticity curves.
-                  Key: uses PEAK-line elasticity, not median. The median is masked to ~0
-                  by high-sample near-zero lines; the peak is the actionable signal.
-
-src/mech.rs       Layer 3: perf TMA / report parser → per-function mechanism. Function-
-                  level, not per-span (robust across perf versions; survives LTO).
-
-src/region_hw.rs  New (v2) mechanism layer: per-region PEBS mem-load samples joined to
-                  region span windows by CLOCK_MONOTONIC timestamp. Requires the probe to
-                  run with FULCRUM_TRACE_CLOCK=monotonic. Reports L1/L2/L3/DRAM hit
-                  fractions, IPC, branch MPKI, and a stall split per region.
-
-src/microbench.rs RDTSC-based primitive microbench harness. Measures ns/op, cycles/op,
-                  and B/cyc for a closure with explicit working-set control. The output
-                  feeds the counterfactual estimator (src/estimate.rs).
-
-src/estimate.rs   Counterfactual cost estimator: predict a structural change's wall delta
-                  before building it. Combines access counts (region_hw.rs) with measured
-                  per-op costs (microbench.rs) and on-critical-path share to produce an
-                  arithmetic wall-move prediction.
-
-src/xtool.rs      Cross-tool region accounting: profiles competing implementations
-                  (the tool under test plus any number of alternative tools) at
-                  comparable granularity on the same inputs, normalizes TMA shapes
-                  side-by-side so a lever recommendation can cite the gap rather than
-                  assert it.
-
-src/rank.rs       Fusion: combines layers 1+2 (and optionally 3) into the ranked lever
-                  list. lever_score = elasticity × on_path_fraction. NaN elasticity
-                  (no Coz data) falls back to on_path_fraction alone.
-
-src/validate.rs   The trust gate: checks the ranking against configured ground truth.
-                  If known answers don't reproduce, the ranking is wrong and says so.
-                  New layers should add corresponding ground truth checks here.
-
-src/config.rs     Declarative pipeline config: region names, source ranges, progress
-                  point, ground truth. Config::demo() is the built-in config for the
-                  toy pipeline. All pipeline-specific logic lives here — none compiled in.
-
-src/main.rs       CLI: critpath, coz-parse, mech-report, rank, validate, plan subcommands.
-
-examples/toy_pipeline.rs   Four-stage demo (parse→transform→compress→emit) with an
-                           in-order consumer. Ground truth is planted: transform is the
-                           long-pole lever, emit is a non-lever. Self-validates.
-
-tests/analyzer.rs  Integration tests over a synthetic hand-built trace. These are
-                   fast and deterministic (no binary, no file I/O beyond a tempfile).
+board            WHERE DO WE STAND — per-label size+wall board (board size / board wall / board goal)
+why <cell>       WHY DOES THIS CELL FAIL — the automated vendor diff
+candidates <cell> WHAT COULD I DO — vendor-precedented techniques + FALSIFY records
+try <ref>        IS THIS CHANGE GOOD — the whole promotion rule → SHIP/NO-SHIP/UNDECIDED
+freeze           box-freeze lifecycle (SIGCONT on every exit path, orphan sweep)
+verify           encoder roundtrip oracle (own decoder every T + independent decoders)
+dropin           drop-in CLI-compatibility census
+ab               paired | matrix | ablate | bisect  (A/B with provenance)
+profile          counters|insn|insn-cat|topdown|classhist|excess|uarch|chainlat|rss|phases
+trace            span-trace views (critpath/flow/causal/consumer/… — the T>1 tooling)
+anatomy          deflate structure diff | ratio | explain
+bank             finding | ledger | scoreboard  (banked artifacts stay readable)
+selftest         run every Gate-0; `selftest invariants` renders the rule registry
+version          baked provenance; --expect <sha> is the deployment check
 ```
+
+Cross-cutting (`src/selfver.rs` + `build.rs`): every command prints its baked
+provenance and checks itself against origin/main at startup. Measurement
+commands REFUSE to run stale; analysis commands self-update when no freeze is
+held; `--no-self-update` pins a reproduction. Measurement artifacts carry
+`fulcrum_commit`/`fulcrum_dirty`.
 
 ## Key invariants — don't break these
 
-1. **validate passes on the toy pipeline.** `make check-pipeline` runs `fulcrum validate`
-   on 1200 items, 4 workers, and expects exit 0. If it fails, something is broken.
-
-2. **transform ranks #1.** `fulcrum rank` on the toy pipeline must output `> transform`
-   as the first row. This is the core claim of the tool working correctly.
-
-3. **lever_score = elasticity × on_path_fraction.** This product is the whole point.
-   A region with high elasticity but ~0 on-path share is a small lever (CPU-sum trap
-   in reverse). The product catches that. Don't replace it with either factor alone.
-
-4. **Config is data, not code.** No pipeline-specific logic is compiled into the analyzer.
-   Everything lives in the JSON config. Keep it that way.
-
-5. **The trace never closes its JSON array.** The writer streams `[` + objects and stops.
-   The loader repairs the unclosed array. This is crash-tolerant by design — don't
-   "fix" the writer to close `]`.
-
-6. **Coz peak-line elasticity, not median.** The median elasticity per region is masked
-   by high-sample near-zero lines. The peak line is the actionable signal. If you touch
-   coz.rs, preserve this distinction.
+1. **A VOID can never score as a win.** sizecensus roundtrip-VOIDs, wallcensus
+   pin-gates, paired A/A-certificates. Every one of these exists because of a
+   real wrong number; their Gate-0s (`fulcrum selftest`) prove the refusals fire.
+2. **SINK LAW + paired-difference CI.** Both arms to /dev/null; interleaved
+   paired deltas; never best-of-N.
+3. **NO-OP and stale-control refusal.** Arms are built from git refs
+   (`ablate::build_arm`); identical binary hashes VOID the run.
+4. **REFUSE, never warn.** Missing datasets, single-level `try` runs, opaque
+   no-debug binaries, unverifiable provenance: hard errors with exit codes.
+5. **Ir/Dr LOCATE, never predict the wall** — keep the disclaimer on every
+   instruction-count surface.
+6. **The trace never closes its JSON array.** The writer streams `[` + objects
+   and stops; the loader repairs it. Crash-tolerant by design — don't "fix" it.
+7. **Config is data, not code** (`config.rs`); the trace views classify span
+   names entirely from the config.
+8. **Banked artifacts stay readable.** New fields on artifact structs must be
+   `#[serde(default)]` so prior runs still load.
 
 ## Adding things
 
-**New CLI subcommand**: add `cmd_X(args: &[String]) -> ExitCode` in main.rs and wire it
-into the match in `main()`. Use the existing `flag()` / `positional()` helpers.
+**New capability**: put it under the existing command whose QUESTION it
+answers (a subcommand or flag), not a new top-level name. If it measures, it
+must stamp provenance and have a Gate-0 registered in `src/selftest.rs`.
+Update `docs/command-taxonomy.md` in the same commit.
 
-**New analysis layer**: add a module, export it from lib.rs, thread it through rank.rs's
-`rank()` signature and the `Lever` struct. Add a ground truth check to validate.rs.
-
-**New probe backend**: add an optional Cargo dependency, gate with a feature flag, keep
-the Chrome-trace backend always available. Follow the Coz feature as a template.
+**New probe backend**: optional Cargo dependency behind a feature flag; the
+Chrome-trace backend stays always-available.
 
 ## Non-obvious things
 
-- `FULCRUM_TRACE_CLOCK=monotonic` switches the probe to absolute CLOCK_MONOTONIC
-  timestamps (Linux only, requires the `libc` dependency). Required for region_hw.rs's
-  timestamp-join with perf PEBS data. Default is relative timestamps (no libc needed).
-
-- The critpath `cp_offpath_region` ground truth check ("emit < 5% on-path") only holds
-  reliably at 4 workers. At 8 workers, all sequential stages accumulate more critical-
-  path blame. The Makefile's robustness tests skip validate for this reason.
-
-- 240 items is too noisy for stable ground truth checks — the toy finishes in ~30ms and
-  scheduling jitter dominates. The integration test uses 1200 items (~150ms) for stability.
-
-- `consumer.emit` span names contain "emit" and get attributed to the emit region via
-  label_region(). This is expected — it's the consumer's own work time.
+- `FULCRUM_TRACE=/path.json` makes an instrumented program emit the span
+  timeline the `trace` family consumes; `examples/toy_pipeline.rs` is the
+  worked example (`make demo`).
+- 240 toy items is too noisy for stable assertions; the integration test uses
+  1200 (~150 ms).
+- macOS + `--features in-process-gzippy` swaps several `profile` subcommands
+  to the kpc backends (`src/macmeasure.rs`) and adds mac-only ones.
+- `stats.rs` is the one home of `sample_stats`/`bimodal` (moved from the
+  retired `perturb`); don't fork a second copy.

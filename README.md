@@ -16,8 +16,8 @@ Regular profilers rank by CPU time. In a parallel pipeline, CPU time and wall-cl
 cargo build --release
 cargo run --release --example toy_pipeline -- --items 1200 --workers 4
 
-./target/release/fulcrum rank     /tmp/fulcrum_toy.json
-./target/release/fulcrum validate /tmp/fulcrum_toy.json
+./target/release/fulcrum trace critpath /tmp/fulcrum_toy.json
+./target/release/fulcrum trace consumer /tmp/fulcrum_toy.json --config demo
 ```
 
 Output:
@@ -93,17 +93,18 @@ Three built-ins: `--config generic` (default, works on any pipeline), `--config 
 ## Other subcommands
 
 ```bash
-fulcrum critpath run.json             # consumer critical-path breakdown
-fulcrum consumer run.json             # WAIT/COMPUTE/OUTPUT/IDLE split
-fulcrum flow run.json                 # per-stage wall-critical vs slack
-fulcrum flow run.json --whatif transform:2   # predicted gain if 2× faster
-fulcrum vs a.json b.json              # compare two traces
-fulcrum validate run.json             # check ranking against known ground truth
-fulcrum chainlat --asm gz.s --cmp-asm igzip.s --path literal-fast
+fulcrum trace critpath run.json       # consumer critical-path breakdown
+fulcrum trace consumer run.json       # WAIT/COMPUTE/OUTPUT/IDLE split
+fulcrum trace flow run.json           # per-stage wall-critical vs slack
+fulcrum trace flow run.json --whatif transform:2   # predicted gain if 2× faster
+fulcrum trace vs a.json b.json        # compare two traces
+fulcrum profile chainlat --asm gz.s --cmp-asm igzip.s --path literal-fast
                                       # llvm-mca loop recurrence / critical-chain diff
 ```
 
-On Linux, `fulcrum plan` prints the exact capture commands for your binary and `fulcrum rank` fuses a trace, Coz profile, and perf report into the full ranked list.
+The full surface is ~13 commands organised by question (`board`, `why`,
+`candidates`, `try`, `freeze`, `verify`, `dropin`, `ab`, `profile`, `trace`,
+`anatomy`, `bank`, `selftest`, `version`) — see `docs/command-taxonomy.md`.
 
 ---
 
