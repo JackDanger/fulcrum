@@ -1,34 +1,29 @@
-//! FULCRUM — a causal-mechanistic pipeline profiler.
+//! FULCRUM — the gzippy campaign's measurement harness.
 //!
-//! Finds the leverage point: the code region whose speedup moves the wall the
-//! most (wall-elasticity), with on/off-critical-path classification, a
-//! per-region mechanism (DRAM-bound / branch-miss / false-sharing), and a
-//! confidence interval.
+//! The surface is ~12 commands organised by the QUESTION each answers — see
+//! `docs/command-taxonomy.md` for the map and the old→new migration table.
 //!
-//! Three fused layers over ONE span+dependency graph your program emits (a
-//! Chrome-trace timeline) plus Coz + perf:
-//!   1. Causal (Coz virtual speedup)  — the primary ∂wall/∂speed metric.
-//!   2. Critical-path (wPerf-style)    — consumer-anchored wait attribution.
-//!   3. Mechanistic (Linux perf)       — TMA / PEBS / c2c → the WHY.
-//!
-//! Subcommands (run `fulcrum help`):
-//!   critpath <trace.json>            critical-path from a Chrome-trace timeline
-//!   coz-parse <profile.coz>          parse a coz profile → per-region curves
-//!   mech-report <perf_report.txt>    parse a perf report → per-func cycles
-//!   rank <trace.json> [profile.coz] [perf_report.txt]
-//!                                    fuse → ranked lever list
-//!   validate <trace.json> [profile.coz]
-//!                                    check vs configured ground truth (the gate)
-//!   plan --bin <path> [...]          print a coz/perf workflow for your binary
+//!   board       WHERE DO WE STAND?  (per-label size+wall board, stale-aware)
+//!   why         WHY DOES THIS CELL FAIL?  (the vendor diff, automated)
+//!   candidates  WHAT COULD I DO ABOUT IT?  (vendor-precedented techniques)
+//!   try         IS THIS CHANGE GOOD?  (the whole promotion rule → verdict)
+//!   freeze      make the box quiet and safe to measure on
+//!   verify      is the encoder correct? (roundtrip oracle)
+//!   dropin      does the CLI behave like gzip/pigz?
+//!   ab          A/B two builds with provenance (paired/matrix/ablate/bisect)
+//!   profile     where do time/instructions/loads go (LOCATE, never predict)
+//!   trace       span-trace views (the T>1 starvation/causation tooling)
+//!   bank        read banked artifacts (finding/ledger/scoreboard)
+//!   selftest    run every Gate-0; `selftest invariants` renders the rule set
+//!   version     baked provenance (+ cross-cutting staleness self-check)
 
 use fulcrum::config::{Config, GzippyAdapter, ProjectAdapter};
 use fulcrum::ledger::Ledger;
+use fulcrum::selfver::CmdClass;
 use fulcrum::{
-    abmeasure, audit, bundle, causal, chainlat, compare, compare_cli, consumer, coz, coz_jsonl,
-    critpath, cycles, decide, decompose, excess, finding, flow, insn, insn_attr, invariants,
-    locate, mech, mech_arch, memlife, model, optgate, perturb, phasebreak, provenance, rank,
-    region_hw, report, rg_verbose, scaling, scaling_matrix, schedule, score, scoreboard, spans,
-    sweep, trace, validate, vs, vs_sweep, xtool,
+    bundle, causal, chainlat, consumer, critpath, cycles, decompose, excess, finding, flow, insn,
+    insn_attr, locate, model, phasebreak, report, scaling, scaling_matrix, schedule, scoreboard,
+    spans, trace, vs, vs_sweep,
 };
 // counterdiff's perf-based command is the fallback whenever the macOS kpc
 // backend (fulcrum::macmeasure) is NOT compiled in — i.e. off macOS, or on
@@ -37,222 +32,6 @@ use fulcrum::{
 use fulcrum::counterdiff;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
-
-fn usage() -> ExitCode {
-    eprintln!(
-        "FULCRUM — causal-mechanistic pipeline profiler\n\
-\n\
-USAGE:\n\
-  fulcrum critpath <trace.json> [--heavy-ms 30] [--config profile.json]\n\
-  fulcrum coz-parse <profile.coz> [--config profile.json]\n\
-  fulcrum mech-report <perf_report.txt>\n\
-  fulcrum rank <trace.json> [profile.coz] [perf_report.txt] [--config profile.json] [--topdown td.txt]\n\
-  fulcrum region-hw <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv] [--config c.json] [--topdown td.txt]\n\
-  fulcrum vs <A-trace.json> <B-trace.json> [--labels a,b] [--config profile]\n\
-  fulcrum vs-sweep --at T:a.json:b.json [--at ...] [--labels a,b] [--config c.json]\n\
-  fulcrum flow <trace.json> [--whatif stage:factor] [--config profile]\n\
-  fulcrum xtool --input <name> --tool name:topdown.txt:report.txt[:mbps] [--tool ...]\n\
-  fulcrum compare --spec compare.json [--samples 5] [--strict-contention] [--timeout-s 120]\n\
-  fulcrum audit --spec compare.json --claim \"<stated perf claim>\" [--samples 5]\n\
-  fulcrum comparability --capture cap.json [--capture ...] --claim subject-specific|settled|law\n\
-              [--subject id --contrast id --counter name] [--field-tools a,b,c] [--statement \"...\"]\n\
-  fulcrum score --gzippy-native <bin> --comparator <bin[:argtmpl]> --corpus <path>\n\
-              --threads <T> [--n 51] [--out <path|json>]\n\
-              THE paired-backed scoreboard — delegates timing to `fulcrum paired`\n\
-              (interleaved paired-Δ + log-ratio CI95; Δ<spread ⇒ TIE) + COMPARATOR-native\n\
-              + FLAVOR-N provenance + byte-exact gate. `score selftest` is the Gate-0.\n\
-  fulcrum score --arch-os <arch-os> --threads <N> --mask <cpu-mask> --corpus <name>\n\
-              --corpus-path <path> --corpus-pin <sha256> --decomp-pin <sha256>\n\
-              --native <path> --isal <path> --rg <path>   [LEGACY best-of-N cell emitter]\n\
-              --box <name> --freeze-method <str> [--freeze-acknowledged]\n\
-              [--samples N] [--src-sha sha7] [--date YYYY-MM-DD] [--out-dir <path>]\n\
-  fulcrum scoreboard run       --spec <spec.json> [--dry-run]\n\
-  fulcrum scoreboard diff      <before.json> <after.json>\n\
-  fulcrum scoreboard render    <artifact.json>\n\
-  fulcrum scoreboard recertify <artifact.json>\n\
-  fulcrum quantity [--demo|--algebra]   dimensioned-quantity evaluator (refuses share×wall→bytes etc.)\n\
-  fulcrum finding add|cite|consult|list   citable finding store (supersedes banked prose)\n\
-  fulcrum run <spec.json> [--out DIR] [--dry-run|--live] [--gate] [--store P] [--fixture-oracle]   the live-capture RUNNER half:\n\
-              run a gzippy-vs-rg decode workload and emit the gate-input artifacts;\n\
-              --gate flows them through the in-process gates and banks CERTIFIED cells\n\
-              (--fixture-oracle certifies a synthetic/dry-run commit; refused with --live)\n\
-              (--spec-help for the spec fields; --live-help for the frozen-box invocation)\n\
-  fulcrum perturb <sweep-dir> [--allow-thaw]   causal perturbation harness (PERTURBATION-OR-NO-LEVER)\n\
-  fulcrum optgate <artifact.json>   OPTIMIZATION A/B GATE (WALL-WIN-OR-NO-WIN): cyc/byte verdict on\n\
-              a base-vs-after-vs-rg artifact; refuses instruction-only/loaded-window/byte-mismatch/\n\
-              clean-regression/sub-spread/single-arch wins (exit 0 only on a banked WALL WIN)\n\
-  fulcrum abmeasure --base-bin <p> --corpus <f.gz> [--after-bin <p>] [--n N] [--core c] [--cross-arch]\n\
-              LIVE interleaved A/B/comparator perf-stat -> optgate verdict; LOAD-IMMUNE (no\n\
-              freeze/governor/SIGSTOP — replaces the hand-rolled frozen_*.sh scripts); --help for flags\n\
-  fulcrum insn-attr --gz-bin <p> --corpus <f.gz> [--cmp-cmd \"igzip -d -c\"]\n\
-              Linux perf plan for instruction-category attribution; --taxonomy prints opcode buckets\n\
-  fulcrum excess <artifact.json>   EXCESS-VS-INTRINSIC differential: per-region verdict on whether a\n\
-              region is gz-recoverable EXCESS (gz/rg high on a LOSS corpus but vanishing on a\n\
-              CONTROL corpus) or INTRINSIC (both tools pay it); refuses excess without a control\n\
-              arm / on instr-only / on sub-spread gaps; emits the recoverable cyc/byte budget\n\
-  fulcrum chainlat --asm gz.s --cmp-asm igzip.s [--path literal-fast]\n\
-              CRITICAL-RECURRENCE / CHAIN-LATENCY loop analysis via llvm-mca; compares steady-state\n\
-              cycles/iter, critical sequence, and port pressure for one linear decode path slice\n\
-  fulcrum phasebreak --native <gzippy-bin> --corpus <f.gz> [-p T] [-n N] [--taskset <mask>] [--json]\n\
-              runs a --features phase-timing gzippy binary N times, Gate-0 conservation-checks\n\
-              each run's phase JSON, reports per-phase median+spread + the dominant blocking phase\n\
-  fulcrum freeze acquire|release|run|status|selftest   the ONE managed box-freeze lifecycle\n\
-              (boost=0 + governor=performance + SIGSTOP tenants supervisor-first + detached\n\
-              TTL watchdog + idempotent release with a GLOBAL orphan sweep). `freeze run\n\
-              [--ttl-s N] -- CMD...` releases on EVERY exit path; kills the re-CONT/orphan\n\
-              bug class. `freeze selftest` is the baked Gate-0 (fake sysfs + real procs)\n\
-  fulcrum paired --a-cmd <tmpl> --b-cmd <tmpl> --corpus <path> [--n 51] [--warmup 2]\n\
-              [--ref-cmd 'gunzip -c {{corpus}}'] [--no-sha] [--out result.json]\n\
-              the ONE interleaved A/B paired-diff runner for ~35 ms /dev/null decode walls\n\
-              (per-round paired Δ cancels common-mode drift; best-of-N is unusable that low).\n\
-              Δ<spread ⇒ TIE (log-ratio CI must EXCLUDE 0). SINK LAW /dev/null both arms +\n\
-              mandatory A/A certificate + byte-exact gate. `paired selftest` is the baked Gate-0.\n\
-              Composes: `fulcrum freeze run -- fulcrum paired ...`\n\
-  fulcrum matrix --a-cmd <tmpl> --b-cmd <tmpl> --corpora a.gz,b.gz --threads 1,4,8,16\n\
-              [--n 51] [--ours a|b] [--box NAME] [--sha-pin K:V ...] [--out matrix.json] [--dry-run]\n\
-              the corpus×T LOSS-SURFACE sweep — drives `paired` per cell and AUTO-BANKS the durable\n\
-              JSON artifact (subsumes breadth_driver.sh; kills the never-banked-N=51-table debt).\n\
-              Fail-soft per cell → MATRIX=OK|PARTIAL. `matrix selftest` is the baked Gate-0.\n\
-              Composes: `fulcrum freeze run -- fulcrum matrix ...`\n\
-  fulcrum frontier --ours gzippy --ours-cmd '<tmpl {{level}}/{{threads}}/{{corpus}}>' --ours-levels 1-9\n\
-              --rival 'pigz=pigz -{{level}} -c -p {{threads}} {{corpus}}=1-9' [--rival ...] --corpus <plaintext>\n\
-              [--threads 1,8] [--gate curve|per-label|both] [--tie-policy beat|pareto] [--exhaustive] [--out f.json]\n\
-              the size↔time Pareto-CURVE verdict engine: sweeps every (tool,level) into a gated\n\
-              size↔time point, builds each tool's frontier, and per vendor op-point runs a REAL\n\
-              gated paired of gzippy's storage-matched witness vs the vendor point → CURVE-DOMINATES /\n\
-              CURVE-OPEN + the vendor→gzippy level-alignment map. Kills level whack-a-mole. Ship gate =\n\
-              curve-dominance (`--exhaustive` for the certificate). `frontier selftest` is the Gate-0.\n\
-  fulcrum bisect --bins <l1=p1,l2=p2,...> --run '<tmpl {{bin}} {{threads}} {{corpus}}>'\n\
-              --corpus <path> --threads <T> [--n 51] [--min-effect 0.02] [--out result.json]\n\
-              native-vs-native paired REGRESSOR-HUNT: races each ADJACENT pair of an ordered build\n\
-              chain (oldest→newest) with `fulcrum paired` and NAMES the transition that moved the\n\
-              wall (ratio B/A>1 ⇒ newer slower ⇒ regression; a move needs CI-excludes-0 AND\n\
-              |ratio-1|>=min-effect, else TIE). A/B byte-identity guarded (sha). Thin\n\
-              `--build '<tmpl {{sha}} {{out}}>' --shas a,b,c` builds each sha first. `bisect\n\
-              selftest` is the baked Gate-0. → BISECT=OK|PARTIAL regressors=[...]\n\
-  fulcrum scope --manifest scope.json --banked <file-or-dir> [--banked ...] [--require-sha SHA] [--json out.json]\n\
-              GOAL-GRID completeness gate — joins banked matrix artifacts onto the FULL\n\
-              box×comparator×corpus×T goal grid; every cell is W/T/L/V/STALE/UNMEASURED and the\n\
-              exit code is the gate (SUCCESS only on SCOPE=WIN). The board can no longer silently\n\
-              shrink to one comparator/box. `scope selftest` is the baked Gate-0.\n\
-  fulcrum gate --cand <bin[:tmpl]> --base <bin[:tmpl]> --rg <bin[:tmpl]> --target-cells c.gz:4,...\n\
-              [--breadth-corpora a.gz,b.gz --breadth-threads 1,4,8] [--freeze-each]\n\
-              [--scope-manifest scope.json --arch-json <banked> ...] [--out gate.json]\n\
-              the WHOLE lever verdict in ONE command: target-cell recovery vs rg + full-breadth\n\
-              no-regress vs base + per-cell peak-RSS + byte-exact + A/A floor + optional cross-arch\n\
-              merge. Exit = PASS|OPEN|VOID|FAIL. `gate selftest` is the baked Gate-0 (no box).\n\
-  fulcrum dispatchgap <event-log.jsonl> [--label L] [--workers N] [--json out.json]\n\
-              per-worker inter-chunk dispatch-gap attribution (H-QUEUE/BLOCKFIND/WINDOWDEP/\n\
-              DECODEWAIT/OTHER) from gzippy's GZIPPY_DISPATCHGAP event log; conservation +\n\
-              pairing + no-dropped-lines gates, non-zero exit on FAIL. `dispatchgap selftest`\n\
-              is the baked Gate-0 (synthetic logs, PASS + refusal paths).\n\
-  fulcrum uarch run|cross|selftest              hardware-counter microarch profiler (core/L1/TLB/\n\
-              LLC/stalls/branch + arch-specific memory-fill-source raw events) on a (bin,corpus,T)\n\
-              cell; `cross` explains a cross-machine win/loss divergence per counter. `uarch\n\
-              selftest` is the baked Gate-0 (pure logic + live perf A/A).\n\
-  fulcrum counterdiff --subject-bin <p> --comparator-cmd \"<cmd>\" --corpus <f.gz> [--threads 3,4]\n\
-              LIVE interleaved paired hw-counter diff + microarch attribution (frontend/backend/\n\
-              bad-spec/cache-memory), arch-aware event sets, A/A noise floor (Linux)\n\
-  fulcrum classhist --subject <elf> --comparator <elf> --corpus <f.gz>\n\
-              execution-weighted INSTRUCTION-CLASS histogram diff — is an instr surplus\n\
-              CONCENTRATED (code lever) or DISTRIBUTED (codegen)? (Linux/x86; mac: macmeasure)\n\
-  fulcrum locate <trace.json> [...] [--wall-ms X] [--threshold pct]\n\
-              closed WALL LEDGER over a span trace — every microsecond classified on the critical\n\
-              path or surfaced as RESIDUAL; refuses (FLAGGED) when the ledger cannot close\n\
-  fulcrum cellwhy <corpus>:<T> --gz <bin> --rg <bin> [--instrumented <bin>] [--budget-s S] [--out j.json]\n\
-              the ONE-COMMAND LOCATE for a loss cell: preflight (pin+ParallelSM+flavor+/dev/null) →\n\
-              magnitude (paired; WIN/TIE ⇒ CELLWHY=NOLOSS stop) → budgeted instrument suite →\n\
-              taxonomy join with CONSERVATION-OR-NO-LOCATE, emitting RANKED candidates + the exact\n\
-              `fulcrum perturb` Gate-2 spec per candidate (never runs a perturbation). `cellwhy\n\
-              selftest` is the baked Gate-0 (synthetic, no box).\n\
-  fulcrum decide --feature <dir> [--ledger P] [--allow-thaw]   ONE artifact-dir → the ranked,\n\
-              causally-annotated next-actions table (wall-ms attribution + CAUSAL-OR-HYPOTHESIS\n\
-              + the exact re-verify command; fingerprint + ledger cross-checked)\n\
-  fulcrum sweep capture|mine|--cand ...         multi-factor lever-boundary characterizer (which\n\
-              corpus/T factors separate cand from base); `sweep --selftest` is the baked Gate-0\n\
-  fulcrum goal --spec goal.json --ours-bin PATH [--baseline-spec b.json] [--json OUT]\n\
-              whole-goal-surface adjudicator over banked `sweep` cells: ONE verdict\n\
-              (PASS|PASS-WITH-WAIVERS|FAIL|INCOMPLETE|STALE) that refuses narrowed scope,\n\
-              stale/unprovenanced/stitched evidence, inside-noise wins, and conflating\n\
-              non-domination with dominance; `goal selftest` covers the refusal paths\n\
-  fulcrum sizecensus --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' \\\n\
-              --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
-              --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus ...] --out DIR\n\
-              the deterministic SIZE-axis census: exact-integer compressed-byte-count vs matched-\n\
-              level rivals, no timing/rig/significance test needed (an integer either matches or\n\
-              doesn't). THREADS ARE A FIRST-CLASS AXIS (cells key on rival/corpus/level/threads,\n\
-              matching wallcensus): a T>=2 byte-identity shortcut is exploited but re-verified\n\
-              every run via a min/max witness sha comparison, and voided loudly if it ever fails.\n\
-              Roundtrip-gated (a non-roundtripping gzippy output is VOID, never a win); per-rival\n\
-              level support reused from `goal::rival_accepts_level`; `sizecensus report --out DIR\n\
-              [--out ...]` merges banked runs (refuses across different gzippy shas);\n\
-              `sizecensus selftest` is the Gate-0\n\
-  fulcrum wallcensus --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' \\\n\
-              --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
-              --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus ...] --out DIR\n\
-              the WALL-axis census (sizecensus's missing half): cells keyed on (corpus, level,\n\
-              rival, THREADS) via `paired::run_paired_inner` compress-mode; a PIN GATE probes\n\
-              each arm's real CPU%% and VOIDs any cell that did not run at its declared\n\
-              concurrency (catches an unpinned rival before it sign-flips a ratio). Resumable\n\
-              per cell (a cached VOID is always re-measured); `wallcensus report --out DIR\n\
-              [--out ...]` merges banked runs; `wallcensus selftest` is the Gate-0. `goal join\n\
-              --size-census DIR --wall-census DIR --spec join.json --ours-bin PATH` fuses a\n\
-              sizecensus artifact with a wallcensus artifact into one verdict.\n\
-  fulcrum dropin --ours PATH --rival name=CMD [--rival ...] \\\n\
-              --fixture FILE [--fixture ...] --out DIR [--oracle-gzip CMD] [--declared FILE.json]\n\
-              the executable DROP-IN COMPATIBILITY census — the missing half of the goal\n\
-              scoreboard: for a hardcoded minimum surface of REAL invocations (in-place vs -c,\n\
-              -k, -f, missing-input/refuse-without-force/corrupt-input error behaviour, -t/-l)\n\
-              diffs exit code, stdout, stderr shape, created/removed/modified files, permission\n\
-              bits, and roundtrip correctness between ours and each rival. Statuses: MATCH /\n\
-              DIVERGENT (real, unreasoned difference) / DECLARED (matches a --declared\n\
-              exception, reason required) / ERROR / OURS-UNAVAILABLE / RIVAL-UNAVAILABLE.\n\
-              `dropin report --out DIR [--out ...]` merges banked runs (refuses across\n\
-              different ours shas); `dropin selftest` is the Gate-0.\n\
-  fulcrum memprofile [--label L] [--env K=V ...] -- ARGV...   self-validating memory+concurrency\n\
-              profile of a decode cmd (RSS timeline/peak/integral, mmap/madvise turnover,\n\
-              faults, per-thread occupancy; Linux)\n\
-  fulcrum invariants                            render THE INVARIANT SET (the enforced-rule registry)\n\
-  fulcrum mech-caps\n\
-  fulcrum validate <trace.json> [profile.coz] [--config profile.json]\n\
-  fulcrum causal <trace.json> [--timeline N] [--static-fraction P] [--verbose-log trace.log]\n\
-  fulcrum stats <trace.log>   parse GZIPPY_VERBOSE counters (bootstrap ring split, clean-decode paths)\n\
-  fulcrum consumer <trace.json> [trace2.json ...]   consumer-span decomposition (WAIT/COMPUTE/OUTPUT/IDLE)\n\
-  fulcrum spans <trace.json> [--config gzippy] [--top N] [--under PARENT]   span atlas (excl-self + wall-crit)\n\
-  fulcrum schedule <trace.json>                     S1 arbiter: per consumer-stall PLACEMENT vs RATE verdict\n\
-  fulcrum scaling --at T:trace.json [--at ...] [--rg-wall T:ms ...] [--config gzippy]\n\
-              SCALING-DEFICIT DECOMPOSITION: why the parallel decode scales worse as T grows\n\
-  fulcrum scaling --box <host> --gz <p> --rg <p> --corpus <f.gz> --oracle-sha <sha> [--threads L] [--n N]\n\
-              COMPETITIVE THREAD-SCALING MATRIX: does gz beat rg at ALL T? LOAD-IMMUNE (per-cell self-1.0 certificate), WIN/TIE/LOSS\n\
-  fulcrum decompose <trace.json> [--config profile] NAME the wall residual (page-fault/ctxsw/blocked-on-host/queueing)\n\
-  fulcrum alloc <trace.json>   per-(tid,region) fault localization (needs --features rpmalloc-stats)\n\
-  fulcrum memlife <run.json>   cross-tool per-buffer memory-lifecycle attribution\n\
-  fulcrum memlife vs <A.json> <B.json>    A vs B vs delta (per-MB-decoded)\n\
-  fulcrum memlife growth <T1.json> <T8.json>  T1→T8 written-bytes growth per component\n\
-  fulcrum model <trace.json> [trace2.json] [--workers T] [--labels A,B]   parallel-SM wall-model params + lever delta\n\
-  fulcrum plan --bin <path> [--args \"...\"] [--scope %/src/%] [--cpus 0,2,4,6] [--iters 200]\n\
-\n\
-The trace.json is a Chrome-trace timeline your program emits (the bundled\n\
-`fulcrum::probe` writes one when FULCRUM_TRACE=/path.json is set). profile.coz\n\
-is produced by running your instrumented binary under `coz run`.\n\
-\n\
---config takes a profile.json PATH or a built-in profile NAME: `generic`\n\
-(the no-vocabulary default — works on any pipeline via the universal wait\n\
-convention), `gzippy` (the worked example vocabulary), or `demo` (matches\n\
-examples/toy_pipeline.rs). The consumer/flow/vs views classify span names\n\
-entirely from the config, so they run on YOUR span vocabulary unchanged.\n\
-\n\
-compare/audit run a FAIR cross-tool benchmark from a generic --spec JSON\n\
-(no competitor names baked in): it verifies every output's sha256 vs a\n\
-reference, detects interpreter-wrapped binaries + subtracts per-invocation\n\
-startup, uses each tool's documented best config, interleaves best-of-N with\n\
-contention detection, and sweeps corpus x thread cells — then `audit` checks\n\
-a stated claim against that matrix (SURVIVES / NARROWS-TO-SCOPE / FALSE).\n\
-mech-caps reports this host's HW-counter availability (never x86-only on arm).\n"
-    );
-    ExitCode::from(2)
-}
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
@@ -338,224 +117,6 @@ fn cmd_critpath(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `fulcrum sixstage <gzippy_trace.json> --rg-verbose <rg.log> [--label L]`
-///
-/// THE cross-tool six-stage table. Left side: gzippy's six canonical pipeline
-/// stages from a GZIPPY_TIMELINE trace (busy-share + wall-critical-share, via
-/// [`flow`]). Right side: rapidgzip's `--verbose` profiling folded into the
-/// SAME six stages (busy-share, via [`rg_verbose`]). The deviant stage — where
-/// gzippy's busy-share materially exceeds rapidgzip's — is flagged, with a
-/// confidence tier per rapidgzip stage (DIRECT vs hypothesis). G0: the gzippy
-/// wall-critical shares are reconciled against the observed wall.
-fn cmd_sixstage(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(gz_trace) = pos.first() else {
-        eprintln!("usage: fulcrum sixstage <gzippy_trace.json> --rg-verbose <rg.log> [--label L]");
-        return ExitCode::FAILURE;
-    };
-    let cfg = Config::gzippy();
-    let events = match trace::load_events(Path::new(gz_trace)) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut preferred = preferred_blockers(&cfg);
-    preferred.extend(cfg.inner_blockers.iter().cloned());
-    let report = flow::analyze_flow(&events, &cfg, &preferred);
-
-    // rapidgzip side (optional — without it we print gzippy-only six rows).
-    let rg = flag(args, "--rg-verbose")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| rg_verbose::parse(&s));
-    let label = flag(args, "--label").unwrap_or("(run)").to_string();
-
-    // The six canonical stage names, in order (must match Config::gzippy).
-    const STAGES: [&str; 6] = [
-        "1·block-find",
-        "2·dispatch",
-        "3·decode",
-        "4·window-publish",
-        "5·marker-resolve",
-        "6·output",
-    ];
-
-    // --- gzippy per-stage busy + wall-critical ---
-    let mut gz_busy = [0.0f64; 6];
-    let mut gz_wc = [0.0f64; 6];
-    for (i, name) in STAGES.iter().enumerate() {
-        if let Some(s) = report.stages.iter().find(|s| &s.name == name) {
-            gz_busy[i] = s.total_busy_us;
-            gz_wc[i] = s.wall_critical_us;
-        }
-    }
-    let gz_busy_tot: f64 = gz_busy.iter().sum();
-    let gz_wc_tot: f64 = gz_wc.iter().sum();
-    let wall = report.wall_us;
-
-    // --- rapidgzip per-stage cpu (seconds) ---
-    let rg_stages = rg.as_ref().filter(|v| v.parsed).map(|v| v.six_stages());
-    let rg_tot: f64 = rg_stages
-        .map(|s| s.iter().map(|x| x.cpu_s).sum())
-        .unwrap_or(0.0);
-
-    println!("\nFULCRUM sixstage — cross-tool wall decomposition  [{label}]");
-    println!("gzippy trace: {gz_trace}");
-    if rg.as_ref().map(|v| v.parsed).unwrap_or(false) {
-        println!(
-            "rapidgzip --verbose: parsed (pool-efficiency {:.1}%, replaced-markers {:.1}%)",
-            rg.as_ref().unwrap().pool_efficiency_pct,
-            rg.as_ref().unwrap().replaced_marker_pct
-        );
-    } else {
-        println!("rapidgzip --verbose: NOT supplied / not parsed (gzippy-only view)");
-    }
-    println!();
-    println!(
-        "  {:<18} {:>10} {:>10} {:>10} {:>10} {:>8}  rg confidence",
-        "stage", "gz busy%", "gz wall%", "rg busy%", "gz/rg", "deviant"
-    );
-    println!("  {}", "-".repeat(90));
-
-    for (i, name) in STAGES.iter().enumerate() {
-        let gzb = pct(gz_busy[i], gz_busy_tot);
-        let gzw = pct(gz_wc[i], wall);
-        let (rgb, conf) = match rg_stages {
-            Some(s) => (
-                pct(s[i].cpu_s, rg_tot),
-                if s[i].direct { "DIRECT" } else { "hypoth" },
-            ),
-            None => (f64::NAN, "—"),
-        };
-        let ratio = if rgb > 0.0 && rgb.is_finite() {
-            gzb / rgb
-        } else {
-            f64::NAN
-        };
-        // Deviant: gzippy busy-share materially exceeds rapidgzip's (>1.3x AND
-        // an absolute gap >5 percentage points), OR the gz wall-critical share
-        // is the dominant stage. We mark on busy-share excess (the comparable).
-        let deviant = if ratio.is_finite() && ratio > 1.3 && (gzb - rgb) > 5.0 {
-            "◄ YES"
-        } else {
-            ""
-        };
-        println!(
-            "  {:<18} {:>9.1} {:>9.1} {:>9} {:>9} {:>8}  {}",
-            name,
-            gzb,
-            gzw,
-            if rgb.is_finite() {
-                format!("{rgb:.1}")
-            } else {
-                "—".to_string()
-            },
-            if ratio.is_finite() {
-                format!("{ratio:.2}x")
-            } else {
-                "—".to_string()
-            },
-            deviant,
-            conf,
-        );
-    }
-    println!("  {}", "-".repeat(90));
-
-    // --- G0 reconciliation ---
-    let wc_residual = wall - gz_wc_tot;
-    let waits_and_umbrella = report.unclassified.iter().map(|(_, d)| d).sum::<f64>();
-    let rpct = pct(wc_residual, wall);
-    println!(
-        "\n  G0 RECONCILE (gzippy wall-critical):  wall {:.2}ms  =  Σ6-stage wall-crit {:.2}ms  +  ·residual {:.2}ms ({:.1}%)",
-        wall / 1000.0,
-        gz_wc_tot / 1000.0,
-        wc_residual / 1000.0,
-        rpct,
-    );
-    // The equation ALWAYS balances (residual is the named 7th bucket =
-    // consumer-wall not pinned to a producing stage = in-order STARVATION,
-    // typically waiting during the speculative boundary-scan phase). G0 is
-    // about whether the SIX stages capture the wall: tight (<5%) ⇒ they do;
-    // a large residual is itself a finding (starvation-bound, e.g. the
-    // low-redundancy nasa corpus), not a tracing bug.
-    let tier = if wc_residual < -1.0 {
-        "INVALID ✗ — negative residual (B/E pairing unsound)"
-    } else if rpct < 5.0 {
-        "TIGHT ✓ — the 6 stages capture the wall"
-    } else if rpct < 15.0 {
-        "OK ✓ — minor starvation residual"
-    } else {
-        "LOOSE ⚠ — large ·residual = consumer STARVATION (in-order wait the 6 stages don't pin; a finding, not a bug)"
-    };
-    println!("  G0 STATUS: {tier}");
-    // Surface the dominant unattributed consumer waits driving a large residual.
-    if rpct >= 5.0 {
-        let spans = trace::pair_spans(&events);
-        let mut waits: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
-        for s in &spans {
-            let n = s.name.as_str();
-            if n.starts_with("wait.")
-                || n.starts_with("ttp.rx_recv")
-                || n.ends_with(".wait")
-                || n == "consumer.dispatch_recv"
-                || n == "consumer.future_recv"
-            {
-                *waits.entry(n).or_default() += s.dur;
-            }
-        }
-        let mut w: Vec<(&str, f64)> = waits.into_iter().collect();
-        w.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top: Vec<String> = w
-            .iter()
-            .take(4)
-            .map(|(n, d)| format!("{n}={:.0}ms", d / 1000.0))
-            .collect();
-        println!(
-            "  ·residual dominated by consumer waits: {}",
-            top.join(", ")
-        );
-    }
-    println!(
-        "  gzippy busy total {:.2}ms across {} threads; unclassified span time {:.2}ms",
-        gz_busy_tot / 1000.0,
-        events
-            .iter()
-            .map(|e| (e.pid, e.tid))
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        waits_and_umbrella / 1000.0,
-    );
-    if !report.unclassified.is_empty() {
-        let top: Vec<String> = report
-            .unclassified
-            .iter()
-            .take(5)
-            .map(|(n, d)| format!("{n}={:.0}us", d))
-            .collect();
-        println!(
-            "  UNCLASSIFIED spans (should be empty for a complete trace): {}",
-            top.join(", ")
-        );
-    }
-    if let Some(v) = rg.as_ref().filter(|v| v.parsed) {
-        println!(
-            "\n  rapidgzip CPU totals (s): block-find {:.4}  decode {:.4}  apply-window {:.4}  alloc+copy {:.4}  crc {:.4}  future::get {:.4}",
-            v.block_finder_s, v.custom_inflate_s + v.inflate_wrapper_s + v.isal_s, v.apply_window_s, v.alloc_copy_s, v.checksum_s, v.future_get_s,
-        );
-        println!("  NOTE: rg busy% are CPU-time SHARES (thread-summed), comparable to gz busy%; rg stages 2/4/6 are hypothesis-tier (see rg_verbose.rs notes).");
-    }
-    ExitCode::SUCCESS
-}
-
-/// Percentage helper: `num / den * 100`, 0 when den is 0.
-fn pct(num: f64, den: f64) -> f64 {
-    if den > 0.0 {
-        100.0 * num / den
-    } else {
-        0.0
-    }
-}
 
 /// `fulcrum flow <trace.json> [--whatif STAGE:FACTOR]`
 ///
@@ -655,21 +216,6 @@ fn cmd_causal(args: &[String]) -> ExitCode {
         fulcrum::verbose_stats::print_verbose_stats(v);
     }
     fulcrum::verbose_stats::print_remediation(&report, verbose.as_ref(), static_fraction);
-    ExitCode::SUCCESS
-}
-
-/// `fulcrum stats <trace.log>` — parse GZIPPY_VERBOSE stderr capture.
-fn cmd_stats(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(log_path) = pos.first() else {
-        eprintln!("usage: fulcrum stats <trace.log>");
-        return ExitCode::FAILURE;
-    };
-    let v = match load_verbose_log(log_path) {
-        Some(v) => v,
-        None => return ExitCode::FAILURE,
-    };
-    fulcrum::verbose_stats::print_verbose_stats(&v);
     ExitCode::SUCCESS
 }
 
@@ -1439,37 +985,6 @@ fn cmd_decompose(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `fulcrum alloc <trace.json>` — the allocation view. Reads the
-/// `alloc.region` (+ `rusage.region` minflt) instants gzippy emits, joins them
-/// per-`(tid,region)`, and LOCALIZES minor faults to the frontier-decode region
-/// the consumer blocks on — WITHOUT decompose's CPU-sum-over-wall lie. Prints a
-/// descriptive verdict (reuse / huge churn / THP / fault concentration); never
-/// claims a wall lever (that needs S3 + a warm-buffer perturbation).
-fn cmd_alloc(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(trace_path) = pos.first() else {
-        eprintln!("usage: fulcrum alloc <trace.json>\n  (trace from a gzippy run with GZIPPY_TIMELINE set, built --features rpmalloc-stats)");
-        return ExitCode::FAILURE;
-    };
-    let events = match trace::load_events(Path::new(trace_path)) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let spans = trace::pair_spans(&events);
-    let mut bndl = bundle::ProfileBundle::from_spans(&spans);
-    let samples = fulcrum::alloc::alloc_samples(&events);
-    let orphans = bndl.join_samples(&spans, &samples);
-    let report = fulcrum::alloc::analyze(&bndl);
-    print!("{}", fulcrum::alloc::render(&report));
-    if orphans > 0 {
-        println!("  ({orphans} alloc samples fell outside any span — trace coverage gap)");
-    }
-    ExitCode::SUCCESS
-}
-
 /// Pull residual counters out of the trace. gzippy emits them as instant
 /// events named `rusage.region` carrying `tid`-implied + counter args; we read
 /// any instant whose args contain known residual counter keys and turn it into
@@ -1939,674 +1454,6 @@ fn print_critpath(cp: &critpath::CritPath) {
     }
 }
 
-fn cmd_coz_parse(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(prof) = pos.first() else {
-        return usage();
-    };
-    let cfg = load_config(args);
-    match coz::parse_profile(Path::new(prof), &cfg.progress_point, &cfg) {
-        Ok(p) => {
-            print_coz(&p, &cfg);
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn print_coz(p: &coz::CozProfile, cfg: &Config) {
-    println!("\n========  COZ CAUSAL PROFILE  ========");
-    println!("progress point  : {}", p.progress_point);
-    println!("experiments     : {}", p.n_experiments);
-    println!("\nPer-REGION wall-elasticity (d(program-speedup) / d(region-speedup)):");
-    println!(
-        "  {:<14} {:>10} {:>16} {:>10} {:>9}",
-        "region", "median", "IQR (proxy)", "PEAK-line", "peak-n"
-    );
-    for (region, rc) in &p.region_curves {
-        let (e, lo, hi) = rc.elasticity_ci();
-        let (peak, peak_n) = rc.peak_line_elasticity();
-        println!(
-            "  {:<14} {:>+10.3} {:>16} {:>+10.3} {:>9.0}",
-            region,
-            e,
-            format!("[{:+.3},{:+.3}]", lo, hi),
-            peak,
-            peak_n,
-        );
-    }
-    println!(
-        "  (median can be masked by a high-sample ~0 line; PEAK-line = the\n   \
-         single highest-confidence line you'd actually optimize)"
-    );
-    if !p.region_latency.is_empty() {
-        println!("\nRegion latency points (scope begin/end counts):");
-        println!(
-            "  {:<20} {:>10} {:>12} {:>14}",
-            "region", "arrivals", "departures", "sum-diff(ns)"
-        );
-        for (name, (a, d, diff)) in &p.region_latency {
-            println!("  {:<20} {:>10.0} {:>12.0} {:>14.0}", name, a, d, diff);
-        }
-    }
-    println!(
-        "\nTop per-LINE curves (confidence-ranked |slope|*sqrt(samples); \
-         samples>={:.0} trusted):",
-        coz::MIN_LINE_SAMPLES
-    );
-    println!(
-        "  {:<46} {:>9} {:>9} region",
-        "selected (file:line)", "slope", "samples"
-    );
-    for c in p
-        .line_curves
-        .iter()
-        .filter(|c| c.total_samples >= 5.0)
-        .take(14)
-    {
-        let region = coz::region_of(&c.selected, cfg).unwrap_or_else(|| "-".into());
-        let mark = if c.total_samples >= coz::MIN_LINE_SAMPLES {
-            " "
-        } else {
-            "~" // low-confidence
-        };
-        println!(
-            "  {}{:<45} {:>+9.3} {:>9.0} {}",
-            mark,
-            c.selected,
-            c.slope(),
-            c.total_samples,
-            region
-        );
-    }
-}
-
-fn cmd_mech_report(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(rep) = pos.first() else {
-        return usage();
-    };
-    let text = match std::fs::read_to_string(rep) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let by_func = mech::parse_perf_report(&text);
-    println!("\n========  PERF REPORT (function cycles%)  ========");
-    let mut rows: Vec<_> = by_func.iter().collect();
-    rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-    for (name, pct) in rows.iter().take(25) {
-        println!("  {:>6.2}%  {}", pct, name);
-    }
-    ExitCode::SUCCESS
-}
-
-fn load_mech_from_report(path: Option<&str>, topdown_path: Option<&str>) -> Option<mech::Mech> {
-    let mut m = mech::Mech::default();
-    let mut any = false;
-    if let Some(p) = path {
-        if let Ok(text) = std::fs::read_to_string(p) {
-            for (name, pct) in mech::parse_perf_report(&text) {
-                m.by_func.entry(name).or_default().cycles_pct = pct;
-            }
-            any = true;
-        }
-    }
-    if let Some(tp) = topdown_path {
-        if let Ok(text) = std::fs::read_to_string(tp) {
-            m.topdown = mech::parse_topdown(&text);
-            any = true;
-        }
-    }
-    if any {
-        Some(m)
-    } else {
-        None
-    }
-}
-
-fn cmd_rank(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(trace_path) = pos.first() else {
-        return usage();
-    };
-    let coz_path = pos.get(1).copied();
-    let perf_path = pos.get(2).copied();
-    let cfg = load_config(args);
-
-    let events = match trace::load_events(Path::new(trace_path)) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fulcrum: trace: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let heavy_ms: f64 = flag(args, "--heavy-ms")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30.0);
-    let cp = critpath::analyze(&events, heavy_ms * 1000.0, &preferred_blockers(&cfg));
-
-    let coz_prof =
-        coz_path.and_then(|p| coz::parse_profile(Path::new(p), &cfg.progress_point, &cfg).ok());
-    let mech = load_mech_from_report(perf_path, flag(args, "--topdown"));
-
-    // Surface the run-level TMA top-down bound (the mechanism headline) if a
-    // --topdown perf-stat capture was supplied.
-    if let Some(m) = &mech {
-        let (bound, pct) = m.topdown.dominant();
-        if pct > 0.0 {
-            println!(
-                "\n========  TMA TOP-DOWN (run-level mechanism)  ========\n  \
-                 dominant: {bound} {pct:.1}%   [retiring {:.1} | bad-spec {:.1} | \
-                 frontend {:.1} | backend {:.1}]",
-                m.topdown.retiring,
-                m.topdown.bad_speculation,
-                m.topdown.frontend_bound,
-                m.topdown.backend_bound,
-            );
-        }
-    }
-
-    print_critpath(&cp);
-    if let Some(c) = &coz_prof {
-        print_coz(c, &cfg);
-    } else {
-        println!("\n(no profile.coz supplied — ranking by critical-path on-path share only)");
-    }
-
-    let levers = rank::rank(coz_prof.as_ref(), &cp, mech.as_ref(), &cfg);
-    print!("{}", rank::render(&levers));
-
-    ExitCode::SUCCESS
-}
-
-fn cmd_validate(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(trace_path) = pos.first() else {
-        eprintln!("validate needs <trace.json> [profile.coz]");
-        return usage();
-    };
-    let coz_path = pos.get(1).copied();
-    let cfg = load_config(args);
-    let events = match trace::load_events(Path::new(trace_path)) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let heavy_ms: f64 = flag(args, "--heavy-ms")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30.0);
-    let cp = critpath::analyze(&events, heavy_ms * 1000.0, &preferred_blockers(&cfg));
-    let coz_prof =
-        coz_path.and_then(|p| coz::parse_profile(Path::new(p), &cfg.progress_point, &cfg).ok());
-
-    let on_path = rank::on_path_by_region(&cp, &cfg);
-    let v =
-        validate::check_against_ground_truth(coz_prof.as_ref(), &cp, &cfg.ground_truth, &on_path);
-    println!("\n========  VALIDATION vs CONFIGURED GROUND TRUTH  ========");
-    if v.is_empty() {
-        println!("  (no ground_truth configured — nothing to self-check)");
-        return ExitCode::SUCCESS;
-    }
-    for c in &v.checks {
-        println!(
-            "  [{}] {}\n        expect : {}\n        measured: {}",
-            if c.passed { "PASS" } else { "FAIL" },
-            c.name,
-            c.expectation,
-            c.measured
-        );
-    }
-    println!(
-        "\n  VERDICT: {}",
-        if v.all_passed() {
-            "FULCRUM reproduces the known ground truth — TRUSTWORTHY."
-        } else {
-            "FULCRUM diverges from ground truth — investigate before trusting."
-        }
-    );
-    if v.all_passed() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
-}
-
-fn cmd_plan(args: &[String]) -> ExitCode {
-    let Some(bin) = flag(args, "--bin") else {
-        eprintln!("plan needs --bin <path-to-your-instrumented-binary>");
-        return usage();
-    };
-    let bin_args = flag(args, "--args").unwrap_or("");
-    let scope = flag(args, "--scope").unwrap_or("%/src/%");
-    let cpus = flag(args, "--cpus");
-    let iters: usize = flag(args, "--iters")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
-    let pin = |c: Option<&str>| c.map(|c| format!("taskset -c {c} ")).unwrap_or_default();
-
-    println!("# ============================================================");
-    println!("# FULCRUM workflow for: {bin} {bin_args}");
-    println!("# Run each phase, then feed the artifacts to the analyzer.");
-    println!("# (Coz + perf are Linux-only. Pin to a fixed CPU set for stable");
-    println!("#  numbers; loop short programs so each phase runs long enough.)");
-    println!("# ============================================================\n");
-
-    println!("## 1. Critical-path trace (one run with FULCRUM_TRACE set)");
-    println!(
-        "{}FULCRUM_TRACE=/tmp/fulcrum_tl.json {bin} {bin_args}",
-        pin(cpus)
-    );
-    println!("fulcrum critpath /tmp/fulcrum_tl.json --heavy-ms 30\n");
-
-    println!("## 2. Coz causal profile (build with --features coz, run under coz)");
-    println!("#    coz appends to --output across runs; loop for statistical power.");
-    println!("rm -f /tmp/profile.coz");
-    println!("{}coz run --output /tmp/profile.coz \\", pin(cpus));
-    println!("  --source-scope '{scope}' --binary-scope MAIN \\");
-    println!("  --- {bin} {bin_args}   # ideally an in-process loop of ~{iters} units");
-    println!("fulcrum coz-parse /tmp/profile.coz\n");
-
-    println!("## 3. Mechanism (perf TMA top-down + function report)");
-    println!(
-        "perf stat --topdown -- {}{bin} {bin_args} 2>/tmp/fulcrum_topdown.txt",
-        pin(cpus)
-    );
-    println!(
-        "perf record -g -o /tmp/fulcrum.data -- {}{bin} {bin_args}",
-        pin(cpus)
-    );
-    println!("perf report -i /tmp/fulcrum.data --stdio -n > /tmp/fulcrum_report.txt");
-    println!("fulcrum mech-report /tmp/fulcrum_report.txt\n");
-
-    println!("## 4. Validate + fuse -> ranked lever list");
-    println!("fulcrum validate /tmp/fulcrum_tl.json /tmp/profile.coz");
-    println!("fulcrum rank /tmp/fulcrum_tl.json /tmp/profile.coz /tmp/fulcrum_report.txt \\");
-    println!("  --topdown /tmp/fulcrum_topdown.txt");
-    ExitCode::SUCCESS
-}
-
-/// region-hw: join PEBS mem-load samples (+ optional perf-stat intervals) into
-/// the trace's region windows → a PER-REGION hardware table. The region→span
-/// substrings come from the config's region `functions` (so it speaks in your
-/// regions). Reconciles against a run-level `--topdown` if supplied.
-fn cmd_region_hw(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let (Some(trace_path), Some(mem_path)) = (pos.first(), pos.get(1)) else {
-        eprintln!(
-            "region-hw needs <trace.json> <perf_script_mem.txt> [perf_stat_intervals.csv]\n  \
-             [--config c.json] [--topdown td.txt]\n\n  \
-             Capture on Linux:\n    \
-             FULCRUM_TRACE=/tmp/tl.json FULCRUM_TRACE_CLOCK=monotonic <bin> <args>\n    \
-             perf mem record -k CLOCK_MONOTONIC -o /tmp/mem.data -- <bin> <args>\n    \
-             perf script -i /tmp/mem.data -F time,data_src > /tmp/mem.txt\n    \
-             fulcrum region-hw /tmp/tl.json /tmp/mem.txt --config c.json"
-        );
-        return usage();
-    };
-    let cfg = load_config(args);
-    let events = match trace::load_events(Path::new(trace_path)) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fulcrum: trace: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if region_hw::clock_base_ns(&events).is_none() {
-        eprintln!(
-            "fulcrum: WARNING — trace has no `fulcrum.clock_base` marker; it was likely\n  \
-             written WITHOUT FULCRUM_TRACE_CLOCK=monotonic, so its timestamps are NOT on\n  \
-             the CLOCK_MONOTONIC timeline and the PEBS join will be GARBAGE. Re-capture\n  \
-             the trace in monotonic mode."
-        );
-    }
-    let mem_text = std::fs::read_to_string(mem_path).unwrap_or_default();
-    let mem = region_hw::parse_perf_script_mem(&mem_text);
-    let intervals = pos
-        .get(2)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| region_hw::parse_perf_stat_intervals(&t, 0.0))
-        .unwrap_or_default();
-    // region → its function/span substrings, from the config.
-    let region_funcs: Vec<(String, Vec<String>)> = cfg
-        .regions
-        .iter()
-        .map(|r| {
-            let mut subs = r.functions.clone();
-            subs.push(r.name.clone());
-            (r.name.clone(), subs)
-        })
-        .collect();
-    // POSITIVE-CONTROL self-test (PROCESS #4): the attribution math must
-    // reproduce a known ground-truth split BEFORE any real T8 output is trusted.
-    let st = region_hw::self_test();
-    println!("\n========  REGION-HW POSITIVE-CONTROL SELF-TEST  ========");
-    for l in &st.lines {
-        println!("  {l}");
-    }
-    if !st.passed {
-        eprintln!(
-            "fulcrum: region-hw SELF-TEST FAILED — the attribution math is broken; \
-             refusing to emit a per-region split (it cannot be trusted)."
-        );
-        return ExitCode::FAILURE;
-    }
-    println!("  self-test PASS — attribution math reproduces ground truth.");
-
-    let rows = region_hw::rollup(&events, &mem, &intervals, &region_funcs);
-    eprintln!(
-        "region-hw: {} PEBS samples, {} counter intervals, {} regions",
-        mem.len(),
-        intervals.len(),
-        rows.len()
-    );
-
-    // Whole-process counter totals (concurrency-immune) for the conservation
-    // self-checks: from an explicit --whole perf-stat file if given, else the
-    // SUM of the interval counters (the whole run is the sum of its intervals).
-    let sum_intervals = |name: &str| -> Option<f64> {
-        let s: f64 = intervals
-            .iter()
-            .filter_map(|iv| iv.counts.get(name).copied())
-            .sum();
-        (s > 0.0).then_some(s)
-    };
-    let (mut whole_cycles, mut whole_instructions) =
-        (sum_intervals("cycles"), sum_intervals("instructions"));
-    if let Some(wp) = flag(args, "--whole") {
-        if let Ok(text) = std::fs::read_to_string(wp) {
-            let wiv = region_hw::parse_perf_stat_intervals(&text, 0.0);
-            let wsum = |name: &str| -> Option<f64> {
-                let s: f64 = wiv
-                    .iter()
-                    .filter_map(|iv| iv.counts.get(name).copied())
-                    .sum();
-                (s > 0.0).then_some(s)
-            };
-            if let Some(c) = wsum("cycles") {
-                whole_cycles = Some(c);
-            }
-            if let Some(i) = wsum("instructions") {
-                whole_instructions = Some(i);
-            }
-        }
-    }
-
-    // FAIL-CLOSED TRUST GATE: smear (concurrency≥0.5) + conservation. Printed
-    // FIRST so a reader cannot use the table below without seeing the verdict.
-    let trust = region_hw::trust_gate(&rows, whole_cycles, whole_instructions);
-    print!("{}", region_hw::render_trust(&trust));
-
-    print!("{}", region_hw::render(&rows));
-    // Reconcile against the run-level TMA if a --topdown capture was given.
-    if let Some(td_path) = flag(args, "--topdown") {
-        if let Ok(text) = std::fs::read_to_string(td_path) {
-            let td = mech::parse_topdown(&text);
-            let (lines, ok) = region_hw::reconcile(&rows, td.backend_bound, td.bad_speculation);
-            println!("\n========  PER-REGION ↔ RUN-LEVEL TMA RECONCILIATION  ========");
-            for l in &lines {
-                println!("  {l}");
-            }
-            // Block any "confirmed/consistent" reconciliation when the trust
-            // gate failed — a smeared/non-conserving split cannot CONFIRM
-            // anything, even if its smeared numbers happen to roll up.
-            let verdict = if !trust.trusted {
-                "BLOCKED — region-hw trust gate UNRELIABLE; this reconciliation \
-                 cannot confirm anything (smear/conservation failed above)"
-            } else if ok {
-                "per-region rolls up to run-level TMA — consistent"
-            } else {
-                "per-region DIVERGES from run-level TMA — investigate"
-            };
-            println!("  verdict: {verdict}");
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// xtool: fold per-tool `perf stat --topdown` + `perf report` captures into one
-/// comparable cross-tool accounting on the same input. Args are triples:
-///   --input <name> --tool <name>:<topdown.txt>:<report.txt>[:<mbps>]  (repeatable)
-fn cmd_xtool(args: &[String]) -> ExitCode {
-    let input = flag(args, "--input").unwrap_or("input").to_string();
-    let mut profiles = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--tool" {
-            if let Some(spec) = args.get(i + 1) {
-                let parts: Vec<&str> = spec.split(':').collect();
-                if parts.len() >= 3 {
-                    let tool = parts[0];
-                    let td = std::fs::read_to_string(parts[1]).unwrap_or_default();
-                    let rep = std::fs::read_to_string(parts[2]).unwrap_or_default();
-                    let mbps = parts.get(3).and_then(|s| s.parse::<f64>().ok());
-                    profiles.push(xtool::ToolProfile::from_captures(
-                        tool, &input, &td, &rep, mbps,
-                    ));
-                } else {
-                    eprintln!("fulcrum: --tool spec must be name:topdown.txt:report.txt[:mbps]");
-                }
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    if profiles.is_empty() {
-        eprintln!(
-            "xtool needs at least one --tool name:topdown.txt:report.txt[:mbps] (and --input <name>)"
-        );
-        return usage();
-    }
-    print!("{}", xtool::render_comparison(&input, &profiles));
-    // Per-tool top functions for drill-down.
-    for p in &profiles {
-        println!("\n  {} top functions (cycles%):", p.tool);
-        for (name, pct) in p.top_funcs.iter().take(8) {
-            println!("    {pct:>6.2}%  {name}");
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Build a [`compare::RunCfg`] from the shared flags.
-fn run_cfg(args: &[String]) -> compare::RunCfg {
-    let samples = flag(args, "--samples")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5usize)
-        .max(1);
-    let startup_samples = flag(args, "--startup-samples")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5usize)
-        .max(1);
-    let timeout = flag(args, "--timeout-s")
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(120));
-    compare::RunCfg {
-        samples,
-        startup_samples,
-        strict_contention: args.iter().any(|a| a == "--strict-contention"),
-        timeout,
-        tmp_dir: std::env::temp_dir(),
-    }
-}
-
-/// Load a compare spec + build its corpora (computing reference digests). On any
-/// error prints it and returns `None`.
-fn load_spec_and_corpora(
-    args: &[String],
-) -> Option<(compare_cli::CompareSpec, Vec<compare::Corpus>)> {
-    let spec_path = flag(args, "--spec")?;
-    let spec = match compare_cli::CompareSpec::load(Path::new(spec_path)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("fulcrum: --spec {spec_path}: {e}");
-            return None;
-        }
-    };
-    let corpora = match spec.build_corpora() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("fulcrum: {e}");
-            return None;
-        }
-    };
-    Some((spec, corpora))
-}
-
-/// coz-jsonl: ingest modern coz `profile.jsonl` (one or more, for stability)
-/// and print per-region causal impact, folded by source filename. Pass the
-/// jsonl from SEVERAL repeated coz runs — a single run is underpowered.
-fn cmd_coz_jsonl(args: &[String]) -> ExitCode {
-    let paths: Vec<&Path> = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .map(Path::new)
-        .collect();
-    if paths.is_empty() {
-        eprintln!("coz-jsonl needs >=1 profile.jsonl (pass several repeated runs for stability)");
-        return ExitCode::FAILURE;
-    }
-    // Fold each `path/to/file.rs:line` into its filename (the region proxy);
-    // line-level coz is too noisy to trust, file-level is the robust unit.
-    let fold = |sel: &str| -> String {
-        let no_line = sel.rsplit_once(':').map(|(f, _)| f).unwrap_or(sel);
-        no_line.rsplit('/').next().unwrap_or(no_line).to_string()
-    };
-    match coz_jsonl::aggregate(&paths, fold) {
-        Ok(rows) => {
-            println!(
-                "\n=====  COZ CAUSAL IMPACT (per region, {} run(s))  =====",
-                paths.len()
-            );
-            println!(
-                "{:>10}  {:<32} {:>10} {:>6}",
-                "impact", "region (file)", "base ch/s", "n_exp"
-            );
-            println!("  speeding a region 1% moves throughput ~impact%. Trust high n_exp; ignore tiny-n rows.");
-            for r in rows.iter().take(15) {
-                println!(
-                    "{:>10.3}  {:<32} {:>10.1} {:>6}",
-                    r.impact, r.key, r.base_rate, r.n_exp
-                );
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("coz-jsonl failed: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// sweep: exhaustive thread-count causal sweep. Two phases:
-///   fulcrum sweep capture --spec s.json --out DIR   (run on the perf box)
-///   fulcrum sweep mine DIR [--config region.json]   (offline, re-runnable)
-fn cmd_sweep(args: &[String]) -> ExitCode {
-    // FACTOR mode (multi-factor lever-boundary characterizer): dispatched when
-    // the caller passes `--cand`/`--selftest` instead of a capture/mine phase.
-    // `fulcrum sweep --cand <bin> --base <bin> --run '...' --corpora ... --threads ...`
-    if args
-        .iter()
-        .any(|a| a == "--cand" || a == "--selftest" || a == "--analyze")
-    {
-        return fulcrum::sweep_factor::cmd(args);
-    }
-    // LEVEL-CURVE LOSS-MAP mode (the level-curve generator: `--ours`/`--rival
-    // name=CMD` across `--levels`/`--corpus`), or its Gate-0 `sweep selftest`.
-    // Flag-sniffed exactly like the FACTOR mode above, so all three `sweep`
-    // shapes (thread-count capture/mine, FACTOR, LEVEL) coexist unambiguously.
-    if args.iter().any(|a| a == "--ours" || a == "--rival")
-        || matches!(
-            args.first().map(|s| s.as_str()),
-            // `reclassify` re-derives banked cells' classes in place after a
-            // classifier fix (resume reuses a cached class, so a fix never
-            // reaches already-measured runs without it). `census` aggregates
-            // several completed --out dirs into one class census + loss list.
-            Some("selftest") | Some("reclassify") | Some("census")
-        )
-    {
-        return fulcrum::levelsweep::cmd(args);
-    }
-    let Some(phase) = args.first().map(|s| s.as_str()) else {
-        eprintln!(
-            "sweep needs a phase: 'capture', 'mine', or the FACTOR mode (--cand ...)\n  \
-             fulcrum sweep capture --spec s.json --out DIR\n  \
-             fulcrum sweep mine DIR [--config region.json]\n  \
-             fulcrum sweep --cand <bin> --base <bin> --run '<tmpl {{bin}} {{threads}} {{corpus}}>' \\\n    \
-               --corpora a.gz,b.gz --threads 2,4,8 [--rg <bin>] [--n 51] [--out sweep.json]\n  \
-             fulcrum sweep --selftest    (Gate-0 separation self-test)"
-        );
-        return usage();
-    };
-    let rest = &args[1..];
-    match phase {
-        "capture" => {
-            let (Some(spec_path), Some(out)) = (flag(rest, "--spec"), flag(rest, "--out")) else {
-                eprintln!("sweep capture needs --spec s.json --out DIR");
-                return ExitCode::FAILURE;
-            };
-            let spec = match sweep::SweepSpec::load(Path::new(spec_path)) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("sweep: bad spec {spec_path}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match sweep::capture(&spec, Path::new(out)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("sweep capture failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        "mine" => {
-            let Some(dir) = rest.iter().find(|a| !a.starts_with("--")) else {
-                eprintln!("sweep mine needs the captured DIR");
-                return ExitCode::FAILURE;
-            };
-            let cfg = flag(rest, "--config").map(Path::new);
-            match sweep::mine(Path::new(dir), cfg) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("sweep mine failed: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        other => {
-            eprintln!("sweep: unknown phase '{other}' (expected 'capture' or 'mine')");
-            usage()
-        }
-    }
-}
-
-/// compare: run the fair cross-tool benchmark and print the honest scoped table.
-fn cmd_compare(args: &[String]) -> ExitCode {
-    if flag(args, "--spec").is_none() {
-        eprintln!("compare needs --spec compare.json  (a generic tools+corpora spec)");
-        return usage();
-    }
-    let Some((spec, corpora)) = load_spec_and_corpora(args) else {
-        return ExitCode::FAILURE;
-    };
-    let cfg = run_cfg(args);
-    let tools = spec.tool_specs();
-    let cells = spec.thread_cells();
-    let cmp = compare::run_comparison(&spec.subject, &tools, &corpora, &cells, &cfg);
-    print!("{}", compare::render(&cmp));
-    ExitCode::SUCCESS
-}
-
 /// provenance: read the decoder witness from a gzippy binary and emit the
 /// self-labeling header (which decoder was/will be measured). The bench harness
 /// runs this so EVERY bundle/report carries pure-Rust-vs-ISA-L provenance.
@@ -2823,603 +1670,6 @@ checked (default: current dir)."
     }
 }
 
-fn cmd_provenance(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let Some(bin) = pos.first() else {
-        eprintln!(
-            "provenance needs <art-dir>            (PROVENANCE-OR-VOID instrument-firing gate)\n  \
-             or      <gzippy-binary>         (decoder-identity witness)\n\n  \
-             GATE  <art-dir>: reads <art-dir>/manifest.txt (key=value) and runs the five\n  \
-             derived sub-checks (consumer / oracle-fired / sink-symmetric / sha-current /\n  \
-             comparator-present). Stamps the CELL provenance_verdict + evidence_tier; a\n  \
-             REFUSED sub-check (the shared-floor sink) exits non-zero.\n    \
-             [--repo <dir>] live `git diff <commit>..HEAD -- src/` differ (default cwd)\n\n  \
-             WITNESS <gzippy-binary>: reads the isal_inflate dynsym count (0=pure-rust,\n  \
-             >0=ISA-L FFI) and bakes the decoder identity into a report header.\n    \
-             [--features \"...\"] [--routing \"path=...\"] [--rev <git-describe>] [--out f.json]"
-        );
-        return usage();
-    };
-    // Dispatch on the argument shape: a directory => the PROVENANCE-OR-VOID gate
-    // (the ported `core/provenance.py`); a file => the decoder-identity witness.
-    if Path::new(bin).is_dir() {
-        return cmd_provenance_gate(bin, args);
-    }
-    let features = flag(args, "--features").unwrap_or("").to_string();
-    let routing = flag(args, "--routing").unwrap_or("").to_string();
-    let rev = flag(args, "--rev").unwrap_or("").to_string();
-    let prov = provenance::DecoderProvenance::capture(Path::new(bin), &features, &routing, &rev);
-    print!("{}", prov.render_header());
-
-    if let Some(out) = flag(args, "--out") {
-        match serde_json::to_string_pretty(&prov) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(out, json) {
-                    eprintln!("fulcrum: provenance: could not write {out}: {e}");
-                    return ExitCode::FAILURE;
-                }
-                eprintln!("fulcrum: provenance written to {out}");
-            }
-            Err(e) => {
-                eprintln!("fulcrum: provenance: serialize failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    // Fail closed on a contradiction or unknown witness — never let a run be
-    // interpreted with the wrong (or unverified) decoder.
-    match prov.decoder {
-        provenance::Decoder::Unknown => {
-            eprintln!("fulcrum: provenance UNKNOWN — could not read symbols; refusing to bless.");
-            ExitCode::FAILURE
-        }
-        _ if prov.consistency_warning().is_some() => ExitCode::FAILURE,
-        _ => ExitCode::SUCCESS,
-    }
-}
-
-/// `fulcrum provenance <art-dir>` — the PROVENANCE-OR-VOID instrument-firing
-/// gate (the ported `core/provenance.py`). Reads `<art-dir>/manifest.txt`,
-/// runs the five derived sub-checks, prints the per-check verdicts + the CELL
-/// stamp, and exits non-zero on a REFUSED sub-check (the shared-floor sink) —
-/// the hard stop that keeps a poisoned A/B from ever becoming a number.
-fn cmd_provenance_gate(art_dir: &str, args: &[String]) -> ExitCode {
-    let manifest_path = Path::new(art_dir).join("manifest.txt");
-    let text = match std::fs::read_to_string(&manifest_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "fulcrum: provenance gate: cannot read {}: {e}",
-                manifest_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let man = provenance::parse_manifest_text(&text);
-    let prov = provenance::from_manifest(&man);
-
-    // Live src/-diff differ, used only when the runner did not capture
-    // src_changed_since_commit and HEAD alone cannot decide currency.
-    let repo = flag(args, "--repo").unwrap_or(".").to_string();
-    let differ = provenance::git_src_differ(repo);
-
-    match provenance::run_gate(&prov, Some(&differ), true) {
-        Ok(report) => {
-            let stamp = report.stamp(&prov.commit_sha);
-            println!("======== PROVENANCE-OR-VOID gate: {art_dir} ========");
-            for c in &report.checks {
-                println!(
-                    "  [{:<10}] {:<22} {:<14} {}",
-                    c.verdict.label(),
-                    c.name,
-                    c.scope,
-                    c.reason
-                );
-            }
-            println!("  ----");
-            println!("  commit_sha:         {}", stamp.commit_sha);
-            println!("  provenance_verdict: {}", stamp.provenance_verdict);
-            println!("  evidence_tier:      {}", stamp.evidence_tier);
-            if !report.voided_scopes.is_empty() {
-                let v: Vec<&str> = report.voided_scopes.iter().map(|s| s.as_str()).collect();
-                println!("  voided_scopes:      {}", v.join(", "));
-            }
-            // A VOID run (absent comparator / stale-as-current) is not citable;
-            // surface it as a non-zero exit so a caller never banks it blindly.
-            match report.run_verdict {
-                provenance::CheckVerdict::Void => ExitCode::FAILURE,
-                _ => ExitCode::SUCCESS,
-            }
-        }
-        Err(violation) => {
-            eprintln!("fulcrum: {violation}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// audit: run the fair comparison, then validate a STATED claim against it.
-fn cmd_audit(args: &[String]) -> ExitCode {
-    let (Some(_), Some(claim_text)) = (flag(args, "--spec"), flag(args, "--claim")) else {
-        eprintln!("audit needs --spec compare.json --claim \"<stated perf claim>\"");
-        return usage();
-    };
-    let claim_text = claim_text.to_string();
-    let Some((spec, corpora)) = load_spec_and_corpora(args) else {
-        return ExitCode::FAILURE;
-    };
-    let cfg = run_cfg(args);
-    let tools = spec.tool_specs();
-    let cells = spec.thread_cells();
-    let cmp = compare::run_comparison(&spec.subject, &tools, &corpora, &cells, &cfg);
-
-    // The fair matrix the audit reasons over (printed so the verdict is auditable).
-    print!("{}", compare::render(&cmp));
-
-    let kinds: Vec<String> = {
-        let mut k: Vec<String> = corpora.iter().map(|c| c.kind.clone()).collect();
-        k.sort();
-        k.dedup();
-        k
-    };
-    let claim = audit::Claim::parse(&spec.subject, &claim_text, &kinds);
-    let result = audit::audit(claim, &cmp);
-    print!("{}", audit::render(&result));
-    match result.verdict {
-        audit::Verdict::Survives => ExitCode::SUCCESS,
-        // A narrowed or false claim is an over-claim caught: nonzero exit so CI
-        // can gate on "this claim does not stand as stated".
-        _ => ExitCode::FAILURE,
-    }
-}
-
-/// comparability: the COMPARABILITY GATE — refuse a specificity/settled/law
-/// claim unless the required comparison arms are present + self-test clean.
-///
-///   fulcrum comparability --capture cap.json --claim subject-specific \
-///       --subject gzippy-native --contrast rapidgzip [--counter marker_count] [--equal-spread 0.05]
-///   fulcrum comparability --capture cap.json --claim settled \
-///       --subject gzippy-native [--field-tools rapidgzip,igzip,libdeflate,zlib-ng] [--tie-bar 0.99]
-///   fulcrum comparability --capture amd.json --capture intel.json --claim law \
-///       --statement "decode kernel gates the wall"
-///
-/// Exit 0 = ADMITTED, nonzero = REFUSED (so CI can gate a banked claim).
-fn cmd_comparability(args: &[String]) -> ExitCode {
-    use fulcrum::comparability as cg;
-
-    // --capture may be given multiple times (law needs ≥2 arches).
-    let cap_paths: Vec<&str> = args
-        .iter()
-        .enumerate()
-        .filter_map(|(i, a)| {
-            if a == "--capture" {
-                args.get(i + 1).map(|s| s.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if cap_paths.is_empty() {
-        eprintln!("comparability needs at least one --capture cap.json");
-        return usage();
-    }
-    let Some(kind) = flag(args, "--claim") else {
-        eprintln!("comparability needs --claim subject-specific|settled|law");
-        return usage();
-    };
-
-    let mut captures = Vec::new();
-    for p in &cap_paths {
-        match std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| parse_capture(&s))
-        {
-            Some(c) => captures.push(c),
-            None => {
-                eprintln!("comparability: could not parse capture {p}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    let outcome = match kind {
-        "law" => {
-            let stmt = flag(args, "--statement").unwrap_or("(unstated)");
-            let refs: Vec<&cg::Capture> = captures.iter().collect();
-            cg::evaluate_law(&refs, stmt)
-        }
-        "subject-specific" => {
-            let (Some(subject), Some(contrast)) =
-                (flag(args, "--subject"), flag(args, "--contrast"))
-            else {
-                eprintln!("subject-specific needs --subject and --contrast");
-                return usage();
-            };
-            let claim = cg::GateClaim::SubjectSpecific {
-                subject: subject.to_string(),
-                contrast: contrast.to_string(),
-                counter: flag(args, "--counter").map(String::from),
-                equal_spread: flag(args, "--equal-spread")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.05),
-            };
-            cg::evaluate(&captures[0], &claim)
-        }
-        "settled" => {
-            let Some(subject) = flag(args, "--subject") else {
-                eprintln!("settled needs --subject");
-                return usage();
-            };
-            let field_tools: Vec<String> = flag(args, "--field-tools")
-                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-                .unwrap_or_else(|| {
-                    cg::FIELD_TOOL_ROSTER
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                });
-            let claim = cg::GateClaim::Settled {
-                subject: subject.to_string(),
-                field_tools,
-                tie_bar: flag(args, "--tie-bar")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.99),
-            };
-            cg::evaluate(&captures[0], &claim)
-        }
-        other => {
-            eprintln!("comparability: unknown --claim '{other}'");
-            return usage();
-        }
-    };
-
-    print!("{}", cg::render(&outcome));
-    if outcome.verdict.admitted() {
-        ExitCode::SUCCESS
-    } else {
-        // A refusal is the WHOLE POINT — nonzero so CI gates the over-claim.
-        ExitCode::FAILURE
-    }
-}
-
-/// Parse a [`fulcrum::comparability::Capture`] from the JSON wire format.
-/// Delegates to the gate-core parser (moved there so the in-process pipeline
-/// can read runner-emitted captures without going through the CLI).
-fn parse_capture(json: &str) -> Option<fulcrum::comparability::Capture> {
-    fulcrum::comparability::parse_capture(json)
-}
-
-/// memlife: cross-tool, per-buffer ATTRIBUTED memory-lifecycle breakdown.
-///
-///   fulcrum memlife <run.json>                 single-run per-component table
-///   fulcrum memlife vs <A.json> <B.json>       cross-tool A vs B vs Δ (per-MB)
-///   fulcrum memlife growth <T1.json> <T8.json> one tool, T1→T8 written growth
-///
-/// `<run.json>` is the schema emitted by gzippy's `decompress::parallel::memlife`
-/// (GZIPPY_MEMLIFE=/path.json) and by the rapidgzip-side LD_PRELOAD counter +
-/// source-derived in-place-resolve term (same fields).
-fn cmd_memlife(args: &[String]) -> ExitCode {
-    let pos = positional(args);
-    let load = |p: &str| match memlife::MemlifeRun::load(p) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            eprintln!("memlife: {e}");
-            None
-        }
-    };
-    match pos.first().copied() {
-        Some("vs") => {
-            let (Some(ap), Some(bp)) = (pos.get(1), pos.get(2)) else {
-                eprintln!("memlife vs needs <A.json> <B.json>");
-                return ExitCode::from(2);
-            };
-            let (Some(a), Some(b)) = (load(ap), load(bp)) else {
-                return ExitCode::FAILURE;
-            };
-            print!("{}", memlife::render_vs(&a, &b));
-            ExitCode::SUCCESS
-        }
-        Some("growth") => {
-            let (Some(ap), Some(bp)) = (pos.get(1), pos.get(2)) else {
-                eprintln!("memlife growth needs <T1.json> <T8.json>");
-                return ExitCode::from(2);
-            };
-            let (Some(a), Some(b)) = (load(ap), load(bp)) else {
-                return ExitCode::FAILURE;
-            };
-            print!("{}", memlife::render_growth(&a, &b));
-            ExitCode::SUCCESS
-        }
-        Some(p) => {
-            let Some(run) = load(p) else {
-                return ExitCode::FAILURE;
-            };
-            print!("{}", memlife::render_single(&run));
-            ExitCode::SUCCESS
-        }
-        None => {
-            eprintln!("memlife: <run.json> | vs <A.json> <B.json> | growth <T1.json> <T8.json>");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// quantity: the DIMENSIONED-QUANTITY evaluator (QUANTITY-DIMENSION-OR-REFUSE).
-/// `--demo` replays the worked refutation of conclusion #11; default (or
-/// `--algebra`) renders the legal/refused algebra table.
-fn cmd_quantity(args: &[String]) -> ExitCode {
-    use fulcrum::quantity as q;
-    if args.iter().any(|a| a == "--demo") {
-        println!("{}", q::render_demo());
-    } else {
-        println!("{}", q::render_legal_algebra());
-    }
-    ExitCode::SUCCESS
-}
-
-/// mech-caps: report this host's cross-arch HW-counter availability.
-fn cmd_mech_caps(_args: &[String]) -> ExitCode {
-    let caps = mech_arch::MechCaps::detect();
-    print!("{}", mech_arch::render(&caps));
-    ExitCode::SUCCESS
-}
-
-/// run: the live-capture RUNNER half — run a gzippy-vs-rg decode workload and
-/// emit the gate-input artifacts (manifest provenance keys, perturb sweeps,
-/// comparability captures, the unified finding cell) into an artifact dir the
-/// gated pipeline consumes.
-///
-///   fulcrum run <spec.json> [--out DIR] [--dry-run | --live] [--gate] [--store P] [--fixture-oracle]
-///   fulcrum run --spec-help          # the run-spec field reference
-///
-/// `--gate` selects the freshness oracle for the in-process pipeline: an explicit
-/// `--fixture-oracle` routes through a [`fulcrum::finding::FixedOracle`] (always
-/// FRESH) so a synthetic/fixture commit can certify; otherwise the real
-/// `GitSrcOracle` is used. `--fixture-oracle --live` is refused (no silent leak).
-///   fulcrum run --live-help          # the documented frozen-box invocation
-fn cmd_run(args: &[String]) -> ExitCode {
-    use fulcrum::runner;
-    if args.iter().any(|a| a == "--spec-help") {
-        print!("{}", runner::spec_help_doc());
-        return ExitCode::SUCCESS;
-    }
-    if args.iter().any(|a| a == "--live-help") {
-        print!("{}", runner::live_invocation_doc());
-        return ExitCode::SUCCESS;
-    }
-    let mut spec_path: Option<&str> = None;
-    let mut out: Option<&str> = None;
-    let mut store: Option<&str> = None;
-    let mut mode = runner::Mode::Fixture;
-    let mut gate = false;
-    let mut fixture_oracle = false;
-    let mut resume = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--out" => {
-                out = args.get(i + 1).map(|s| s.as_str());
-                i += 2;
-            }
-            "--store" => {
-                store = args.get(i + 1).map(|s| s.as_str());
-                i += 2;
-            }
-            "--dry-run" | "--fixture" => {
-                mode = runner::Mode::Fixture;
-                i += 1;
-            }
-            "--live" => {
-                mode = runner::Mode::Live;
-                i += 1;
-            }
-            "--gate" => {
-                gate = true;
-                i += 1;
-            }
-            "--resume" => {
-                resume = true;
-                i += 1;
-            }
-            "--fixture-oracle" => {
-                fixture_oracle = true;
-                i += 1;
-            }
-            other if !other.starts_with("--") => {
-                spec_path = Some(other);
-                i += 1;
-            }
-            other => {
-                eprintln!("run: unknown flag '{other}'");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(spec_path) = spec_path else {
-        eprintln!(
-            "run: needs a <spec.json> (see `fulcrum run --spec-help`)\n\n{}",
-            runner::spec_help_doc()
-        );
-        return ExitCode::from(2);
-    };
-    // Fail fast on the one contradictory flag combo: the fixture oracle (always
-    // FRESH) must NEVER apply to a LIVE run, or it would falsely certify a real
-    // finding as fresh. Refused here, before any work, so it's unreachable past
-    // arg-parse regardless of what the live runner does.
-    if fixture_oracle && matches!(mode, runner::Mode::Live) {
-        eprintln!(
-            "run: REFUSED — --fixture-oracle cannot combine with --live \
-             (the fixture oracle would falsely certify a live finding as FRESH; \
-             drop --fixture-oracle for a real run, or use --dry-run)"
-        );
-        return ExitCode::from(2);
-    }
-    let spec_txt = match std::fs::read_to_string(spec_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("run: cannot read spec {spec_path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let spec: runner::RunSpec = match serde_json::from_str(&spec_txt) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("run: invalid spec JSON {spec_path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let out_dir = match out {
-        Some(o) => std::path::PathBuf::from(o),
-        // Default to Linux tmpfs `/dev/shm` when it exists (fast, RAM-backed);
-        // otherwise (macOS has no /dev/shm) fall back to the OS temp dir so the
-        // runner doesn't fail to create its artifact tree on a non-Linux host.
-        None => {
-            let shm = std::path::Path::new("/dev/shm");
-            if shm.is_dir() {
-                shm.join("fulcrum-art")
-            } else {
-                std::env::temp_dir().join("fulcrum-art")
-            }
-        }
-    };
-    if !gate {
-        // No gating: emit the batch artifact tree as before.
-        let dir = match runner::run(&spec, &out_dir, mode) {
-            Ok(dir) => dir,
-            Err(e) => {
-                eprintln!("run: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        println!("FULCRUM_RUN_ARTIFACTS={}", dir.display());
-        return ExitCode::SUCCESS;
-    }
-    // --gate: measure + gate + bank ONE CELL AT A TIME. Each CERTIFIED cell is
-    // banked to the store on disk IMMEDIATELY (before the next cell is measured),
-    // and a per-cell progress line is emitted as it finishes — so a `tail -f`
-    // watcher sees live progress and a run that dies after cell k leaves k cells
-    // durably banked. No subprocess, no Python.
-    use fulcrum::finding::{FixedOracle, GitSrcOracle, SrcChangeOracle, Store};
-    use fulcrum::runner::{CellProgress, CellReporter};
-    use std::io::Write;
-    use std::ops::ControlFlow;
-    let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let store_path = store
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| Store::default_path(&repo));
-    let mut store_obj = match Store::load(&store_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("run --gate: load store {store_path:?}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Oracle selection (the freshness gate's source-of-truth). The fixture oracle
-    // (always FRESH) is the ONLY way a synthetic/fixture commit — which is not in
-    // any git repo, so the live `GitSrcOracle` answers UNKNOWN("commit … not in
-    // repo") and refuses — can clear the freshness gate. It is selected ONLY by an
-    // EXPLICIT `--fixture-oracle`, never implicitly; a run without the flag (live OR
-    // dry-run) keeps the real `GitSrcOracle`. The choice is logged. (The
-    // contradictory `--fixture-oracle --live` combo is refused at arg-parse above.)
-    let git_oracle;
-    let fixed_oracle;
-    let oracle: &dyn SrcChangeOracle = if fixture_oracle {
-        eprintln!(
-            "run --gate: FIXTURE oracle (always FRESH) — explicit --fixture-oracle, \
-             synthetic/dry-run commit; NOT a live freshness check"
-        );
-        fixed_oracle = FixedOracle::fresh();
-        &fixed_oracle
-    } else {
-        eprintln!("run --gate: LIVE GitSrcOracle (repo {})", repo.display());
-        git_oracle = GitSrcOracle::new(&repo);
-        &git_oracle
-    };
-
-    /// The CLI reporter: prints the detailed `=== cell ===` block + the concise
-    /// greppable progress line, flushing stdout per cell so `tail -f` is live.
-    /// Never aborts (the CLI runs every planned cell).
-    struct CliReporter;
-    impl CellReporter for CliReporter {
-        fn on_cell(&mut self, p: &CellProgress) -> ControlFlow<()> {
-            println!("\n=== cell {} ===", p.label);
-            println!("{}", p.render);
-            println!("{}", p.line());
-            let _ = std::io::stdout().flush();
-            ControlFlow::Continue(())
-        }
-    }
-    let mut reporter = CliReporter;
-
-    match fulcrum::runner::run_and_gate_incremental(
-        &spec,
-        &out_dir,
-        mode,
-        resume,
-        &mut store_obj,
-        &store_path,
-        oracle,
-        &mut reporter,
-    ) {
-        Ok(summary) => {
-            println!("FULCRUM_RUN_ARTIFACTS={}", summary.run_dir.display());
-            println!(
-                "\nFULCRUM_PIPELINE: {certified}/{total} cell(s) CERTIFIED + banked into {store}{skip}",
-                certified = summary.certified,
-                total = summary.total,
-                store = store_path.display(),
-                skip = if summary.skipped > 0 {
-                    format!(" ({} resume-skipped)", summary.skipped)
-                } else {
-                    String::new()
-                },
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("run --gate: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// perturb: the causal perturbation harness (PERTURBATION-OR-NO-LEVER). Consumes
-/// a documented sweep-artifact directory written by a project's measurement
-/// policy and converts a HYPOTHESIS into a STRONG verdict (or refuses). ALL prose
-/// is routed through the gated cell methods, so a lever claim is impossible to
-/// emit for a non-(perturbation/LEVER) cell.
-fn cmd_perturb(args: &[String]) -> ExitCode {
-    let Some(dir) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!(
-            "fulcrum perturb <sweep-dir> [--allow-thaw]\n\
-             \n\
-             <sweep-dir> layout: meta.txt (region, region_self_ms, perturb_cmd, \
-             sha_ok, cell_id, freeze_state, quiet_state), baseline.txt, \
-             baseline_recheck.txt, spin/t{{10,20,30}}.txt, sleep/t{{10,20,30}}.txt, \
-             oracle_removed.txt (optional)."
-        );
-        return ExitCode::from(2);
-    };
-    let (sweep, meta) = match perturb::load_sweep(Path::new(dir)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("fulcrum perturb: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let frozen = perturb::frozen_ok(&meta) || args.iter().any(|a| a == "--allow-thaw");
-    let cell = perturb::analyze_sweep(&sweep);
-    print!("{}", perturb::render_perturb(&cell, frozen));
-    ExitCode::SUCCESS
-}
-
-/// invariants: render THE INVARIANT SET (the Rust-native registry).
-fn cmd_invariants(_args: &[String]) -> ExitCode {
-    println!("{}", invariants::render());
-    ExitCode::SUCCESS
-}
-
 /// The default results-ledger path (`FULCRUM_LEDGER` env, else
 /// `<cwd>/artifacts/fulcrum/ledger.jsonl`). Mirrors `cli._default_ledger_path`.
 fn default_ledger_path(explicit: Option<&str>) -> PathBuf {
@@ -3436,142 +1686,6 @@ fn default_ledger_path(explicit: Option<&str>) -> PathBuf {
         .join("artifacts")
         .join("fulcrum")
         .join("ledger.jsonl")
-}
-
-/// decide: artifact-dir -> ranked decision table + brief. Mirrors `cli.decide_main`.
-fn cmd_decide(args: &[String]) -> ExitCode {
-    let mut allow_thaw = false;
-    let mut no_ledger = false;
-    let mut feature: Option<String> = None;
-    let mut ledger_path: Option<String> = None;
-    let mut dirs: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
-            "--allow-thaw" => allow_thaw = true,
-            "--no-ledger" => no_ledger = true,
-            "--feature" => {
-                feature = args.get(i + 1).cloned();
-                i += 2;
-                continue;
-            }
-            "--ledger" => {
-                ledger_path = args.get(i + 1).cloned();
-                i += 2;
-                continue;
-            }
-            other if other.starts_with("--") => {
-                eprintln!(
-                    "decide: unknown flag {other} (--feature --ledger --allow-thaw --no-ledger)"
-                );
-                return ExitCode::from(2);
-            }
-            _ => dirs.push(a.clone()),
-        }
-        i += 1;
-    }
-    let Some(dir) = dirs.first() else {
-        eprintln!(
-            "fulcrum decide <artifact-dir> [--feature F] [--ledger PATH] [--allow-thaw] [--no-ledger]"
-        );
-        return ExitCode::from(1);
-    };
-    let adapter = GzippyAdapter::new();
-    let led = if no_ledger {
-        None
-    } else {
-        Some(Ledger::new(default_ledger_path(ledger_path.as_deref())))
-    };
-    let run = match decide::load_run(Path::new(dir), &adapter) {
-        Ok(r) => r,
-        Err(e) => {
-            println!("\n[INSTRUMENT REFUSED] {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match decide::analyze_run(&run, &adapter, allow_thaw, feature.as_deref(), led.as_ref()) {
-        Ok(rep) => {
-            report::print_report(&rep, adapter.tie_bar());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            println!("\n[INSTRUMENT REFUSED] {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// total: the trace-analyzer subcommand (whole-system trace analysis or a
-/// cross-tool delta). Mirrors `cli.total_main`.
-fn cmd_total(args: &[String]) -> ExitCode {
-    let mut counters: Option<String> = None;
-    let mut declared_t: Option<u32> = None;
-    let mut feature: Option<String> = None;
-    let mut files: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
-            "--counters" => {
-                counters = args.get(i + 1).cloned();
-                i += 2;
-                continue;
-            }
-            "--T" => {
-                declared_t = args.get(i + 1).and_then(|v| v.parse().ok());
-                i += 2;
-                continue;
-            }
-            "--feature" => {
-                feature = args.get(i + 1).cloned();
-                i += 2;
-                continue;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("total: unknown flag {other} (--counters --T --feature)");
-                return ExitCode::from(2);
-            }
-            _ => files.push(a.clone()),
-        }
-        i += 1;
-    }
-    if files.is_empty() {
-        eprintln!("fulcrum total <trace.json> [trace2.json] [--counters F] [--T N] [--feature F]");
-        return ExitCode::from(1);
-    }
-    let adapter = GzippyAdapter::new();
-    let counter_path = counters.as_deref().map(Path::new);
-    let first = match trace::analyze(
-        Path::new(&files[0]),
-        &adapter,
-        counter_path,
-        declared_t,
-        feature.as_deref(),
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            println!("\n[INSTRUMENT REFUSED] {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let second = if files.len() >= 2 {
-        match trace::analyze(Path::new(&files[1]), &adapter, None, None, None) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                println!("\n[INSTRUMENT REFUSED] {e}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        None
-    };
-    trace::print_bundle(&first);
-    if let Some(b) = &second {
-        trace::print_bundle(b);
-        trace::print_delta(&first, b);
-    }
-    ExitCode::SUCCESS
 }
 
 /// locate: closed-wall-ledger localization over a critical-path model.
@@ -3805,65 +1919,6 @@ fn cmd_cycles(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// optgate: the OPTIMIZATION A/B GATE — render a self-validated WALL-WIN verdict
-/// from a measurement-policy artifact (base + after + rg arms, byte shas, box
-/// run-queue, clean-path). The seven hard-won refusals are enforced by
-/// [`optgate::evaluate`]; this is just the artifact loader + renderer.
-///
-///   usage: fulcrum optgate <artifact.json>
-///
-/// Exit code: 0 for a banked WALL WIN (Win + Law), 1 for any non-win verdict
-/// (TIE / INSTRUCTION-ONLY / REGRESSION / UNDERPOWERED / VOID / NOT-YET-LAW), 2
-/// for a usage / artifact error — so CI can gate `ship` on a non-zero exit.
-fn cmd_optgate(args: &[String]) -> ExitCode {
-    let mut artifact: Option<String> = None;
-    let known = "<artifact.json> [--artifact <path>]";
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--artifact" => {
-                artifact = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--help" | "-h" => {
-                println!("usage: fulcrum optgate {known}");
-                return ExitCode::SUCCESS;
-            }
-            other if !other.starts_with("--") => {
-                artifact = Some(other.to_string());
-                i += 1;
-            }
-            other => {
-                eprintln!("optgate: unknown argument {other}; usage: fulcrum optgate {known}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(artifact) = artifact else {
-        eprintln!(
-            "optgate: an artifact path is required.\n      usage: fulcrum optgate {known}\n\n\
-             The artifact is the JSON your measurement policy writes: the base/after/rg arms \
-             (each a list of {{cycles, instructions, bytes, procs_running}} samples), the \
-             reference_sha, the clean_base/clean_after arms, k, arch, and cross_arch_replicated."
-        );
-        return ExitCode::from(2);
-    };
-    let input = match optgate::load_artifact(std::path::Path::new(&artifact)) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("[INSTRUMENT REFUSED] {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let verdict = optgate::evaluate(&input);
-    print!("{}", verdict.render());
-    if verdict.is_banked_wall_win() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
-}
-
 /// counterdiff: the LIVE paired hardware-COUNTER differ + microarch attribution.
 /// Interleaves subject vs comparator(s) under `perf stat` with an arch-aware
 /// counter set, sha-gates + A/A-noise-gates every arm, and renders the per-counter
@@ -3887,39 +1942,6 @@ fn cmd_counterdiff(args: &[String]) -> ExitCode {
         }
     };
     match counterdiff::run(cfg) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
-        Err(e) => {
-            eprintln!("[INSTRUMENT REFUSED] {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// abmeasure: the LIVE interleaved A/B/comparator measurement half. Shells out
-/// to `perf stat` under background contention (LOAD-IMMUNE: never freezes the
-/// box, changes the governor, or SIGSTOPs/kills any process), assembles the
-/// optgate artifact, and renders the gated verdict — replacing the hand-rolled
-/// `/tmp/frozen_*.sh` scripts. The gate logic itself is [`optgate::evaluate`].
-///
-///   usage: fulcrum abmeasure --base-bin <p> --corpus <f.gz> [flags]  (--help)
-///
-/// Exit code: 0 iff every corpus gates to a banked WALL WIN (or `--no-gate`); 1
-/// if any did not; 2 for a usage error / refused instrument (perf missing / no
-/// permission / oracle failure).
-fn cmd_abmeasure(args: &[String]) -> ExitCode {
-    let cfg = match abmeasure::parse_args(args) {
-        Ok(c) => c,
-        Err(e) if e == "HELP" => {
-            println!("{}", abmeasure::HELP);
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            eprintln!("abmeasure: {e}\n\n{}", abmeasure::HELP);
-            return ExitCode::from(2);
-        }
-    };
-    match abmeasure::run(cfg) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
@@ -3988,130 +2010,6 @@ fn cmd_excess(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    }
-}
-
-/// chainlat: static steady-state loop recurrence analysis via llvm-mca.
-fn cmd_optimality(args: &[String]) -> ExitCode {
-    use fulcrum::insn_attr::Arch;
-    use fulcrum::optimality::{self, Manifest};
-
-    // arg parse
-    let mut manifest: Option<String> = None;
-    let mut self_cal_script: Option<String> = None;
-    let mut gen_fixture: Option<String> = None;
-    let mut arch_s = "x86_64".to_string();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                println!("{}", optimality::HELP);
-                return ExitCode::SUCCESS;
-            }
-            "--manifest" => {
-                manifest = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--self-cal" => {
-                i += 1;
-            }
-            "--script" => {
-                self_cal_script = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--gen-fixture" => {
-                gen_fixture = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--arch" => {
-                if let Some(a) = args.get(i + 1) {
-                    arch_s = a.clone();
-                }
-                i += 2;
-            }
-            other => {
-                eprintln!(
-                    "optimality: unexpected arg '{other}'\n\n{}",
-                    optimality::HELP
-                );
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    // gen-fixture mode
-    if let Some(out) = gen_fixture {
-        let fixture = optimality::gen_fixture();
-        if out == "-" {
-            print!("{fixture}");
-        } else if let Err(e) = std::fs::write(&out, &fixture) {
-            eprintln!("optimality: writing fixture {out}: {e}");
-            return ExitCode::from(2);
-        } else {
-            eprintln!("wrote self-cal fixture to {out}");
-        }
-        return ExitCode::SUCCESS;
-    }
-
-    // self-cal-only mode
-    if let Some(script_path) = self_cal_script {
-        let arch = match Arch::parse(&arch_s) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("optimality: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        let script = match std::fs::read_to_string(&script_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("optimality: {script_path}: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        let sc = optimality::run_self_cal(&script, arch, None);
-        print!("{}", optimality::render_self_cal(&sc));
-        return if sc.passed {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-    }
-
-    // full manifest mode
-    let Some(manifest_path) = manifest else {
-        eprintln!(
-            "optimality: need --manifest, --self-cal --script, or --gen-fixture\n\n{}",
-            optimality::HELP
-        );
-        return ExitCode::from(2);
-    };
-    let text = match std::fs::read_to_string(&manifest_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("optimality: {manifest_path}: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let m: Manifest = match serde_json::from_str(&text) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("optimality: {manifest_path}: invalid manifest JSON: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match optimality::run(&m) {
-        Ok(report) => {
-            print!("{}", optimality::render(&report));
-            match report.dominant {
-                Some(true) => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
-            }
-        }
-        Err(e) => {
-            eprintln!("[INSTRUMENT REFUSED] {e}");
-            ExitCode::from(2)
-        }
     }
 }
 
@@ -4357,149 +2255,367 @@ fn print_ledger_listing(led: &Ledger, path: &Path) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The command surface
+// ---------------------------------------------------------------------------
+
+fn usage() -> ExitCode {
+    eprintln!(
+        "FULCRUM — the gzippy campaign's measurement harness\n\
+\n\
+THE FOUR CAMPAIGN VERBS (each ends in a verdict or a next action, not a table):\n\
+  fulcrum board                 WHERE DO WE STAND? Failing per-label cells, ranked by gap,\n\
+                                stale-flagged against the subject commit, denominator stated.\n\
+                                `board size …` / `board wall …` derive the axes (size is\n\
+                                roundtrip-VOIDed; wall is paired). `board goal …` adjudicates\n\
+                                a goal spec / joins the censuses.\n\
+  fulcrum why <cell>            WHY DOES THIS CELL FAIL? The automated vendor diff: anatomy\n\
+                                position-count structure verdict, callgrind per-line Ir+Dr\n\
+                                (both arms, refuses opaque no-debug binaries), paired counters\n\
+                                with threads MATCHED, declared-parameter diff.\n\
+  fulcrum candidates <cell>     WHAT COULD I DO ABOUT IT? Vendor-precedented techniques we\n\
+                                don't already do (from gzippy's vendor-technique-index.md),\n\
+                                with citations, parameter diffs, and FALSIFY records surfaced\n\
+                                loudly.\n\
+  fulcrum try <ref>             IS THIS CHANGE GOOD? Builds both arms from git refs (NO-OPs\n\
+                                and stale controls refused), verifies, runs size+wall censuses\n\
+                                on both arms at a shallow+deep level set (single-level verdicts\n\
+                                REFUSED), applies docs/promotion-rule.md clause by clause →\n\
+                                SHIP / NO-SHIP(clause+numbers) / UNDECIDED(what to re-run).\n\
+\n\
+THE PRIMITIVES:\n\
+  fulcrum freeze acquire|release|run|status|selftest\n\
+                                the ONE managed box-freeze lifecycle (SIGCONT on every exit\n\
+                                path, TTL watchdog, global orphan sweep).\n\
+  fulcrum verify …              encoder correctness oracle: roundtrip through OUR decoder at\n\
+                                every thread count + every independent decoder present.\n\
+  fulcrum dropin …              executable drop-in CLI-compatibility census vs gzip/pigz/….\n\
+  fulcrum ab paired|matrix|ablate|bisect|selftest\n\
+                                the A/B family: `paired` interleaved paired-Δ walls (SINK LAW,\n\
+                                mandatory A/A certificate, VOID on aa_bias); `matrix` corpus×T\n\
+                                sweep; `ablate` builds arms from git refs and refuses NO-OPs;\n\
+                                `bisect` names the regressing transition in a build chain.\n\
+  fulcrum profile counters|insn|insn-cat|topdown|excess|uarch|chainlat|classhist|rss|phases\n\
+                                where time/instructions/loads go, incl. vs a rival binary.\n\
+                                Instruction and read counts LOCATE; they NEVER predict the\n\
+                                wall. (On macOS the kpc-backed variants also expose\n\
+                                wall|assay|scalewall|oracle|phaseprof|insndiff|insnattr|kpcphase.)\n\
+  fulcrum trace critpath|flow|causal|consumer|occupancy|spans|schedule|scaling|decompose|\n\
+                locate|model|vs|vs-sweep|dispatchgap\n\
+                                span-trace views over a Chrome-trace timeline — the\n\
+                                starvation/causation tooling reserved for the T>1 encoder.\n\
+  fulcrum bank finding|ledger|scoreboard\n\
+                                read/append the banked-artifact stores (citable findings,\n\
+                                results ledger, legacy scoreboard render/diff/recertify).\n\
+  fulcrum selftest [name|invariants|--list]\n\
+                                run every Gate-0 (or one); render the enforced-rule registry.\n\
+  fulcrum version [--json] [--expect <sha>]\n\
+                                baked provenance: commit, dirty flag, build time. --expect\n\
+                                exits non-zero on mismatch (the deployment check).\n\
+\n\
+Every command checks its own staleness against origin/main at startup (cached 60s,\n\
+2.5s network cap): analysis commands self-update+re-exec when safe; MEASUREMENT\n\
+commands REFUSE to run stale. `--no-self-update` pins a reproduction.\n\
+See docs/command-taxonomy.md for the full old→new migration table.\n"
+    );
+    ExitCode::from(2)
+}
+
+/// Legacy → new-surface pointers. Every name that existed before the 2026-07
+/// consolidation either still works under a new spelling (printed here) or
+/// was deleted with its evidence recorded in docs/command-taxonomy.md.
+fn legacy_hint(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "sizecensus" => "fulcrum board size …",
+        "wallcensus" => "fulcrum board wall …",
+        "goal" => "fulcrum board goal …",
+        "paired" => "fulcrum ab paired …",
+        "matrix" => "fulcrum ab matrix …",
+        "ablate" => "fulcrum ab ablate …",
+        "bisect" => "fulcrum ab bisect …",
+        "counterdiff" => "fulcrum profile counters …",
+        "insn" => "fulcrum profile insn …",
+        "insn-attr" | "insnattr" | "insndiff" => "fulcrum profile insn-cat …",
+        "cycles" | "topdown" => "fulcrum profile topdown …",
+        "excess" => "fulcrum profile excess …",
+        "uarch" => "fulcrum profile uarch …",
+        "chainlat" => "fulcrum profile chainlat …",
+        "classhist" => "fulcrum profile classhist …",
+        "memprofile" => "fulcrum profile rss …",
+        "phasebreak" => "fulcrum profile phases …",
+        "critpath" | "critpath-trace" => "fulcrum trace critpath …",
+        "flow" => "fulcrum trace flow …",
+        "causal" => "fulcrum trace causal …",
+        "consumer" => "fulcrum trace consumer …",
+        "occupancy" => "fulcrum trace occupancy …",
+        "spans" => "fulcrum trace spans …",
+        "schedule" => "fulcrum trace schedule …",
+        "scaling" => "fulcrum trace scaling …",
+        "decompose" => "fulcrum trace decompose …",
+        "locate" => "fulcrum trace locate …",
+        "model" => "fulcrum trace model …",
+        "vs" => "fulcrum trace vs …",
+        "vs-sweep" => "fulcrum trace vs-sweep …",
+        "dispatchgap" => "fulcrum trace dispatchgap …",
+        "finding" => "fulcrum bank finding …",
+        "ledger" => "fulcrum bank ledger …",
+        "scoreboard" => "fulcrum bank scoreboard …",
+        "invariants" => "fulcrum selftest invariants",
+        "explain" => "fulcrum anatomy explain …",
+        "ratio" => "fulcrum anatomy ratio …",
+        // Deleted outright — the taxonomy doc records the evidence.
+        "score" | "sweep" | "perturb" | "decide" | "run" | "gate" | "scope" | "cellwhy"
+        | "frontier" | "optgate" | "abmeasure" | "optimality" | "compare" | "audit"
+        | "comparability" | "quantity" | "memlife" | "alloc" | "coz-parse" | "coz-jsonl"
+        | "mech-report" | "mech-caps" | "rank" | "region-hw" | "validate" | "plan" | "xtool"
+        | "sixstage" | "total" | "stats" | "l1search" | "provenance" => {
+            return Some(
+                "DELETED in the 2026-07 command consolidation — see docs/command-taxonomy.md \
+                 for the evidence and the replacement workflow (banked artifacts remain \
+                 readable via `fulcrum bank` / `fulcrum board`).",
+            )
+        }
+        _ => return None,
+    })
+}
+
+fn cmd_ab(rest: &[String]) -> ExitCode {
+    match rest.first().map(|s| s.as_str()) {
+        Some("paired") => fulcrum::paired::cmd_paired(&rest[1..]),
+        Some("matrix") => fulcrum::matrix::cmd_matrix(&rest[1..]),
+        Some("ablate") => fulcrum::ablate::cmd(&rest[1..]),
+        Some("bisect") => fulcrum::bisect::cmd_bisect(&rest[1..]),
+        Some("selftest") => {
+            let mut ok = true;
+            for (name, f) in [
+                ("paired", fulcrum::paired::selftest as fn() -> ExitCode),
+                ("matrix", fulcrum::matrix::selftest),
+                ("ablate", fulcrum::ablate::selftest),
+                ("bisect", fulcrum::bisect::selftest),
+            ] {
+                println!("== ab {name} Gate-0");
+                ok &= f() == ExitCode::SUCCESS;
+            }
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        _ => {
+            eprintln!(
+                "fulcrum ab — A/B two builds with provenance\n\n\
+                 \x20 ab paired …   interleaved paired-Δ walls (SINK LAW, A/A certificate)\n\
+                 \x20 ab matrix …   corpus×T loss-surface sweep of paired cells\n\
+                 \x20 ab ablate …   build BOTH arms from git refs; NO-OPs and stale controls refused\n\
+                 \x20 ab bisect …   name the regressing transition in an ordered build chain\n\
+                 \x20 ab selftest   the family's Gate-0s\n\
+                 (each subcommand has its own --help)"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_profile(rest: &[String]) -> ExitCode {
+    let sub = rest.first().map(|s| s.as_str());
+    let tail = if rest.is_empty() { rest } else { &rest[1..] };
+    match sub {
+        // Platform-dispatched: on macOS with the in-process feature the kpc
+        // backends serve these; elsewhere the perf-based paths do.
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("counters") => fulcrum::macmeasure::cmd_counterdiff(tail),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        Some("counters") => cmd_counterdiff(tail),
+        Some("insn") => cmd_insn(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("insn-cat") => fulcrum::macmeasure::cmd_insnattr(tail),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        Some("insn-cat") => cmd_insn_attr(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("topdown") => fulcrum::macmeasure::cmd_topdown(tail),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        Some("topdown") => cmd_cycles(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("classhist") => fulcrum::macmeasure::cmd_classhist(tail),
+        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
+        Some("classhist") => fulcrum::classhist::cmd_classhist(tail),
+        Some("excess") => cmd_excess(tail),
+        Some("uarch") => fulcrum::uarch::cmd_uarch(tail),
+        Some("chainlat") => cmd_chainlat(tail),
+        Some("rss") => fulcrum::memprofile::cmd_memprofile(tail),
+        Some("phases") => cmd_phasebreak(tail),
+        // macOS kpc extras keep their names under `profile`.
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("critpath") => fulcrum::macmeasure::cmd_critpath(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("wall") => fulcrum::macmeasure::cmd_wall(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("assay") => fulcrum::macmeasure::cmd_assay(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("scalewall") => fulcrum::macmeasure::cmd_scalewall(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("oracle") => fulcrum::macmeasure::cmd_oracle(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("phaseprof") => fulcrum::macmeasure::cmd_phaseprof(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("insndiff") => fulcrum::macmeasure::cmd_insndiff(tail),
+        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
+        Some("kpcphase") => fulcrum::macmeasure::cmd_kpcphase(tail),
+        _ => {
+            eprintln!(
+                "fulcrum profile — where time/instructions/loads go. These LOCATE; they never\n\
+                 predict the wall (a 28%% instruction gap has coexisted with a 2-10%% wall gap).\n\n\
+                 \x20 profile counters …   LIVE paired hw-counter diff vs a rival (threads matched)\n\
+                 \x20 profile insn …       CLOSED instruction-accounting ledger (perf stat+report)\n\
+                 \x20 profile insn-cat …   instruction-category attribution / capture plan\n\
+                 \x20 profile topdown …    TMA top-down stall breakdown (closed L1 ledger)\n\
+                 \x20 profile classhist …  execution-weighted instruction-class histogram diff\n\
+                 \x20 profile excess …     EXCESS-vs-INTRINSIC per-region differential\n\
+                 \x20 profile uarch …      hw-counter microarch profiler (run|cross|selftest)\n\
+                 \x20 profile chainlat …   critical-recurrence / chain-latency loop analysis (llvm-mca)\n\
+                 \x20 profile rss …        self-validating memory+concurrency profile (Linux)\n\
+                 \x20 profile phases …     per-phase medians of a phase-timing gzippy build\n\
+                 (macOS kpc backends add: critpath wall assay scalewall oracle phaseprof insndiff kpcphase)"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_trace(rest: &[String]) -> ExitCode {
+    let sub = rest.first().map(|s| s.as_str());
+    let tail = if rest.is_empty() { rest } else { &rest[1..] };
+    match sub {
+        Some("critpath") => cmd_critpath(tail),
+        Some("flow") => cmd_flow(tail),
+        Some("causal") => cmd_causal(tail),
+        Some("consumer") => cmd_consumer(tail),
+        Some("occupancy") => cmd_occupancy(tail),
+        Some("spans") => cmd_spans(tail),
+        Some("schedule") => cmd_schedule(tail),
+        Some("scaling") => cmd_scaling(tail),
+        Some("decompose") => cmd_decompose(tail),
+        Some("locate") => cmd_locate(tail),
+        Some("model") => cmd_model(tail),
+        Some("vs") => cmd_vs(tail),
+        Some("vs-sweep") => cmd_vs_sweep(tail),
+        Some("dispatchgap") => fulcrum::dispatchgap::cmd_dispatchgap(tail),
+        _ => {
+            eprintln!(
+                "fulcrum trace — span-trace views over a Chrome-trace timeline (FULCRUM_TRACE).\n\
+                 This is the starvation/causation tooling reserved for the T>1 encoder path.\n\n\
+                 \x20 trace critpath|flow|causal|consumer|occupancy|spans|schedule|scaling|\n\
+                 \x20       decompose|locate|model|vs|vs-sweep <trace.json> [--config gzippy]\n\
+                 \x20 trace dispatchgap <event-log.jsonl>   per-worker dispatch-gap attribution"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_bank(rest: &[String]) -> ExitCode {
+    let sub = rest.first().map(|s| s.as_str());
+    let tail = if rest.is_empty() { rest } else { &rest[1..] };
+    match sub {
+        Some("finding") => cmd_finding(tail),
+        Some("ledger") => cmd_ledger(tail),
+        Some("scoreboard") => ExitCode::from(scoreboard::cmd(tail) as u8),
+        _ => {
+            eprintln!(
+                "fulcrum bank — the banked-artifact stores (prior runs stay readable forever)\n\n\
+                 \x20 bank finding add|cite|consult|list   citable finding store (JSONL)\n\
+                 \x20 bank ledger …                        results ledger (append-only, hash-chained)\n\
+                 \x20 bank scoreboard render|diff|recertify <artifact.json>   legacy decode scoreboard"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_anatomy_family(rest: &[String]) -> ExitCode {
+    match rest.first().map(|s| s.as_str()) {
+        Some("ratio") => fulcrum::ratio::cmd_ratio(&rest[1..]),
+        Some("explain") => fulcrum::explain::cmd(&rest[1..]),
+        _ => fulcrum::anatomy::cmd_anatomy(rest),
+    }
+}
+
+fn cmd_board(rest: &[String]) -> ExitCode {
+    match rest.first().map(|s| s.as_str()) {
+        Some("goal") => fulcrum::goal::cmd(&rest[1..]),
+        _ => fulcrum::board::cmd(rest),
+    }
+}
+
+/// How each command relates to measurement — drives the staleness gate
+/// (`selfver::enforce`): measurement commands REFUSE to run stale; analysis
+/// commands self-update when safe; exempt commands always run.
+fn classify(sub: &str, rest: &[String]) -> CmdClass {
+    // Any selftest invocation must run on whatever binary is present (the
+    // deployment flow runs Gate-0s immediately after an update).
+    if rest.iter().any(|a| a == "selftest") {
+        return CmdClass::Exempt;
+    }
+    match sub {
+        // `freeze` must never be blocked: a stale binary must still be able
+        // to RELEASE a freeze (orphaned frozen boxes are the worse failure).
+        "version" | "help" | "--help" | "-h" | "selftest" | "freeze" => CmdClass::Exempt,
+        "why" | "try" | "verify" | "dropin" | "ab" | "profile" => CmdClass::Measurement,
+        "board" => match rest.first().map(|s| s.as_str()) {
+            // Deriving the board measures; reading/adjudicating it analyses.
+            Some("size") | Some("wall") => CmdClass::Measurement,
+            _ => CmdClass::Analysis,
+        },
+        _ => CmdClass::Analysis,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = args.first().cloned() else {
         return usage();
     };
     let rest = &args[1..];
-    match sub.as_str() {
-        // On Apple Silicon (with in-process-gzippy), `critpath` is the kpc/CNTVCT
-        // slope-attribution tool (per-region wall-causal localization). Elsewhere
-        // it is the Chrome-trace consumer-anchored analyzer; that stays reachable
-        // as `critpath-trace`.
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "critpath" => fulcrum::macmeasure::cmd_critpath(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "critpath-trace" => cmd_critpath(rest),
-        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
-        "critpath" => cmd_critpath(rest),
-        "flow" => cmd_flow(rest),
-        "causal" => cmd_causal(rest),
-        "stats" => cmd_stats(rest),
-        "consumer" => cmd_consumer(rest),
-        "occupancy" => cmd_occupancy(rest),
-        "spans" => cmd_spans(rest),
-        "schedule" => cmd_schedule(rest),
-        "scaling" => cmd_scaling(rest),
-        "memlife" => cmd_memlife(rest),
-        "memprofile" => fulcrum::memprofile::cmd_memprofile(rest),
-        "decompose" => cmd_decompose(rest),
-        "dispatchgap" => fulcrum::dispatchgap::cmd_dispatchgap(rest),
-        "alloc" => cmd_alloc(rest),
-        "model" => cmd_model(rest),
-        "vs" => cmd_vs(rest),
-        "vs-sweep" => cmd_vs_sweep(rest),
-        "coz-parse" => cmd_coz_parse(rest),
-        "mech-report" => cmd_mech_report(rest),
-        "rank" => cmd_rank(rest),
-        "region-hw" => cmd_region_hw(rest),
-        "provenance" => cmd_provenance(rest),
-        "xtool" => cmd_xtool(rest),
-        "compare" => cmd_compare(rest),
-        "sweep" => cmd_sweep(rest),
-        "goal" => fulcrum::goal::cmd(rest),
-        "sizecensus" => fulcrum::sizecensus::cmd(rest),
-        "wallcensus" => fulcrum::wallcensus::cmd(rest),
-        "dropin" => fulcrum::dropin::cmd(rest),
-        "verify" => fulcrum::verify::cmd(rest),
-        "ablate" => fulcrum::ablate::cmd(rest),
-        "explain" => fulcrum::explain::cmd(rest),
-        "coz-jsonl" => cmd_coz_jsonl(rest),
-        "audit" => cmd_audit(rest),
-        "comparability" => cmd_comparability(rest),
-        "quantity" => cmd_quantity(rest),
-        "mech-caps" => cmd_mech_caps(rest),
-        "validate" => cmd_validate(rest),
-        "plan" => cmd_plan(rest),
-        "sixstage" => cmd_sixstage(rest),
-        "finding" => cmd_finding(rest),
-        "run" => cmd_run(rest),
-        "perturb" => cmd_perturb(rest),
-        "decide" => cmd_decide(rest),
-        "total" => cmd_total(rest),
-        "locate" => cmd_locate(rest),
-        "insn" => cmd_insn(rest),
-        "insn-attr" => cmd_insn_attr(rest),
-        "cycles" => cmd_cycles(rest),
-        "optgate" => cmd_optgate(rest),
-        "abmeasure" => cmd_abmeasure(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "counterdiff" => fulcrum::macmeasure::cmd_counterdiff(rest),
-        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
-        "counterdiff" => cmd_counterdiff(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "topdown" => fulcrum::macmeasure::cmd_topdown(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "wall" => fulcrum::macmeasure::cmd_wall(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "assay" => fulcrum::macmeasure::cmd_assay(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "scalewall" => fulcrum::macmeasure::cmd_scalewall(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "oracle" => fulcrum::macmeasure::cmd_oracle(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "phaseprof" => fulcrum::macmeasure::cmd_phaseprof(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "insndiff" => fulcrum::macmeasure::cmd_insndiff(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "classhist" => fulcrum::macmeasure::cmd_classhist(rest),
-        #[cfg(not(all(target_os = "macos", feature = "in-process-gzippy")))]
-        "classhist" => fulcrum::classhist::cmd_classhist(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "insnattr" => fulcrum::macmeasure::cmd_insnattr(rest),
-        #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
-        "kpcphase" => fulcrum::macmeasure::cmd_kpcphase(rest),
-        "excess" => cmd_excess(rest),
-        "chainlat" => cmd_chainlat(rest),
-        "freeze" => fulcrum::freeze::cmd_freeze(rest),
-        "paired" => fulcrum::paired::cmd_paired(rest),
-        "matrix" => fulcrum::matrix::cmd_matrix(rest),
-        "frontier" => fulcrum::frontier::cmd_frontier(rest),
-        "gate" => fulcrum::gate::cmd_gate(rest),
-        "bisect" => fulcrum::bisect::cmd_bisect(rest),
-        "scope" => fulcrum::scope::cmd_scope(rest),
-        "phasebreak" => cmd_phasebreak(rest),
-        "optimality" => cmd_optimality(rest),
-        "ledger" => cmd_ledger(rest),
-        "invariants" => cmd_invariants(rest),
-        "score" => {
-            // `selftest` and the paired-backed form (`--gzippy-native`) route to
-            // the paired engine; the legacy best-of-N form (`--native/--isal/--rg`)
-            // is preserved for the deployed 2-way workflow.
-            if rest.first().map(|s| s.as_str()) == Some("selftest") {
-                score::selftest()
-            } else if rest.iter().any(|a| a == "--gzippy-native") {
-                score::cmd_score_paired(rest)
-            } else {
-                match score::args_from_cli(rest) {
-                    Ok(a) => {
-                        if let Err(e) = score::run_score(&a) {
-                            eprintln!("fulcrum score: {e}");
-                            ExitCode::FAILURE
-                        } else {
-                            ExitCode::SUCCESS
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{e}\n\nUsage:\n{}", score::usage_score());
-                        ExitCode::from(2)
-                    }
-                }
-            }
+
+    // The staleness gate applies only to REAL commands: an unknown or legacy
+    // name must fall through to its hint without a network probe or (worse)
+    // a self-update triggered by a typo.
+    const KNOWN: &[&str] = &[
+        "board", "why", "candidates", "try", "freeze", "verify", "dropin", "ab", "profile",
+        "trace", "anatomy", "bank", "selftest", "version",
+    ];
+    if KNOWN.contains(&sub.as_str()) {
+        if let Err(msg) = fulcrum::selfver::enforce(classify(&sub, rest), &args) {
+            eprintln!("fulcrum: {msg}");
+            return ExitCode::FAILURE;
         }
-        "uarch" => fulcrum::uarch::cmd_uarch(rest),
-        "cellwhy" => fulcrum::cellwhy::cmd_cellwhy(rest),
-        "scoreboard" => ExitCode::from(scoreboard::cmd(rest) as u8),
-        "behavior" => fulcrum::behavior::cmd_behavior(rest),
-        "ratio" => fulcrum::ratio::cmd_ratio(rest),
-        "anatomy" => fulcrum::anatomy::cmd_anatomy(rest),
-        "l1search" => fulcrum::l1search::cmd_l1search(rest),
+    }
+
+    match sub.as_str() {
+        "board" => cmd_board(rest),
+        "why" => fulcrum::why::cmd(rest),
+        "candidates" => fulcrum::candidates::cmd(rest),
+        "try" => fulcrum::promote::cmd(rest),
+        "freeze" => fulcrum::freeze::cmd_freeze(rest),
+        "verify" => fulcrum::verify::cmd(rest),
+        "dropin" => fulcrum::dropin::cmd(rest),
+        "ab" => cmd_ab(rest),
+        "profile" => cmd_profile(rest),
+        "trace" => cmd_trace(rest),
+        "anatomy" => cmd_anatomy_family(rest),
+        "bank" => cmd_bank(rest),
+        "selftest" => fulcrum::selftest::cmd(rest),
+        "version" | "--version" | "-V" => fulcrum::selfver::cmd_version(rest),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
         }
         other => {
+            if let Some(hint) = legacy_hint(other) {
+                eprintln!("fulcrum: '{other}' moved in the 2026-07 command consolidation → {hint}");
+                return ExitCode::from(2);
+            }
             eprintln!("fulcrum: unknown subcommand '{other}'");
             usage()
         }

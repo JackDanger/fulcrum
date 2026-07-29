@@ -81,6 +81,9 @@ impl Cell {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    /// selfver stamp of the fulcrum that ran the oracle.
+    #[serde(default)]
+    pub fulcrum_commit: String,
     pub cells: Vec<Cell>,
     /// Corpus -> the P4 violations found (level, size, prev_level, prev_size).
     pub monotonic_size_violations: Vec<String>,
@@ -284,6 +287,7 @@ pub fn run(
     let total = cells.len();
     let clean = failed == 0 && mono.is_empty() && ident.is_empty();
     Report {
+        fulcrum_commit: crate::selfver::stamp(),
         total_cells: total,
         failed_cells: failed,
         verdict: if total == 0 {
@@ -480,7 +484,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
 /// Gate-0. A correctness harness that cannot detect corruption is worse than
 /// no harness, so this does not merely exercise the plumbing — it feeds the
 /// checker a stream it MUST reject and fails if the checker passes it.
-fn selftest() -> ExitCode {
+pub fn selftest() -> ExitCode {
     let mut fails = 0;
 
     // 1. Template substitution.
@@ -557,6 +561,7 @@ fn selftest() -> ExitCode {
     // 5. P4 must fire when a higher level is bigger. `gzip -1` on incompressible
     //    input is larger than... not reliably. Construct it directly instead.
     let mut r = Report {
+        fulcrum_commit: crate::selfver::stamp(),
         cells: vec![],
         monotonic_size_violations: vec![],
         thread_identity_violations: vec![],

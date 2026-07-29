@@ -7,10 +7,8 @@
 //! it can be asserted on.
 
 use crate::cycles::{Tma, TmaComparison};
-use crate::decide::Report;
 use crate::insn::{InsnResult, Ledger};
 use crate::locate::LocateResult;
-use crate::perturb::PerturbCell;
 
 const BAR: &str = "====================================================================================================";
 const DASH: &str = "----------------------------------------------------------------------------------------------------";
@@ -30,79 +28,12 @@ fn commas_signed(n: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The decision brief (print_report).
-// ---------------------------------------------------------------------------
-
-/// Render the ranked decision table + brief. Faithful port of
-/// `report.print_report`.
-pub fn render_report(rep: &Report, tie_bar: f64) -> String {
-    let mut o = String::new();
-    macro_rules! ln {
-        ($($a:tt)*) => {{ o.push_str(&format!($($a)*)); o.push('\n'); }};
-    }
-    ln!("{BAR}");
-    ln!("fulcrum decide — ONE-RUN decision table");
-    ln!("{BAR}");
-    for h in &rep.header {
-        ln!("{h}");
-    }
-    ln!("\n-- CELL SCOREBOARD (wall, interleaved, sha-verified; bar = {tie_bar}x EVERY T) --");
-    for s in &rep.scoreboard {
-        ln!("{s}");
-    }
-    ln!(
-        "\n-- RANKED COMPONENTS (tier 1 causal-COSTS > tier 2 hypotheses > tier 3 confirms > tier 4 null) --"
-    );
-    for (i, r) in rep.rows.iter().enumerate() {
-        ln!("\n[{:2}] {}   cells: {}", i + 1, r.component, r.cells);
-        ln!("     attribution : {}", r.attrib);
-        ln!("     status      : {}", r.status);
-        ln!("     distribution: {}", r.dist);
-        if let Some(rss) = &r.rss {
-            ln!("     rss         : {rss}");
-        }
-        ln!("     re-verify   : {}", r.verify);
-    }
-    if !rep.anomalies.is_empty() {
-        ln!("\n-- ANOMALIES (verbatim; investigate before trusting affected rows) --");
-        for a in &rep.anomalies {
-            ln!("  !! {a}");
-        }
-    }
-    ln!("\n{BAR}");
-    ln!("DO THIS NEXT: {}", rep.do_next);
-    ln!("{BAR}");
-    let b = &rep.brief;
-    ln!("DECISION BRIEF");
-    ln!("  action       : {}", b.action);
-    ln!("  evidence     : {}", b.evidence);
-    ln!("  preconditions:");
-    for p in &b.preconditions {
-        ln!("    - {p}");
-    }
-    ln!("  command      : {}", b.command);
-    ln!("  falsifier    : {}", b.falsifier);
-    ln!("{BAR}");
-    o
-}
-
-/// Print the ranked decision table + brief.
-pub fn print_report(rep: &Report, tie_bar: f64) {
-    print!("{}", render_report(rep, tie_bar));
-}
-
-// ---------------------------------------------------------------------------
-// locate / perturb wrappers (the renderers live in their own modules).
+// locate wrapper (the renderer lives in its own module).
 // ---------------------------------------------------------------------------
 
 /// Print the locate report (delegates to [`crate::locate::render`]).
 pub fn print_locate(result: &LocateResult) {
     print!("{}", crate::locate::render(result));
-}
-
-/// Print the perturb report (delegates to [`crate::perturb::render_perturb`]).
-pub fn print_perturb(cell: &PerturbCell, frozen: bool) {
-    print!("{}", crate::perturb::render_perturb(cell, frozen));
 }
 
 // ---------------------------------------------------------------------------

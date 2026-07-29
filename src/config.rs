@@ -713,6 +713,16 @@ impl Default for Config {
 // into a second config. [`GzippyAdapter::config`] ties the two together.
 // ===========================================================================
 
+/// A (corpus, threads) cell key. (Moved here from the retired decode-campaign
+/// `decide` module in the 2026-07 consolidation — the adapter surface and the
+/// banked-profile comparator still key on it.)
+pub type CellKey = (String, u32);
+
+/// Render a cell key as `corpus:T<n>`.
+pub fn fmt_cell(ck: &CellKey) -> String {
+    format!("{}:T{}", ck.0, ck.1)
+}
+
 /// One same-binary kill-switch. Faithful port of `adapters/base.py::Knob`.
 ///
 /// `env` is the FEATURE-ALTERED arm; `pred` names the effect predicate proving
@@ -804,36 +814,11 @@ pub trait ProjectAdapter {
         BTreeMap::new()
     }
 
-    // -- artifact loading -----------------------------------------------------
-    /// Load one measurement-run artifact directory into the [`crate::decide::Run`]
-    /// the decision engine consumes. The default implements the documented schema
-    /// (`decide/docs/SCHEMA.md`); a project with its own artifact layout overrides
-    /// this and maps to the same run shape. Mirrors
-    /// `adapters/base.py::ProjectAdapter.load_run`.
-    fn load_run(
-        &self,
-        art_dir: &Path,
-    ) -> Result<crate::decide::Run, crate::trace::InstrumentError> {
-        crate::decide::load_run_documented(art_dir, self)
-    }
-
     // -- micro-profile (optional per-project engine counters) -----------------
     /// Profile-capture text -> opaque [`Prof`], or `None`. Mirrors
     /// `adapters/base.py::parse_microprofile`.
     fn parse_microprofile(&self, _text: &str) -> Option<Prof> {
         None
-    }
-
-    /// `(rows, anomalies)` for the decision table. Mirrors
-    /// `adapters/base.py::microprofile_rows` (default: nothing).
-    fn microprofile_rows(
-        &self,
-        _ck: &crate::decide::CellKey,
-        _prof: Option<&Prof>,
-        _gap_ms: f64,
-        _run: &crate::decide::Run,
-    ) -> (Vec<crate::decide::Row>, Vec<String>) {
-        (Vec::new(), Vec::new())
     }
 
     // -- knobs ----------------------------------------------------------------
@@ -842,29 +827,6 @@ pub trait ProjectAdapter {
     /// `adapters/base.py::effect_check`.
     fn effect_check(&self, pred: &str, _base_txt: &str, _knob_txt: &str) -> (Option<bool>, String) {
         (None, format!("unknown predicate '{pred}'"))
-    }
-
-    // -- re-verify command surfaces -------------------------------------------
-    /// The exact re-run command for a knob A/B. Mirrors
-    /// `adapters/base.py::reverify_knob`.
-    fn reverify_knob(
-        &self,
-        ck: &crate::decide::CellKey,
-        kname: &str,
-        _run: &crate::decide::Run,
-    ) -> String {
-        format!("re-run the {kname} A/B on {}:T{}", ck.0, ck.1)
-    }
-
-    /// The exact re-analyze command for a cell trace. Mirrors
-    /// `adapters/base.py::reverify_trace`.
-    fn reverify_trace(
-        &self,
-        ck: &crate::decide::CellKey,
-        _run: &crate::decide::Run,
-        _feature: Option<&str>,
-    ) -> String {
-        format!("re-analyze the {}:T{} trace", ck.0, ck.1)
     }
 }
 
@@ -1287,120 +1249,12 @@ impl ProjectAdapter for GzippyAdapter {
 
     fn parse_microprofile(&self, text: &str) -> Option<Prof> {
         // gzippy's parser always yields a Prof (possibly with empty classes);
-        // the consumer (microprofile_rows) guards on `classes` being empty.
+        // consumers guard on `classes` being empty.
         Some(parse_prof(text))
-    }
-
-    fn microprofile_rows(
-        &self,
-        ck: &crate::decide::CellKey,
-        prof: Option<&Prof>,
-        gap_ms: f64,
-        run: &crate::decide::Run,
-    ) -> (Vec<crate::decide::Row>, Vec<String>) {
-        use crate::decide::{fmt_cell, Row};
-        let mut rows = Vec::new();
-        let mut anomalies = Vec::new();
-        let Some(prof) = prof else {
-            return (rows, anomalies);
-        };
-        if prof.classes.is_empty() {
-            return (rows, anomalies);
-        }
-        for d in bank_divergence(ck, prof) {
-            anomalies.push(format!("{}:T{}: {d}", ck.0, ck.1));
-        }
-        let compute = self
-            .perturbations()
-            .get("compute")
-            .cloned()
-            .unwrap_or_default();
-        // Sorted by class share descending (stable on ties -> parse order).
-        let mut items: Vec<&(String, ProfClass)> = prof.classes.iter().collect();
-        items.sort_by(|a, b| {
-            b.1.share_pct
-                .partial_cmp(&a.1.share_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let bin = run.manifest.get("bin").unwrap_or("None");
-        for (cls_name, c) in items {
-            let bounded = gap_ms * c.share_pct / 100.0;
-            rows.push(Row {
-                component: format!("engine.{cls_name}"),
-                kind: "engine".to_string(),
-                perturb_cmd: Some(compute.clone()),
-                cells: format!("{}:T{}", ck.0, ck.1),
-                attrib: format!(
-                    "{:.1}% of classed cyc, {:.1} cyc/iter, iters={}",
-                    c.share_pct,
-                    c.cyc_iter,
-                    commas(c.iters),
-                ),
-                status: format!(
-                    "HYPOTHESIS: bounded ≤{bounded:.0}ms ESTIMATE (= cell rg-gap \
-                     {gap_ms:.0}ms × class share; a partition, not a promise). \
-                     Perturb: {compute}"
-                ),
-                dist: "prof=1-shot counters (unfrozen-counters label)".to_string(),
-                verify: format!(
-                    "GZIPPY_CONTIG_PROF=1 GZIPPY_VERBOSE=1 taskset -c <mask> {bin} \
-                     -d -c -p {} <BENCH_ROOT>/{}.gz >/dev/null",
-                    ck.1, ck.0
-                ),
-                tier: 2,
-                rank_ms: bounded,
-                reverted: false,
-                rss: None,
-                effect_verified: None,
-                n_needed: None,
-            });
-            let _ = fmt_cell; // (fmt_cell reserved for parity with sibling rows)
-        }
-        if let Some(wc) = prof.wrapper_calls {
-            if wc != 0 {
-                anomalies.push(format!(
-                    "{}:T{}: WRAPPER calls={wc} (expected 0 — contig should be the \
-                     sole production engine)",
-                    ck.0, ck.1
-                ));
-            }
-        }
-        (rows, anomalies)
     }
 
     fn effect_check(&self, pred: &str, base_txt: &str, knob_txt: &str) -> (Option<bool>, String) {
         effect_check_gzippy(pred, base_txt, knob_txt)
-    }
-
-    fn reverify_knob(
-        &self,
-        ck: &crate::decide::CellKey,
-        kname: &str,
-        run: &crate::decide::Run,
-    ) -> String {
-        format!(
-            "scripts/bench/decide.sh --cells {}:{} --knob-cells {}:{} --knobs \
-             {kname} --knob-n 21 --bin {}",
-            ck.0,
-            ck.1,
-            ck.0,
-            ck.1,
-            run.manifest.get("bin").unwrap_or("None"),
-        )
-    }
-
-    fn reverify_trace(
-        &self,
-        ck: &crate::decide::CellKey,
-        _run: &crate::decide::Run,
-        feature: Option<&str>,
-    ) -> String {
-        format!(
-            "scripts/fulcrum total <artdir>/cell_{}_T{}/trace.json --feature {}",
-            ck.0,
-            ck.1,
-            feature.unwrap_or("None"),
-        )
     }
 }
 
@@ -1685,7 +1539,7 @@ const BANK_REL_TOL: f64 = 0.25;
 /// Compare a silesia T8 prof against the banked P3.5 comparator. Returns
 /// divergence strings (empty == consistent). Faithful port of
 /// `adapters/gzippy.py::bank_divergence`.
-pub fn bank_divergence(ck: &crate::decide::CellKey, prof: &Prof) -> Vec<String> {
+pub fn bank_divergence(ck: &CellKey, prof: &Prof) -> Vec<String> {
     let mut div = Vec::new();
     if ck.0 != "silesia" || ck.1 != 8 || prof.classes.is_empty() {
         return div;

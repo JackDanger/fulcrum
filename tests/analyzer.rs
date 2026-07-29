@@ -7,7 +7,7 @@
 //! `toy_pipeline` example exercises, but deterministic and Coz-free.
 
 use fulcrum::config::{Config, GroundTruth, RegionDef, SourceRange};
-use fulcrum::{critpath, rank, trace, validate};
+use fulcrum::{critpath, trace};
 use std::io::Write;
 
 /// Append a `B`/`E` span pair on a thread to a Chrome-trace JSON buffer.
@@ -96,7 +96,15 @@ fn critpath_blames_the_long_pole_stage() {
     // Nearly all the wall is consumer wait.
     assert!(cp.consumer_wait_us > cp.consumer_busy_us);
 
-    let on_path = rank::on_path_by_region(&cp, &cfg);
+    // Per-region on-path fraction (the essence of the retired `rank`
+    // module's `on_path_by_region`, inlined when rank was deleted in the
+    // 2026-07 consolidation).
+    let mut on_path = std::collections::BTreeMap::<String, f64>::new();
+    for e in &cp.entries {
+        if let Some(r) = cfg.label_region(&e.label) {
+            *on_path.entry(r).or_default() += e.fraction;
+        }
+    }
     let transform = *on_path.get("transform").unwrap_or(&0.0);
     let emit = *on_path.get("emit").unwrap_or(&0.0);
     // transform (800us of the 1000us wait) must dominate; emit (20us) must not.
@@ -105,41 +113,6 @@ fn critpath_blames_the_long_pole_stage() {
         "transform should own most of the critical path, got {transform}"
     );
     assert!(transform > emit, "transform must out-rank emit");
-}
-
-#[test]
-fn rank_puts_long_pole_first() {
-    let mut f = tempfile();
-    f.write_all(build_trace().as_bytes()).unwrap();
-    let events = trace::load_events(f.path()).unwrap();
-    let cfg = demo_config();
-    let cp = critpath::analyze(&events, 30_000.0, &preferred(&cfg));
-    let levers = rank::rank(None, &cp, None, &cfg);
-    assert_eq!(
-        levers.first().map(|l| l.region.as_str()),
-        Some("transform"),
-        "the long-pole stage must rank #1"
-    );
-}
-
-#[test]
-fn validate_reproduces_planted_ground_truth() {
-    let mut f = tempfile();
-    f.write_all(build_trace().as_bytes()).unwrap();
-    let events = trace::load_events(f.path()).unwrap();
-    let cfg = demo_config();
-    let cp = critpath::analyze(&events, 30_000.0, &preferred(&cfg));
-    let on_path = rank::on_path_by_region(&cp, &cfg);
-    let v = validate::check_against_ground_truth(None, &cp, &cfg.ground_truth, &on_path);
-    assert!(!v.is_empty(), "the demo config has trace-only ground truth");
-    assert!(
-        v.all_passed(),
-        "validation should pass; checks: {:?}",
-        v.checks
-            .iter()
-            .map(|c| (c.name.clone(), c.passed))
-            .collect::<Vec<_>>()
-    );
 }
 
 #[test]

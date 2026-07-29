@@ -34,49 +34,45 @@
 /// Mirrors `decide/fulcrum/__init__.py::PROTOCOL_VERSION`.
 pub const PROTOCOL_VERSION: &str = "fulcrum-v3";
 
+// The campaign verbs (see docs/command-taxonomy.md).
+pub mod board;
+pub mod candidates;
+pub mod promote;
+pub mod why;
+
+// Cross-cutting: baked provenance + staleness self-check; the Gate-0 runner.
+pub mod selftest;
+pub mod selfver;
+
+// The primitives and their libraries.
 pub mod ablate;
-pub mod abmeasure;
-pub mod alloc;
 pub mod anatomy;
-pub mod audit;
 pub mod behavior;
-pub mod binloc;
 pub mod bisect;
 pub mod bundle;
 pub mod causal;
-pub mod cellwhy;
 pub mod chainlat;
 pub mod classhist;
-pub mod comparability;
 pub mod compare;
-pub mod compare_cli;
 pub mod config;
-pub mod conserve;
 pub mod consumer;
 pub mod counterdiff;
-pub mod coz;
-pub mod coz_jsonl;
 pub mod cpreflight;
 pub mod critpath;
 pub mod cycles;
-pub mod decide;
 pub mod decompose;
 pub mod dispatchgap;
 pub mod dropin;
-pub mod estimate;
 pub mod excess;
 pub mod explain;
 pub mod finding;
 pub mod fingerprint;
 pub mod flow;
 pub mod freeze;
-pub mod frontier;
-pub mod gate;
 pub mod goal;
 pub mod insn;
 pub mod insn_attr;
 pub mod invariants;
-pub mod l1search;
 pub mod labels;
 pub mod ledger;
 pub mod levelsweep;
@@ -86,45 +82,26 @@ pub mod matrix;
 // when the optional `gzippy` dep is present (`--features in-process-gzippy`).
 #[cfg(all(target_os = "macos", feature = "in-process-gzippy"))]
 pub mod macmeasure;
-pub mod mech;
-pub mod mech_arch;
-pub mod memlife;
 pub mod memprofile;
-pub mod microbench;
 pub mod model;
 pub mod occupancy;
 pub mod optgate;
-pub mod optimality;
 pub mod paired;
-pub mod perturb;
 pub mod phasebreak;
-pub mod pipeline;
 pub mod probe;
-pub mod provenance;
-pub mod quantity;
-pub mod rank;
 pub mod ratio;
-pub mod region_hw;
 pub mod report;
-pub mod rg_verbose;
-pub mod runner;
 pub mod scaling;
 pub mod scaling_matrix;
 pub mod schedule;
-pub mod scope;
-pub mod score;
 pub mod scoreboard;
 pub mod sizecensus;
 pub mod spans;
 pub mod stats;
-pub mod sweep;
-pub mod sweep_factor;
 pub mod trace;
 pub mod uarch;
-pub mod validate;
 pub mod verbose_stats;
 pub mod verify;
 pub mod vs;
 pub mod vs_sweep;
 pub mod wallcensus;
-pub mod xtool;

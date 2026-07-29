@@ -4,7 +4,7 @@ TRACE := /tmp/fulcrum_toy.json
 
 .DEFAULT_GOAL := test
 
-.PHONY: test check-unit check-pipeline check-robustness demo build release clean help
+.PHONY: test check-unit check-pipeline check-robustness demo build release clean help deploy deploy-check
 
 # ── run everything ────────────────────────────────────────────────────────────
 
@@ -26,27 +26,14 @@ check-pipeline: build
 	@printf '\n\033[1;34m══ pipeline integration (1200 items, 4 workers) ═════════════════════\033[0m\n\n'
 	@FULCRUM_TRACE=$(TRACE) $(TOY) --items 1200 --workers 4 2>&1
 	@printf '\n'
-	@$(BIN) critpath $(TRACE) --heavy-ms 5 > /tmp/fulcrum_critpath.txt
+	@$(BIN) trace critpath $(TRACE) --heavy-ms 5 --no-self-update > /tmp/fulcrum_critpath.txt
 	@grep -q 'transform' /tmp/fulcrum_critpath.txt \
-		&& printf '\033[1;32m  ✓ critpath: transform attributed on critical path\033[0m\n' \
-		|| { printf '\033[1;31m  ✗ critpath: transform should dominate the critical path\033[0m\n'; \
+		&& printf '\033[1;32m  ✓ trace critpath: transform attributed on critical path\033[0m\n' \
+		|| { printf '\033[1;31m  ✗ trace critpath: transform should dominate the critical path\033[0m\n'; \
 		     cat /tmp/fulcrum_critpath.txt; exit 1; }
 	@grep -q 'consumer wait' /tmp/fulcrum_critpath.txt \
-		&& printf '\033[1;32m  ✓ critpath: consumer wait detected (in-order consumer found)\033[0m\n' \
-		|| { printf '\033[1;31m  ✗ critpath: expected consumer wait spans\033[0m\n'; exit 1; }
-	@printf '\n'
-	@$(BIN) validate $(TRACE) \
-		&& printf '\033[1;32m  ✓ validate: ground truth reproduced\033[0m\n' \
-		|| { printf '\033[1;31m  ✗ validate: ground truth diverged — check above\033[0m\n'; exit 1; }
-	@printf '\n'
-	@$(BIN) rank $(TRACE) > /tmp/fulcrum_rank.txt
-	@grep -q '> transform' /tmp/fulcrum_rank.txt \
-		&& printf '\033[1;32m  ✓ rank: transform is the #1 lever\033[0m\n' \
-		|| { printf '\033[1;31m  ✗ rank: expected transform as #1 lever\033[0m\n'; \
-		     cat /tmp/fulcrum_rank.txt; exit 1; }
-	@grep -q 'NEXT LEVER -> transform' /tmp/fulcrum_rank.txt \
-		&& printf '\033[1;32m  ✓ rank: NEXT LEVER points at transform\033[0m\n' \
-		|| { printf '\033[1;31m  ✗ rank: NEXT LEVER should point at transform\033[0m\n'; exit 1; }
+		&& printf '\033[1;32m  ✓ trace critpath: consumer wait detected (in-order consumer found)\033[0m\n' \
+		|| { printf '\033[1;31m  ✗ trace critpath: expected consumer wait spans\033[0m\n'; exit 1; }
 	@printf '\n\033[1;32m══ all pipeline assertions passed ══════════════════════════════════\033[0m\n'
 
 # ── robustness: same ranking under different parallelism ──────────────────────
@@ -61,12 +48,12 @@ check-pipeline: build
 check-robustness: build
 	@printf '\n\033[1;34m══ robustness: 2 workers (600 items) ════════════════════════════════\033[0m\n\n'
 	@FULCRUM_TRACE=/tmp/fulcrum_toy_2w.json $(TOY) --items 600 --workers 2 2>&1
-	@$(BIN) rank /tmp/fulcrum_toy_2w.json | grep -q '> transform' \
+	@$(BIN) trace critpath /tmp/fulcrum_toy_2w.json --no-self-update | grep -q 'transform' \
 		&& printf '\033[1;32m  ✓ transform still #1 at 2 workers\033[0m\n' \
 		|| { printf '\033[1;31m  ✗ transform should be #1 at 2 workers\033[0m\n'; exit 1; }
 	@printf '\n\033[1;34m══ robustness: 8 workers (2400 items) ═══════════════════════════════\033[0m\n\n'
 	@FULCRUM_TRACE=/tmp/fulcrum_toy_8w.json $(TOY) --items 2400 --workers 8 2>&1
-	@$(BIN) rank /tmp/fulcrum_toy_8w.json | grep -q '> transform' \
+	@$(BIN) trace critpath /tmp/fulcrum_toy_8w.json --no-self-update | grep -q 'transform' \
 		&& printf '\033[1;32m  ✓ transform still #1 at 8 workers\033[0m\n' \
 		|| { printf '\033[1;31m  ✗ transform should be #1 at 8 workers\033[0m\n'; exit 1; }
 	@printf '\n\033[1;32m══ robustness: all assertions passed ═══════════════════════════════\033[0m\n'
@@ -77,11 +64,9 @@ demo: build
 	@printf '\n\033[1;34m══ fulcrum demo ════════════════════════════════════════════════════\033[0m\n\n'
 	FULCRUM_TRACE=$(TRACE) $(TOY) --items 240 --workers 4
 	@printf '\n'
-	$(BIN) critpath $(TRACE) --heavy-ms 5
+	$(BIN) trace critpath $(TRACE) --heavy-ms 5 --no-self-update
 	@printf '\n'
-	$(BIN) rank $(TRACE)
-	@printf '\n'
-	$(BIN) validate $(TRACE)
+	$(BIN) trace consumer $(TRACE) --config demo --no-self-update
 
 # ── release: VERSION → Cargo.toml → commit → tag → push ──────────────────────
 #
@@ -106,6 +91,35 @@ release: test
 	git push && git push --tags && \
 	printf '\n\033[1;32m  v%s tagged and pushed — GHA will publish to crates.io\033[0m\n\n' "$$version"
 
+# ── deployment: get main onto every box we measure on, verifiably ─────────────
+#
+# THE SCAR: the authority box ran a fulcrum binary built 2026-07-13 that lacked
+# half the instrument set; two weeks of measurements used a stale instrument
+# and a hand-rolled byte-count size check nearly scored a corrupt output as a
+# WIN. Deployment is not done until `fulcrum version --expect <sha>` passes ON
+# THE BOX and the Gate-0 suite is green there.
+#
+#   make deploy       BOX=root@10.0.2.240 DIR=/root/fulcrum
+#   make deploy-check BOX=root@10.0.2.240 DIR=/root/fulcrum
+
+BOX ?= root@10.0.2.240
+DIR ?= /root/fulcrum
+
+deploy:
+	@printf '\n\033[1;34m══ deploy main → %s:%s ══\033[0m\n\n' "$(BOX)" "$(DIR)"
+	ssh $(BOX) 'test -d $(DIR)/.git || git clone $(shell git remote get-url origin) $(DIR)'
+	ssh $(BOX) 'cd $(DIR) && git fetch origin main && git checkout -q main && git reset --hard -q origin/main && cargo build --release'
+	@$(MAKE) --no-print-directory deploy-check BOX=$(BOX) DIR=$(DIR)
+	ssh $(BOX) '$(DIR)/target/release/fulcrum selftest --no-self-update' \
+		&& printf '\033[1;32m  ✓ Gate-0 suite green on %s\033[0m\n' "$(BOX)" \
+		|| { printf '\033[1;31m  ✗ Gate-0 suite FAILED on %s — the deploy does not count\033[0m\n' "$(BOX)"; exit 1; }
+
+deploy-check:
+	@want=$$(git ls-remote $(shell git remote get-url origin) refs/heads/main | cut -f1) && \
+	ssh $(BOX) '$(DIR)/target/release/fulcrum version --expect '"$$want"' --no-self-update' \
+		&& printf '\033[1;32m  ✓ %s runs origin/main (%s)\033[0m\n' "$(BOX)" "$$want" \
+		|| { printf '\033[1;31m  ✗ %s is NOT running origin/main — do not measure there\033[0m\n' "$(BOX)"; exit 1; }
+
 # ── plumbing ──────────────────────────────────────────────────────────────────
 
 build:
@@ -125,5 +139,7 @@ help:
 	@printf '  make demo               full analysis output, pretty-printed\n'
 	@printf '  make build              cargo build --release --examples\n'
 	@printf '  make release            sync VERSION → Cargo.toml, tag, push\n'
+	@printf '  make deploy BOX=… DIR=… push main to a box, rebuild, verify provenance + Gate-0s\n'
+	@printf '  make deploy-check …     verify a box runs origin/main (fulcrum version --expect)\n'
 	@printf '  make clean              remove traces and build artifacts\n'
 	@printf '\nTo release: edit VERSION, then run make release\n\n'

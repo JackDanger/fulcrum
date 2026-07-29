@@ -40,11 +40,6 @@ impl fmt::Display for InvariantViolation {
 
 impl std::error::Error for InvariantViolation {}
 
-impl From<crate::perturb::LeverClaimRefused> for InvariantViolation {
-    fn from(e: crate::perturb::LeverClaimRefused) -> InvariantViolation {
-        InvariantViolation::new(crate::perturb::LeverClaimRefused::INVARIANT, e.message)
-    }
-}
 
 /// One registered invariant: the scar-name, the rule the tool enforces, the
 /// historical failure that made it law, and where the refusal/label lives.
@@ -301,7 +296,7 @@ mod tests {
     #[test]
     fn perturbation_invariant_is_registered() {
         let inv = lookup("PERTURBATION-OR-NO-LEVER").expect("keystone invariant registered");
-        assert_eq!(inv.name, crate::perturb::LeverClaimRefused::INVARIANT);
+        assert_eq!(inv.name, "PERTURBATION-OR-NO-LEVER");
     }
 
     #[test]
@@ -348,11 +343,4 @@ mod tests {
         assert!(out.contains("frequency-neutral SLEEP control"));
     }
 
-    #[test]
-    fn lever_claim_refused_converts_to_invariant_violation() {
-        let refused = crate::perturb::LeverClaimRefused::new("nope");
-        let v: InvariantViolation = refused.into();
-        assert_eq!(v.invariant, "PERTURBATION-OR-NO-LEVER");
-        assert!(format!("{v}").starts_with("[PERTURBATION-OR-NO-LEVER]"));
-    }
 }

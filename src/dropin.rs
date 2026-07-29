@@ -1003,6 +1003,9 @@ fn placeholder_cell(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DropinProvenance {
+    /// selfver stamp of the fulcrum that ran the census.
+    #[serde(default)]
+    pub fulcrum_commit: String,
     pub ours_cmd: String,
     pub ours_bin: Option<String>,
     pub ours_sha256: Option<String>,
@@ -1222,6 +1225,7 @@ pub fn run_dropin(cfg: &DropinConfig) -> Result<DropinArtifact, String> {
 
     let ours_commit = git_commit_for_binary(ours_bin.as_deref());
     let provenance = DropinProvenance {
+        fulcrum_commit: crate::selfver::stamp(),
         ours_cmd: cfg.ours.clone(),
         ours_bin: ours_bin.map(|p| p.display().to_string()),
         ours_sha256: ours_sha,
@@ -2483,6 +2487,7 @@ pub fn selftest() -> ExitCode {
             );
             let artifact = DropinArtifact {
                 provenance: DropinProvenance {
+                    fulcrum_commit: String::new(),
                     ours_cmd: "synth".to_string(),
                     ours_bin: None,
                     ours_sha256: Some(sha.to_string()),

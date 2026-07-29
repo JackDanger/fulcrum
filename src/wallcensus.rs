@@ -636,6 +636,8 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
         // wallcensus has no size-axis witness/shortcut concept (that's
         // sizecensus's own mechanism) — always empty here.
         thread_shortcut_voided: vec![],
+        fulcrum_commit: Some(crate::selfver::COMMIT.to_string()),
+        fulcrum_dirty: Some(crate::selfver::is_dirty()),
     };
     if provenance.gzippy_commit.is_none() {
         eprintln!(
@@ -1246,6 +1248,8 @@ pub fn selftest() -> ExitCode {
             corpus_files: vec![],
             created_unix: 0,
             thread_shortcut_voided: vec![],
+            fulcrum_commit: None,
+            fulcrum_dirty: None,
         },
         &synth_cells,
     );
@@ -1591,6 +1595,8 @@ pub fn selftest() -> ExitCode {
                     corpus_files: vec![],
                     created_unix: 0,
                     thread_shortcut_voided: vec![],
+                fulcrum_commit: None,
+                fulcrum_dirty: None,
                 },
                 cells: vec![],
             };
