@@ -74,13 +74,64 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
 }
 
-fn run_all() -> ExitCode {
+/// In-process fallback for when the binary cannot locate itself. Retained only
+/// for that path; `run_all` is the isolated one and is what normally executes.
+fn run_all_in_process() -> ExitCode {
     let mut failed: Vec<&str> = Vec::new();
     let reg = registry();
     let total = reg.len();
     for (name, f) in reg {
         println!("\n== Gate-0: {name}");
         if f() != ExitCode::SUCCESS {
+            failed.push(name);
+        }
+    }
+    println!("\nselftest: {}/{} Gate-0s passed", total - failed.len(), total);
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for f in &failed {
+            println!("  FAILED: {f}");
+        }
+        ExitCode::FAILURE
+    }
+}
+
+/// Run every Gate-0, each in a FRESH SUBPROCESS.
+///
+/// FALSIFY: do not "simplify" this back to calling `f()` in-process. Several
+/// Gate-0s touch process-wide or on-disk state — the paired gate exercises the
+/// freeze state file, the RSS gate spawns a memory hog — so running them in one
+/// process lets an earlier gate contaminate a later one. Measured on solvency:
+/// `ab paired` and `board wall` each print PASS with exit 0 when run alone, and
+/// were both reported FAILED by the in-process aggregator. That false failure
+/// made `make deploy` refuse to certify a box that was in fact correct, which
+/// pushes the operator straight back to hand-rolled scripts — the exact failure
+/// this harness exists to prevent. A slower, isolated suite is worth far more
+/// than a fast one that lies.
+fn run_all() -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        // No self-path: fall back to in-process rather than skipping the suite,
+        // and say so, because the results are then contamination-prone.
+        Err(e) => {
+            eprintln!("selftest: cannot locate own binary ({e}); running IN-PROCESS, results may be contaminated");
+            return run_all_in_process();
+        }
+    };
+    let mut failed: Vec<&str> = Vec::new();
+    let reg = registry();
+    let total = reg.len();
+    for (name, _) in reg {
+        println!("\n== Gate-0: {name}");
+        let ok = std::process::Command::new(&exe)
+            .arg("selftest")
+            .args(name.split_whitespace())
+            .arg("--no-self-update")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
             failed.push(name);
         }
     }

@@ -107,8 +107,39 @@ DIR ?= /root/fulcrum
 
 deploy:
 	@printf '\n\033[1;34m══ deploy main → %s:%s ══\033[0m\n\n' "$(BOX)" "$(DIR)"
-	ssh $(BOX) 'test -d $(DIR)/.git || git clone $(shell git remote get-url origin) $(DIR)'
-	ssh $(BOX) 'cd $(DIR) && git fetch origin main && git checkout -q main && git reset --hard -q origin/main && cargo build --release'
+	@# DIR may already exist as a NON-git directory — that is exactly the state
+	@# solvency was found in (a plain copy, running a binary two weeks stale).
+	@# `git clone` refuses a non-empty target, so adopt the directory in place:
+	@# init + set origin, then let the reset below overwrite tracked files. This
+	@# deletes nothing, so a box with local scratch under DIR keeps it.
+	@# DIR is adopted in place rather than cloned: `git clone` refuses a non-empty
+	@# target, and boxes are found in states clone cannot handle. Both were real:
+	@#   * a plain COPY with no .git at all (solvency, running a 2-week-stale binary)
+	@#   * a .git FILE left by a worktree, pointing at a path on another machine
+	@# So test repo-ness with rev-parse, not `[ -d .git ]`, and clear only a broken
+	@# .git FILE (a pointer, safe to delete) — never a .git directory.
+	@# Boxes are found in states `git clone` cannot handle. All three were real on
+	@# solvency: a plain COPY with no .git (running a 2-week-stale binary); a .git
+	@# FILE left by a worktree pointing at a path on another machine; and untracked
+	@# build leftovers colliding with tracked files. So: adopt a clean repo in
+	@# place, otherwise MOVE the legacy tree aside — never delete it, and never
+	@# clobber. The guard refuses anything that is not an absolute path well below
+	@# root, so a mistyped DIR cannot move / or a home directory.
+	ssh $(BOX) 'set -e; d=$(DIR); \
+		case "$$d" in /|/root|/home|/usr|/etc|"") echo "refusing DIR=$$d"; exit 1;; esac; \
+		case "$$d" in /*) ;; *) echo "DIR must be absolute, got $$d"; exit 1;; esac; \
+		usable=0; \
+		if [ -e "$$d" ] && git -C "$$d" rev-parse --git-dir >/dev/null 2>&1; then \
+			git -C "$$d" fetch -q origin main 2>/dev/null && \
+			git -C "$$d" checkout -q -B main FETCH_HEAD 2>/dev/null && usable=1; \
+		fi; \
+		if [ -e "$$d" ] && [ "$$usable" = 0 ]; then \
+			s="$$d.legacy-$$(date +%Y%m%dT%H%M%S)"; \
+			echo "  $$d cannot be fast-forwarded to origin/main (not a repo, or untracked files collide with tracked ones) — moving it to $$s; nothing is deleted"; \
+			mv "$$d" "$$s"; \
+		fi; \
+		if [ ! -e "$$d" ]; then git clone -q $(shell git remote get-url origin) "$$d"; fi'
+	ssh $(BOX) 'set -e; cd $(DIR) && git fetch -q origin main && git checkout -q -B main FETCH_HEAD && git reset --hard -q FETCH_HEAD && cargo build --release'
 	@$(MAKE) --no-print-directory deploy-check BOX=$(BOX) DIR=$(DIR)
 	ssh $(BOX) '$(DIR)/target/release/fulcrum selftest --no-self-update' \
 		&& printf '\033[1;32m  ✓ Gate-0 suite green on %s\033[0m\n' "$(BOX)" \
