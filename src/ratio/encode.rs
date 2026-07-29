@@ -350,29 +350,94 @@ fn last_nonzero(lens: &[u8]) -> Option<usize> {
     lens.iter().rposition(|&l| l != 0)
 }
 
-/// Optimal dynamic-block plan for `tokens`: optimal ≤15-bit litlen/dist codes,
-/// optimal ≤7-bit code-length code, exact RLE header. Returns the plan fields
-/// plus its exact total bit cost (3 header bits + header + Σ tokens + EOB).
-fn plan_dynamic(tokens: &[Tok]) -> BlockPlan {
-    let mut litfreq = [0u32; 288];
-    let mut distfreq = [0u32; 30];
-    for &tok in tokens {
-        match tok {
-            Tok::Lit(b) => litfreq[b as usize] += 1,
-            Tok::Match { len, dist } => {
-                litfreq[257 + len_code_index(len) as usize] += 1;
-                distfreq[dist_code_index(dist as u32) as usize] += 1;
+/// Faithful port of zopfli's `OptimizeHuffmanForRle` (deflate.c): smooth a
+/// symbol-COUNT array so the Huffman code-length array it induces RLE-compresses
+/// into a cheaper dynamic header. Runs on counts BEFORE length-limited Huffman.
+/// It preserves zeros (an all-zero stride stays zero) and never drops a used
+/// symbol (a nonzero stride collapses to a value ≥ 1), so EOB and every emitted
+/// symbol keep a code; unused symbols beyond the last nonzero are left as
+/// trailing zeros (trimmed first), so it never resurrects symbols 286/287.
+fn optimize_huffman_for_rle(mut length: usize, counts: &mut [u32]) {
+    // 1) Trim trailing zeros so we never smooth a used symbol down into them.
+    while length > 0 && counts[length - 1] == 0 {
+        length -= 1;
+    }
+    if length == 0 {
+        return;
+    }
+
+    // 2) Protect runs that already RLE well: zero runs ≥ 5, nonzero runs ≥ 7.
+    let mut good_for_rle = vec![false; length];
+    let mut symbol = counts[0];
+    let mut stride = 0usize;
+    for i in 0..=length {
+        if i == length || counts[i] != symbol {
+            if (symbol == 0 && stride >= 5) || (symbol != 0 && stride >= 7) {
+                for k in 0..stride {
+                    good_for_rle[i - k - 1] = true;
+                }
             }
+            stride = 1;
+            if i != length {
+                symbol = counts[i];
+            }
+        } else {
+            stride += 1;
         }
     }
-    litfreq[256] += 1; // end-of-block
 
-    let ll_vec = package_merge(&litfreq, 15);
+    // 3) Collapse stride ranges near a running average so more symbols share one
+    //    code length (cheaper RLE), without disturbing protected/zero runs.
+    let mut stride = 0usize;
+    let mut limit = counts[0];
+    let mut sum = 0u64;
+    for i in 0..=length {
+        if i == length || good_for_rle[i] || (counts[i] as i64 - limit as i64).abs() >= 4 {
+            if stride >= 4 || (stride >= 3 && sum == 0) {
+                let mut count = ((sum + stride as u64 / 2) / stride as u64) as u32;
+                if count < 1 {
+                    count = 1;
+                }
+                if sum == 0 {
+                    count = 0; // keep an all-zero stride zero
+                }
+                for k in 0..stride {
+                    counts[i - k - 1] = count;
+                }
+            }
+            stride = 0;
+            sum = 0;
+            if i + 3 < length {
+                limit = (counts[i] + counts[i + 1] + counts[i + 2] + counts[i + 3] + 2) / 4;
+            } else if i < length {
+                limit = counts[i];
+            } else {
+                limit = 0;
+            }
+        }
+        stride += 1;
+        if i != length {
+            sum += counts[i] as u64;
+        }
+    }
+}
+
+/// Build the full dynamic-block plan (lengths, RLE header, exact cost) from a
+/// given litlen/dist count histogram (which already includes the EOB count).
+/// The data cost is computed under the derived lengths against the ACTUAL
+/// tokens, so the returned `total_bits` is exact regardless of any count
+/// smoothing applied to derive the lengths.
+fn build_dynamic_from_counts(
+    litfreq: &[u32; 288],
+    distfreq: &[u32; 30],
+    tokens: &[Tok],
+) -> BlockPlan {
+    let ll_vec = package_merge(litfreq, 15);
     let mut litlen_lens = [0u8; 288];
     litlen_lens.copy_from_slice(&ll_vec);
 
     let dist_used = distfreq.iter().any(|&f| f > 0);
-    let dl_vec = package_merge(&distfreq, 15);
+    let dl_vec = package_merge(distfreq, 15);
     let mut dist_lens = [0u8; 32];
     dist_lens[..30].copy_from_slice(&dl_vec);
     let hdist = if dist_used {
@@ -422,6 +487,44 @@ fn plan_dynamic(tokens: &[Tok]) -> BlockPlan {
         hdist,
         hclen,
     }
+}
+
+/// Optimal dynamic-block plan for `tokens`. Computes two deterministic candidate
+/// encodings — one from raw package-merge lengths, one from lengths derived off
+/// zopfli-`OptimizeHuffmanForRle`-smoothed counts (cheaper header, possibly
+/// costlier data) — and keeps the smaller EXACT total. Because the returned
+/// `BlockPlan` is what `emit_block` writes, `block_cost_exact` and the emitted
+/// bit length remain equal bit-for-bit.
+fn plan_dynamic(tokens: &[Tok]) -> BlockPlan {
+    let mut litfreq = [0u32; 288];
+    let mut distfreq = [0u32; 30];
+    for &tok in tokens {
+        match tok {
+            Tok::Lit(b) => litfreq[b as usize] += 1,
+            Tok::Match { len, dist } => {
+                litfreq[257 + len_code_index(len) as usize] += 1;
+                distfreq[dist_code_index(dist as u32) as usize] += 1;
+            }
+        }
+    }
+    litfreq[256] += 1; // end-of-block
+
+    // Smoothing litlen and dist counts each helps some headers and hurts others,
+    // so try all four {raw, smoothed} × {raw, smoothed} combinations and keep the
+    // smaller EXACT total. All deterministic; strictly ≥ as good as best-of-two.
+    let mut sll = litfreq;
+    optimize_huffman_for_rle(288, &mut sll);
+    let mut sd = distfreq;
+    optimize_huffman_for_rle(30, &mut sd);
+
+    let mut best = build_dynamic_from_counts(&litfreq, &distfreq, tokens);
+    for (lf, df) in [(&sll, &distfreq), (&litfreq, &sd), (&sll, &sd)] {
+        let cand = build_dynamic_from_counts(lf, df, tokens);
+        if cand.total_bits < best.total_bits {
+            best = cand;
+        }
+    }
+    best
 }
 
 /// Exact minimum bit cost + emission plan of `tokens` as ONE deflate block:
