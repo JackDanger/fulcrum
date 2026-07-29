@@ -195,10 +195,10 @@ surviving engines' own Gate-0s.
 | `rescue/fulcrum-instr-20260719` (1 commit, 62/62 across 14 files) | **DELETE** | A checkpoint snapshot whose entire delta vs its base un-redacts host/path placeholders (`<BENCH_HOST>` → neurotic/solvency, `<BENCH_ROOT>` → /root). Main's redaction was intentional; the branch preserves no code capability and is 119 commits behind. |
 | `bump/0.1.1` ("Release v0.1.1": VERSION/Cargo bump only) | **DELETE** | The crate is at v0.3.0; the release it staged is superseded twice over. |
 
-The four DELETE branches are safe to remove with `git branch -D` at merge
-time (all are fully documented above; `git reflog` retains recovery for 90
-days). `feat/ratio-tool-v2` becomes deletable the moment this branch lands,
-because its only unlanded commit is included here.
+The four DELETE branches were removed with `git branch -D` on 2026-07-29
+(all fully documented above; `git reflog` retains recovery for 90 days).
+`feat/ratio-tool-v2` is kept until this branch lands — its only unlanded
+commit is included here — and becomes deletable at merge.
 
 ## Output design rules (enforced, not aspirational)
 

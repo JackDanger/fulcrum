@@ -6,6 +6,28 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — BREAKING: the 2026-07 command consolidation
+
+- **~90 subcommands → 13, organised by the question each answers** (see
+  `docs/command-taxonomy.md` for the complete old→new migration table,
+  every deletion with its evidence, and the orphaned-branch adjudication):
+  `board`, `why`, `candidates`, `try` (the campaign verbs) + `freeze`,
+  `verify`, `dropin`, `ab`, `profile`, `trace`, `anatomy`, `bank`,
+  `selftest`, `version`. Legacy names print their migration target.
+- **Baked provenance + safe self-update** (`build.rs` + `src/selfver.rs`):
+  `fulcrum version --expect <sha>` is the deployment check; measurement
+  commands refuse to run stale; analysis commands self-update when no
+  freeze is held; artifacts carry `fulcrum_commit`/`fulcrum_dirty`.
+  `make deploy BOX=… DIR=…` pushes main to a box and verifies it
+  (`docs/deployment.md`).
+- **Ported from `feat/ratio-tool-v2`**: zopfli `OptimizeHuffmanForRle` in
+  the ratio frontier emitter (best-of-4 exact).
+- Removed the decode-campaign gate chain and unused analysis layers
+  (score, run, decide, perturb, sweep, gate, scope, cellwhy, frontier,
+  abmeasure, coz, mech, rank, validate, and friends) — the decompression
+  campaign is closed (gzippy PR #116). Banked artifacts remain readable
+  via `bank` and the census/matrix report paths.
+
 ### Changed
 
 - **`fulcrum locate` — three advisor-review fixes** (FIX 1/2/3):
