@@ -57,7 +57,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
         Some(one) if !one.starts_with("--") => {
             let reg = registry();
-            match reg.iter().find(|(n, _)| n.split_whitespace().next() == Some(one) || *n == one) {
+            // Exact name first; only then the first-word convenience form. The
+            // other order lets `board wall (wallcensus)` resolve to `board`.
+            match reg
+                .iter()
+                .find(|(n, _)| *n == one)
+                .or_else(|| reg.iter().find(|(n, _)| n.split_whitespace().next() == Some(one)))
+            {
                 Some((name, f)) => {
                     println!("== Gate-0: {name}");
                     f()
@@ -125,8 +131,15 @@ fn run_all() -> ExitCode {
     for (name, _) in reg {
         println!("\n== Gate-0: {name}");
         let ok = std::process::Command::new(&exe)
+            // The WHOLE name as ONE argument. Passing `name.split_whitespace()`
+            // sends "board wall (wallcensus)" as three args, and the lookup below
+            // matches on the FIRST word — which silently runs the plain `board`
+            // gate and reports it as `board wall` passing. A false PASS in the
+            // instrument that certifies every other measurement is the worst
+            // possible defect here; it is strictly more dangerous than the false
+            // FAIL this subprocess isolation was added to fix.
             .arg("selftest")
-            .args(name.split_whitespace())
+            .arg(name)
             .arg("--no-self-update")
             .status()
             .map(|s| s.success())
