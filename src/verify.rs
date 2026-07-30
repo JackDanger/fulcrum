@@ -37,9 +37,22 @@
 //!
 //! * **P4 MONOTONIC SIZE** — a user typing a higher level must never get a
 //!   bigger file. Checked across the level sweep per corpus file.
-//! * **P8 THREADS DO NOT CHANGE THE ANSWER** — T>1 compressed output must be
-//!   byte-identical to T1's, or never larger. This is the invariant that makes
-//!   the parallel path a pure wall problem with a free correctness oracle.
+//! * **P8 T>1 SIZE DRIFT — REPORTED, NOT GATED (retracted 2026-07-28).** T>1
+//!   output larger than T1's is recorded so the seam cost stays visible, but it
+//!   does NOT fail the verdict. It used to, and that was enforcing a rule the
+//!   user retracted — three times, because each correction landed in a leaf doc
+//!   while other files kept regenerating it. gzippy's `CLAUDE.md` STEP 2 now
+//!   states the opposite outright: "THE ONLY CORRECTNESS BAR, at every thread
+//!   count, is VALID GZIP ... T>1 may emit different bytes than T1 ...
+//!   Byte-identity to a vendor, to our own T1, or to our own previous run is
+//!   never a goal and never a gate."
+//!
+//!   Receipt for the fix: on 2026-07-30 a `verify` run over the TUNE set
+//!   returned `failed_cells 0` — every roundtrip through our own decoder at
+//!   every thread count, plus gzip/pigz/libdeflate cross-checks, passed — and
+//!   still reported `verdict FAIL`, on 91 P8 entries spanning L0 and L2-L9 that
+//!   were byte-identical to `main`'s own banked size census. A gate that says
+//!   FAIL when correctness is perfect trains its users to ignore the verdict.
 //!
 //! No timing. No frozen box. No significance test. Every number here is an
 //! exact integer or a hash, so a run either passes or it does not.
@@ -285,7 +298,11 @@ pub fn run(
 
     let failed = cells.iter().filter(|c| !c.ok()).count();
     let total = cells.len();
-    let clean = failed == 0 && mono.is_empty() && ident.is_empty();
+    // P8 (`ident`) is deliberately NOT part of `clean` — see the module doc. It is
+    // reported for visibility and never gates. P4 (`mono`) still gates: a user
+    // typing a higher level and getting a bigger file is a contract violation, not
+    // a thread-scheduling artifact.
+    let clean = failed == 0 && mono.is_empty();
     Report {
         fulcrum_commit: crate::selfver::stamp(),
         total_cells: total,
@@ -355,7 +372,7 @@ pub fn render(r: &Report) -> String {
         }
     }
     if !r.thread_identity_violations.is_empty() {
-        s.push_str("\n  P8 THREADS CHANGED THE ANSWER (T>1 larger than T1 and not identical)\n");
+        s.push_str("\n  P8 T>1 SIZE DRIFT — INFORMATIONAL, DOES NOT GATE (T>1 larger than T1, not identical)\n");
         for v in &r.thread_identity_violations {
             s.push_str(&format!("    {v}\n"));
         }
@@ -372,7 +389,8 @@ fn usage() -> ExitCode {
         \x20            [--cross 'gzip -dc'] [--out report.json]\n\n\
         \x20 The ENCODER CORRECTNESS oracle: compress, decompress with OUR OWN decoder at\n\
         \x20 every thread count, sha256 against the original. Also asserts P4 (monotonic\n\
-        \x20 size) and P8 (threads do not change the answer). Deterministic — no rig, no\n\
+        \x20 size, GATING) and reports P8 (T>1 size drift, INFORMATIONAL — byte-identity\n\
+        \x20 across thread counts is explicitly not a gate). Deterministic — no rig, no\n\
         \x20 timing, no significance test.\n\n\
         \x20 fulcrum verify selftest        Gate-0\n"
     );
