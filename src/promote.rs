@@ -335,12 +335,34 @@ pub struct TryConfig {
     pub skip_wall: bool,
 }
 
+/// The roundtrip command both censuses VOID against.
+///
+/// **This was `String::new()` until 2026-07-30, and an empty command decompresses
+/// nothing** — so `rt_sha != input_sha` for every cell, every cell VOIDed on
+/// `FAIL-roundtrip`, and `try` returned "no decidable cells" no matter what the
+/// change did. `try` is the command that IS `docs/promotion-rule.md`, so for as long
+/// as that held it could not adjudicate anything. Receipt: a full frozen run on
+/// solvency (2026-07-30, 176 cells, both arms) produced 176 VOIDs while the very same
+/// binaries round-tripped by hand with matching sha256.
+///
+/// It uses **the arm's OWN gzippy binary as the decoder**, which is the right oracle
+/// and not merely a convenient one: gzippy's decompressor is finished and is the
+/// fastest available, so it is both the most faithful check and the cheapest. It is
+/// also a decoder that necessarily exists for every arm `try` builds, where a vendor
+/// binary is an assumption about the box. Independent decoders are NOT dropped — they
+/// stay in clause 1, which runs `verify` with `--cross` against every vendor decoder
+/// present, so a shared misunderstanding of the format still cannot pass.
+fn arm_roundtrip_cmd(bin: &std::path::Path) -> String {
+    format!("{} -dc", bin.display())
+}
+
 fn arm_cells(
     bin: &std::path::Path,
     cfg: &TryConfig,
     arm_name: &str,
 ) -> Result<BTreeMap<String, (String, f64, bool)>, String> {
     let tmpl = format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display());
+    let roundtrip_cmd = arm_roundtrip_cmd(bin);
     let mut map = BTreeMap::new();
     // SIZE axis.
     let sc = crate::sizecensus::CensusConfig {
@@ -350,7 +372,7 @@ fn arm_cells(
         threads: cfg.threads.clone(),
         corpora: cfg.corpora.clone(),
         out_dir: cfg.out_dir.join(format!("{arm_name}-size")),
-        roundtrip_cmd: String::new(),
+        roundtrip_cmd: roundtrip_cmd.clone(),
         size_reps: 1,
         ours_commit: None,
     };
@@ -369,7 +391,7 @@ fn arm_cells(
             threads: cfg.threads.clone(),
             corpora: cfg.corpora.clone(),
             out_dir: cfg.out_dir.join(format!("{arm_name}-wall")),
-            roundtrip_cmd: String::new(),
+            roundtrip_cmd,
             n: cfg.n,
             warmup: 2,
             sink: PathBuf::from("/dev/null"),
@@ -736,6 +758,20 @@ pub fn selftest() -> ExitCode {
         after_failing: af,
     };
     let arch = vec!["x86_64".to_string()];
+
+    // The roundtrip command each census VOIDs against must be NON-EMPTY and must
+    // name a real decoder. An empty one decompresses nothing, so every cell VOIDs on
+    // FAIL-roundtrip and `try` can never adjudicate anything — which is exactly what
+    // it did until 2026-07-30. That bug survived because no check asserted the
+    // command was usable; asserting the VERDICT logic (everything below) cannot catch
+    // it, because the verdict logic was correct and was simply never handed a
+    // decidable cell.
+    let rt = arm_roundtrip_cmd(std::path::Path::new("/tmp/some-arm/target/release/gzippy"));
+    check("roundtrip cmd: non-empty", !rt.trim().is_empty());
+    check(
+        "roundtrip cmd: names the arm's own decoder and a decompress flag",
+        rt.contains("gzippy") && rt.contains("-d"),
+    );
 
     // Level-set refusal.
     check("refuse: single level", check_level_set(&[2]).is_err());
