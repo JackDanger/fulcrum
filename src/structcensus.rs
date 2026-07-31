@@ -4,8 +4,8 @@
 //!
 //! Fulcrum had `sizecensus` and `wallcensus`: both compare us to gzip / pigz /
 //! libdeflate / igzip, per level, per thread count. Those are OUTCOME axes. There
-//! was no vendor-comparative census for STRUCTURE — allocations, bytes allocated,
-//! memory copied — so for months nobody ran one, and the encoder shipped this:
+//! was no vendor-comparative census for STRUCTURE — allocation count and bytes
+//! allocated — so for months nobody ran one, and the encoder shipped this:
 //!
 //!     6,000,000 B of dickens at -6, whole process
 //!         gzippy       731 allocs    83,909,568 bytes
@@ -38,8 +38,8 @@
 //!
 //! ## What this measures
 //!
-//! Per cell (corpus x level x threads x binary): total allocation COUNT, total
-//! BYTES allocated, and peak bytes live. Structure is DETERMINISTIC, like size and
+//! Per cell (corpus x level x threads x binary): total allocation COUNT and total
+//! BYTES allocated. Structure is DETERMINISTIC, like size and
 //! unlike wall: no frozen box, no paired CI, no noise floor, no A/A gate. That
 //! makes this the CHEAPEST FALSIFIER we never built — run it before any wall work.
 //!
@@ -58,6 +58,23 @@
 //!   the `sizecensus` incident where a census measured three rivals and said
 //!   nothing about the fourth.
 //! * The subject binary's identity is stamped in the artifact. Hard stop #7.
+//!
+//! ## NOT MEASURED YET — named, because unmeasured prose is how this goes wrong
+//!
+//! An earlier draft of this very file claimed it measured "memory copied" and "peak
+//! bytes live". It measures NEITHER — `parse_memcheck` returns `(allocs, bytes)` and
+//! nothing else. That overclaim was caught by an adversarial review, and it is exactly
+//! the defect this campaign keeps paying for: prose asserting a capability the code does
+//! not have. Both gaps are real and both currently hide a known defect:
+//!
+//! * **COPY VOLUME.** `memcheck` cannot see it; DHAT reports it (`Reads:`/`Writes:`).
+//!   Its absence hides the T>1 staging copy (G8) — that path copies the entire input
+//!   plus 32 KiB of dictionary per chunk for `BUF_PAD` slack the mapping already has,
+//!   and NOTHING in this census would show it, because the copy reuses one allocation.
+//! * **PEAK LIVE BYTES.** DHAT's `At t-gmax:` line. Its absence means a change that
+//!   halves total bytes allocated while doubling peak residency scores as a clean win.
+//!
+//! Do not add either to the prose above until the parser returns it.
 
 use std::path::Path;
 use std::process::{Command, ExitCode};
