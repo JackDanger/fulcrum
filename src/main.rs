@@ -2594,6 +2594,7 @@ fn main() -> ExitCode {
 
     match sub.as_str() {
         "board" => cmd_board(rest),
+        "structcensus" => fulcrum::structcensus::cmd(rest),
         "why" => fulcrum::why::cmd(rest),
         "candidates" => fulcrum::candidates::cmd(rest),
         "try" => fulcrum::promote::cmd(rest),
