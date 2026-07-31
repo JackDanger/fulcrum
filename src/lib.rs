@@ -96,6 +96,7 @@ pub mod scaling_matrix;
 pub mod schedule;
 pub mod scoreboard;
 pub mod sizecensus;
+pub mod structcensus;
 pub mod spans;
 pub mod stats;
 pub mod trace;
