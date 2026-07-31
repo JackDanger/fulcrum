@@ -209,6 +209,14 @@ pub struct CensusCell {
     /// concurrency was never independently confirmed).
     #[serde(default)]
     pub pin_unmeasurable: bool,
+    /// True iff the rival's command carries no `{threads}` token, i.e. the rival is
+    /// STRUCTURALLY SINGLE-THREADED (gzip and libdeflate-gzip have no thread flag at
+    /// all). Such a rival cannot reach a declared concurrency > 1, so its pin probe
+    /// "violating" the window is an expected property of the tool, NOT a mis-pinned
+    /// arm — and VOIDing on it made every T>1 cell against gzip and libdeflate
+    /// permanently unmeasurable. See `rival_is_thread_pinnable`.
+    #[serde(default)]
+    pub rival_single_threaded: bool,
     /// Bonus (free from `paired`'s compress-mode roundtrip pass) — NOT the
     /// SIZE axis of record (that is `sizecensus`'s job); kept only so a
     /// cross-check against sizecensus's own number is possible.
@@ -242,6 +250,31 @@ fn save_cell(path: &Path, cell: &CensusCell) {
 /// combination without a subprocess. Precedence mirrors `sizecensus`'s
 /// `classify_cell` with ONE new rung: the PIN GATE sits between
 /// availability and the paired wall verdict — a cell that never ran at its
+/// Does this rival command carry an explicit thread-pin substitution?
+///
+/// A rival whose template has no `{threads}` token cannot be asked to run at a declared
+/// concurrency — gzip and libdeflate-gzip have no thread flag at all. Their CPU% will sit
+/// at ~100 no matter what `--threads` says, which the pin gate reads as a PROVEN
+/// wrong-concurrency arm and VOIDs.
+///
+/// That was wrong, and it cost the campaign a third of its coverage: a 2026-07-30 L6 wall
+/// board over 22 corpus members returned 45 VOIDs of 160 declared cells, 41 of them
+/// `pin-gate FAIL: ours cpu%=~400 (ok=true) rival cpu%=100.0 (ok=false)`. Every T>1 cell
+/// against a single-threaded rival VOIDed, permanently — so "never lose at any thread
+/// count" could not be scored against gzip or libdeflate at all.
+///
+/// The comparison is still meaningful, and is in fact the user-facing one: a drop-in user
+/// types `gzip -6` and gets one thread, types `gzippy -6` and gets many, and the wall
+/// clock they experience is the ratio between those. What must NOT happen is silently
+/// pretending the concurrencies matched, so the asymmetry is DECLARED on the cell
+/// (`rival_single_threaded`) rather than hidden.
+///
+/// Our own arm is still gated normally: if OURS misses its declared concurrency the cell
+/// still VOIDs, because that IS a mis-pinned arm.
+pub fn rival_is_thread_pinnable(tmpl: &str) -> bool {
+    tmpl.contains("{threads}")
+}
+
 /// intended concurrency is VOID before the wall verdict is even consulted.
 pub fn classify_status(
     rival_accepts_this_level: bool,
@@ -290,6 +323,7 @@ fn placeholder_cell(
         b_cpu_pct: f64::NAN,
         pin_ok: false,
         pin_unmeasurable: false,
+        rival_single_threaded: false,
         size_ratio_bonus: f64::NAN,
         n: 0,
         error: reason,
@@ -410,7 +444,11 @@ fn measure_cell(
     let a_pin = probe_arm_pin(&a_cmd, threads, cfg.pin_reps);
     let b_pin = probe_arm_pin(&b_cmd, threads, cfg.pin_reps);
     let a_violated = matches!(a_pin, ArmPin::Violated(_));
-    let b_violated = matches!(b_pin, ArmPin::Violated(_));
+    // A structurally single-threaded rival cannot reach threads>1; that is the tool, not
+    // a mis-pinned arm. Declare it on the cell and do not block. See
+    // `rival_is_thread_pinnable` for the coverage incident this fixes.
+    let rival_single_threaded = !rival_is_thread_pinnable(&rival.tmpl) && threads > 1;
+    let b_violated = matches!(b_pin, ArmPin::Violated(_)) && !rival_single_threaded;
     let pin_unmeasurable =
         matches!(a_pin, ArmPin::Unmeasurable(_)) || matches!(b_pin, ArmPin::Unmeasurable(_));
     let (a_pct, a_desc) = arm_pin_parts(&a_pin);
@@ -438,6 +476,7 @@ fn measure_cell(
         c.b_cpu_pct = b_pct;
         c.pin_ok = false;
         c.pin_unmeasurable = pin_unmeasurable;
+        c.rival_single_threaded = rival_single_threaded;
         return c;
     }
     if pin_unmeasurable {
@@ -490,6 +529,7 @@ fn measure_cell(
                 a_cpu_pct: a_pct,
                 b_cpu_pct: b_pct,
                 pin_ok: true,
+                rival_single_threaded,
                 pin_unmeasurable,
                 size_ratio_bonus: pr.size_ratio,
                 n: pr.n,
@@ -511,6 +551,7 @@ fn measure_cell(
             );
             c.a_cpu_pct = a_pct;
             c.b_cpu_pct = b_pct;
+            c.rival_single_threaded = rival_single_threaded;
             c.pin_ok = true; // pin gate itself passed; the paired run failed after
             c.pin_unmeasurable = pin_unmeasurable;
             c
@@ -1131,6 +1172,33 @@ pub fn selftest() -> ExitCode {
         classify_status(false, true, true, "OK") == "ABSENT",
     );
 
+    // -- 1b. STRUCTURALLY SINGLE-THREADED RIVALS ----------------------------
+    // gzip and libdeflate-gzip have no thread flag, so their CPU% sits at ~100 no matter
+    // what --threads says. Reading that as a mis-pinned arm VOIDed EVERY T>1 cell against
+    // them, permanently: a 2026-07-30 L6 wall board over 22 corpus members returned 45
+    // VOIDs of 160 cells, 41 of them exactly this. "Never lose at any thread count" could
+    // not be scored against gzip or libdeflate at all.
+    //
+    // These checks assert the DETECTION, not the verdict logic — the verdict logic was
+    // already right and simply never saw a scoreable cell, which is the same shape as the
+    // `try` roundtrip bug (an empty input to correct logic).
+    check(
+        "single-threaded rival: gzip's template has no {threads} and is detected",
+        !rival_is_thread_pinnable("gzip -{level} -c {input}"),
+    );
+    check(
+        "single-threaded rival: libdeflate-gzip likewise",
+        !rival_is_thread_pinnable("libdeflate-gzip -{level} -c {input}"),
+    );
+    check(
+        "thread-pinnable rival: pigz carries {threads} and is NOT declared asymmetric",
+        rival_is_thread_pinnable("pigz -{level} -p {threads} -c {input}"),
+    );
+    check(
+        "thread-pinnable rival: our own template carries {threads}",
+        rival_is_thread_pinnable("gzippy -{level} -p {threads} -c {input}"),
+    );
+
     // -- 2. rival_accepts_level reuse (goal.rs's verified CLI table) ---------
     check(
         "reuse: gzip does NOT accept level 0 (goal.rs's verified CLI table)",
@@ -1171,6 +1239,7 @@ pub fn selftest() -> ExitCode {
 
     // -- 5. summarize(): ABSENT/RIVAL-UNAVAILABLE/VOID excluded from measured_ok
     let mk = |rival: &str, corpus: &str, threads: u32, status: &str, slower: bool| CensusCell {
+        rival_single_threaded: false,
         rival: rival.to_string(),
         corpus: corpus.to_string(),
         level: 1,
@@ -1733,6 +1802,7 @@ mod tests {
     #[test]
     fn tsv_and_json_roundtrip() {
         let cell = CensusCell {
+            rival_single_threaded: false,
             rival: "gzip".to_string(),
             corpus: "x".to_string(),
             level: 3,

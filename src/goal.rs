@@ -2314,6 +2314,7 @@ pub fn selftest() -> ExitCode {
             ratio: f64,
         ) -> wallcensus::CensusCell {
             wallcensus::CensusCell {
+                rival_single_threaded: false,
                 rival: rival.to_string(),
                 corpus: corpus.to_string(),
                 level,
