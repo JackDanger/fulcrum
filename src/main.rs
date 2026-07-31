@@ -2583,7 +2583,7 @@ fn main() -> ExitCode {
     // a self-update triggered by a typo.
     const KNOWN: &[&str] = &[
         "board", "why", "candidates", "try", "freeze", "verify", "dropin", "ab", "profile",
-        "trace", "anatomy", "bank", "selftest", "version",
+        "trace", "anatomy", "bank", "selftest", "version", "structcensus",
     ];
     if KNOWN.contains(&sub.as_str()) {
         if let Err(msg) = fulcrum::selfver::enforce(classify(&sub, rest), &args) {

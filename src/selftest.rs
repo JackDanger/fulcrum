@@ -24,6 +24,7 @@ fn registry() -> Vec<(&'static str, Gate0)> {
         ("board", crate::board::selftest),
         ("board size (sizecensus)", crate::sizecensus::selftest),
         ("board wall (wallcensus)", crate::wallcensus::selftest),
+        ("structcensus", crate::structcensus::selftest),
         ("goal", crate::goal::selftest),
         ("ab paired", crate::paired::selftest),
         ("ab matrix", crate::matrix::selftest),
