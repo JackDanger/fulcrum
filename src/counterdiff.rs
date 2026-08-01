@@ -130,6 +130,22 @@ pub struct CounterConfig {
     /// `taskset -c <mask>` value (a single core "8" or a mask "8-11").
     pub mask: String,
     pub oracle_cmd: Vec<String>,
+    /// COMPRESS MODE. The decode design sha-gates every arm against one oracle
+    /// output, which is only meaningful when all arms produce IDENTICAL bytes —
+    /// true for decompression, false for compression by construction (gzippy and
+    /// libdeflate emit different, equally-valid gzip). So in compress mode the
+    /// reference is the CORPUS ITSELF and each arm's stdout is piped through the
+    /// oracle (a decompressor) before hashing: the gate becomes "this arm's
+    /// output round-trips to the input", which is the real correctness contract.
+    ///
+    /// RECEIPT (2026-08-01): without this, `fulcrum why` layer [3] and
+    /// `profile counters` REFUSE every compression cell with
+    /// "oracle 'gzip' exited Some(1) on <plain file>" — it was running
+    /// `gzip -dc` on the uncompressed INPUT. The counter layer had therefore
+    /// never run for the encoder campaign at all, leaving the microarch question
+    /// (identical bytes, 12-17 points slower on x86 than on aarch64) with no
+    /// working instrument.
+    pub compress: bool,
     pub common_env: Vec<(String, String)>,
     pub out: Option<String>,
     pub arch: String,
@@ -154,6 +170,7 @@ impl Default for CounterConfig {
             n: 11,
             mask: "8".to_string(),
             oracle_cmd: split_args("gzip -dc"),
+            compress: false,
             common_env: Vec::new(),
             out: None,
             arch: String::new(),
@@ -544,6 +561,11 @@ FLAGS:
   --n <N>                   interleaved reps (default: 11; >=9 for the sig gate)
   --core, --mask <m>        taskset -c value (default: 8)
   --oracle-cmd \"<cmd>\"      trusted decompressor for reference sha+bytes (default: \"gzip -dc\")
+  --compress                COMPRESS mode: reference is the CORPUS ITSELF and each arm
+                            stdout is piped through --oracle-cmd before hashing, so the
+                            gate is a ROUND-TRIP proof. Required for encoder work: arms
+                            emit DIFFERENT valid gzip by design, so the decode-mode
+                            shared-output gate can never pass.
   --common-env \"K=V K=V\"    env for the subject arms (default: \"\")
   --out <path>              JSON artifact path/dir (default: /dev/shm)
   --arch <s>                arch label (default: /proc/cpuinfo model name)
@@ -613,6 +635,9 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
             "--core" | "--mask" => {
                 cfg.mask = need(i, "--core/--mask")?.clone();
                 i += 2;
+            }
+            "--compress" => {
+                cfg.compress = true;
             }
             "--oracle-cmd" => {
                 cfg.oracle_cmd = split_args(need(i, "--oracle-cmd")?);
@@ -1036,7 +1061,15 @@ fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
 }
 
 /// Run the trusted oracle once → (reference_sha, output byte count).
-fn run_oracle(oracle_cmd: &[String], corpus: &str) -> Result<(String, f64), String> {
+fn run_oracle(oracle_cmd: &[String], corpus: &str, compress: bool) -> Result<(String, f64), String> {
+    if compress {
+        // The reference IS the input: every arm must round-trip to it.
+        let bytes = std::fs::read(corpus).map_err(|e| format!("cannot read corpus {corpus}: {e}"))?;
+        if bytes.is_empty() {
+            return Err(format!("corpus {corpus} is empty"));
+        }
+        return Ok((hex32(&sha256(&bytes)), bytes.len() as f64));
+    }
     let (prog, args) = oracle_cmd
         .split_first()
         .ok_or_else(|| "--oracle-cmd is empty".to_string())?;
@@ -1062,6 +1095,7 @@ fn run_arm_sha(
     env: &[(String, String)],
     args: &[String],
     corpus: &str,
+    verify: Option<&[String]>,
 ) -> Result<(String, usize), String> {
     let mut c = Command::new(bin);
     for (k, v) in env {
@@ -1079,6 +1113,42 @@ fn run_arm_sha(
             "arm '{bin}' exited {:?} on {corpus}",
             out.status.code()
         ));
+    }
+    // COMPRESS MODE: the arm's stdout is compressed and every arm's bytes
+    // differ legitimately, so hashing it directly can never match a shared
+    // reference. Pipe it through the verifier (a decompressor) and hash THAT —
+    // the gate becomes "this arm round-trips to the input", and the byte count
+    // becomes the INPUT size, which is the same denominator for every arm.
+    if let Some(v) = verify {
+        let (vp, va) = v
+            .split_first()
+            .ok_or_else(|| "verify command is empty".to_string())?;
+        let mut vc = Command::new(vp)
+            .args(va)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot spawn verifier '{vp}': {e}"))?;
+        {
+            use std::io::Write;
+            let si = vc
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "verifier stdin unavailable".to_string())?;
+            si.write_all(&out.stdout)
+                .map_err(|e| format!("cannot write to verifier '{vp}': {e}"))?;
+        }
+        let vout = vc
+            .wait_with_output()
+            .map_err(|e| format!("verifier '{vp}' failed: {e}"))?;
+        if !vout.status.success() {
+            return Err(format!(
+                "verifier '{vp}' exited {:?} on output of '{bin}' for {corpus} — the arm did not emit valid gzip",
+                vout.status.code()
+            ));
+        }
+        return Ok((hex32(&sha256(&vout.stdout)), vout.stdout.len()));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len()))
 }
@@ -1185,12 +1255,19 @@ fn run_cell(
 ) -> Result<CellArtifact, String> {
     let gz_args = substitute_threads(&cfg.gz_args, thread);
     let comp_cmd = substitute_threads(&comp.cmd, thread);
+    // In compress mode every arm's output is piped through the oracle before
+    // hashing, so the gate is a ROUND-TRIP proof rather than a byte comparison.
+    let verify: Option<&[String]> = if cfg.compress {
+        Some(&cfg.oracle_cmd)
+    } else {
+        None
+    };
 
     // Gate-0 sha + decode proof for both arms (once per cell).
     let subj_full: Vec<String> = std::iter::once(cfg.subject_bin.clone())
         .chain(gz_args.iter().cloned())
         .collect();
-    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus)?;
+    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus, verify)?;
     if subj_sha != reference_sha {
         return Err(format!(
             "SHA MISMATCH subject vs oracle on {corpus} T{thread}: {subj_sha} != {reference_sha}"
@@ -1201,7 +1278,7 @@ fn run_cell(
             "subject produced 0 bytes on {corpus} T{thread} (empty-output trap)"
         ));
     }
-    let (comp_sha, comp_bytes) = run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus)?;
+    let (comp_sha, comp_bytes) = run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus, verify)?;
     if comp_bytes == 0 {
         return Err(format!(
             "comparator '{}' produced 0 bytes on {corpus} T{thread} (empty-output / bad-argv trap)",
@@ -1610,7 +1687,7 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
     let mut all_ok = true;
     let mut paths: Vec<PathBuf> = Vec::new();
     for corpus in &cfg.corpora {
-        let (reference_sha, bytes) = run_oracle(&cfg.oracle_cmd, corpus)?;
+        let (reference_sha, bytes) = run_oracle(&cfg.oracle_cmd, corpus, cfg.compress)?;
         if bytes <= 0.0 {
             return Err(format!("oracle produced 0 bytes for {corpus}"));
         }
