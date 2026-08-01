@@ -353,3 +353,220 @@ fn ratio_safe_div() {
     assert_eq!(ratio(2.0, 4.0), 0.5);
     assert!(ratio(1.0, 0.0).is_nan());
 }
+
+// ── 2026-08-01 regression guards ────────────────────────────────────────────
+//
+// Every test below encodes a defect that was OBSERVED IN PRODUCTION on this
+// date, on solvency, in the encoder campaign's first-ever attempt to run the
+// counter layer. Each one hung or lied silently. They are watchdogged so that
+// a reintroduction FAILS in seconds instead of hanging CI forever.
+
+/// Run `f` on a worker thread; panic if it does not finish inside `secs`.
+/// A SPIN or a PIPE DEADLOCK in the code under test becomes a test FAILURE
+/// with a named cause, not an infinite hang.
+fn with_watchdog<T: Send + 'static>(
+    secs: u64,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "WATCHDOG: {what} did not complete within {secs}s — spin or pipe deadlock reintroduced"
+        ),
+    }
+}
+
+/// REGRESSION GUARD (2026-08-01, solvency): `--no-self-update` and `--compress`
+/// are VALUELESS flags. This parser's loop has NO shared `i += 1` at the bottom
+/// — every arm advances the index itself — while `board.rs` and `candidates.rs`
+/// (the loops the one-line arm was copied from) DO have a shared increment.
+/// Copying the arm without the increment made `parse_args` spin forever on the
+/// first valueless flag: state R, zero children, banner-then-nothing, 6+ min on
+/// a 200 KB input before it was killed. The first-ever encoder counter run died
+/// here, BEFORE parse even returned.
+#[test]
+fn valueless_flags_terminate_the_parse_loop() {
+    let cfg = with_watchdog(10, "parse_args with valueless flags", || {
+        parse_args(&[
+            s("--no-self-update"),
+            s("--compress"),
+            s("--subject-bin"),
+            s("/bin/gz"),
+            s("--gz-args"),
+            s("-6 -c -p {t}"),
+            s("--comparator-cmd"),
+            s("libdeflate-gzip -6 -c"),
+            s("--corpus"),
+            s("a.txt"),
+        ])
+    })
+    .expect("parse ok");
+    assert!(cfg.compress);
+    assert_eq!(cfg.gz_args, split_args("-6 -c -p {t}"));
+}
+
+/// REGRESSION GUARD: compress mode with subject args that pin no thread count.
+/// gzippy with no `-p` uses num_cpus — a whole callgrind profile was mislabelled
+/// T1 when it was T16 and the finding had to be retracted. The parser must
+/// REFUSE (never warn) unless the caller declares the subject single-threaded.
+#[test]
+fn compress_mode_refuses_an_unpinned_subject() {
+    // Watchdogged: every parse_args call carrying `--compress` spun forever
+    // before the increment fix; a refusal test must fail, not hang.
+    let err = with_watchdog(10, "parse_args (unpinned subject)", || {
+        parse_args(&[
+            s("--compress"),
+            s("--subject-bin"),
+            s("/bin/gz"),
+            s("--gz-args"),
+            s("-6 -c"),
+            s("--comparator-cmd"),
+            s("libdeflate-gzip -6 -c"),
+            s("--corpus"),
+            s("a.txt"),
+        ])
+    })
+    .unwrap_err();
+    assert!(err.contains("-p"), "refusal must name the missing pin: {err}");
+    assert!(
+        err.contains("--subject-single-threaded"),
+        "refusal must name the escape hatch: {err}"
+    );
+
+    // The declared escape hatch lifts the refusal.
+    let cfg = with_watchdog(10, "parse_args (escape hatch)", || {
+        parse_args(&[
+            s("--compress"),
+            s("--subject-single-threaded"),
+            s("--subject-bin"),
+            s("/bin/gz"),
+            s("--gz-args"),
+            s("-6 -c"),
+            s("--comparator-cmd"),
+            s("libdeflate-gzip -6 -c"),
+            s("--corpus"),
+            s("a.txt"),
+        ])
+    })
+    .expect("escape hatch parses");
+    assert!(cfg.subject_single_threaded);
+
+    // An explicit `-p1` pin also lifts it.
+    with_watchdog(10, "parse_args (-p1 pin)", || {
+        parse_args(&[
+            s("--compress"),
+            s("--subject-bin"),
+            s("/bin/gz"),
+            s("--gz-args"),
+            s("-6 -c -p1"),
+            s("--comparator-cmd"),
+            s("libdeflate-gzip -6 -c"),
+            s("--corpus"),
+            s("a.txt"),
+        ])
+    })
+    .expect("-p1 pin parses");
+}
+
+/// REGRESSION GUARD: `--compress` while --gz-args still carries `-d` (the
+/// DECODE default). Forgetting --gz-args in compress mode inherits
+/// "-d -c -p {t}" and measures decompression while reporting an encoder cell.
+#[test]
+fn compress_mode_refuses_decode_subject_args() {
+    let err = with_watchdog(10, "parse_args (decode default args)", || {
+        parse_args(&[
+            s("--compress"),
+            s("--subject-bin"),
+            s("/bin/gz"),
+            s("--comparator-cmd"),
+            s("libdeflate-gzip -6 -c"),
+            s("--corpus"),
+            s("a.txt"),
+        ])
+    })
+    .unwrap_err();
+    assert!(
+        err.contains("-d"),
+        "refusal must name the decode-args contradiction: {err}"
+    );
+}
+
+/// REGRESSION GUARD: thread-capable comparators (gzippy, pigz) must pin their
+/// thread count in compress mode; single-threaded rivals (libdeflate-gzip,
+/// gzip, igzip) are exempt.
+#[test]
+fn compress_comparator_pin_guard() {
+    assert!(check_compress_comparator_pin(&split_args("libdeflate-gzip -6 -c")).is_ok());
+    assert!(check_compress_comparator_pin(&split_args("gzip -6 -c")).is_ok());
+    assert!(check_compress_comparator_pin(&split_args("pigz -6 -c")).is_err());
+    assert!(check_compress_comparator_pin(&split_args("pigz -6 -p1 -c")).is_ok());
+    assert!(check_compress_comparator_pin(&split_args("/root/gzippy/target/release/gzippy -6 -c")).is_err());
+    assert!(check_compress_comparator_pin(&split_args("/root/gzippy/target/release/gzippy -6 -c -p {t}")).is_ok());
+}
+
+/// REGRESSION GUARD (2026-08-01): the compress-mode round-trip verifier piped
+/// the arm's whole output through `gzip -dc` by writing it all, synchronously,
+/// before reading any of the verifier's stdout. Once the verifier's stdout pipe
+/// filled (~64 KiB) it stopped reading stdin, our write blocked, and the run
+/// hung forever. Any real corpus (MBs compressed, MBs decompressed) deadlocks;
+/// only toy inputs survive — which is exactly how the bug passed its first
+/// manual check. The writer must run on its own thread (see `paired.rs`, which
+/// already did this correctly).
+#[test]
+fn compress_verify_survives_outputs_larger_than_a_pipe_buffer() {
+    // ~8 MiB of xorshift bytes: incompressible, so BOTH the compressed stream
+    // (~8 MiB) and the decompressed stream (8 MiB) far exceed any pipe buffer.
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut raw = Vec::with_capacity(8 << 20);
+    while raw.len() < (8 << 20) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        raw.extend_from_slice(&state.to_le_bytes());
+    }
+    let dir = std::env::temp_dir().join(format!("fulcrum-cdtest-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let corpus = dir.join("pipe-deadlock.bin");
+    std::fs::write(&corpus, &raw).expect("write corpus");
+    let corpus_s = corpus.display().to_string();
+    let want_sha = hex32(&sha256(&raw));
+
+    let oracle = split_args("gzip -dc");
+    let got = with_watchdog(120, "run_arm_sha compress round-trip on an 8 MiB corpus", move || {
+        run_arm_sha("gzip", &[], &split_args("-1 -c"), &corpus_s, Some(&oracle))
+    });
+    let _ = std::fs::remove_file(&corpus);
+    let _ = std::fs::remove_dir(&dir);
+    let (sha, n) = got.expect("round-trip verify");
+    assert_eq!(n, raw.len(), "verifier must yield the decompressed byte count");
+    assert_eq!(sha, want_sha, "round-trip sha must equal the input sha");
+}
+
+/// The decode-mode oracle failure must TEACH the fix: running the decode-mode
+/// gate on an encoder cell (oracle `gzip -dc` on a PLAIN corpus) is exactly the
+/// mistake that left the counter layer unused for the whole encoder campaign.
+/// The error must name `--compress`.
+#[test]
+fn decode_oracle_failure_names_compress_mode() {
+    let dir = std::env::temp_dir().join(format!("fulcrum-cdtest-oracle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let corpus = dir.join("plain.txt");
+    std::fs::write(&corpus, b"this is not gzip data, it is the raw corpus\n").expect("write");
+    let err = run_oracle(
+        &split_args("gzip -dc"),
+        &corpus.display().to_string(),
+        false,
+    )
+    .unwrap_err();
+    let _ = std::fs::remove_file(&corpus);
+    let _ = std::fs::remove_dir(&dir);
+    assert!(
+        err.contains("--compress"),
+        "decode-mode oracle failure on a plain corpus must point at --compress: {err}"
+    );
+}
