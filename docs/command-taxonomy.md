@@ -133,7 +133,7 @@ gzippy commit messages / fulcrum docs / fulcrum commit messages, measured
 | `matrix` | `ab matrix` | auto-banking, fail-soft cells intact |
 | `ablate` | `ab ablate` | NO-OP refusal (identical hashes), stale-control-impossible arm building intact; `build_arm` now also powers `try` |
 | `bisect` | `ab bisect` | unchanged |
-| `counterdiff` | `profile counters` | Linux perf path and macOS kpc path behind one name; threads flag unchanged |
+| `counterdiff` | `profile counters` | Linux perf path and macOS kpc path behind one name; threads flag unchanged. ENCODER cells need `--compress` (reference = the corpus itself; each arm's stdout piped through the oracle → round-trip gate). Decode mode on a plain corpus can never gate encoders — that omission kept this layer from ever running for the encoder campaign until 2026-08-01. Compress mode REFUSES unpinned thread-capable subjects/comparators and `-d` in `--gz-args`. |
 | `insn` | `profile insn` | closed instruction ledger (INSN-CLOSURE-OR-NO-LEDGER) |
 | `insn-attr` | `profile insn-cat` | + macOS `insnattr`/`insndiff` variants behind the same verb on that platform |
 | `cycles` / mac `topdown` | `profile topdown` | TMA closed L1 ledger |
