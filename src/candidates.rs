@@ -367,6 +367,57 @@ pub fn cmd(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A board cell id, fully decomposed. The id already NAMES the rival, the
+/// corpus, the level and the thread count — commands that make the caller
+/// restate any of that are asking them to get it wrong (`fulcrum why` used to
+/// demand `--ours`, `--rival-cmd` and `--corpus` alongside a cell id that
+/// already said which rival and which corpus).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellId {
+    pub rival: Option<String>,
+    pub corpus: Option<String>,
+    pub level: u32,
+    pub threads: u32,
+    pub axis: Option<String>,
+}
+
+/// Decompose `rival:corpus:L6:T1:axis` (or any `:`-joined subset carrying an L
+/// token). Tokens are identified by SHAPE — `L<n>`, `T<n>`, a known axis name —
+/// and the remaining tokens keep board order: rival first, corpus second.
+pub fn parse_cell_full(cell: &str) -> Result<CellId, String> {
+    let mut level = None;
+    let mut threads = 1u32;
+    let mut axis = None;
+    let mut rest: Vec<String> = Vec::new();
+    for tok in cell.split(':') {
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(n) = tok.strip_prefix('L').and_then(|r| r.parse::<u32>().ok()) {
+            level = Some(n);
+        } else if let Some(n) = tok.strip_prefix('T').and_then(|r| r.parse::<u32>().ok()) {
+            threads = n;
+        } else if matches!(tok, "size" | "wall" | "struct" | "structure") {
+            axis = Some(tok.to_string());
+        } else {
+            rest.push(tok.to_string());
+        }
+    }
+    let Some(level) = level else {
+        return Err(format!(
+            "cell '{cell}' carries no L<level> token — the level names the code path, so \
+             candidates cannot be selected without it (e.g. pigz:silesia:L6:T1:size)"
+        ));
+    };
+    Ok(CellId {
+        rival: rest.first().cloned(),
+        corpus: rest.get(1).cloned(),
+        level,
+        threads,
+        axis,
+    })
+}
+
 /// Accept `rival:corpus:L6:T1:axis` (board id) or any `:`-joined subset
 /// containing an L token, e.g. `silesia:L6:T1` or `L6`.
 pub fn parse_cell(cell: &str) -> Result<(u32, u32), String> {

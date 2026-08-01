@@ -223,6 +223,221 @@ fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Deriving the arms from the cell id (pure parts are fixture-tested in Gate-0)
+// ---------------------------------------------------------------------------
+
+/// The rival commands a gzippy checkout DECLARES, parsed out of
+/// `scripts/campaign/lib.sh` — the campaign's single source of truth for which
+/// rivals are graded and with exactly which flags. Parsed rather than copied so
+/// the two cannot drift: a rival added there is derivable here immediately, and
+/// a rival that is NOT declared there is refused rather than invented.
+///
+/// Both declaration forms in that file are recognised:
+///   `_rival gzip  gzip  'gzip -{level} -c {input}'`
+///   `CAMPAIGN_RIVAL_ARGS+=(--rival "igzip=$igzip_local -{level} -T {threads} -c {input}")`
+pub fn parse_declared_rivals(sh: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for raw in sh.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("_rival ") {
+            // `_rival <name> <bin> '<template>'`, COLUMN-ALIGNED in the real
+            // file — so split on the first whitespace RUN and find the quote,
+            // never on single whitespace chars (that read the padding as the
+            // binary field and silently dropped gzip and pigz from the table).
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let q = rest.find(['\'', '"']).map(|i| &rest[i..]);
+            if let (false, Some(t)) = (name.is_empty(), q.and_then(quoted)) {
+                out.push((name.to_string(), t));
+            }
+        } else if let Some(pos) = line.find("--rival \"") {
+            if let Some(t) = quoted(&line[pos + "--rival ".len()..]) {
+                if let Some((name, tmpl)) = t.split_once('=') {
+                    out.push((name.to_string(), tmpl.to_string()));
+                }
+            }
+        }
+    }
+    // A later declaration of the same name (the igzip local-build branch) wins.
+    // A name that is still a shell variable is the helper's own body
+    // (`--rival "$name=$tmpl"`), not a declared rival.
+    let mut dedup: Vec<(String, String)> = Vec::new();
+    for (n, t) in out.into_iter().filter(|(n, _)| !n.contains('$')) {
+        if let Some(slot) = dedup.iter_mut().find(|(x, _)| *x == n) {
+            slot.1 = t;
+        } else {
+            dedup.push((n, t));
+        }
+    }
+    dedup
+}
+
+fn quoted(s: &str) -> Option<String> {
+    let s = s.trim();
+    let q = s.chars().next()?;
+    if q != '\'' && q != '"' {
+        return None;
+    }
+    let rest = &s[q.len_utf8()..];
+    let end = rest.find(q)?;
+    Some(rest[..end].to_string())
+}
+
+/// The corpus names a gzippy checkout DECLARES (gate + tune), from
+/// `corpus_split.json`. A file outside this set is never silently measured:
+/// undeclared-corpus evidence is what left two binding FALSIFY records citing
+/// files that are not on any box.
+pub fn parse_declared_corpus(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for set in ["gate", "tune"] {
+        if let Some(files) = v.get(set).and_then(|s| s.get("files")).and_then(|f| f.as_array()) {
+            for f in files {
+                if let Some(name) = f.as_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Where staged corpus files live. A LOCATION, never a behaviour — the same
+/// knob `scripts/campaign/lib.sh` uses, so both agree on one box.
+fn corpus_root() -> PathBuf {
+    if let Ok(v) = std::env::var("CAMPAIGN_CORPUS_ROOT") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("www/gzippy-bench/corpus")
+}
+
+/// Fill in whatever the caller did not pass, from the cell id + the repo's own
+/// declared tables. Every failure names the file it needed and what to do.
+fn derive(
+    repo: Option<&std::path::Path>,
+    id: &crate::candidates::CellId,
+    ours: Option<String>,
+    rival_cmd: Option<String>,
+    corpus: Option<PathBuf>,
+) -> Result<(String, String, PathBuf), String> {
+    if ours.is_some() && rival_cmd.is_some() && corpus.is_some() {
+        return Ok((ours.unwrap(), rival_cmd.unwrap(), corpus.unwrap()));
+    }
+    let Some(repo) = repo else {
+        return Err(
+            "need --ours, --rival-cmd and --corpus, or a single --repo <gzippy-repo> to derive \
+             them from the cell id"
+                .to_string(),
+        );
+    };
+
+    let ours = match ours {
+        Some(o) => o,
+        None => {
+            let bin = repo.join("target/release/gzippy");
+            if !bin.is_file() {
+                return Err(format!(
+                    "no gzippy binary at {} — build it (cargo build --release) or pass --ours",
+                    bin.display()
+                ));
+            }
+            bin.display().to_string()
+        }
+    };
+
+    let rival_cmd = match rival_cmd {
+        Some(r) => r,
+        None => {
+            let name = id.rival.as_deref().ok_or_else(|| {
+                "the cell id carries no rival token, so the rival command cannot be derived \
+                 (use the full board id rival:corpus:L6:T1:axis, or pass --rival-cmd)"
+                    .to_string()
+            })?;
+            let lib = repo.join("scripts/campaign/lib.sh");
+            let body = std::fs::read_to_string(&lib)
+                .map_err(|e| format!("cannot read the declared rival table {} ({e}); pass --rival-cmd", lib.display()))?;
+            let declared = parse_declared_rivals(&body);
+            if declared.is_empty() {
+                return Err(format!(
+                    "{} declared no rivals this parser recognises — the format changed? pass --rival-cmd",
+                    lib.display()
+                ));
+            }
+            let tmpl = declared
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "rival '{name}' is not declared in {} (declared: {}) — a cell measured \
+                         against a rival the campaign does not declare cannot be diffed against it",
+                        lib.display(),
+                        declared.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                })?;
+            // The one shell indirection the table uses: the locally built igzip.
+            let local_igzip = repo.join("vendor/isa-l/build/igzip");
+            let tmpl = if tmpl.starts_with('$') {
+                let (_var, rest) = tmpl.split_once(char::is_whitespace).unwrap_or((tmpl.as_str(), ""));
+                let bin = if local_igzip.is_file() {
+                    local_igzip.display().to_string()
+                } else {
+                    name.to_string()
+                };
+                format!("{bin} {rest}")
+            } else {
+                tmpl
+            };
+            println!("  derived rival-cmd from {}: {tmpl}", lib.display());
+            tmpl
+        }
+    };
+
+    let corpus = match corpus {
+        Some(c) => c,
+        None => {
+            let name = id.corpus.as_deref().ok_or_else(|| {
+                "the cell id carries no corpus token, so the input cannot be derived (use the \
+                 full board id rival:corpus:L6:T1:axis, or pass --corpus)"
+                    .to_string()
+            })?;
+            let split = repo.join("corpus_split.json");
+            let body = std::fs::read_to_string(&split)
+                .map_err(|e| format!("cannot read the declared corpus split {} ({e}); pass --corpus", split.display()))?;
+            let declared = parse_declared_corpus(&body);
+            if !declared.iter().any(|d| d == name) {
+                return Err(format!(
+                    "corpus '{name}' is not a declared member of {} — measuring an undeclared file \
+                     is how two binding FALSIFY records ended up citing inputs that are not on any \
+                     box. Declare it, or pass --corpus explicitly and say why.",
+                    split.display()
+                ));
+            }
+            let path = corpus_root().join(name);
+            if !path.is_file() {
+                return Err(format!(
+                    "declared corpus member '{name}' is not staged at {} — produce the data \
+                     (set CAMPAIGN_CORPUS_ROOT, or stage it) rather than measuring something else",
+                    path.display()
+                ));
+            }
+            println!("  derived corpus: {}", path.display());
+            path
+        }
+    };
+
+    Ok((ours, rival_cmd, corpus))
+}
+
 pub fn cmd(args: &[String]) -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("selftest") {
         return selftest();
@@ -231,6 +446,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut ours: Option<String> = None;
     let mut rival_cmd: Option<String> = None;
     let mut corpus: Option<PathBuf> = None;
+    let mut repo: Option<PathBuf> = None;
     let mut tol = 0.02f64;
     let mut i = 0;
     while i < args.len() {
@@ -246,6 +462,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--corpus" => {
                 i += 1;
                 corpus = args.get(i).map(PathBuf::from);
+            }
+            "--repo" => {
+                i += 1;
+                repo = args.get(i).map(PathBuf::from);
             }
             "--tol" => {
                 i += 1;
@@ -264,15 +484,29 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
-    let (Some(cell), Some(ours), Some(rival_cmd), Some(corpus)) = (cell, ours, rival_cmd, corpus)
-    else {
+    let Some(cell) = cell else {
         eprintln!("{}", usage());
         return ExitCode::from(2);
     };
-    let (level, threads) = match crate::candidates::parse_cell(&cell) {
+    let id = match crate::candidates::parse_cell_full(&cell) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("why: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (level, threads) = (id.level, id.threads);
+
+    // The cell id already NAMES the rival and the corpus. Restating them is
+    // work the caller can only get wrong — an easy-to-mistype `--rival-cmd`
+    // template silently measures the wrong rival, and a corpus file nobody
+    // declared is exactly what made two binding FALSIFY records unusable.
+    // So --repo derives all three from the repo's own declared tables, and
+    // REFUSES by name rather than guessing.
+    let (ours, rival_cmd, corpus) = match derive(repo.as_deref(), &id, ours, rival_cmd, corpus) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("why: REFUSED — {e}\n\n{}", usage());
             return ExitCode::from(2);
         }
     };
@@ -457,9 +691,15 @@ pub fn cmd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> String {
-    "fulcrum why <cell> --ours <gzippy-bin> --rival-cmd 'CMD -{level} -c {input}' --corpus FILE [--tol 0.02]\n\
+    "fulcrum why <cell> --repo <gzippy-repo> [--tol 0.02]\n\
+     fulcrum why <cell> --ours <gzippy-bin> --rival-cmd 'CMD -{level} -c {input}' --corpus FILE\n\
      \n\
      <cell> is a board cell id (rival:corpus:L6:T1:axis) or any subset with an L token.\n\
+     With --repo, the cell id is taken at its word: the RIVAL token selects the rival\n\
+     command from the repo's own declared rival table (scripts/campaign/lib.sh), the\n\
+     CORPUS token is resolved against the declared corpus split, and --ours defaults to\n\
+     the repo's release binary. Anything that cannot be derived is REFUSED by name — it\n\
+     is never guessed. Explicit --ours/--rival-cmd/--corpus still win over derivation.\n\
      Runs the vendor diff for that cell: [1] anatomy position-count structure diff\n\
      (same-algorithm vs different-work verdict), [2] callgrind per-line Ir+Dr for both\n\
      arms (LOCATE only — never predicts the wall; refuses arms without line tables),\n\
@@ -556,6 +796,90 @@ pub fn selftest() -> ExitCode {
         "structure: divergent position counts => different work, algorithmic gap",
         !v.same_algorithm && v.summary.contains("ALGORITHMIC"),
     );
+
+    // ---- deriving the arms from the cell id ------------------------------
+    // The fixture is a verbatim excerpt of gzippy's scripts/campaign/lib.sh,
+    // COLUMN-ALIGNED exactly as the real file is: an earlier parser split on
+    // single whitespace characters, read the padding as the binary field, and
+    // silently dropped gzip and pigz from the declared table. A table that is
+    // quietly short does not refuse — it derives the WRONG rival.
+    const LIB_SH: &str = r#"
+  _rival() { # name, binary, template
+    local name="$1" bin="$2" tmpl="$3"
+    if command -v "$bin" >/dev/null 2>&1 || [ -x "$bin" ]; then
+      CAMPAIGN_RIVAL_ARGS+=(--rival "$name=$tmpl")
+    else
+      missing+=("$name")
+    fi
+  }
+  _rival gzip       gzip            'gzip -{level} -c {input}'
+  _rival pigz       pigz            'pigz -{level} -p {threads} -c {input}'
+  _rival libdeflate libdeflate-gzip 'libdeflate-gzip -{level} -c {input}'
+  if [ -x "$igzip_local" ]; then
+    CAMPAIGN_RIVAL_ARGS+=(--rival "igzip=$igzip_local -{level} -T {threads} -c {input}")
+  fi
+"#;
+    let rivals = parse_declared_rivals(LIB_SH);
+    check(
+        "rivals: all FOUR declared rivals parse from the column-aligned table",
+        rivals.len() == 4
+            && rivals.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                == vec!["gzip", "pigz", "libdeflate", "igzip"],
+    );
+    check(
+        "rivals: the template is the FULL declared command, flags included",
+        rivals.iter().any(|(n, t)| n == "pigz" && t == "pigz -{level} -p {threads} -c {input}"),
+    );
+    check(
+        "rivals: the helper's own body (`--rival \"$name=$tmpl\"`) is not a rival",
+        !rivals.iter().any(|(n, _)| n.contains('$')),
+    );
+
+    const SPLIT: &str = r#"{"gate":{"files":["sil40","access.log"]},"tune":{"files":["dd79_text6"]}}"#;
+    let corpora = parse_declared_corpus(SPLIT);
+    check(
+        "corpus: gate AND tune members are both declared (a gate-only view hides half the board)",
+        corpora.len() == 3 && corpora.contains(&"access.log".to_string()),
+    );
+    check(
+        "corpus: a malformed split declares NOTHING (never a silent partial set)",
+        parse_declared_corpus("not json").is_empty(),
+    );
+
+    // Refusals. Each names what it needed; none of them guesses.
+    let cell = crate::candidates::parse_cell_full("libdeflate:sil40:L6:T1:wall").unwrap();
+    check(
+        "cell id: rival, corpus, level, threads and axis all decompose",
+        cell.rival.as_deref() == Some("libdeflate")
+            && cell.corpus.as_deref() == Some("sil40")
+            && cell.level == 6
+            && cell.threads == 1
+            && cell.axis.as_deref() == Some("wall"),
+    );
+    let tmp = std::env::temp_dir().join(format!("fulcrum-why-derive-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let e = derive(Some(&tmp), &cell, None, None, None).unwrap_err();
+    check(
+        "derive: no binary in the repo => REFUSED by path, never a guessed binary",
+        e.contains("target/release/gzippy"),
+    );
+    let e = derive(None, &cell, None, None, None).unwrap_err();
+    check(
+        "derive: neither --repo nor the explicit trio => REFUSED, and says which",
+        e.contains("--repo"),
+    );
+    let explicit = derive(
+        None,
+        &cell,
+        Some("/bin/ours".into()),
+        Some("rival -{level}".into()),
+        Some(std::path::PathBuf::from("/tmp/in")),
+    );
+    check(
+        "derive: explicit --ours/--rival-cmd/--corpus need no repo and are passed through",
+        explicit == Ok(("/bin/ours".into(), "rival -{level}".into(), std::path::PathBuf::from("/tmp/in"))),
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
 
     println!("why selftest: {pass} passed, {fail} failed");
     if fail == 0 {

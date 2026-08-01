@@ -164,8 +164,8 @@ pub const COMMANDS: &[Cmd] = &[
     gated("why", C(
         "why",
         "Why does this cell fail? What is the MECHANISM, vendor-diffed?",
-        "<cell> --ours BIN --rival-cmd 'CMD -{level} -c {input}' --corpus FILE",
-        "fulcrum why libdeflate:silesia.tar:L6:T1:wall --ours ~/www/gzippy/target/release/gzippy --rival-cmd 'libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar",
+        "<cell> --repo PATH (derives the arms from the cell id), or --ours/--rival-cmd/--corpus",
+        "fulcrum why libdeflate:sil40:L6:T1:wall --repo ~/www/gzippy",
         Class::Measurement,
     )),
     gated("candidates", C(
@@ -592,12 +592,14 @@ pub const INTENTS: &[Intent] = &[
         id: "why",
         question: "Why does this cell fail? What is the mechanism?",
         keywords: &["why", "mechanism", "vendor", "diff", "cause", "gap", "slower", "bigger", "callgrind"],
-        run: &["fulcrum why <cell> --ours BIN --rival-cmd 'CMD -{level} -c {input}' --corpus FILE"],
+        run: &["fulcrum why <cell> --repo ~/www/gzippy"],
         note: "FOUR layers automatically: [1] anatomy position-count structure verdict (same algorithm vs \
                different work), [2] callgrind per-line Ir+Dr for BOTH arms (refuses a rival built without \
                -g — one opaque symbol is not an attribution), [3] paired counters with threads MATCHED, \
                [4] declared-parameter diff. It states its own denominator: skipped layers are NOT covered \
-               by any claim. Do not hand-build this — 3 of 3 wins came from a vendor diff, 3 of 3 failures \
+               by any claim. The cell id already names the rival and the corpus, so --repo derives both \
+               from the repo's own declared tables and REFUSES an undeclared one by name. \
+               Do not hand-build this — 3 of 3 wins came from a vendor diff, 3 of 3 failures \
                from reading our own profile's top line.",
     },
     Intent {
@@ -659,7 +661,7 @@ pub const INTENTS: &[Intent] = &[
         question: "Where does the time go?",
         keywords: &["time", "profile", "hot", "slow", "cycles", "instructions", "counters", "perf", "stall", "ipc"],
         run: &[
-            "fulcrum why <cell> --ours BIN --rival-cmd CMD --corpus FILE   # start here: the vendor-diffed version of this question",
+            "fulcrum why <cell> --repo ~/www/gzippy      # start here: the vendor-diffed version of this question",
             "fulcrum profile counters --a-cmd '…' --b-cmd '…'",
             "fulcrum profile topdown --a-stat a.stat --b-stat b.stat",
         ],
