@@ -152,6 +152,12 @@ pub fn profile_argv(
 // ───────────────────────────── CLI ─────────────────────────────
 
 pub fn cmd_memprofile(args: &[String]) -> ExitCode {
+    // Asking what it does must describe it, not error: `--help` used to reach
+    // the ARGV parser and come back as "unknown arg '--help'".
+    if crate::guide::is_help_request(args) {
+        usage();
+        return ExitCode::SUCCESS;
+    }
     match args.first().map(|s| s.as_str()) {
         Some("selftest") => selftest(),
         Some("__hog") => hog_main(&args[1..]),

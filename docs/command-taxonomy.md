@@ -29,6 +29,44 @@ organised by the QUESTION each command answers, shaped by the four campaign
 verbs the operator actually needs, and the binary now carries baked provenance
 plus a staleness self-check so the stale-instrument failure class is closed.
 
+## The task index (2026-07-31): `fulcrum guide`
+
+The consolidation above fixed *sprawl*. It did not fix *arrival*: the help is
+indexed by COMMAND, and an agent arrives holding a QUESTION. Receipt, three days
+later — an agent on the encoder campaign hand-built a vendor diff (position
+counts, match/literal ratios, per-line Ir/Dr, a declared-parameter table) over
+several sessions, which is exactly the four layers of `fulcrum why`; hand-parsed
+census JSON in python to count failing cells by rival and thread count, which is
+`fulcrum board`; and never ran `fulcrum dropin` at all, leaving a whole axis of
+the stated goal unmeasured for the entire campaign (19 divergences in 208
+scenarios when it was finally run). Every one of those tools was listed in
+`--help`. "Why does this cell fail?" does not look like the word `why` until you
+already know the answer.
+
+So the index now runs in the other direction as well:
+
+| Command | What it gives you |
+|---|---|
+| `fulcrum guide` | Every question this harness answers, each mapped to literal runnable command lines, in the order to run them. |
+| `fulcrum guide <words>` | The same, ranked against your words: `fulcrum guide did I break the CLI` leads with `dropin`. |
+| `fulcrum commands` / `--json` | The whole surface, machine-readable: path, the question it answers, required args, a worked example, staleness class, Gate-0 name, next action. |
+| `<any command> --help` | Answered from the same registry — question, required args, example, class, Gate-0, NEXT ACTION — and only then the command's own detailed usage. |
+
+Three rules make the registry load-bearing rather than decorative, all enforced
+by `fulcrum selftest guide`:
+
+1. `main.rs` derives its known-subcommand list from the registry.
+2. The Gate-0 EXECUTES `--help` for every advertised path and requires it to
+   resolve, exit 0, and print something — an advertised command that does not
+   exist fails the selftest.
+3. Every advertised Gate-0 name is checked against the selftest registry, and
+   every example must start with its own command path.
+
+`--help` also had to stop *performing* commands: `fulcrum freeze acquire --help`
+used to stop processes and pin the governor, and `fulcrum selftest --help` ran
+every Gate-0 on the box. Probing the surface to find out what something does is
+now always safe, and never triggers a staleness probe or a self-update.
+
 ## The new surface (13 top-level commands)
 
 ### The four campaign verbs

@@ -44,6 +44,10 @@ pub mod why;
 pub mod selftest;
 pub mod selfver;
 
+// The TASK INDEX: questions -> runnable command lines, and the machine-readable
+// command registry that `--help` and `main.rs`'s dispatch list are derived from.
+pub mod guide;
+
 // The primitives and their libraries.
 pub mod ablate;
 pub mod anatomy;

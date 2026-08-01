@@ -38,14 +38,36 @@ fn registry() -> Vec<(&'static str, Gate0)> {
         ("trace dispatchgap", crate::dispatchgap::selftest),
         ("anatomy ratio", crate::ratio::selftest::run),
         ("anatomy explain", crate::explain::selftest),
+        ("guide", crate::guide::selftest as Gate0),
         ("lib levelsweep", crate::levelsweep::selftest),
         ("lib cpreflight", crate::cpreflight::selftest),
         ("lib behavior", crate::behavior::selftest),
     ]
 }
 
+/// Every Gate-0 name, exactly as `fulcrum selftest <name>` takes it. The guide
+/// registry's Gate-0 cross-checks its own advertised names against this list,
+/// so a command cannot advertise a self-test that was never registered.
+pub fn gate_names() -> Vec<&'static str> {
+    registry().into_iter().map(|(n, _)| n).collect()
+}
+
 pub fn cmd(args: &[String]) -> ExitCode {
     match args.first().map(|s| s.as_str()) {
+        // `--help` used to fall through to run_all(): asking what the command
+        // does ran every Gate-0 on the box, which is minutes of work and, from
+        // inside another Gate-0, unbounded recursion.
+        Some("--help") | Some("-h") | Some("help") => {
+            println!(
+                "fulcrum selftest [<name> | invariants | --list]\n\
+                 \n\
+                 \x20 (no args)     run EVERY Gate-0 — the deploy check for this box\n\
+                 \x20 <name>        run one (see --list; the first word of a name is enough)\n\
+                 \x20 --list        the Gate-0 names\n\
+                 \x20 invariants    render the enforced-rule registry (what this binary REFUSES)\n"
+            );
+            ExitCode::SUCCESS
+        }
         Some("invariants") => {
             println!("{}", crate::invariants::render());
             ExitCode::SUCCESS
@@ -142,6 +164,9 @@ fn run_all() -> ExitCode {
             .arg("selftest")
             .arg(name)
             .arg("--no-self-update")
+            // A Gate-0 sub-run is machine-facing: suppress the registry's
+            // NEXT ACTION line so it is not interleaved once per gate.
+            .env("FULCRUM_IN_SELFTEST", "1")
             .status()
             .map(|s| s.success())
             .unwrap_or(false);

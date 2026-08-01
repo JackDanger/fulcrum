@@ -1496,6 +1496,10 @@ checked (default: current dir)."
         );
     };
 
+    if fulcrum::guide::is_help_request(args) {
+        finding_usage();
+        return ExitCode::SUCCESS;
+    }
     let Some(action) = args.first().map(|s| s.as_str()) else {
         finding_usage();
         return ExitCode::from(2);
@@ -1691,6 +1695,13 @@ fn default_ledger_path(explicit: Option<&str>) -> PathBuf {
 /// locate: closed-wall-ledger localization over a critical-path model.
 /// Mirrors `cli.locate_main`.
 fn cmd_locate(args: &[String]) -> ExitCode {
+    if fulcrum::guide::is_help_request(args) {
+        eprintln!(
+            "fulcrum trace locate — which region holds enough wall to be worth optimising.\n\
+             usage: fulcrum trace locate <trace.json> [--wall-ms N] [--threshold PCT]"
+        );
+        return ExitCode::SUCCESS;
+    }
     let mut wall_ms: Option<f64> = None;
     let mut threshold = locate::DEFAULT_THRESHOLD_PCT;
     let mut files: Vec<String> = Vec::new();
@@ -1745,6 +1756,18 @@ fn cmd_locate(args: &[String]) -> ExitCode {
 /// insn: closed instruction-accounting ledger (INSN-CLOSURE-OR-NO-LEDGER).
 /// Mirrors `cli.insn_main`.
 fn cmd_insn(args: &[String]) -> ExitCode {
+    // `--help` must DESCRIBE, never error: it used to answer "unknown/unexpected
+    // argument --help", which reads as a broken command to anyone probing the surface.
+    if fulcrum::guide::is_help_request(args) {
+        eprintln!(
+            "fulcrum profile insn — the CLOSED instruction-accounting ledger.\n\
+             usage: fulcrum profile insn --a-stat FILE --a-report FILE [--a-bytes N] [--a-label L]\n\
+             \x20                        [--b-stat FILE --b-report FILE --b-bytes N --b-label L]\n\
+             \x20                        [--tol PCT] [--threshold PCT] [--feature decode|compress]\n\
+             Captures: `perf stat` totals and `perf report -F period,symbol` per binary."
+        );
+        return ExitCode::SUCCESS;
+    }
     let mut tol = insn::DEFAULT_TOL_PCT;
     let mut threshold = insn::DEFAULT_THRESHOLD_PCT;
     let mut a_stat: Option<String> = None;
@@ -1860,6 +1883,14 @@ fn cmd_insn_attr(args: &[String]) -> ExitCode {
 /// cycles: TMA top-down stall-breakdown (TMA-CLOSURE-OR-NO-BREAKDOWN).
 /// Mirrors `cli.cycles_main`.
 fn cmd_cycles(args: &[String]) -> ExitCode {
+    if fulcrum::guide::is_help_request(args) {
+        eprintln!(
+            "fulcrum profile topdown — TMA top-down stall breakdown (closed L1 ledger).\n\
+             usage: fulcrum profile topdown --a-stat FILE [--a-label L] [--b-stat FILE --b-label L] [--tol PCT]\n\
+             Capture: `perf stat` with the TMA event set."
+        );
+        return ExitCode::SUCCESS;
+    }
     let mut tol = cycles::DEFAULT_TOL_PCT;
     let mut a_stat: Option<String> = None;
     let mut a_label: Option<String> = None;
@@ -2069,6 +2100,16 @@ fn cmd_phasebreak(args: &[String]) -> ExitCode {
 
 /// ledger: list rows + the supersede/invalidate verbs. Mirrors `cli.ledger_main`.
 fn cmd_ledger(args: &[String]) -> ExitCode {
+    if fulcrum::guide::is_help_request(args) {
+        eprintln!(
+            "fulcrum bank ledger — the append-only, hash-chained results ledger.\n\
+             usage: fulcrum bank ledger [<ledger.jsonl>]                 list the rows\n\
+             \x20      fulcrum bank ledger supersede  --key K --target T --reason R\n\
+             \x20      fulcrum bank ledger invalidate --key K --reason R\n\
+             Default path: $FULCRUM_LEDGER, else <cwd>/artifacts/fulcrum/ledger.jsonl"
+        );
+        return ExitCode::SUCCESS;
+    }
     let verb = match args.first().map(String::as_str) {
         Some(v @ ("supersede" | "invalidate")) => Some(v),
         _ => None,
@@ -2263,6 +2304,13 @@ fn usage() -> ExitCode {
     eprintln!(
         "FULCRUM — the gzippy campaign's measurement harness\n\
 \n\
+DON'T KNOW THE COMMAND NAME? ASK BY QUESTION:\n\
+  fulcrum guide                 the task index: every question this harness answers,\n\
+                                each mapped to a literal runnable command line.\n\
+  fulcrum guide <your words>    e.g. `fulcrum guide why is this cell slower`\n\
+  fulcrum commands --json       the whole surface, machine-readable: path, required\n\
+                                args, the question it answers, a worked example.\n\
+\n\
 THE FOUR CAMPAIGN VERBS (each ends in a verdict or a next action, not a table):\n\
   fulcrum board                 WHERE DO WE STAND? Failing per-label cells, ranked by gap,\n\
                                 stale-flagged against the subject commit, denominator stated.\n\
@@ -2316,6 +2364,8 @@ THE PRIMITIVES:\n\
 Every command checks its own staleness against origin/main at startup (cached 60s,\n\
 2.5s network cap): analysis commands self-update+re-exec when safe; MEASUREMENT\n\
 commands REFUSE to run stale. `--no-self-update` pins a reproduction.\n\
+`<any command> --help` prints the question it answers, its required args, a runnable\n\
+example and its next action — and never performs the command.\n\
 See docs/command-taxonomy.md for the full old→new migration table.\n"
     );
     ExitCode::from(2)
@@ -2557,10 +2607,20 @@ fn classify(sub: &str, rest: &[String]) -> CmdClass {
     if rest.iter().any(|a| a == "selftest") {
         return CmdClass::Exempt;
     }
+    // Asking what a command IS must never probe the network, self-update, or
+    // rebuild — describing the surface is not measuring with it.
+    if fulcrum::guide::is_help_request(rest) {
+        return CmdClass::Exempt;
+    }
     match sub {
         // `freeze` must never be blocked: a stale binary must still be able
         // to RELEASE a freeze (orphaned frozen boxes are the worse failure).
-        "version" | "help" | "--help" | "-h" | "selftest" | "freeze" => CmdClass::Exempt,
+        // `guide`/`commands` DESCRIBE the surface: they must not probe the
+        // network, self-update, or re-exec. Discovery has to work on a stale
+        // box, offline, mid-freeze — that is precisely when it is needed.
+        "version" | "help" | "--help" | "-h" | "selftest" | "freeze" | "guide" | "commands" => {
+            CmdClass::Exempt
+        }
         "why" | "try" | "verify" | "dropin" | "ab" | "profile" => CmdClass::Measurement,
         "board" => match rest.first().map(|s| s.as_str()) {
             // Deriving the board measures; reading/adjudicating it analyses.
@@ -2580,19 +2640,68 @@ fn main() -> ExitCode {
 
     // The staleness gate applies only to REAL commands: an unknown or legacy
     // name must fall through to its hint without a network probe or (worse)
-    // a self-update triggered by a typo.
-    const KNOWN: &[&str] = &[
-        "board", "why", "candidates", "try", "freeze", "verify", "dropin", "ab", "profile",
-        "trace", "anatomy", "bank", "selftest", "version", "structcensus",
-    ];
-    if KNOWN.contains(&sub.as_str()) {
+    // a self-update triggered by a typo. The known-name list is DERIVED from
+    // the guide registry so the registry cannot advertise a command this
+    // dispatcher has never heard of.
+    let known = fulcrum::guide::top_level_names();
+    if known.contains(&sub.as_str()) {
         if let Err(msg) = fulcrum::selfver::enforce(classify(&sub, rest), &args) {
             eprintln!("fulcrum: {msg}");
             return ExitCode::FAILURE;
         }
     }
 
-    match sub.as_str() {
+    // ---- `--help` is ANSWERED, never PERFORMED ----------------------------
+    // Receipt: `fulcrum freeze acquire --help` used to stop processes and pin
+    // the governor, and `fulcrum selftest --help` ran every Gate-0 — probing
+    // the surface to find out what a command does was itself dangerous. And a
+    // dozen commands answered `--help` with exit 2 (or an "unknown arg"
+    // error), so a script discovering the surface saw failures. Help now comes
+    // from the registry FIRST — the question the command answers, its required
+    // args, a runnable example, its staleness class, its Gate-0 and its next
+    // action — and only then delegates to the command's own detailed usage,
+    // which is skipped entirely for the paths that would act on it.
+    if fulcrum::guide::is_help_request(&args) {
+        let entry = fulcrum::guide::lookup(&args);
+        if let Some(e) = entry {
+            print!("{}", fulcrum::guide::render_cmd(e));
+            println!();
+            if e.help_acts {
+                // Delegating the verb would DO the thing. Show the family's
+                // usage instead.
+                let family = e.path.split_whitespace().next().unwrap_or(e.path);
+                let _ = dispatch(family, &[]);
+            } else {
+                let _ = dispatch(&sub, rest);
+            }
+            eprintln!("\n(`fulcrum guide` indexes every command by the QUESTION it answers.)");
+            return ExitCode::SUCCESS;
+        }
+        // Unregistered path: fall through to whatever the dispatcher says,
+        // including the unknown-subcommand hint.
+    }
+
+    let code = dispatch(&sub, rest);
+
+    // ---- a NEXT ACTION on every command that has one ----------------------
+    // Universal by construction: one place, driven by the registry, so it
+    // cannot drift command by command. Printed on stderr so it never
+    // contaminates a --json stdout. Commands that compute their OWN contextual
+    // next action carry `next: None` here, so the two can never contradict.
+    if code == ExitCode::SUCCESS && std::env::var("FULCRUM_IN_SELFTEST").is_err() {
+        if let Some(e) = fulcrum::guide::lookup(&args) {
+            if let Some(n) = e.next {
+                eprintln!("\nNEXT ACTION: {n}");
+            }
+        }
+    }
+    code
+}
+
+/// The command table. Split out of `main` so `--help` can render a registry
+/// entry and THEN delegate here for the command's own detailed usage.
+fn dispatch(sub: &str, rest: &[String]) -> ExitCode {
+    match sub {
         "board" => cmd_board(rest),
         "structcensus" => fulcrum::structcensus::cmd(rest),
         "why" => fulcrum::why::cmd(rest),
@@ -2607,6 +2716,8 @@ fn main() -> ExitCode {
         "anatomy" => cmd_anatomy_family(rest),
         "bank" => cmd_bank(rest),
         "selftest" => fulcrum::selftest::cmd(rest),
+        "guide" => fulcrum::guide::cmd_guide(rest),
+        "commands" => fulcrum::guide::cmd_commands(rest),
         "version" | "--version" | "-V" => fulcrum::selfver::cmd_version(rest),
         "help" | "--help" | "-h" => {
             usage();
@@ -2618,6 +2729,11 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             eprintln!("fulcrum: unknown subcommand '{other}'");
+            eprintln!(
+                "         Don't know the name? Ask by QUESTION instead: \
+                 `fulcrum guide <what you want to find out>`\n         \
+                 The whole surface, machine-readable: `fulcrum commands --json`"
+            );
             usage()
         }
     }
