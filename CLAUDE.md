@@ -19,6 +19,24 @@ make deploy BOX=root@10.0.2.240 DIR=/root/fulcrum   # push main to a box, verify
 `make test` is the right command after any change. Run `cargo clippy` too and
 add no new warnings.
 
+## Arriving with a question (start here)
+
+You almost certainly want a command that already exists. Ask by QUESTION, not by
+name — the whole point of `guide` is that "why does this cell fail?" does not
+look like the word `why` until you already know the answer:
+
+```bash
+fulcrum guide                       # every question, mapped to runnable lines
+fulcrum guide did I break the CLI   # ranked: leads with `dropin`
+fulcrum commands --json             # the whole surface, machine-readable
+<any command> --help                # question answered, required args, example, NEXT ACTION
+```
+
+Receipt for why this exists: an agent hand-built a four-layer vendor diff that
+`fulcrum why` runs in one command, hand-parsed census JSON that `fulcrum board`
+already ranks, and never ran `fulcrum dropin` at all — leaving a whole axis of
+the goal unmeasured for an entire campaign. Every one of those was in `--help`.
+
 ## The command surface (see docs/command-taxonomy.md for detail)
 
 ```
@@ -35,8 +53,18 @@ trace            span-trace views (critpath/flow/causal/consumer/… — the T>1
 anatomy          deflate structure diff | ratio | explain
 bank             finding | ledger | scoreboard  (banked artifacts stay readable)
 selftest         run every Gate-0; `selftest invariants` renders the rule registry
-version          baked provenance; --expect <sha> is the deployment check
+version          baked provenance + PATH-shadow check; --expect <sha> is the deployment check
+guide            the TASK INDEX: questions -> runnable command lines
+commands         the same surface, machine-readable (--json)
 ```
+
+`src/guide.rs` is the registry behind `guide`, `commands` and every `--help`.
+It is load-bearing: `main.rs` derives its known-subcommand list from it, and
+`fulcrum selftest guide` EXECUTES `--help` for every advertised path (must
+resolve, exit 0, print something), checks every advertised Gate-0 name against
+the selftest registry, and requires every NEXT ACTION to name a real command.
+**Adding a subcommand means adding its registry entry in the same change** — the
+Gate-0 is what stops the surface from drifting back into "listed but unfindable".
 
 Cross-cutting (`src/selfver.rs` + `build.rs`): every command prints its baked
 provenance and checks itself against origin/main at startup. Measurement
