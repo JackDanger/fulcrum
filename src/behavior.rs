@@ -1033,6 +1033,14 @@ fn run_dhat(spec: &RunSpec) -> Result<AllocProfile, String> {
 
 pub(crate) fn run_cachegrind(spec: &RunSpec) -> Result<CacheProfile, String> {
     let out = spec.outdir.join(format!("cg.{}.out", spec.tag));
+    // STALENESS: `out.exists()` below is only meaningful if THIS run produced the file.
+    // A leftover from a previous run satisfied it, so a failed invocation silently
+    // returned the PREVIOUS run's numbers. Measured: `anatomy --exec` reported
+    // total_ir=1,703,992,455 for engine.wasm (868 KB), dickens (12.2 MB) and movie.mp4
+    // (12.9 MB) alike — one constant replayed for every input, because the tag
+    // (`{name}.L{level}`) does not name the INPUT either. Remove it first so existence
+    // proves production.
+    let _ = std::fs::remove_file(&out);
     let mut c = Command::new("valgrind");
     c.arg("--tool=cachegrind")
         .arg("--cache-sim=yes")
