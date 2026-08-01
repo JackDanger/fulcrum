@@ -56,6 +56,7 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
     let mut cur_file = String::new();
     let mut out: Vec<LineCost> = Vec::new();
     let mut last_line = 0u32;
+    let mut skip_next_cost_row = false;
     for raw in body.lines() {
         let l = raw.trim();
         if let Some(ev) = l.strip_prefix("events:") {
@@ -78,13 +79,45 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
                 cur_file = fl.to_string();
             }
             last_line = 0;
-        } else if !l.is_empty() && (l.starts_with(|c: char| c.is_ascii_digit()) || l.starts_with('+') || l.starts_with('*')) {
+            skip_next_cost_row = false;
+        } else if l.starts_with("fn=")
+            || l.starts_with("cfn=")
+            || l.starts_with("cfi=")
+            || l.starts_with("cob=")
+            || l.starts_with("ob=")
+        {
+            // Any position-defining line ends a pending call: only the row IMMEDIATELY
+            // after `calls=` is the inclusive cost. Without this, a `cfn=`/`fn=` between
+            // them would let the skip consume an unrelated SELF row (measured: 93,108,494
+            // vs a cachegrind truth of 100,723,312 — 7% low).
+            skip_next_cost_row = false;
+        } else if l.starts_with("calls=") {
+            // CALLGRIND FORMAT: the cost row IMMEDIATELY AFTER a `calls=` line is the
+            // callee's INCLUSIVE subtree cost, attributed at the call site — not a self
+            // cost. Summing it double-counts every call at every level of the chain.
+            // Measured before this guard existed: gzippy/dickens/L6 reported
+            // 16,710,714,581 Ir against a hand-measured cachegrind truth of
+            // 1,385,371,628 (x12.06), and libdeflate x8.04 — asymmetric, because deep
+            // Rust call chains re-count more often than flat C, which turned a true
+            // 1.20 ratio into a reported 1.80.
+            skip_next_cost_row = true;
+        } else if !l.is_empty()
+            && (l.starts_with(|c: char| c.is_ascii_digit())
+                || l.starts_with('+')
+                || l.starts_with('-')
+                || l.starts_with('*'))
+        {
+            // '-N' is a NEGATIVE relative position and is valid callgrind syntax. It was
+            // omitted here, so those rows were dropped entirely: on a real capture that
+            // silently lost 1,761 rows carrying 7,088,324 Ir (7% of the file's total).
             let mut parts = l.split_whitespace();
             let pos = parts.next().unwrap_or("0");
             let line = if pos == "*" {
                 last_line
             } else if let Some(d) = pos.strip_prefix('+') {
                 last_line + d.parse::<u32>().unwrap_or(0)
+            } else if let Some(d) = pos.strip_prefix('-') {
+                last_line.saturating_sub(d.parse::<u32>().unwrap_or(0))
             } else {
                 pos.parse().unwrap_or(0)
             };
@@ -92,6 +125,11 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
             let vals: Vec<u64> = parts.map(|v| v.parse().unwrap_or(0)).collect();
             let ir = ir_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
             let dr = dr_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
+            if skip_next_cost_row {
+                // inclusive cost of the call declared by the preceding `calls=`
+                skip_next_cost_row = false;
+                continue;
+            }
             if ir > 0 || dr > 0 {
                 out.push(LineCost {
                     file: cur_file.clone(),
@@ -726,6 +764,14 @@ fn=(2) build_codes
 fl=(1)
 fn=(3) other
 100 25 5 1
+fl=(2)
+fn=(4) caller_with_calls
+70 11 2 1
+cfn=(2) build_codes
+calls=3 40
+70 999999 5555 77
+71 13 3 1
+-1 7 1 0
 ";
 
 pub fn selftest() -> ExitCode {
@@ -755,7 +801,30 @@ pub fn selftest() -> ExitCode {
         costs.iter().any(|c| c.file.ends_with("matchfinder.rs") && c.line == 100 && c.ir == 500 + 25),
     );
     check("callgrind: sorted by Ir descending", costs.windows(2).all(|w| w[0].ir >= w[1].ir));
-    check("callgrind: total Ir sums every line", total_ir(&costs) == 500 + 25 + 300 + 200 + 100);
+    check(
+        "callgrind: total Ir sums every SELF line",
+        total_ir(&costs) == 500 + 25 + 300 + 200 + 100 + 11 + 13 + 7,
+    );
+    // REGRESSION GUARD: '-N' is a NEGATIVE relative position, valid callgrind syntax.
+    // The row-start test omitted '-', so those rows were dropped ENTIRELY — on a real
+    // capture that silently lost 1,761 rows carrying 7,088,324 Ir, 7% of the total.
+    check(
+        "callgrind: '-N' negative relative positions are parsed, not dropped",
+        // line 70 of file (2) carries 11 from its own row plus 7 from the `-1`
+        // relative row that resolves back to it; duplicates aggregate, so 18.
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("huffman.rs") && c.line == 70 && c.ir == 18),
+    );
+    // REGRESSION GUARD: the row after `calls=` is the callee's INCLUSIVE subtree cost.
+    // Counting it as a self cost double-counts every call at every level of the chain.
+    // It inflated real captures ASYMMETRICALLY (gzippy x12.06, libdeflate x8.04 on
+    // dickens/L6), turning a true 1.20 instruction ratio into a reported 1.80. The old
+    // fixture had no `calls=` line at all, so Gate-0 passed while the parser was wrong.
+    check(
+        "callgrind: the row after `calls=` (inclusive) is NOT counted as a self cost",
+        !costs.iter().any(|c| c.ir == 999999) && total_ir(&costs) < 999999,
+    );
     check("callgrind: line-info guard accepts real tables", has_line_info(&costs));
     check(
         "callgrind: line-info guard refuses an opaque capture (no -g)",
