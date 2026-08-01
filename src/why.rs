@@ -631,15 +631,30 @@ pub fn cmd(args: &[String]) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         println!("\n[3 COUNTERS] paired hw-counter diff, threads MATCHED at T{threads}:");
+        // COMPRESS mode is mandatory here and was MISSING for the entire
+        // encoder campaign: without it counterdiff inherited the decode
+        // defaults — the subject ran `-d -c` (decompressing!) and the oracle
+        // ran `gzip -dc` on the PLAIN corpus, so this layer refused every
+        // encoder cell with "oracle 'gzip' exited Some(1)" and the counter
+        // layer never ran once. The comparator template must NOT carry
+        // `{input}` — counterdiff appends the corpus itself, and a rival
+        // command with the file named twice compresses it twice.
+        let rival_counters = rival_full
+            .replace(&corpus.display().to_string(), "")
+            .trim()
+            .to_string();
         let cd_args: Vec<String> = vec![
             "--subject-bin".into(),
             ours.clone(),
+            "--compress".into(),
+            "--gz-args".into(),
+            format!("-{level} -c -p {{t}}"),
             "--comparator-cmd".into(),
-            rival_full.clone(),
+            rival_counters,
             "--corpus".into(),
             corpus.display().to_string(),
             "--threads".into(),
-            format!("{threads},{threads}"),
+            format!("{threads}"),
         ];
         match crate::counterdiff::parse_args(&cd_args) {
             Ok(cfg) => match crate::counterdiff::run(cfg) {
