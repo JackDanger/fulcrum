@@ -1138,9 +1138,15 @@ fn run_arm_sha(
             .map_err(|e| format!("cannot spawn verifier '{vp}': {e}"))?;
         {
             use std::io::Write;
-            let si = vc
+            // TAKE the handle (do not borrow it): dropping it at the end of this
+            // scope is what CLOSES the pipe and gives the verifier EOF. Borrowing
+            // via `stdin.as_mut()` leaves the handle owned by the child, so
+            // `gzip -dc` blocks forever waiting for more input and the whole
+            // measurement hangs. Cost me two stalled runs before the
+            // implausibly-long runtime gave it away.
+            let mut si = vc
                 .stdin
-                .as_mut()
+                .take()
                 .ok_or_else(|| "verifier stdin unavailable".to_string())?;
             si.write_all(&out.stdout)
                 .map_err(|e| format!("cannot write to verifier '{vp}': {e}"))?;
