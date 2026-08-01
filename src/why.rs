@@ -48,6 +48,36 @@ pub struct LineCost {
 /// are `line events…`. Handles the compressed `fl=(N) name` id form and bare
 /// `fl=(N)` back-references.
 pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
+    parse_callgrind_checked(body).0
+}
+
+/// `parse_callgrind`, plus the file's own `summary:`/`totals:` line — the
+/// denominator callgrind itself computed. Returned so the caller can VERIFY
+/// the parse instead of trusting it.
+///
+/// WHY THIS EXISTS. This parser summed EVERY cost-shaped line, including the
+/// inclusive-cost line that callgrind emits after each `calls=<N> <pos>`
+/// directive. That cost is the callee's, already recorded in full under the
+/// callee's own section, so summing it adds one extra copy per ancestor
+/// call-site on the path to every instruction.
+///
+/// RECEIPT (2026-08-01, gzippy L2 dickens on the trainer box): this layer
+/// reported `ours total Ir 10,307,929,423` and `rival 5,987,049,889`, a
+/// 1.72x ratio, and it was quoted as a finding. callgrind's OWN `summary:`
+/// for the same two runs read 886,643,354 and 752,825,508 — a ratio of
+/// **1.178**. The inflation was 11.6x on one arm and 7.95x on the other:
+/// ASYMMETRIC, because it scales with call depth, which differs between a
+/// Rust binary and a C one. An asymmetric error on a RATIO is the worst
+/// possible failure mode for a vendor diff, and nothing in the output looked
+/// wrong.
+///
+/// `behavior.rs::parse_callgrind_symbolized` documents this exact bug (its
+/// "bug 2") and fixes it with a `pending_call_arc` flag. That fix was written
+/// after measuring 9.02x inflation on an igzip trace. This parser, in the
+/// same binary, never got it — a lesson learned in one module and not carried
+/// to its sibling. Hence the `summary:` cross-check below: a fix that can
+/// silently rot is the same defect one refactor later.
+pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
     #[allow(unused_assignments)]
     let mut events: Vec<String> = Vec::new();
     let mut ir_idx = None;
@@ -56,12 +86,27 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
     let mut cur_file = String::new();
     let mut out: Vec<LineCost> = Vec::new();
     let mut last_line = 0u32;
+    let mut summary_ir: Option<u64> = None;
+    // Set by `calls=`, consumed and cleared by the very next cost line — which
+    // is that call arc's INCLUSIVE cost, not self-cost, and must not be summed.
+    let mut pending_call_arc = false;
     for raw in body.lines() {
         let l = raw.trim();
         if let Some(ev) = l.strip_prefix("events:") {
             events = ev.split_whitespace().map(|s| s.to_string()).collect();
             ir_idx = events.iter().position(|e| e == "Ir");
             dr_idx = events.iter().position(|e| e == "Dr");
+        } else if l.starts_with("calls=") {
+            pending_call_arc = true;
+        } else if let Some(rest) = l
+            .strip_prefix("summary:")
+            .or_else(|| l.strip_prefix("totals:"))
+        {
+            let vals: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u64>().ok())
+                .collect();
+            summary_ir = ir_idx.and_then(|i| vals.get(i)).copied();
         } else if let Some(fl) = l.strip_prefix("fl=").or_else(|| l.strip_prefix("fi=")).or_else(|| l.strip_prefix("fe=")) {
             let fl = fl.trim();
             if let Some(rest) = fl.strip_prefix('(') {
@@ -89,6 +134,14 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
                 pos.parse().unwrap_or(0)
             };
             last_line = line;
+            // The cost line right after `calls=` is the call arc's INCLUSIVE
+            // cost — the callee's own instructions, recorded again under the
+            // callee's section. Skip it; summing it inflates the total once
+            // per ancestor call-site (11.6x on a real Rust trace).
+            if pending_call_arc {
+                pending_call_arc = false;
+                continue;
+            }
             let vals: Vec<u64> = parts.map(|v| v.parse().unwrap_or(0)).collect();
             let ir = ir_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
             let dr = dr_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
@@ -114,7 +167,7 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
         .map(|((file, line), (ir, dr))| LineCost { file, line, ir, dr })
         .collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.ir));
-    v
+    (v, summary_ir)
 }
 
 /// Sum of Ir over all lines — the denominator every per-line share is
@@ -587,7 +640,28 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 std::fs::read_to_string(&outfile).map_err(|e| format!("read {}: {e}", outfile.display()))
             }) {
                 Ok(body) => {
-                    let costs = parse_callgrind(&body);
+                    let (costs, summary) = parse_callgrind_checked(&body);
+                    // SELF-CHECK: callgrind computes its own grand total. If our
+                    // per-line sum disagrees with it, the parse is wrong and every
+                    // percentage below is wrong — REFUSE rather than print it. The
+                    // call-arc bug this catches produced an 11.6x/7.95x ASYMMETRIC
+                    // inflation that turned a true 1.178 ratio into 1.72, and looked
+                    // completely ordinary on screen.
+                    if let Some(sum) = summary {
+                        let got = total_ir(&costs);
+                        let drift = (got as f64 - sum as f64).abs() / (sum.max(1) as f64);
+                        if drift > 0.01 {
+                            println!(
+                                "\n[2 LINES] REFUSED for {name} — parsed Ir {got} disagrees with \
+                                 callgrind's own summary {sum} by {:.1}%. The per-line attribution \
+                                 is not trustworthy and no percentage from it may be quoted.",
+                                100.0 * drift
+                            );
+                            ok = false;
+                            let _ = std::fs::remove_file(&outfile);
+                            continue;
+                        }
+                    }
                     if !has_line_info(&costs) {
                         println!(
                             "\n[2 LINES] REFUSED for {name} — no line tables in the binary (built without -g?): \
@@ -756,6 +830,49 @@ pub fn selftest() -> ExitCode {
     );
     check("callgrind: sorted by Ir descending", costs.windows(2).all(|w| w[0].ir >= w[1].ir));
     check("callgrind: total Ir sums every line", total_ir(&costs) == 500 + 25 + 300 + 200 + 100);
+
+    // ---- the call-arc fixture: this parser was GREEN for months without it --
+    // FIXTURE_CALLGRIND above contains no `calls=` directive, so no assertion
+    // over it could ever have caught the inclusive-cost double-count. The bug
+    // shipped a 1.72x ratio (true: 1.178) with 18/18 selftests passing. A
+    // fixture that cannot express the defect certifies it.
+    //
+    // Shape below: `main` (self 100) calls `work` twice; `work`'s self cost is
+    // 900 total, recorded under its own fn=. The line after `calls=2` is that
+    // call's INCLUSIVE cost (900) — the SAME instructions, a second time.
+    // Correct total = 100 + 900 = 1000, which is what `summary:` says.
+    // The naive sum is 1900.
+    const FIXTURE_CALL_ARC: &str = "\
+events: Ir Dr
+fl=(1) /src/main.rs
+fn=(1) main
+10 100 0
+cfl=(2) /src/work.rs
+cfn=(2) work
+calls=2 20
+10 900 0
+fl=(2) /src/work.rs
+fn=(2) work
+20 900 0
+summary: 1000 0
+";
+    let (arc_costs, arc_summary) = parse_callgrind_checked(FIXTURE_CALL_ARC);
+    check(
+        "callgrind: the cost line after `calls=` is a call arc and is NOT summed as self-cost",
+        total_ir(&arc_costs) == 1000,
+    );
+    check(
+        "callgrind: `summary:` is parsed, so the total can be VERIFIED not trusted",
+        arc_summary == Some(1000),
+    );
+    check(
+        "callgrind: parsed total agrees with callgrind's own summary (the refuse-guard's input)",
+        arc_summary.is_some_and(|s| total_ir(&arc_costs) == s),
+    );
+    check(
+        "callgrind: work's 900 lands on work.rs ONCE, not once per call site",
+        arc_costs.iter().filter(|c| c.file == "/src/work.rs").map(|c| c.ir).sum::<u64>() == 900,
+    );
     check("callgrind: line-info guard accepts real tables", has_line_info(&costs));
     check(
         "callgrind: line-info guard refuses an opaque capture (no -g)",
