@@ -123,13 +123,39 @@ pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
                 cur_file = fl.to_string();
             }
             last_line = 0;
-        } else if !l.is_empty() && (l.starts_with(|c: char| c.is_ascii_digit()) || l.starts_with('+') || l.starts_with('*')) {
+        // A cost line begins with an instruction position: an absolute number,
+        // `+N`/`-N` relative to the previous line, or `*` (repeat).
+        //
+        // `-N` WAS MISSING and cost 18.9% of every total. Callgrind emits
+        // NEGATIVE relative positions whenever the next annotated line is
+        // BACKWARD from the previous one — which happens constantly in
+        // optimised code, where a loop body's lines are not laid out in source
+        // order. On a real libdeflate trace that was 1,560 lines carrying
+        // 142,121,037 Ir, silently dropped: parsed 610,704,481 against
+        // callgrind's own summary of 752,825,508.
+        //
+        // This bug PREDATES the call-arc fix in this function and survived it —
+        // it was found only because that fix also added the `summary:`
+        // cross-check, which REFUSED the layer and printed both numbers. The
+        // cross-check has now caught more bugs than the fix it was written to
+        // protect. Verify a parse against the file's own total; never trust it.
+        } else if !l.is_empty()
+            && (l.starts_with(|c: char| c.is_ascii_digit())
+                || l.starts_with('+')
+                || l.starts_with('-')
+                || l.starts_with('*'))
+        {
             let mut parts = l.split_whitespace();
             let pos = parts.next().unwrap_or("0");
             let line = if pos == "*" {
                 last_line
             } else if let Some(d) = pos.strip_prefix('+') {
                 last_line + d.parse::<u32>().unwrap_or(0)
+            } else if let Some(d) = pos.strip_prefix('-') {
+                // Backward relative position. Saturating: a malformed file must
+                // not panic a measurement, and line 0 is already the "unknown"
+                // sentinel everywhere else in this parser.
+                last_line.saturating_sub(d.parse::<u32>().unwrap_or(0))
             } else {
                 pos.parse().unwrap_or(0)
             };
@@ -856,6 +882,36 @@ fn=(2) work
 20 900 0
 summary: 1000 0
 ";
+    // ---- negative relative positions: 18.9% of a real trace ----------------
+    // `-N` means "N lines BACKWARD from the previous position". Optimised code
+    // emits these constantly because line order is not source order. The parser
+    // did not recognise them as cost lines AT ALL, so they were dropped.
+    // Shape below: 100, then +5 => 105, then -3 => 102, then * => 102.
+    // Correct total = 10+20+30+40 = 100, which is what `summary:` says.
+    const FIXTURE_NEG_POS: &str = "\
+events: Ir
+fl=(1) /src/loop.rs
+fn=(1) hot
+100 10
++5 20
+-3 30
+* 40
+summary: 100
+";
+    let (neg_costs, neg_summary) = parse_callgrind_checked(FIXTURE_NEG_POS);
+    check(
+        "callgrind: `-N` backward relative positions are COST LINES, not skipped",
+        total_ir(&neg_costs) == 100,
+    );
+    check(
+        "callgrind: `-N` resolves to previous_line - N (105 - 3 = 102)",
+        neg_costs.iter().any(|c| c.line == 102 && c.ir == 30 + 40),
+    );
+    check(
+        "callgrind: negative-position total agrees with the file's own summary",
+        neg_summary.is_some_and(|s| total_ir(&neg_costs) == s),
+    );
+
     let (arc_costs, arc_summary) = parse_callgrind_checked(FIXTURE_CALL_ARC);
     check(
         "callgrind: the cost line after `calls=` is a call arc and is NOT summed as self-cost",
