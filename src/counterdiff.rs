@@ -636,6 +636,12 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
                 cfg.mask = need(i, "--core/--mask")?.clone();
                 i += 2;
             }
+            // Consumed by selfver::enforce, which scans the FULL argv before
+            // subcommand dispatch. Without this arm the parser rejects it as
+            // unknown and prints usage, so a pinned reproduction is impossible
+            // for this command while `board` and `candidates` both allow it
+            // (board.rs:326, candidates.rs:279 — same one-line arm).
+            "--no-self-update" => {}
             "--compress" => {
                 cfg.compress = true;
             }
