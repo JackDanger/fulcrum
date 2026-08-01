@@ -154,13 +154,16 @@ pub const COMMANDS: &[Cmd] = &[
         )),
         "fulcrum board --wall <that --out DIR>   (rank the failing cells)",
     ),
-    gated("goal", C(
-        "board goal",
-        "Does the WHOLE goal surface pass, or was the scope narrowed?",
-        "--spec goal.json --ours-bin PATH",
-        "fulcrum board goal join --size-census /tmp/board-size --wall-census /tmp/board-wall --spec goal.json --ours-bin ~/www/gzippy/target/release/gzippy",
-        Class::Analysis,
-    )),
+    then(
+        gated("goal", C(
+            "board goal",
+            "Does the WHOLE goal surface pass, or was the scope narrowed?",
+            "--spec goal.json --ours-bin PATH",
+            "fulcrum board goal join --size-census /tmp/board-size --wall-census /tmp/board-wall --spec goal.json --ours-bin ~/www/gzippy/target/release/gzippy",
+            Class::Analysis,
+        )),
+        "fulcrum board --size DIR --wall DIR   (a narrowed scope is INCOMPLETE, never a pass — widen the grid and re-run)",
+    ),
     gated("why", C(
         "why",
         "Why does this cell fail? What is the MECHANISM, vendor-diffed?",
@@ -214,27 +217,36 @@ pub const COMMANDS: &[Cmd] = &[
         "pass two sizes of the same data to get the SCALING verdict (allocations that grow with input = per-block allocation)",
     ),
     // ---- the box -----------------------------------------------------------
-    gated("freeze", C(
-        "freeze",
-        "How do I make this box quiet enough to trust a wall number?",
-        "a verb: acquire|release|run|status|selftest",
-        "fulcrum freeze run --ttl-s 600 -- fulcrum board wall --ours '…' --out /tmp/board-wall",
-        Class::Exempt,
-    )),
-    acts_on_help(C(
-        "freeze acquire",
-        "Pin the governor and stop the noisy processes (prefer `freeze run`, which cannot orphan).",
-        "nothing (--ttl-s recommended)",
-        "fulcrum freeze acquire --ttl-s 600",
-        Class::Exempt,
-    )),
-    acts_on_help(C(
-        "freeze release",
-        "Undo a freeze — SIGCONT everything, restore boost/governor.",
-        "nothing",
-        "fulcrum freeze release",
-        Class::Exempt,
-    )),
+    then(
+        gated("freeze", C(
+            "freeze",
+            "How do I make this box quiet enough to trust a wall number?",
+            "a verb: acquire|release|run|status|selftest",
+            "fulcrum freeze run --ttl-s 600 -- fulcrum board wall --ours '…' --out /tmp/board-wall",
+            Class::Exempt,
+        )),
+        "fulcrum freeze run --ttl-s 600 -- <the measurement>   (the only form that cannot orphan a stopped process)",
+    ),
+    then(
+        acts_on_help(C(
+            "freeze acquire",
+            "Pin the governor and stop the noisy processes (prefer `freeze run`, which cannot orphan).",
+            "nothing (--ttl-s recommended)",
+            "fulcrum freeze acquire --ttl-s 600",
+            Class::Exempt,
+        )),
+        "fulcrum freeze release   (or use `fulcrum freeze run --`, which releases on every exit path)",
+    ),
+    then(
+        acts_on_help(C(
+            "freeze release",
+            "Undo a freeze — SIGCONT everything, restore boost/governor.",
+            "nothing",
+            "fulcrum freeze release",
+            Class::Exempt,
+        )),
+        "fulcrum freeze status   (verify nothing is left stopped — an orphaned SIGSTOP is the worse failure)",
+    ),
     acts_on_help(C(
         "freeze run",
         "Run one command under a freeze that is released on EVERY exit path.",
@@ -242,12 +254,15 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum freeze run --ttl-s 900 -- fulcrum ab paired --a-cmd '…' --b-cmd '…'",
         Class::Exempt,
     )),
-    C(
-        "freeze status",
-        "Is a freeze held right now, and by what, and for how long?",
-        "nothing",
-        "fulcrum freeze status",
-        Class::Exempt,
+    then(
+        C(
+            "freeze status",
+            "Is a freeze held right now, and by what, and for how long?",
+            "nothing",
+            "fulcrum freeze status",
+            Class::Exempt,
+        ),
+        "fulcrum freeze release   (if one is held and you are done)",
     ),
     // ---- A/B ---------------------------------------------------------------
     C(
@@ -257,34 +272,46 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum ab paired --a-cmd '…' --b-cmd '…' --n 15",
         Class::Measurement,
     ),
-    gated("ab paired", C(
-        "ab paired",
-        "Is A really faster than B? (interleaved paired-Δ with an A/A certificate)",
-        "--a-cmd, --b-cmd",
-        "fulcrum ab paired --a-cmd 'A -6 -c in > /dev/null' --b-cmd 'B -6 -c in > /dev/null' --n 15",
-        Class::Measurement,
-    )),
-    gated("ab matrix", C(
-        "ab matrix",
-        "Does the A/B verdict hold across the corpus x thread-count grid?",
-        "--a-cmd, --b-cmd",
-        "fulcrum ab matrix --a-cmd '…' --b-cmd '…' --corpus ~/www/gzippy-bench/corpus/silesia.tar --threads 1,4",
-        Class::Measurement,
-    )),
-    gated("ab ablate", C(
-        "ab ablate",
-        "Which PART of my change paid? (builds both arms from refs; refuses a NO-OP control)",
-        "--repo, --base REF, --after REF, --class name=FILE",
-        "fulcrum ab ablate --repo ~/www/gzippy --base origin/main --after my-branch --class matchfinder=src/compress/hc.rs",
-        Class::Measurement,
-    )),
-    gated("ab bisect", C(
-        "ab bisect",
-        "Which commit in this chain introduced the regression?",
-        "--run '<tmpl with {bin} {threads} {corpus}>'",
-        "fulcrum ab bisect --repo ~/www/gzippy --run '{bin} -6 -p {threads} -c {corpus} > /dev/null' --refs a,b,c",
-        Class::Measurement,
-    )),
+    then(
+        gated("ab paired", C(
+            "ab paired",
+            "Is A really faster than B? (interleaved paired-Δ with an A/A certificate)",
+            "--a-cmd, --b-cmd",
+            "fulcrum ab paired --a-cmd 'A -6 -c in > /dev/null' --b-cmd 'B -6 -c in > /dev/null' --n 15",
+            Class::Measurement,
+        )),
+        "fulcrum try <ref> --repo ~/www/gzippy …   (a paired win is not a ship decision; the promotion rule has more clauses)",
+    ),
+    then(
+        gated("ab matrix", C(
+            "ab matrix",
+            "Does the A/B verdict hold across the corpus x thread-count grid?",
+            "--a-cmd, --b-cmd",
+            "fulcrum ab matrix --a-cmd '…' --b-cmd '…' --corpus ~/www/gzippy-bench/corpus/silesia.tar --threads 1,4",
+            Class::Measurement,
+        )),
+        "fulcrum try <ref> --repo ~/www/gzippy --levels 2,6,9   (a verdict at one level generalises to none)",
+    ),
+    then(
+        gated("ab ablate", C(
+            "ab ablate",
+            "Which PART of my change paid? (builds both arms from refs; refuses a NO-OP control)",
+            "--repo, --base REF, --after REF, --class name=FILE",
+            "fulcrum ab ablate --repo ~/www/gzippy --base origin/main --after my-branch --class matchfinder=src/compress/hc.rs",
+            Class::Measurement,
+        )),
+        "fulcrum try <ref> --repo ~/www/gzippy …   (turn the surviving class into SHIP / NO-SHIP)",
+    ),
+    then(
+        gated("ab bisect", C(
+            "ab bisect",
+            "Which commit in this chain introduced the regression?",
+            "--run '<tmpl with {bin} {threads} {corpus}>'",
+            "fulcrum ab bisect --repo ~/www/gzippy --run '{bin} -6 -p {threads} -c {corpus} > /dev/null' --refs a,b,c",
+            Class::Measurement,
+        )),
+        "fulcrum why <cell> --repo ~/www/gzippy   (the named transition still needs a mechanism)",
+    ),
     // ---- profile -----------------------------------------------------------
     C(
         "profile",
@@ -293,75 +320,105 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum profile counters --a-cmd '…' --b-cmd '…'",
         Class::Measurement,
     ),
-    C(
-        "profile counters",
-        "Where does the hardware time go vs the rival, with threads MATCHED?",
-        "--a-cmd, --b-cmd",
-        "fulcrum profile counters --a-cmd '…' --b-cmd '…'",
-        Class::Measurement,
+    then(
+        C(
+            "profile counters",
+            "Where does the hardware time go vs the rival, with threads MATCHED?",
+            "--a-cmd, --b-cmd",
+            "fulcrum profile counters --a-cmd '…' --b-cmd '…'",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (counters LOCATE; only the paired wall decides)",
     ),
-    C(
-        "profile insn",
-        "Where do the instructions go? (closed accounting ledger from perf stat+report)",
-        "--a-stat FILE, --a-report FILE",
-        "fulcrum profile insn --a-stat a.stat --a-report a.report",
-        Class::Measurement,
+    then(
+        C(
+            "profile insn",
+            "Where do the instructions go? (closed accounting ledger from perf stat+report)",
+            "--a-stat FILE, --a-report FILE",
+            "fulcrum profile insn --a-stat a.stat --a-report a.report",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (Ir has been cut 1.77% while the wall got 9.9% WORSE)",
     ),
-    C(
-        "profile insn-cat",
-        "Which instruction CATEGORIES carry the excess?",
-        "a perf report capture",
-        "fulcrum profile insn-cat --a-report a.report",
-        Class::Measurement,
+    then(
+        C(
+            "profile insn-cat",
+            "Which instruction CATEGORIES carry the excess?",
+            "a perf report capture",
+            "fulcrum profile insn-cat --a-report a.report",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (confirm on the wall before quoting it)",
     ),
-    C(
-        "profile topdown",
-        "Is the gap frontend, backend, bad speculation or retiring? (TMA)",
-        "--a-stat FILE",
-        "fulcrum profile topdown --a-stat a.stat --b-stat b.stat",
-        Class::Measurement,
+    then(
+        C(
+            "profile topdown",
+            "Is the gap frontend, backend, bad speculation or retiring? (TMA)",
+            "--a-stat FILE",
+            "fulcrum profile topdown --a-stat a.stat --b-stat b.stat",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (confirm on the wall before quoting it)",
     ),
-    C(
-        "profile excess",
-        "Which region is EXCESS over intrinsic work, per region?",
-        "<artifact.json>",
-        "fulcrum profile excess artifact.json",
-        Class::Measurement,
+    then(
+        C(
+            "profile excess",
+            "Which region is EXCESS over intrinsic work, per region?",
+            "<artifact.json>",
+            "fulcrum profile excess artifact.json",
+            Class::Measurement,
+        ),
+        "fulcrum why <cell> --repo ~/www/gzippy   (excess is located; the mechanism still needs the vendor diff)",
     ),
-    gated("profile uarch", C(
-        "profile uarch",
-        "What do the raw microarch counters say, and how do two boxes differ?",
-        "a subcommand: run|cross|selftest",
-        "fulcrum profile uarch run -- ~/www/gzippy/target/release/gzippy -6 -c in",
-        Class::Measurement,
-    )),
-    C(
-        "profile chainlat",
-        "Is this loop latency-bound on a recurrence? (llvm-mca chain analysis)",
-        "an object/asm input",
-        "fulcrum profile chainlat --obj target/release/gzippy --symbol hc_find",
-        Class::Measurement,
+    then(
+        gated("profile uarch", C(
+            "profile uarch",
+            "What do the raw microarch counters say, and how do two boxes differ?",
+            "a subcommand: run|cross|selftest",
+            "fulcrum profile uarch run -- ~/www/gzippy/target/release/gzippy -6 -c in",
+            Class::Measurement,
+        )),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (confirm on the wall before quoting it)",
     ),
-    C(
-        "profile classhist",
-        "Which instruction CLASSES execute most, ours vs theirs? (x86-64)",
-        "a perf capture",
-        "fulcrum profile classhist --a-report a.report --b-report b.report",
-        Class::Measurement,
+    then(
+        C(
+            "profile chainlat",
+            "Is this loop latency-bound on a recurrence? (llvm-mca chain analysis)",
+            "an object/asm input",
+            "fulcrum profile chainlat --obj target/release/gzippy --symbol hc_find",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (a latency model predicts nothing until the wall agrees)",
     ),
-    gated("profile rss (memprofile)", C(
-        "profile rss",
-        "How much memory does it hold, and how does that move with threads?",
-        "-- ARGV…",
-        "fulcrum profile rss -- ~/www/gzippy/target/release/gzippy -6 -p 16 -c in",
-        Class::Measurement,
-    )),
-    C(
-        "profile phases",
-        "How does the wall split across the phases of a phase-timing build?",
-        "a phase-timing gzippy build",
-        "fulcrum profile phases --runs 5 -- ~/www/gzippy/target/release/gzippy -6 -c in",
-        Class::Measurement,
+    then(
+        C(
+            "profile classhist",
+            "Which instruction CLASSES execute most, ours vs theirs? (x86-64)",
+            "a perf capture",
+            "fulcrum profile classhist --a-report a.report --b-report b.report",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (confirm on the wall before quoting it)",
+    ),
+    then(
+        gated("profile rss (memprofile)", C(
+            "profile rss",
+            "How much memory does it hold, and how does that move with threads?",
+            "-- ARGV…",
+            "fulcrum profile rss -- ~/www/gzippy/target/release/gzippy -6 -p 16 -c in",
+            Class::Measurement,
+        )),
+        "fulcrum structcensus --ours '…' --rival name=CMD --corpus FILE   (RSS is its own scoreboard; allocation COUNT and its scaling are the falsifier)",
+    ),
+    then(
+        C(
+            "profile phases",
+            "How does the wall split across the phases of a phase-timing build?",
+            "a phase-timing gzippy build",
+            "fulcrum profile phases --runs 5 -- ~/www/gzippy/target/release/gzippy -6 -c in",
+            Class::Measurement,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (confirm on the wall before quoting it)",
     ),
     // ---- trace (T>1) --------------------------------------------------------
     C(
@@ -371,119 +428,167 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum trace occupancy trace.json",
         Class::Analysis,
     ),
-    C(
-        "trace critpath",
-        "Which span is on the critical path of this parallel run?",
-        "<trace.json>",
-        "fulcrum trace critpath trace.json --config gzippy",
-        Class::Analysis,
+    then(
+        C(
+            "trace critpath",
+            "Which span is on the critical path of this parallel run?",
+            "<trace.json>",
+            "fulcrum trace critpath trace.json --config gzippy",
+            Class::Analysis,
+        ),
+        "fulcrum trace causal trace.json   (being ON the critical path is not the same as MOVING the wall)",
     ),
-    C(
-        "trace flow",
-        "How does work FLOW between the threads over time?",
-        "<trace.json>",
-        "fulcrum trace flow trace.json --config gzippy",
-        Class::Analysis,
+    then(
+        C(
+            "trace flow",
+            "How does work FLOW between the threads over time?",
+            "<trace.json>",
+            "fulcrum trace flow trace.json --config gzippy",
+            Class::Analysis,
+        ),
+        "fulcrum trace occupancy trace.json   (name the starved thread, not the busy one)",
     ),
-    C(
-        "trace causal",
-        "If I sped up this region, how much wall would actually move? (virtual speedup)",
-        "<trace.json>",
-        "fulcrum trace causal trace.json --config gzippy",
-        Class::Analysis,
+    then(
+        C(
+            "trace causal",
+            "If I sped up this region, how much wall would actually move? (virtual speedup)",
+            "<trace.json>",
+            "fulcrum trace causal trace.json --config gzippy",
+            Class::Analysis,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (a virtual speedup is a prediction; the wall is the verdict)",
     ),
-    C(
-        "trace consumer",
-        "Is the consumer thread the bottleneck?",
-        "<trace.json>",
-        "fulcrum trace consumer trace.json",
-        Class::Analysis,
-    ),
-    C(
-        "trace occupancy",
-        "Is any thread ever STARVED, and for how long?",
-        "<trace.json>",
+    then(
+        C(
+            "trace consumer",
+            "Is the consumer thread the bottleneck?",
+            "<trace.json>",
+            "fulcrum trace consumer trace.json",
+            Class::Analysis,
+        ),
         "fulcrum trace occupancy trace.json",
-        Class::Analysis,
     ),
-    C(
-        "trace spans",
-        "What are the heaviest spans in this trace?",
-        "<trace.json>",
-        "fulcrum trace spans trace.json --config gzippy --top 20",
-        Class::Analysis,
+    then(
+        C(
+            "trace occupancy",
+            "Is any thread ever STARVED, and for how long?",
+            "<trace.json>",
+            "fulcrum trace occupancy trace.json",
+            Class::Analysis,
+        ),
+        "fulcrum trace dispatchgap events.jsonl   (attribute the starvation to a dispatcher, not a guess)",
     ),
-    C(
-        "trace schedule",
-        "Were the reads and writes scheduled in the right order?",
-        "<trace.json>",
-        "fulcrum trace schedule trace.json",
-        Class::Analysis,
+    then(
+        C(
+            "trace spans",
+            "What are the heaviest spans in this trace?",
+            "<trace.json>",
+            "fulcrum trace spans trace.json --config gzippy --top 20",
+            Class::Analysis,
+        ),
+        "fulcrum trace critpath trace.json --config gzippy   (the heaviest span is often not the blocking one)",
     ),
-    C(
-        "trace scaling",
-        "Why does it stop scaling at T threads?",
-        "--at T:trace.json",
-        "fulcrum trace scaling --at 4:t4.json --at 16:t16.json --config gzippy",
-        Class::Analysis,
+    then(
+        C(
+            "trace schedule",
+            "Were the reads and writes scheduled in the right order?",
+            "<trace.json>",
+            "fulcrum trace schedule trace.json",
+            Class::Analysis,
+        ),
+        "fulcrum trace occupancy trace.json",
     ),
-    C(
-        "trace decompose",
-        "What fraction of the wall is serial, parallel, and overhead?",
-        "<trace.json>",
-        "fulcrum trace decompose trace.json",
-        Class::Analysis,
+    then(
+        C(
+            "trace scaling",
+            "Why does it stop scaling at T threads?",
+            "--at T:trace.json",
+            "fulcrum trace scaling --at 4:t4.json --at 16:t16.json --config gzippy",
+            Class::Analysis,
+        ),
+        "fulcrum board --wall DIR   (measure at the coordinate where the cells FAIL, not where the trace is convenient)",
     ),
-    C(
-        "trace locate",
-        "Which region holds enough wall to be worth optimising at all?",
-        "<trace.json> [--wall-ms N]",
-        "fulcrum trace locate trace.json --wall-ms 350",
-        Class::Analysis,
+    then(
+        C(
+            "trace decompose",
+            "What fraction of the wall is serial, parallel, and overhead?",
+            "<trace.json>",
+            "fulcrum trace decompose trace.json",
+            Class::Analysis,
+        ),
+        "fulcrum trace causal trace.json",
     ),
-    C(
-        "trace model",
-        "What does the analytic model predict for this thread count?",
-        "<trace.json>",
-        "fulcrum trace model trace.json --workers 8",
-        Class::Analysis,
+    then(
+        C(
+            "trace locate",
+            "Which region holds enough wall to be worth optimising at all?",
+            "<trace.json> [--wall-ms N]",
+            "fulcrum trace locate trace.json --wall-ms 350",
+            Class::Analysis,
+        ),
+        "fulcrum why <cell> --repo ~/www/gzippy   (a region with wall in it is not yet a mechanism)",
     ),
-    C(
-        "trace vs",
-        "Where do these two traces spend their time differently?",
-        "<A-trace.json> <B-trace.json>",
-        "fulcrum trace vs a.json b.json --labels ours,rival",
-        Class::Analysis,
+    then(
+        C(
+            "trace model",
+            "What does the analytic model predict for this thread count?",
+            "<trace.json>",
+            "fulcrum trace model trace.json --workers 8",
+            Class::Analysis,
+        ),
+        "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'",
     ),
-    C(
-        "trace vs-sweep",
-        "Where does the two-trace gap open up as threads rise?",
-        "--at T:a.json:b.json",
-        "fulcrum trace vs-sweep --at 4:a4.json:b4.json --at 16:a16.json:b16.json",
-        Class::Analysis,
+    then(
+        C(
+            "trace vs",
+            "Where do these two traces spend their time differently?",
+            "<A-trace.json> <B-trace.json>",
+            "fulcrum trace vs a.json b.json --labels ours,rival",
+            Class::Analysis,
+        ),
+        "fulcrum trace scaling --at T:a.json --at T:b.json",
     ),
-    gated("trace dispatchgap", C(
-        "trace dispatchgap",
-        "Which worker waited on dispatch, and for how long?",
-        "<event-log.jsonl>",
-        "fulcrum trace dispatchgap events.jsonl --workers 8",
-        Class::Analysis,
-    )),
+    then(
+        C(
+            "trace vs-sweep",
+            "Where does the two-trace gap open up as threads rise?",
+            "--at T:a.json:b.json",
+            "fulcrum trace vs-sweep --at 4:a4.json:b4.json --at 16:a16.json:b16.json",
+            Class::Analysis,
+        ),
+        "fulcrum board --wall DIR   (a trace gap only matters where a cell fails)",
+    ),
+    then(
+        gated("trace dispatchgap", C(
+            "trace dispatchgap",
+            "Which worker waited on dispatch, and for how long?",
+            "<event-log.jsonl>",
+            "fulcrum trace dispatchgap events.jsonl --workers 8",
+            Class::Analysis,
+        )),
+        "fulcrum trace occupancy trace.json",
+    ),
     // ---- anatomy ------------------------------------------------------------
-    C(
-        "anatomy",
-        "What is the STRUCTURE of our deflate output vs theirs — tokens, matches, literals, header bits?",
-        "two .gz files or a compare spec",
-        "fulcrum anatomy --ours ours.gz --rival rival.gz --input ~/www/gzippy-bench/corpus/silesia.tar",
-        Class::Measurement,
+    then(
+        C(
+            "anatomy",
+            "What is the STRUCTURE of our deflate output vs theirs — tokens, matches, literals, header bits?",
+            "two .gz files or a compare spec",
+            "fulcrum anatomy --ours ours.gz --rival rival.gz --input ~/www/gzippy-bench/corpus/silesia.tar",
+            Class::Measurement,
+        ),
+        "fulcrum why <cell> --repo ~/www/gzippy   (this diff plus three more layers, run for you)",
     ),
-    gated("anatomy ratio", C(
-        "anatomy ratio",
-        "How much ratio is left on the table vs the optimal parse frontier?",
-        "an input file",
-        "fulcrum anatomy ratio --input ~/www/gzippy-bench/corpus/silesia.tar --level 9",
-        Class::Measurement,
-    )),
+    then(
+        gated("anatomy ratio", C(
+            "anatomy ratio",
+            "How much ratio is left on the table vs the optimal parse frontier?",
+            "an input file",
+            "fulcrum anatomy ratio --input ~/www/gzippy-bench/corpus/silesia.tar --level 9",
+            Class::Measurement,
+        )),
+        "fulcrum candidates <cell> --repo ~/www/gzippy   (a ratio gap is an algorithmic question)",
+    ),
     then(
         gated("anatomy explain", C(
             "anatomy explain",
@@ -502,12 +607,15 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum bank finding consult",
         Class::Analysis,
     ),
-    C(
-        "bank finding",
-        "What has already been established, with a citation I can quote?",
-        "an action: add|cite|consult|list",
-        "fulcrum bank finding consult",
-        Class::Analysis,
+    then(
+        C(
+            "bank finding",
+            "What has already been established, with a citation I can quote?",
+            "an action: add|cite|consult|list",
+            "fulcrum bank finding consult",
+            Class::Analysis,
+        ),
+        "fulcrum candidates <cell> --repo ~/www/gzippy   (a prior falsification is BINDING until a NEW mechanism is named)",
     ),
     C(
         "bank ledger",
@@ -544,19 +652,25 @@ pub const COMMANDS: &[Cmd] = &[
         ),
         "run this on EVERY box before quoting a number from it — version skew is invisible until something fails",
     ),
-    gated("guide", C(
-        "guide",
-        "I have a question — which command answers it?",
-        "nothing; or words to search",
-        "fulcrum guide why does this cell fail",
-        Class::Exempt,
-    )),
-    C(
-        "commands",
-        "What is the whole capability surface, machine-readably?",
-        "nothing; [--json]",
-        "fulcrum commands --json",
-        Class::Exempt,
+    then(
+        gated("guide", C(
+            "guide",
+            "I have a question — which command answers it?",
+            "nothing; or words to search",
+            "fulcrum guide why does this cell fail",
+            Class::Exempt,
+        )),
+        "fulcrum commands --json   (the same surface, machine-readable)",
+    ),
+    then(
+        C(
+            "commands",
+            "What is the whole capability surface, machine-readably?",
+            "nothing; [--json]",
+            "fulcrum commands --json",
+            Class::Exempt,
+        ),
+        "fulcrum guide <words>   (search by the question instead of the name)",
     ),
 ];
 
@@ -1038,6 +1152,21 @@ pub fn selftest() -> ExitCode {
             format!("registry: `{}` states a question and required args", c.path),
             !c.question.is_empty() && !c.required.is_empty(),
         );
+        if let Some(n) = c.next {
+            // A next action that names a command that does not exist is worse
+            // than none: it is a dead end presented as the way forward.
+            if let Some(rest) = n.strip_prefix("fulcrum ") {
+                let argv: Vec<String> = rest
+                    .split_whitespace()
+                    .take_while(|t| !t.starts_with('-') && !t.starts_with('<'))
+                    .map(|s| s.to_string())
+                    .collect();
+                check(
+                    format!("registry: `{}` NEXT ACTION names a real command", c.path),
+                    !argv.is_empty() && lookup(&argv).is_some(),
+                );
+            }
+        }
         if let Some(g) = c.gate0 {
             check(
                 format!("registry: `{}` advertises a Gate-0 that EXISTS (`{g}`)", c.path),
