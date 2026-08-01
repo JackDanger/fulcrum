@@ -134,6 +134,127 @@ pub fn header() -> String {
 // `fulcrum version`
 // ---------------------------------------------------------------------------
 
+/// Every `fulcrum` on PATH, in PATH order, plus the binary actually running.
+///
+/// THE SCAR: a box carried a stale `/usr/local/bin/fulcrum` that predated the
+/// `version` subcommand entirely. `fulcrum <anything>` on that box ran the old
+/// binary, the campaign guard's `fulcrum version --json` failed with an
+/// unrelated-looking error, and the operator went back to hand-rolled scripts.
+/// Baked provenance answers "which commit is THIS binary"; it cannot answer
+/// "which binary will the next `fulcrum` command actually be" — and that is the
+/// question version skew is hiding behind.
+///
+/// Deliberately does NOT execute the candidates: a shadowing binary may be old
+/// enough to lack `version`, may probe the network on startup, or may hang. It
+/// reports what can be observed without running anything, and names the command
+/// that identifies each one.
+pub fn path_installs() -> Vec<(PathBuf, bool)> {
+    let running = std::env::current_exe().ok();
+    let mut out = Vec::new();
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let cand = Path::new(dir).join("fulcrum");
+        if !cand.is_file() {
+            continue;
+        }
+        let canon = std::fs::canonicalize(&cand).unwrap_or_else(|_| cand.clone());
+        let is_running = running
+            .as_ref()
+            .and_then(|r| std::fs::canonicalize(r).ok())
+            .map(|r| r == canon)
+            .unwrap_or(false);
+        if out.iter().any(|(p, _): &(PathBuf, bool)| *p == cand) {
+            continue;
+        }
+        out.push((cand, is_running));
+    }
+    out
+}
+
+/// Gate-0 for the provenance surface: the PATH-shadow detector must SEE a
+/// shadowing binary and must recognise the running one. A detector that quietly
+/// finds nothing is indistinguishable from a clean box, which is the exact
+/// failure it exists to prevent.
+pub fn selftest() -> ExitCode {
+    let pass = std::cell::Cell::new(0u32);
+    let fail = std::cell::Cell::new(0u32);
+    let check = |name: &str, ok: bool| {
+        if ok {
+            pass.set(pass.get() + 1);
+            println!("  PASS {name}");
+        } else {
+            fail.set(fail.get() + 1);
+            println!("  FAIL {name}");
+        }
+    };
+
+    let tmp = std::env::temp_dir().join(format!("fulcrum-selfver-st-{}", std::process::id()));
+    let shadow_dir = tmp.join("bin");
+    let empty_dir = tmp.join("empty");
+    let dir_named_fulcrum = tmp.join("adir");
+    let _ = std::fs::create_dir_all(&shadow_dir);
+    let _ = std::fs::create_dir_all(&empty_dir);
+    let _ = std::fs::create_dir_all(dir_named_fulcrum.join("fulcrum"));
+    let shadow = shadow_dir.join("fulcrum");
+    let _ = std::fs::write(&shadow, b"#!/bin/sh\nexit 0\n");
+
+    let saved = std::env::var("PATH").unwrap_or_default();
+    let running_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    // 1. A stale binary earlier on PATH is SEEN, and flagged as not-the-running-one.
+    std::env::set_var("PATH", format!("{}:{}", shadow_dir.display(), empty_dir.display()));
+    let found = path_installs();
+    check(
+        "PATH: a shadowing fulcrum is found",
+        found.iter().any(|(p, _)| *p == shadow),
+    );
+    check(
+        "PATH: the shadow is NOT reported as the running binary",
+        found.iter().all(|(_, r)| !*r),
+    );
+    check(
+        "PATH: a directory with no fulcrum contributes nothing",
+        found.len() == 1,
+    );
+
+    // 2. A DIRECTORY named `fulcrum` is not an installation.
+    std::env::set_var("PATH", format!("{}", dir_named_fulcrum.display()));
+    check(
+        "PATH: a directory named `fulcrum` is not counted as an install",
+        path_installs().is_empty(),
+    );
+
+    // 3. The running binary's own dir is recognised, and duplicate PATH
+    //    entries do not produce duplicate rows.
+    if let Some(rd) = running_dir {
+        std::env::set_var("PATH", format!("{}:{}", rd.display(), rd.display()));
+        let found = path_installs();
+        check(
+            "PATH: the running binary's own directory is recognised as the running one",
+            found.len() == 1 && found[0].1,
+        );
+    } else {
+        check("PATH: running binary locatable", false);
+    }
+
+    std::env::set_var("PATH", saved);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    println!(
+        "SELFVER_SELFTEST={} pass={} fail={}",
+        if fail.get() == 0 { "PASS" } else { "FAIL" },
+        pass.get(),
+        fail.get()
+    );
+    if fail.get() == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 pub fn cmd_version(args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let expect = args
@@ -151,6 +272,13 @@ pub fn cmd_version(args: &[String]) -> ExitCode {
                 "built": fmt_build_time(),
                 "origin": ORIGIN,
                 "src_dir": SRC_DIR,
+                "running": std::env::current_exe().ok().map(|p| p.display().to_string()),
+                "path_installs": path_installs()
+                    .iter()
+                    .map(|(p, r)| serde_json::json!({"path": p.display().to_string(), "running": r}))
+                    .collect::<Vec<_>>(),
+                "shadowed": !path_installs().is_empty()
+                    && !path_installs().iter().any(|(_, r)| *r),
             })
         );
     } else {
@@ -159,6 +287,29 @@ pub fn cmd_version(args: &[String]) -> ExitCode {
         println!("  built  : {}", fmt_build_time());
         println!("  origin : {ORIGIN}");
         println!("  source : {SRC_DIR}");
+        if let Ok(exe) = std::env::current_exe() {
+            println!("  running: {}", exe.display());
+        }
+        let installs = path_installs();
+        if !installs.is_empty() {
+            println!("  on PATH:");
+            for (p, running) in &installs {
+                println!(
+                    "    {}{}",
+                    p.display(),
+                    if *running { "   <- the one running" } else { "" }
+                );
+            }
+            if !installs.iter().any(|(_, r)| *r) {
+                println!(
+                    "  WARNING: a DIFFERENT fulcrum shadows this one on PATH. Typing `fulcrum`\n\
+                     \x20         runs {} — identify it with `{} version` before\n\
+                     \x20         quoting any number from a command you typed as `fulcrum`.",
+                    installs[0].0.display(),
+                    installs[0].0.display()
+                );
+            }
+        }
     }
     if let Some(want) = expect {
         let want = want.trim();

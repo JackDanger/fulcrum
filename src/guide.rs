@@ -643,13 +643,13 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum selftest invariants   (the rules this binary ENFORCES, not the ones we remember)",
     ),
     then(
-        C(
+        gated("version", C(
             "version",
-            "Which binary is this, and is it the one that ships?",
+            "Which binary is this, is it the one that ships, and is another one shadowing it on PATH?",
             "nothing; [--json] [--expect SHA]",
             "fulcrum version --expect $(git -C ~/www/fulcrum rev-parse origin/main)",
             Class::Exempt,
-        ),
+        )),
         "run this on EVERY box before quoting a number from it — version skew is invisible until something fails",
     ),
     then(
