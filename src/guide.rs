@@ -901,6 +901,37 @@ pub fn is_help_request(args: &[String]) -> bool {
     args.iter().any(|a| a == "--help" || a == "-h" || a == "help")
 }
 
+/// After the registry entry is printed, WHAT may be invoked to add the
+/// command's own detailed usage — which is not always the argv that was typed.
+///
+/// * A path that would ACT on `--help` ([`Cmd::help_acts`]) delegates to its
+///   FAMILY's usage instead of its own verb.
+/// * Any argv naming a Gate-0 delegates to something that cannot run one. A
+///   Gate-0 is minutes of measurement: `fulcrum ab selftest --help` ran the
+///   whole A/B gate battery, and `fulcrum selftest --help` ran EVERY gate on
+///   the box, when all that was asked was what the command is.
+/// * Everything else delegates the argv as typed.
+pub fn help_delegation(entry: &Cmd, args: &[String]) -> Vec<String> {
+    let family = entry
+        .path
+        .split_whitespace()
+        .next()
+        .unwrap_or(entry.path)
+        .to_string();
+    if entry.help_acts {
+        return vec![family];
+    }
+    if args.first().map(|s| s.as_str()) == Some("selftest") {
+        // `selftest --help` is handled inside the command and is safe; a NAMED
+        // gate (`selftest guide --help`) would run that gate.
+        return vec!["selftest".to_string(), "--help".to_string()];
+    }
+    if args.iter().any(|a| a == "selftest") {
+        return vec![family];
+    }
+    args.to_vec()
+}
+
 /// Render one registry entry the way `--help` shows it.
 pub fn render_cmd(c: &Cmd) -> String {
     let mut s = String::new();
@@ -1063,7 +1094,8 @@ pub fn cmd_guide(args: &[String]) -> ExitCode {
         .map(|it| (score(it, &words), it))
         .filter(|(n, _)| *n > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    // Highest score first; ties keep registry order (most-needed intents lead).
+    scored.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
 
     if scored.is_empty() {
         println!(
@@ -1219,6 +1251,31 @@ pub fn selftest() -> ExitCode {
         check(
             "lookup: `board --size …` resolves to `board`".to_string(),
             lookup(&argv).map(|c| c.path) == Some("board"),
+        );
+        let ab = lookup(&["ab".to_string()]).expect("ab is registered");
+        check(
+            "help: `ab selftest --help` falls back to the family usage, never the Gate-0".to_string(),
+            help_delegation(ab, &["ab".into(), "selftest".into(), "--help".into()]) == vec!["ab".to_string()],
+        );
+        check(
+            "help: an ordinary path delegates the argv as typed".to_string(),
+            help_delegation(ab, &["ab".into(), "--help".into()])
+                == vec!["ab".to_string(), "--help".to_string()],
+        );
+        let st = lookup(&["selftest".to_string()]).expect("selftest is registered");
+        check(
+            "help: `selftest <gate> --help` is rewritten to `selftest --help` — it runs NO gate".to_string(),
+            help_delegation(st, &["selftest".into(), "guide".into(), "--help".into()])
+                == vec!["selftest".to_string(), "--help".to_string()],
+        );
+        check(
+            "help: a path that would ACT on --help delegates to its family instead".to_string(),
+            lookup(&["freeze".to_string(), "acquire".to_string()])
+                .map(|c| {
+                    help_delegation(c, &["freeze".into(), "acquire".into(), "--help".into()])
+                        == vec!["freeze".to_string()]
+                })
+                .unwrap_or(false),
         );
         check(
             "is_help_request: bare --help/-h/help only".to_string(),

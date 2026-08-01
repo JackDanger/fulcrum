@@ -2666,14 +2666,11 @@ fn main() -> ExitCode {
         if let Some(e) = entry {
             print!("{}", fulcrum::guide::render_cmd(e));
             println!();
-            if e.help_acts {
-                // Delegating the verb would DO the thing. Show the family's
-                // usage instead.
-                let family = e.path.split_whitespace().next().unwrap_or(e.path);
-                let _ = dispatch(family, &[]);
-            } else {
-                let _ = dispatch(&sub, rest);
-            }
+            // What may safely be invoked for the command's own detailed usage
+            // is not always the argv that was typed: freeze verbs would act,
+            // and anything naming a Gate-0 would run minutes of measurement.
+            let d = fulcrum::guide::help_delegation(e, &args);
+            let _ = dispatch(&d[0], &d[1..]);
             eprintln!("\n(`fulcrum guide` indexes every command by the QUESTION it answers.)");
             return ExitCode::SUCCESS;
         }
