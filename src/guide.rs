@@ -323,9 +323,12 @@ pub const COMMANDS: &[Cmd] = &[
     then(
         C(
             "profile counters",
-            "Where does the hardware time go vs the rival, with threads MATCHED?",
-            "--a-cmd, --b-cmd",
-            "fulcrum profile counters --a-cmd '…' --b-cmd '…'",
+            "Where does the hardware time go vs the rival, with threads MATCHED? (encoder cells need --compress)",
+            // These flags were advertised as --a-cmd/--b-cmd for months while the
+            // command accepts --subject-bin/--comparator-cmd — the advertised
+            // example was never runnable. Executed, not read, this time.
+            "--subject-bin, --comparator-cmd, --corpus; --compress + --gz-args \"-6 -c -p {t}\" for encoders",
+            "fulcrum profile counters --compress --subject-bin ./gzippy --gz-args '-6 -c -p {t}' --comparator-cmd 'libdeflate-gzip -6 -c' --corpus F --threads 1",
             Class::Measurement,
         ),
         "fulcrum freeze run -- fulcrum ab paired --a-cmd '…' --b-cmd '…'   (counters LOCATE; only the paired wall decides)",

@@ -39,7 +39,7 @@
 
 use crate::compare::{hex32, sha256};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 
 // ── Microarchitectural category ─────────────────────────────────────────────
 
@@ -130,6 +130,26 @@ pub struct CounterConfig {
     /// `taskset -c <mask>` value (a single core "8" or a mask "8-11").
     pub mask: String,
     pub oracle_cmd: Vec<String>,
+    /// COMPRESS MODE. The decode design sha-gates every arm against one oracle
+    /// output, which is only meaningful when all arms produce IDENTICAL bytes —
+    /// true for decompression, false for compression by construction (gzippy and
+    /// libdeflate emit different, equally-valid gzip). So in compress mode the
+    /// reference is the CORPUS ITSELF and each arm's stdout is piped through the
+    /// oracle (a decompressor) before hashing: the gate becomes "this arm's
+    /// output round-trips to the input", which is the real correctness contract.
+    ///
+    /// RECEIPT (2026-08-01): without this, `fulcrum why` layer [3] and
+    /// `profile counters` REFUSE every compression cell with
+    /// "oracle 'gzip' exited Some(1) on <plain file>" — it was running
+    /// `gzip -dc` on the uncompressed INPUT. The counter layer had therefore
+    /// never run for the encoder campaign at all, leaving the microarch question
+    /// (identical bytes, 12-17 points slower on x86 than on aarch64) with no
+    /// working instrument.
+    pub compress: bool,
+    /// Declares the SUBJECT single-threaded, lifting the compress-mode
+    /// thread-pin refusal for binaries that have no thread flag at all
+    /// (e.g. measuring libdeflate-gzip AS the subject).
+    pub subject_single_threaded: bool,
     pub common_env: Vec<(String, String)>,
     pub out: Option<String>,
     pub arch: String,
@@ -154,6 +174,8 @@ impl Default for CounterConfig {
             n: 11,
             mask: "8".to_string(),
             oracle_cmd: split_args("gzip -dc"),
+            compress: false,
+            subject_single_threaded: false,
             common_env: Vec::new(),
             out: None,
             arch: String::new(),
@@ -544,6 +566,15 @@ FLAGS:
   --n <N>                   interleaved reps (default: 11; >=9 for the sig gate)
   --core, --mask <m>        taskset -c value (default: 8)
   --oracle-cmd \"<cmd>\"      trusted decompressor for reference sha+bytes (default: \"gzip -dc\")
+  --compress                COMPRESS mode: reference is the CORPUS ITSELF and each arm
+                            stdout is piped through --oracle-cmd before hashing, so the
+                            gate is a ROUND-TRIP proof. Required for encoder work: arms
+                            emit DIFFERENT valid gzip by design, so the decode-mode
+                            shared-output gate can never pass. REFUSES --gz-args that
+                            still carry '-d', or that pin no thread count ('{t}'/'-p N'),
+                            and thread-capable comparators (gzippy/pigz) with no pin.
+  --subject-single-threaded declare the subject binary has NO thread flag (lifts the
+                            compress-mode thread-pin refusal, e.g. libdeflate as subject)
   --common-env \"K=V K=V\"    env for the subject arms (default: \"\")
   --out <path>              JSON artifact path/dir (default: /dev/shm)
   --arch <s>                arch label (default: /proc/cpuinfo model name)
@@ -614,6 +645,31 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
                 cfg.mask = need(i, "--core/--mask")?.clone();
                 i += 2;
             }
+            // Consumed by selfver::enforce, which scans the FULL argv before
+            // subcommand dispatch. Without this arm the parser rejects it as
+            // unknown and prints usage, so a pinned reproduction is impossible
+            // for this command while `board` and `candidates` both allow it.
+            //
+            // THE INCREMENT IS LOAD-BEARING. This arm was first copied from
+            // board.rs/candidates.rs as `"--no-self-update" => {}` — correct
+            // THERE because those loops share one `i += 1` at the bottom.
+            // THIS loop advances per-arm, so the bare arm spun forever on the
+            // first valueless flag: state R, zero children, banner-then-
+            // nothing. It burned 41 CPU-minutes on `--help` (the flag is hit
+            // first) and killed the encoder campaign's first counter run on
+            // solvency (2026-08-01). A pattern is only safe in the loop shape
+            // it was written for.
+            "--no-self-update" => {
+                i += 1;
+            }
+            "--compress" => {
+                cfg.compress = true;
+                i += 1;
+            }
+            "--subject-single-threaded" => {
+                cfg.subject_single_threaded = true;
+                i += 1;
+            }
             "--oracle-cmd" => {
                 cfg.oracle_cmd = split_args(need(i, "--oracle-cmd")?);
                 i += 2;
@@ -645,7 +701,70 @@ pub fn parse_args(args: &[String]) -> Result<CounterConfig, String> {
     if cfg.n == 0 {
         return Err("--n must be >= 1".to_string());
     }
+    if cfg.compress {
+        // TRAP 1: forgetting --gz-args in compress mode inherits the DECODE
+        // default ("-d -c -p {t}") and silently measures decompression while
+        // the artifact says "encoder".
+        if cfg.gz_args.iter().any(|t| t == "-d") {
+            return Err(
+                "--compress but --gz-args contains '-d' (the decode default). Compress mode \
+                 needs the subject's ENCODE args, e.g. --gz-args \"-6 -c -p {t}\"."
+                    .to_string(),
+            );
+        }
+        // TRAP 2 (the retracted-finding trap): gzippy with no explicit -p uses
+        // num_cpus. A whole callgrind profile was mislabelled T1 when it was
+        // T16. REFUSE an unpinned subject; a genuinely single-threaded subject
+        // binary declares itself with --subject-single-threaded.
+        if !cfg.subject_single_threaded {
+            let pinned = cfg
+                .gz_args
+                .iter()
+                .any(|t| t.contains("{t}") || t.starts_with("-p"));
+            if !pinned {
+                return Err(
+                    "--compress subject has no thread pin: --gz-args carries neither '{t}' nor \
+                     an explicit '-p N'. An unpinned gzippy runs at num_cpus and the cell is \
+                     mislabelled (this retracted a real finding). Add '-p {t}' (or '-p1'), or \
+                     pass --subject-single-threaded if the subject binary has no thread flag."
+                        .to_string(),
+                );
+            }
+        }
+    }
     Ok(cfg)
+}
+
+/// Compress-mode comparator hygiene: a THREAD-CAPABLE comparator (gzippy,
+/// pigz) with no explicit pin runs at num_cpus and poisons the whole cell
+/// (its counters become the T{num_cpus} numbers labelled T1). Single-threaded
+/// rivals — gzip, libdeflate-gzip, igzip — carry no thread flag and are exempt.
+/// Same family as `check_thread_flag` (the rapidgzip '-p'-vs-'-P' trap). PURE.
+pub fn check_compress_comparator_pin(cmd: &[String]) -> Result<(), String> {
+    let Some(prog) = cmd.first() else {
+        return Err("comparator argv is empty".to_string());
+    };
+    let base = Path::new(prog)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| prog.clone());
+    let thread_capable = base.contains("gzippy") || base == "pigz" || base == "unpigz";
+    if !thread_capable {
+        return Ok(());
+    }
+    let pinned = cmd
+        .iter()
+        .skip(1)
+        .any(|t| t.contains("{t}") || t.starts_with("-p"));
+    if pinned {
+        Ok(())
+    } else {
+        Err(format!(
+            "comparator '{base}' is thread-capable but its command pins no thread count \
+             (no '{{t}}', no '-p N'). It would run at num_cpus while the cell is labelled \
+             by --threads. Add '-p {{t}}' or an explicit '-p N'."
+        ))
+    }
 }
 
 // ── Aggregated per-counter result + verdict (PURE assembly) ─────────────────
@@ -1036,7 +1155,15 @@ fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
 }
 
 /// Run the trusted oracle once → (reference_sha, output byte count).
-fn run_oracle(oracle_cmd: &[String], corpus: &str) -> Result<(String, f64), String> {
+fn run_oracle(oracle_cmd: &[String], corpus: &str, compress: bool) -> Result<(String, f64), String> {
+    if compress {
+        // The reference IS the input: every arm must round-trip to it.
+        let bytes = std::fs::read(corpus).map_err(|e| format!("cannot read corpus {corpus}: {e}"))?;
+        if bytes.is_empty() {
+            return Err(format!("corpus {corpus} is empty"));
+        }
+        return Ok((hex32(&sha256(&bytes)), bytes.len() as f64));
+    }
     let (prog, args) = oracle_cmd
         .split_first()
         .ok_or_else(|| "--oracle-cmd is empty".to_string())?;
@@ -1048,8 +1175,15 @@ fn run_oracle(oracle_cmd: &[String], corpus: &str) -> Result<(String, f64), Stri
         .output()
         .map_err(|e| format!("cannot spawn oracle '{prog}': {e}"))?;
     if !out.status.success() {
+        // The most common way to land here is pointing DECODE mode at a plain
+        // (uncompressed) corpus — i.e. trying to measure an ENCODER. That
+        // mistake left the counter layer unused for the whole encoder
+        // campaign, refusing every cell with this very error. Teach the fix.
         return Err(format!(
-            "oracle '{prog}' exited {:?} on {corpus}",
+            "oracle '{prog}' exited {:?} on {corpus}. If {corpus} is a PLAIN corpus and the \
+             arms are ENCODERS, this is decode mode measuring the wrong direction — pass \
+             --compress (reference = the corpus itself; each arm's output is piped through \
+             the oracle, so the gate becomes a round-trip proof).",
             out.status.code()
         ));
     }
@@ -1062,12 +1196,13 @@ fn run_arm_sha(
     env: &[(String, String)],
     args: &[String],
     corpus: &str,
+    verify: Option<&[String]>,
 ) -> Result<(String, usize), String> {
     let mut c = Command::new(bin);
     for (k, v) in env {
         c.env(k, v);
     }
-    let out = c
+    let mut out = c
         .args(args)
         .arg(corpus)
         .stdout(Stdio::piped())
@@ -1079,6 +1214,68 @@ fn run_arm_sha(
             "arm '{bin}' exited {:?} on {corpus}",
             out.status.code()
         ));
+    }
+    // COMPRESS MODE: the arm's stdout is compressed and every arm's bytes
+    // differ legitimately, so hashing it directly can never match a shared
+    // reference. Pipe it through the verifier (a decompressor) and hash THAT —
+    // the gate becomes "this arm round-trips to the input", and the byte count
+    // becomes the INPUT size, which is the same denominator for every arm.
+    if let Some(v) = verify {
+        let (vp, va) = v
+            .split_first()
+            .ok_or_else(|| "verify command is empty".to_string())?;
+        let mut vc = Command::new(vp)
+            .args(va)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot spawn verifier '{vp}': {e}"))?;
+        // THE WRITE MUST RUN ON ITS OWN THREAD. Two hangs shipped here in one
+        // day, and each fix looked complete:
+        //   1. `stdin.as_mut()` never closed the pipe — no EOF, verifier waits
+        //      forever. "Fixed" by `.take()` + scope-drop…
+        //   2. …which still deadlocks on any REAL corpus: writing the whole
+        //      compressed stream synchronously while nobody reads the
+        //      verifier's stdout means its stdout pipe fills (~64 KiB), it
+        //      stops reading stdin, our write_all blocks — mutual wait. Only
+        //      toy inputs survive, which is exactly how the first fix passed
+        //      its manual check and then hung on solvency.
+        // `paired.rs` had the correct pattern all along: writer thread owns
+        // the stdin handle (write side), main thread drains stdout.
+        let mut si = vc
+            .stdin
+            .take()
+            .ok_or_else(|| "verifier stdin unavailable".to_string())?;
+        let compressed = std::mem::take(&mut out.stdout);
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let r = si.write_all(&compressed);
+            // si drops here → EOF to the verifier.
+            r
+        });
+        let vout = vc
+            .wait_with_output()
+            .map_err(|e| format!("verifier '{vp}' failed: {e}"))?;
+        match writer.join() {
+            Ok(Ok(())) => {}
+            // A verifier that exits early (e.g. rejects the stream) closes its
+            // stdin and the writer sees EPIPE; the status check below reports
+            // the real failure, so only surface a write error when the
+            // verifier claims success.
+            Ok(Err(e)) if vout.status.success() => {
+                return Err(format!("cannot write to verifier '{vp}': {e}"));
+            }
+            Ok(Err(_)) => {}
+            Err(_) => return Err(format!("verifier '{vp}' writer thread panicked")),
+        }
+        if !vout.status.success() {
+            return Err(format!(
+                "verifier '{vp}' exited {:?} on output of '{bin}' for {corpus} — the arm did not emit valid gzip",
+                vout.status.code()
+            ));
+        }
+        return Ok((hex32(&sha256(&vout.stdout)), vout.stdout.len()));
     }
     Ok((hex32(&sha256(&out.stdout)), out.stdout.len()))
 }
@@ -1185,12 +1382,19 @@ fn run_cell(
 ) -> Result<CellArtifact, String> {
     let gz_args = substitute_threads(&cfg.gz_args, thread);
     let comp_cmd = substitute_threads(&comp.cmd, thread);
+    // In compress mode every arm's output is piped through the oracle before
+    // hashing, so the gate is a ROUND-TRIP proof rather than a byte comparison.
+    let verify: Option<&[String]> = if cfg.compress {
+        Some(&cfg.oracle_cmd)
+    } else {
+        None
+    };
 
     // Gate-0 sha + decode proof for both arms (once per cell).
     let subj_full: Vec<String> = std::iter::once(cfg.subject_bin.clone())
         .chain(gz_args.iter().cloned())
         .collect();
-    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus)?;
+    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus, verify)?;
     if subj_sha != reference_sha {
         return Err(format!(
             "SHA MISMATCH subject vs oracle on {corpus} T{thread}: {subj_sha} != {reference_sha}"
@@ -1201,7 +1405,7 @@ fn run_cell(
             "subject produced 0 bytes on {corpus} T{thread} (empty-output trap)"
         ));
     }
-    let (comp_sha, comp_bytes) = run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus)?;
+    let (comp_sha, comp_bytes) = run_arm_sha(&comp_cmd[0], &[], &comp_cmd[1..], corpus, verify)?;
     if comp_bytes == 0 {
         return Err(format!(
             "comparator '{}' produced 0 bytes on {corpus} T{thread} (empty-output / bad-argv trap)",
@@ -1550,6 +1754,10 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
     for comp in &cfg.comparators {
         check_comparator_binary(&comp.cmd)
             .map_err(|e| format!("comparator '{}' REFUSED: {e}", comp.label))?;
+        if cfg.compress {
+            check_compress_comparator_pin(&comp.cmd)
+                .map_err(|e| format!("comparator '{}' REFUSED: {e}", comp.label))?;
+        }
     }
 
     // Gate-0: arch-aware event support probe; drop+flag unsupported.
@@ -1610,7 +1818,7 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
     let mut all_ok = true;
     let mut paths: Vec<PathBuf> = Vec::new();
     for corpus in &cfg.corpora {
-        let (reference_sha, bytes) = run_oracle(&cfg.oracle_cmd, corpus)?;
+        let (reference_sha, bytes) = run_oracle(&cfg.oracle_cmd, corpus, cfg.compress)?;
         if bytes <= 0.0 {
             return Err(format!("oracle produced 0 bytes for {corpus}"));
         }
@@ -1660,6 +1868,137 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
         println!("artifact: {}", p.display());
     }
     Ok(all_ok)
+}
+
+// ── Gate-0 ──────────────────────────────────────────────────────────────────
+
+/// Gate-0 for `profile counters`. This command had NO self-test at all while
+/// it (a) could never run for the encoder campaign (decode-only gate), (b)
+/// spun forever on `--no-self-update`/`--compress`/`--help`, and (c)
+/// deadlocked on any real corpus in compress mode. Each check below is one of
+/// those defects, executed — not read.
+pub fn selftest() -> ExitCode {
+    let mut fails = 0u32;
+    let mut check = |name: &str, ok: bool| {
+        println!("  [{}] {name}", if ok { "ok" } else { "FAIL" });
+        if !ok {
+            fails += 1;
+        }
+    };
+    // Watchdog runner: a SPIN or DEADLOCK must fail the gate, not hang it.
+    fn bounded<T: Send + 'static>(
+        secs: u64,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+
+    // 1. Valueless flags terminate the parse loop (the 2026-08-01 spin).
+    let parsed = bounded(10, || {
+        parse_args(&[
+            "--no-self-update".to_string(),
+            "--compress".to_string(),
+            "--subject-bin".to_string(),
+            "/bin/gz".to_string(),
+            "--gz-args".to_string(),
+            "-6 -c -p {t}".to_string(),
+            "--comparator-cmd".to_string(),
+            "libdeflate-gzip -6 -c".to_string(),
+            "--corpus".to_string(),
+            "a.txt".to_string(),
+        ])
+    });
+    check(
+        "parse: valueless flags (--no-self-update/--compress) terminate the loop",
+        matches!(&parsed, Some(Ok(c)) if c.compress),
+    );
+
+    // 2. Compress mode REFUSES an unpinned subject and decode-default args.
+    let unpinned = bounded(10, || {
+        parse_args(&[
+            "--compress".to_string(),
+            "--subject-bin".to_string(),
+            "/bin/gz".to_string(),
+            "--gz-args".to_string(),
+            "-6 -c".to_string(),
+            "--comparator-cmd".to_string(),
+            "libdeflate-gzip -6 -c".to_string(),
+            "--corpus".to_string(),
+            "a.txt".to_string(),
+        ])
+    });
+    check(
+        "refuse: compress subject with no thread pin (the mislabelled-T1 trap)",
+        matches!(&unpinned, Some(Err(e)) if e.contains("--subject-single-threaded")),
+    );
+    let decode_args = bounded(10, || {
+        parse_args(&[
+            "--compress".to_string(),
+            "--subject-bin".to_string(),
+            "/bin/gz".to_string(),
+            "--comparator-cmd".to_string(),
+            "libdeflate-gzip -6 -c".to_string(),
+            "--corpus".to_string(),
+            "a.txt".to_string(),
+        ])
+    });
+    check(
+        "refuse: --compress while --gz-args still carries '-d' (decode default)",
+        matches!(&decode_args, Some(Err(e)) if e.contains("-d")),
+    );
+
+    // 3. Thread-capable comparators must pin; single-threaded rivals exempt.
+    check(
+        "refuse: unpinned thread-capable comparator (pigz/gzippy)",
+        check_compress_comparator_pin(&split_args("pigz -6 -c")).is_err()
+            && check_compress_comparator_pin(&split_args("libdeflate-gzip -6 -c")).is_ok(),
+    );
+
+    // 4. The compress round-trip verifier survives outputs larger than a pipe
+    //    buffer (the deadlock that survived the first "fix"). Uses the real
+    //    gzip on this box; 1 MiB of incompressible bytes overfills every pipe.
+    if Command::new("gzip").arg("--version").output().is_ok() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut raw = Vec::with_capacity(1 << 20);
+        while raw.len() < (1 << 20) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raw.extend_from_slice(&state.to_le_bytes());
+        }
+        let dir = std::env::temp_dir();
+        let corpus = dir.join(format!("fulcrum-cd-gate0-{}.bin", std::process::id()));
+        let write_ok = std::fs::write(&corpus, &raw).is_ok();
+        let want = hex32(&sha256(&raw));
+        let corpus_s = corpus.display().to_string();
+        let got = write_ok
+            .then(|| {
+                bounded(60, move || {
+                    let oracle = split_args("gzip -dc");
+                    run_arm_sha("gzip", &[], &split_args("-1 -c"), &corpus_s, Some(&oracle))
+                })
+            })
+            .flatten();
+        let _ = std::fs::remove_file(&corpus);
+        check(
+            "compress verify: 1 MiB round-trip completes (no pipe deadlock) and shas match",
+            matches!(&got, Some(Ok((sha, n))) if *sha == want && *n == raw.len()),
+        );
+    } else {
+        check("compress verify: SKIPPED — no gzip on this box (install it)", false);
+    }
+
+    if fails == 0 {
+        println!("counterdiff Gate-0: PASS");
+        ExitCode::SUCCESS
+    } else {
+        println!("counterdiff Gate-0: {fails} FAILURE(S)");
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]

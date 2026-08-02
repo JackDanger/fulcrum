@@ -7,10 +7,12 @@
 //! was no vendor-comparative census for STRUCTURE — allocation count and bytes
 //! allocated — so for months nobody ran one, and the encoder shipped this:
 //!
-//!     6,000,000 B of dickens at -6, whole process
-//!         gzippy       731 allocs    83,909,568 bytes
-//!         libdeflate     3 allocs     6,674,327 bytes
-//!         gzip           0 allocs             0 bytes
+//! ```text
+//! 6,000,000 B of dickens at -6, whole process
+//!     gzippy       731 allocs    83,909,568 bytes
+//!     libdeflate     3 allocs     6,674,327 bytes
+//!     gzip           0 allocs             0 bytes
+//! ```
 //!
 //! 244x the allocation count and 12.6x the bytes, and the count GREW LINEARLY
 //! WITH INPUT (per-block allocation). That single comparison — three runs of one
