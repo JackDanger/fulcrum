@@ -409,6 +409,139 @@ fn arm_cells(
     Ok(map)
 }
 
+/// Indices of decidable WALL cells that flipped pass->fail — the only cells
+/// clause 3 would fail on that a NOISY measurement can manufacture. Size is
+/// an exact integer: a size flip needs no confirmation and never gets one.
+pub fn wall_flip_indices(cells: &[TryCell]) -> Vec<usize> {
+    cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.axis == "wall"
+                && c.base_status == "OK"
+                && c.after_status == "OK"
+                && !c.base_failing
+                && c.after_failing
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Clause 8's "raise n on close calls", applied where it bites: every WALL
+/// pass->fail flip found at census n is RE-MEASURED at a higher n, both arms,
+/// before it may carry a clause-3 verdict. The confirmed numbers replace the
+/// cell's wall ratios for every clause, whichever way they land.
+///
+/// Receipt: an L4-gated lever's first full adjudication named three wall
+/// flips at L2/L3 — levels its `level == 4` gate cannot reach — with deltas
+/// inside the rig's stated ~1.5% A/A floor, on a freshly rebooted box. A
+/// full-grid wall census at n=15 with a zero-tolerance flip clause
+/// manufactures false flips by lottery; this is the rule's own remedy
+/// ("raise n on close calls rather than reading the tea leaves"), landed
+/// separately from any lever it affects.
+fn confirm_wall_flips(
+    cells: &mut [TryCell],
+    base_bin: &std::path::Path,
+    after_bin: &std::path::Path,
+    cfg: &TryConfig,
+) -> Result<Option<(String, serde_json::Value)>, String> {
+    let flips = wall_flip_indices(cells);
+    if flips.is_empty() {
+        return Ok(None);
+    }
+    let confirm_n = (cfg.n * 3).clamp(cfg.n, 45);
+    let mut confirmed = Vec::new();
+    let mut dissolved = Vec::new();
+    let mut detail = Vec::new();
+    for idx in flips {
+        let (rival_name, corpus, level, threads, orig_base, orig_after) = {
+            let c = &cells[idx];
+            (
+                c.rival.clone(),
+                c.corpus.clone(),
+                c.level,
+                c.threads,
+                c.base_ratio,
+                c.after_ratio,
+            )
+        };
+        let Some(rival) = cfg.rivals.iter().find(|r| r.name == rival_name).cloned() else {
+            continue;
+        };
+        let Some(corpus_path) = cfg
+            .corpora
+            .iter()
+            .find(|p| p.file_name().map(|f| f.to_string_lossy() == corpus).unwrap_or(false))
+            .cloned()
+        else {
+            continue;
+        };
+        let mut arm = |bin: &std::path::Path, arm_name: &str| -> Result<(String, f64, bool), String> {
+            let wc = crate::wallcensus::CensusConfig {
+                ours_tmpl: format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display()),
+                rivals: vec![rival.clone()],
+                levels: vec![level],
+                threads: vec![threads],
+                corpora: vec![corpus_path.clone()],
+                out_dir: cfg.out_dir.join(format!(
+                    "confirm-{arm_name}-{rival_name}-{corpus}-L{level}-T{threads}"
+                )),
+                roundtrip_cmd: arm_roundtrip_cmd(bin),
+                n: confirm_n,
+                warmup: 2,
+                sink: std::path::PathBuf::from("/dev/null"),
+                pin_reps: 3,
+                ours_commit: None,
+            };
+            let art = crate::wallcensus::run_census(&wc)?;
+            let c = art
+                .cells
+                .into_iter()
+                .next()
+                .ok_or_else(|| "confirmation census produced no cell".to_string())?;
+            Ok((c.status, c.wall_ratio, c.slower))
+        };
+        let (bs, br, bf) = arm(base_bin, "base")?;
+        let (as_, ar, af) = arm(after_bin, "after")?;
+        let cell = &mut cells[idx];
+        cell.base_status = bs;
+        cell.after_status = as_;
+        cell.base_ratio = br;
+        cell.after_ratio = ar;
+        cell.base_failing = bf;
+        cell.after_failing = af;
+        let id = cell.id();
+        let still_flips = cell.base_status == "OK"
+            && cell.after_status == "OK"
+            && !cell.base_failing
+            && cell.after_failing;
+        detail.push(serde_json::json!({
+            "cell": id,
+            "census": { "n": cfg.n, "base_ratio": orig_base, "after_ratio": orig_after },
+            "confirm": { "n": confirm_n, "base_ratio": br, "after_ratio": ar },
+            "confirmed": still_flips,
+        }));
+        if still_flips {
+            confirmed.push(id);
+        } else {
+            dissolved.push(id);
+        }
+    }
+    let note = format!(
+        "clause 8: {} wall pass->fail flip(s) re-measured at n={confirm_n} (census n={}) — {} confirmed, {} dissolved{}",
+        detail.len(),
+        cfg.n,
+        confirmed.len(),
+        dissolved.len(),
+        if confirmed.is_empty() && !detail.is_empty() {
+            "; clause 3 judges the confirmed numbers"
+        } else {
+            ""
+        }
+    );
+    Ok(Some((note, serde_json::Value::Array(detail))))
+}
+
 pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::Value), String> {
     check_level_set(&cfg.levels)?;
     if cfg.rivals.is_empty() {
@@ -500,8 +633,18 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
         });
     }
 
+    // Confirm wall flips at higher n BEFORE adjudication (clause 8).
+    let confirmation = if noop || cfg.skip_wall {
+        None
+    } else {
+        confirm_wall_flips(&mut cells, &base_bin, &after_bin, cfg)?
+    };
+
     let arch = std::env::consts::ARCH.to_string();
-    let adj = adjudicate(&cells, verify_failures, noop, std::slice::from_ref(&arch), &cfg.archs_required);
+    let mut adj = adjudicate(&cells, verify_failures, noop, std::slice::from_ref(&arch), &cfg.archs_required);
+    if let Some((note, _)) = &confirmation {
+        adj.clauses.insert(0, note.clone());
+    }
 
     let mut artifact = serde_json::json!({
         "base": { "git_ref": cfg.base_ref, "commit": base_prov.resolved_commit, "bin_sha": base_prov.binary_sha256 },
@@ -514,6 +657,7 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
         "method": "paired interleaved per-pair ratios (wallcensus/paired engine); size exact-integer roundtrip-VOIDed",
         "verify_failures": verify_failures,
         "cells": cells,
+        "wall_flip_confirmation": confirmation.as_ref().map(|(_, d)| d.clone()).unwrap_or(serde_json::Value::Null),
         "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause },
         "verdict": match adj.verdict { Verdict::Ship => "SHIP", Verdict::NoShip => "NO-SHIP", Verdict::Undecided => "UNDECIDED" },
     });
@@ -778,6 +922,29 @@ pub fn selftest() -> ExitCode {
     check("refuse: all-shallow set", check_level_set(&[1, 2, 4]).is_err());
     check("refuse: all-deep set", check_level_set(&[6, 9]).is_err());
     check("accept: shallow+deep", check_level_set(&[2, 6, 9]).is_ok());
+
+    // Wall-flip confirmation SELECTION (clause 8 applied to clause 3): only
+    // decidable WALL pass->fail flips qualify — size flips are exact integers
+    // and confirm themselves; fail->pass movement is never confirmation-worthy
+    // (it cannot fail clause 3); VOID arms already demand their own re-run.
+    {
+        let cs = vec![
+            cell("wall", 3, 1.008, false, 1.016, true), // wall pass->fail: CONFIRM
+            cell("size", 3, 1.008, false, 1.016, true), // size flip: exact, no confirm
+            cell("wall", 6, 1.05, true, 0.99, false),   // fail->pass: no confirm
+            cell("wall", 9, 0.90, false, 0.95, false),  // still passing: no confirm
+        ];
+        check(
+            "confirmation: selects exactly the decidable wall pass->fail flips",
+            wall_flip_indices(&cs) == vec![0],
+        );
+        let mut voided = cell("wall", 3, 1.008, false, 1.016, true);
+        voided.after_status = "VOID".into();
+        check(
+            "confirmation: a VOID arm is re-run territory, not confirmation territory",
+            wall_flip_indices(&[voided]).is_empty(),
+        );
+    }
 
     // Clause 2: NO-OP.
     let a = adjudicate(&[], 0, true, &arch, &arch);
