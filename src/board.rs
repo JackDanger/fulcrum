@@ -244,7 +244,9 @@ pub fn render(r: &BoardReport) -> String {
                 "    {} (measured {} ago against {})\n",
                 c.id(),
                 age(c.measured_unix),
-                c.subject_commit.as_deref().unwrap_or("<no recorded subject>"),
+                c.subject_commit
+                    .as_deref()
+                    .unwrap_or("<no recorded subject>"),
             ));
         }
         if stale.len() > 8 {
@@ -356,10 +358,7 @@ fn report_cmd(args: &[String]) -> ExitCode {
         }
     }
     let cells = merge(cells, subject.as_deref());
-    let report = BoardReport {
-        cells,
-        subject,
-    };
+    let report = BoardReport { cells, subject };
     print!("{}", render(&report));
     if let Some(out) = json_out {
         let mut doc = serde_json::json!({ "cells": report.cells, "subject": report.subject });
@@ -391,7 +390,13 @@ pub fn selftest() -> ExitCode {
         }
     };
 
-    let cell = |axis: &str, rival: &str, level: u32, ratio: f64, failing: bool, unix: u64, commit: &str| BoardCell {
+    let cell = |axis: &str,
+                rival: &str,
+                level: u32,
+                ratio: f64,
+                failing: bool,
+                unix: u64,
+                commit: &str| BoardCell {
         axis: axis.into(),
         rival: rival.into(),
         corpus: "c.bin".into(),
@@ -423,7 +428,10 @@ pub fn selftest() -> ExitCode {
         vec![cell("size", "gzip", 6, 1.02, true, 100, "aaaa")],
         Some("bbbb1234"),
     );
-    check("stale: measured against another subject => flagged", merged[0].stale);
+    check(
+        "stale: measured against another subject => flagged",
+        merged[0].stale,
+    );
     let rendered = render(&BoardReport {
         cells: merged,
         subject: Some("bbbb1234".into()),
@@ -438,7 +446,10 @@ pub fn selftest() -> ExitCode {
     let mut anon = cell("size", "gzip", 6, 1.02, true, 100, "x");
     anon.subject_commit = None;
     let merged = merge(vec![anon], Some("bbbb"));
-    check("stale: missing recorded subject => stale, never ranked", merged[0].stale);
+    check(
+        "stale: missing recorded subject => stale, never ranked",
+        merged[0].stale,
+    );
 
     // 4. Ranking is by gap, descending; denominator names every bucket.
     let merged = merge(
@@ -455,7 +466,10 @@ pub fn selftest() -> ExitCode {
     });
     let pigz_at = rendered.find("pigz").unwrap_or(usize::MAX);
     let gzip_at = rendered.find("gzip").unwrap_or(0);
-    check("rank: worst gap first (pigz 20% before gzip 1%)", pigz_at < gzip_at);
+    check(
+        "rank: worst gap first (pigz 20% before gzip 1%)",
+        pigz_at < gzip_at,
+    );
     check(
         "denominator: printed with every bucket named",
         rendered.contains("DENOMINATOR:") && rendered.contains("NOT MEASURED"),

@@ -117,7 +117,6 @@ fn cmd_critpath(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-
 /// `fulcrum flow <trace.json> [--whatif STAGE:FACTOR]`
 ///
 /// Multi-stage pipeline flow: per stage, WALL-CRITICAL vs TOTAL-BUSY (the gap

@@ -40,7 +40,6 @@ impl fmt::Display for InvariantViolation {
 
 impl std::error::Error for InvariantViolation {}
 
-
 /// One registered invariant: the scar-name, the rule the tool enforces, the
 /// historical failure that made it law, and where the refusal/label lives.
 #[derive(Debug, Clone, Copy)]
@@ -342,5 +341,4 @@ mod tests {
         assert!(out.contains("PERTURBATION-OR-NO-LEVER"));
         assert!(out.contains("frequency-neutral SLEEP control"));
     }
-
 }

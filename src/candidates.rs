@@ -192,7 +192,9 @@ pub fn scan_falsify(repo: &Path) -> Vec<Falsify> {
 /// Words from a technique name/identifiers worth matching against a FALSIFY
 /// comment (lowercased, len > 3, no stop-words).
 fn keywords(t: &Technique) -> Vec<String> {
-    const STOP: &[&str] = &["with", "from", "that", "this", "into", "only", "over", "parse"];
+    const STOP: &[&str] = &[
+        "with", "from", "that", "this", "into", "only", "over", "parse",
+    ];
     let mut words: Vec<String> = format!("{} {}", t.name, t.identifiers)
         .to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -248,7 +250,7 @@ pub fn rank<'a>(
         .collect();
     out.sort_by_key(|r| {
         (
-            !r.falsified.is_empty(), // un-falsified first
+            !r.falsified.is_empty(),          // un-falsified first
             r.technique.ours_verdict != "NO", // NO before PARTIALLY
             r.technique.id.clone(),
         )
@@ -509,7 +511,9 @@ pub fn selftest() -> ExitCode {
     check("parse: all four fixture entries parsed", ts.len() == 4);
     check(
         "parse: verdict extracted (YES/NO/PARTIALLY)",
-        ts[0].ours_verdict == "YES" && ts[1].ours_verdict == "NO" && ts[2].ours_verdict == "PARTIALLY",
+        ts[0].ours_verdict == "YES"
+            && ts[1].ours_verdict == "NO"
+            && ts[2].ours_verdict == "PARTIALLY",
     );
     check(
         "parse: citation and parameters preserved verbatim",
@@ -520,7 +524,8 @@ pub fn selftest() -> ExitCode {
         Falsify {
             file: "src/compress/deflate/matchfinder/hc.rs".into(),
             line: 10,
-            text: "// FALSIFY(2026-07-20): hash4 head table lost 2.1% wall at L6 — deeper chains".into(),
+            text: "// FALSIFY(2026-07-20): hash4 head table lost 2.1% wall at L6 — deeper chains"
+                .into(),
         },
         Falsify {
             file: "src/x.rs".into(),
@@ -532,7 +537,9 @@ pub fn selftest() -> ExitCode {
     let ranked = rank(&ts, &records, 6, 1);
     check(
         "filter: YES techniques never surface; L0-only technique excluded at L6",
-        ranked.iter().all(|r| r.technique.id != "P1" && r.technique.id != "Z1"),
+        ranked
+            .iter()
+            .all(|r| r.technique.id != "P1" && r.technique.id != "Z1"),
     );
     check(
         "rank: both applicable NO/PARTIALLY techniques surface at L6",

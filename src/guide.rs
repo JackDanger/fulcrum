@@ -901,7 +901,8 @@ pub fn lookup(args: &[String]) -> Option<&'static Cmd> {
 
 /// True when this argv is asking for help (a bare `--help`/`-h`/`help` token).
 pub fn is_help_request(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--help" || a == "-h" || a == "help")
+    args.iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
 }
 
 /// After the registry entry is printed, WHAT may be invoked to add the
@@ -1069,7 +1070,10 @@ pub fn cmd_guide(args: &[String]) -> ExitCode {
         return selftest();
     }
     if args.iter().any(|a| a == "--json") {
-        println!("{}", serde_json::to_string_pretty(&registry_json()).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&registry_json()).unwrap_or_default()
+        );
         return ExitCode::SUCCESS;
     }
     let words: Vec<String> = args
@@ -1086,7 +1090,9 @@ pub fn cmd_guide(args: &[String]) -> ExitCode {
             print!("{}", render_intent(it, false));
             println!();
         }
-        println!("For the full rationale on one of these:  fulcrum guide <words from the question>");
+        println!(
+            "For the full rationale on one of these:  fulcrum guide <words from the question>"
+        );
         println!("For the whole surface, machine-readable:  fulcrum commands --json");
         println!("For the rules this binary ENFORCES:       fulcrum selftest invariants");
         return ExitCode::SUCCESS;
@@ -1114,7 +1120,11 @@ pub fn cmd_guide(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    println!("{} matching intent(s) for {:?}:\n", scored.len(), words.join(" "));
+    println!(
+        "{} matching intent(s) for {:?}:\n",
+        scored.len(),
+        words.join(" ")
+    );
     for (i, (_, it)) in scored.iter().take(3).enumerate() {
         if i > 0 {
             println!();
@@ -1123,7 +1133,14 @@ pub fn cmd_guide(args: &[String]) -> ExitCode {
     }
     if scored.len() > 3 {
         println!();
-        println!("also: {}", scored[3..].iter().map(|(_, it)| it.id).collect::<Vec<_>>().join(", "));
+        println!(
+            "also: {}",
+            scored[3..]
+                .iter()
+                .map(|(_, it)| it.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     ExitCode::SUCCESS
 }
@@ -1134,7 +1151,10 @@ pub fn cmd_commands(args: &[String]) -> ExitCode {
         return selftest();
     }
     if args.iter().any(|a| a == "--json") {
-        println!("{}", serde_json::to_string_pretty(&registry_json()).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&registry_json()).unwrap_or_default()
+        );
         return ExitCode::SUCCESS;
     }
     println!(
@@ -1204,7 +1224,10 @@ pub fn selftest() -> ExitCode {
         }
         if let Some(g) = c.gate0 {
             check(
-                format!("registry: `{}` advertises a Gate-0 that EXISTS (`{g}`)", c.path),
+                format!(
+                    "registry: `{}` advertises a Gate-0 that EXISTS (`{g}`)",
+                    c.path
+                ),
                 crate::selftest::gate_names().contains(&g),
             );
         }
@@ -1227,7 +1250,10 @@ pub fn selftest() -> ExitCode {
                 // Non-fulcrum lines (e.g. `cd … && make board-size`) are allowed
                 // but must still mention a real entry point.
                 check(
-                    format!("intent `{}`: non-fulcrum line names a real target: {head}", it.id),
+                    format!(
+                        "intent `{}`: non-fulcrum line names a real target: {head}",
+                        it.id
+                    ),
                     head.contains("make ") || head.contains("fulcrum"),
                 );
                 continue;
@@ -1238,7 +1264,11 @@ pub fn selftest() -> ExitCode {
                 .map(|s| s.to_string())
                 .collect();
             check(
-                format!("intent `{}`: `fulcrum {}` is a registered path", it.id, argv.first().cloned().unwrap_or_default()),
+                format!(
+                    "intent `{}`: `fulcrum {}` is a registered path",
+                    it.id,
+                    argv.first().cloned().unwrap_or_default()
+                ),
                 lookup(&argv).is_some(),
             );
         }
@@ -1257,8 +1287,10 @@ pub fn selftest() -> ExitCode {
         );
         let ab = lookup(&["ab".to_string()]).expect("ab is registered");
         check(
-            "help: `ab selftest --help` falls back to the family usage, never the Gate-0".to_string(),
-            help_delegation(ab, &["ab".into(), "selftest".into(), "--help".into()]) == vec!["ab".to_string()],
+            "help: `ab selftest --help` falls back to the family usage, never the Gate-0"
+                .to_string(),
+            help_delegation(ab, &["ab".into(), "selftest".into(), "--help".into()])
+                == vec!["ab".to_string()],
         );
         check(
             "help: an ordinary path delegates the argv as typed".to_string(),
@@ -1267,7 +1299,8 @@ pub fn selftest() -> ExitCode {
         );
         let st = lookup(&["selftest".to_string()]).expect("selftest is registered");
         check(
-            "help: `selftest <gate> --help` is rewritten to `selftest --help` — it runs NO gate".to_string(),
+            "help: `selftest <gate> --help` is rewritten to `selftest --help` — it runs NO gate"
+                .to_string(),
             help_delegation(st, &["selftest".into(), "guide".into(), "--help".into()])
                 == vec!["selftest".to_string(), "--help".to_string()],
         );

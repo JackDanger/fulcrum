@@ -168,7 +168,10 @@ pub fn adjudicate(
         .map(|c| format!("{} ({:.4} -> {:.4})", c.id(), c.base_ratio, c.after_ratio))
         .collect();
     if flips.is_empty() {
-        clauses.push(format!("clause 3 OK: no pass->fail flips across {} decidable cells", decided.len()));
+        clauses.push(format!(
+            "clause 3 OK: no pass->fail flips across {} decidable cells",
+            decided.len()
+        ));
     } else {
         fail(
             &mut failed,
@@ -194,7 +197,10 @@ pub fn adjudicate(
     let gap_after = gap(|c| c.after_ratio, |c| c.after_failing);
     let gap_progress = gap_before > 0.0 && gap_after <= gap_before * 0.99;
     if !closed.is_empty() {
-        clauses.push(format!("clause 4 OK: closed failing cell(s): {}", closed.join(", ")));
+        clauses.push(format!(
+            "clause 4 OK: closed failing cell(s): {}",
+            closed.join(", ")
+        ));
     } else if gap_progress {
         clauses.push(format!(
             "clause 4 OK: fail-gap {:.4} -> {:.4} (-{:.1}%)",
@@ -233,7 +239,10 @@ pub fn adjudicate(
         fail(
             &mut failed,
             &mut clauses,
-            format!("clause 5 FAIL: erosion budget exceeded: {}", eroded.join(", ")),
+            format!(
+                "clause 5 FAIL: erosion budget exceeded: {}",
+                eroded.join(", ")
+            ),
         );
     }
 
@@ -267,7 +276,10 @@ pub fn adjudicate(
         .filter(|a| !archs_covered.contains(a))
         .collect();
     if missing.is_empty() {
-        clauses.push(format!("clause 7 OK: all required arch(s) covered: {}", archs_covered.join(", ")));
+        clauses.push(format!(
+            "clause 7 OK: all required arch(s) covered: {}",
+            archs_covered.join(", ")
+        ));
     } else {
         clauses.push(format!(
             "clause 7 PENDING: measured on [{}]; still required: [{}] — run `fulcrum try` with the same refs on each missing box (the try.json artifacts carry the per-arch verdicts)",
@@ -291,7 +303,11 @@ pub fn adjudicate(
     if failed.is_none() && verdict == Verdict::Undecided && rerun.is_empty() {
         rerun.push(format!(
             "run `fulcrum try` on the missing architecture(s): {}",
-            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     Adjudication {
@@ -471,36 +487,41 @@ fn confirm_wall_flips(
         let Some(corpus_path) = cfg
             .corpora
             .iter()
-            .find(|p| p.file_name().map(|f| f.to_string_lossy() == corpus).unwrap_or(false))
+            .find(|p| {
+                p.file_name()
+                    .map(|f| f.to_string_lossy() == corpus)
+                    .unwrap_or(false)
+            })
             .cloned()
         else {
             continue;
         };
-        let mut arm = |bin: &std::path::Path, arm_name: &str| -> Result<(String, f64, bool), String> {
-            let wc = crate::wallcensus::CensusConfig {
-                ours_tmpl: format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display()),
-                rivals: vec![rival.clone()],
-                levels: vec![level],
-                threads: vec![threads],
-                corpora: vec![corpus_path.clone()],
-                out_dir: cfg.out_dir.join(format!(
-                    "confirm-{arm_name}-{rival_name}-{corpus}-L{level}-T{threads}"
-                )),
-                roundtrip_cmd: arm_roundtrip_cmd(bin),
-                n: confirm_n,
-                warmup: 2,
-                sink: std::path::PathBuf::from("/dev/null"),
-                pin_reps: 3,
-                ours_commit: None,
+        let mut arm =
+            |bin: &std::path::Path, arm_name: &str| -> Result<(String, f64, bool), String> {
+                let wc = crate::wallcensus::CensusConfig {
+                    ours_tmpl: format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display()),
+                    rivals: vec![rival.clone()],
+                    levels: vec![level],
+                    threads: vec![threads],
+                    corpora: vec![corpus_path.clone()],
+                    out_dir: cfg.out_dir.join(format!(
+                        "confirm-{arm_name}-{rival_name}-{corpus}-L{level}-T{threads}"
+                    )),
+                    roundtrip_cmd: arm_roundtrip_cmd(bin),
+                    n: confirm_n,
+                    warmup: 2,
+                    sink: std::path::PathBuf::from("/dev/null"),
+                    pin_reps: 3,
+                    ours_commit: None,
+                };
+                let art = crate::wallcensus::run_census(&wc)?;
+                let c = art
+                    .cells
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "confirmation census produced no cell".to_string())?;
+                Ok((c.status, c.wall_ratio, c.slower))
             };
-            let art = crate::wallcensus::run_census(&wc)?;
-            let c = art
-                .cells
-                .into_iter()
-                .next()
-                .ok_or_else(|| "confirmation census produced no cell".to_string())?;
-            Ok((c.status, c.wall_ratio, c.slower))
-        };
         let (bs, br, bf) = arm(base_bin, "base")?;
         let (as_, ar, af) = arm(after_bin, "after")?;
         let cell = &mut cells[idx];
@@ -545,21 +566,28 @@ fn confirm_wall_flips(
 pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::Value), String> {
     check_level_set(&cfg.levels)?;
     if cfg.rivals.is_empty() {
-        return Err("REFUSED: at least one --rival is required — the board is per-label vs rivals".into());
+        return Err(
+            "REFUSED: at least one --rival is required — the board is per-label vs rivals".into(),
+        );
     }
     if cfg.corpora.is_empty() {
         return Err("REFUSED: at least one --corpus is required".into());
     }
     for c in &cfg.corpora {
         if !c.is_file() {
-            return Err(format!("REFUSED: corpus {} does not exist — a gate may only cite a dataset that exists", c.display()));
+            return Err(format!(
+                "REFUSED: corpus {} does not exist — a gate may only cite a dataset that exists",
+                c.display()
+            ));
         }
     }
-    std::fs::create_dir_all(&cfg.out_dir).map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
+    std::fs::create_dir_all(&cfg.out_dir)
+        .map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
 
     // 1+2: build both arms from refs; NO-OP refusal on identical hashes.
     let (base_bin, base_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.base_ref, &cfg.out_dir)?;
-    let (after_bin, after_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.after_ref, &cfg.out_dir)?;
+    let (after_bin, after_prov) =
+        crate::ablate::build_arm(&cfg.repo, &cfg.after_ref, &cfg.out_dir)?;
     let noop = base_prov.binary_sha256 == after_prov.binary_sha256;
 
     // 3: verify the after arm (clause 1).
@@ -567,7 +595,10 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
         0
     } else {
         let decoder = format!("{} -d -c {{input}}", after_bin.display());
-        let ours = format!("{} -{{level}} -p {{threads}} -c {{input}}", after_bin.display());
+        let ours = format!(
+            "{} -{{level}} -p {{threads}} -c {{input}}",
+            after_bin.display()
+        );
         let cross: Vec<(String, String)> = [
             ("gzip", "gzip -d -c {input}"),
             ("pigz", "pigz -d -c {input}"),
@@ -641,7 +672,13 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
     };
 
     let arch = std::env::consts::ARCH.to_string();
-    let mut adj = adjudicate(&cells, verify_failures, noop, std::slice::from_ref(&arch), &cfg.archs_required);
+    let mut adj = adjudicate(
+        &cells,
+        verify_failures,
+        noop,
+        std::slice::from_ref(&arch),
+        &cfg.archs_required,
+    );
     if let Some((note, _)) = &confirmation {
         adj.clauses.insert(0, note.clone());
     }
@@ -919,7 +956,10 @@ pub fn selftest() -> ExitCode {
 
     // Level-set refusal.
     check("refuse: single level", check_level_set(&[2]).is_err());
-    check("refuse: all-shallow set", check_level_set(&[1, 2, 4]).is_err());
+    check(
+        "refuse: all-shallow set",
+        check_level_set(&[1, 2, 4]).is_err(),
+    );
     check("refuse: all-deep set", check_level_set(&[6, 9]).is_err());
     check("accept: shallow+deep", check_level_set(&[2, 6, 9]).is_ok());
 
@@ -954,10 +994,20 @@ pub fn selftest() -> ExitCode {
     );
 
     // Clause 1: verify failure dominates.
-    let a = adjudicate(&[cell("size", 6, 1.05, true, 1.0, false)], 3, false, &arch, &arch);
+    let a = adjudicate(
+        &[cell("size", 6, 1.05, true, 1.0, false)],
+        3,
+        false,
+        &arch,
+        &arch,
+    );
     check(
         "clause 1: any roundtrip failure => NO-SHIP",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 1"),
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 1"),
     );
 
     // Clause 3: one flip blocks even with big wins elsewhere.
@@ -973,24 +1023,39 @@ pub fn selftest() -> ExitCode {
     );
     check(
         "clause 3: one pass->fail flip => NO-SHIP regardless of other wins",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 3"),
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 3"),
     );
 
     // Clause 4: no progress.
-    let a = adjudicate(&[cell("size", 6, 0.98, false, 0.98, false)], 0, false, &arch, &arch);
+    let a = adjudicate(
+        &[cell("size", 6, 0.98, false, 0.98, false)],
+        0,
+        false,
+        &arch,
+        &arch,
+    );
     check(
         "clause 4: nothing closed, gap unchanged => NO-SHIP",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 4"),
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 4"),
     );
 
     // Clause 5: erosion budget.
     check(
         "clause 5: budget = min(quarter-margin, 0.5%)",
-        (erosion_budget(0.9) - 0.005).abs() < 1e-12 && (erosion_budget(0.999) - 0.00025).abs() < 1e-12,
+        (erosion_budget(0.9) - 0.005).abs() < 1e-12
+            && (erosion_budget(0.999) - 0.00025).abs() < 1e-12,
     );
     let a = adjudicate(
         &[
-            cell("size", 6, 1.05, true, 1.02, true),   // progress on the gap
+            cell("size", 6, 1.05, true, 1.02, true), // progress on the gap
             cell("wall", 2, 0.999, false, 1.0035, false), // eroded 0.35% > 0.025% budget, no flip
         ],
         0,
@@ -1018,7 +1083,11 @@ pub fn selftest() -> ExitCode {
     // fires first — assert that ordering is stable (first failed clause wins).
     check(
         "clause ordering: the FIRST failed clause names the verdict",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 5"),
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 5"),
     );
     let a = adjudicate(
         &[
@@ -1033,7 +1102,11 @@ pub fn selftest() -> ExitCode {
     );
     check(
         "clause 6: improvement < 2x harm => NO-SHIP even when each erosion is in budget",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 6"),
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 6"),
     );
 
     // SHIP path.
@@ -1047,7 +1120,10 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
     );
-    check("ship: closes a cell, no flips/erosion/harm => SHIP", a.verdict == Verdict::Ship);
+    check(
+        "ship: closes a cell, no flips/erosion/harm => SHIP",
+        a.verdict == Verdict::Ship,
+    );
 
     // Clause 7: missing arch => UNDECIDED with the re-run named.
     let a = adjudicate(

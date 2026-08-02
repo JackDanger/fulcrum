@@ -1155,10 +1155,15 @@ fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
 }
 
 /// Run the trusted oracle once → (reference_sha, output byte count).
-fn run_oracle(oracle_cmd: &[String], corpus: &str, compress: bool) -> Result<(String, f64), String> {
+fn run_oracle(
+    oracle_cmd: &[String],
+    corpus: &str,
+    compress: bool,
+) -> Result<(String, f64), String> {
     if compress {
         // The reference IS the input: every arm must round-trip to it.
-        let bytes = std::fs::read(corpus).map_err(|e| format!("cannot read corpus {corpus}: {e}"))?;
+        let bytes =
+            std::fs::read(corpus).map_err(|e| format!("cannot read corpus {corpus}: {e}"))?;
         if bytes.is_empty() {
             return Err(format!("corpus {corpus} is empty"));
         }
@@ -1394,7 +1399,8 @@ fn run_cell(
     let subj_full: Vec<String> = std::iter::once(cfg.subject_bin.clone())
         .chain(gz_args.iter().cloned())
         .collect();
-    let (subj_sha, subj_bytes) = run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus, verify)?;
+    let (subj_sha, subj_bytes) =
+        run_arm_sha(&cfg.subject_bin, &cfg.common_env, &gz_args, corpus, verify)?;
     if subj_sha != reference_sha {
         return Err(format!(
             "SHA MISMATCH subject vs oracle on {corpus} T{thread}: {subj_sha} != {reference_sha}"
@@ -1886,10 +1892,7 @@ pub fn selftest() -> ExitCode {
         }
     };
     // Watchdog runner: a SPIN or DEADLOCK must fail the gate, not hang it.
-    fn bounded<T: Send + 'static>(
-        secs: u64,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Option<T> {
+    fn bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(f());
@@ -1989,7 +1992,10 @@ pub fn selftest() -> ExitCode {
             matches!(&got, Some(Ok((sha, n))) if *sha == want && *n == raw.len()),
         );
     } else {
-        check("compress verify: SKIPPED — no gzip on this box (install it)", false);
+        check(
+            "compress verify: SKIPPED — no gzip on this box (install it)",
+            false,
+        );
     }
 
     if fails == 0 {
