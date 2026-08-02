@@ -33,6 +33,10 @@ fn registry() -> Vec<(&'static str, Gate0)> {
         ("why", crate::why::selftest),
         ("candidates", crate::candidates::selftest),
         ("try", crate::promote::selftest),
+        (
+            "profile counters (counterdiff)",
+            crate::counterdiff::selftest,
+        ),
         ("profile uarch", crate::uarch::selftest),
         ("profile rss (memprofile)", crate::memprofile::selftest),
         ("trace dispatchgap", crate::dispatchgap::selftest),
@@ -83,19 +87,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
             let reg = registry();
             // Exact name first; only then the first-word convenience form. The
             // other order lets `board wall (wallcensus)` resolve to `board`.
-            match reg
-                .iter()
-                .find(|(n, _)| *n == one)
-                .or_else(|| reg.iter().find(|(n, _)| n.split_whitespace().next() == Some(one)))
-            {
+            match reg.iter().find(|(n, _)| *n == one).or_else(|| {
+                reg.iter()
+                    .find(|(n, _)| n.split_whitespace().next() == Some(one))
+            }) {
                 Some((name, f)) => {
                     println!("== Gate-0: {name}");
                     f()
                 }
                 None => {
-                    eprintln!(
-                        "selftest: no Gate-0 named '{one}' (see `fulcrum selftest --list`)"
-                    );
+                    eprintln!("selftest: no Gate-0 named '{one}' (see `fulcrum selftest --list`)");
                     ExitCode::from(2)
                 }
             }
@@ -116,7 +117,11 @@ fn run_all_in_process() -> ExitCode {
             failed.push(name);
         }
     }
-    println!("\nselftest: {}/{} Gate-0s passed", total - failed.len(), total);
+    println!(
+        "\nselftest: {}/{} Gate-0s passed",
+        total - failed.len(),
+        total
+    );
     if failed.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -175,7 +180,11 @@ fn run_all() -> ExitCode {
             failed.push(name);
         }
     }
-    println!("\nselftest: {}/{} Gate-0s passed", total - failed.len(), total);
+    println!(
+        "\nselftest: {}/{} Gate-0s passed",
+        total - failed.len(),
+        total
+    );
     if failed.is_empty() {
         ExitCode::SUCCESS
     } else {

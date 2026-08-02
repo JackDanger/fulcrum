@@ -126,7 +126,10 @@ fn family_dispatchers_print_their_menus() {
     ] {
         let (_, stderr, code) = run(&[fam]);
         assert_eq!(code, Some(2), "{fam} without a subcommand should exit 2");
-        assert!(stderr.contains(token), "{fam} menu must mention {token}: {stderr}");
+        assert!(
+            stderr.contains(token),
+            "{fam} menu must mention {token}: {stderr}"
+        );
     }
 }
 

@@ -284,7 +284,17 @@ pub fn run_exec_anatomy(
 ) -> Result<ExecAnatomy, String> {
     let outdir = Path::new("/tmp/fulcrum-anatomy");
     std::fs::create_dir_all(outdir).map_err(|e| format!("mkdir {}: {e}", outdir.display()))?;
-    let tag = format!("{name}.L{level}");
+    // The tag names the cachegrind out-file. It MUST include the input: without it,
+    // every `{name}.L{level}` run collided on one path and (with the staleness bug in
+    // `behavior::run_cachegrind`) replayed the first input's numbers for every later
+    // one. Measured: 1,703,992,455 reported for three files spanning 15x in size.
+    let input_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        input.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let tag = format!("{name}.L{level}.{input_key}");
     // See `anatomy::is_gzippy_name` doc: gzippy defaults `-p` to "all CPUs",
     // which would silently swap the cachegrind arm onto the parallel
     // multi-block encoder. Pin `-p1` for any gzippy-named encoder so the

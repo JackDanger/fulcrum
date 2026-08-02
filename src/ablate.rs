@@ -163,10 +163,17 @@ pub fn build_arm(
         }
         // Submodules are not populated in a fresh worktree; the vendored
         // sources are needed to build, so borrow the primary repo's.
+        //
+        // MUST be an ABSOLUTE source path. `ln -s` resolves a relative target
+        // against the LINK'S OWN directory, so `--repo .` used to produce
+        // `<wt>/vendor -> ./vendor` — a self-referential symlink that fails every
+        // build with "Too many levels of symbolic links (os error 62)" and
+        // reported only as the generic "build failed for <ref>".
+        let repo_abs = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
         let _ = sh(&format!(
             "rm -rf {}/vendor && ln -s {}/vendor {}/vendor",
             wt.display(),
-            repo.display(),
+            repo_abs.display(),
             wt.display()
         ));
     }

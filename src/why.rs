@@ -89,6 +89,8 @@ pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
     let mut summary_ir: Option<u64> = None;
     // Set by `calls=`, consumed and cleared by the very next cost line — which
     // is that call arc's INCLUSIVE cost, not self-cost, and must not be summed.
+    // Cleared early by any position-defining line (`fn=`/`cfn=`/...): only the
+    // row IMMEDIATELY after `calls=` is the inclusive cost.
     let mut pending_call_arc = false;
     for raw in body.lines() {
         let l = raw.trim();
@@ -107,7 +109,11 @@ pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
                 .filter_map(|t| t.parse::<u64>().ok())
                 .collect();
             summary_ir = ir_idx.and_then(|i| vals.get(i)).copied();
-        } else if let Some(fl) = l.strip_prefix("fl=").or_else(|| l.strip_prefix("fi=")).or_else(|| l.strip_prefix("fe=")) {
+        } else if let Some(fl) = l
+            .strip_prefix("fl=")
+            .or_else(|| l.strip_prefix("fi="))
+            .or_else(|| l.strip_prefix("fe="))
+        {
             let fl = fl.trim();
             if let Some(rest) = fl.strip_prefix('(') {
                 if let Some((id, name)) = rest.split_once(')') {
@@ -123,16 +129,28 @@ pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
                 cur_file = fl.to_string();
             }
             last_line = 0;
+            pending_call_arc = false;
+        } else if l.starts_with("fn=")
+            || l.starts_with("cfn=")
+            || l.starts_with("cfi=")
+            || l.starts_with("cob=")
+            || l.starts_with("ob=")
+        {
+            // Any position-defining line ends a pending call: only the row IMMEDIATELY
+            // after `calls=` is the inclusive cost. Without this, a `cfn=`/`fn=` between
+            // them would let the skip consume an unrelated SELF row (measured: 93,108,494
+            // vs a cachegrind truth of 100,723,312 — 7% low).
+            pending_call_arc = false;
         // A cost line begins with an instruction position: an absolute number,
         // `+N`/`-N` relative to the previous line, or `*` (repeat).
         //
-        // `-N` WAS MISSING and cost 18.9% of every total. Callgrind emits
+        // `-N` WAS MISSING and cost up to 18.9% of a total. Callgrind emits
         // NEGATIVE relative positions whenever the next annotated line is
-        // BACKWARD from the previous one — which happens constantly in
-        // optimised code, where a loop body's lines are not laid out in source
-        // order. On a real libdeflate trace that was 1,560 lines carrying
-        // 142,121,037 Ir, silently dropped: parsed 610,704,481 against
-        // callgrind's own summary of 752,825,508.
+        // BACKWARD from the previous one — constant in optimised code, where a
+        // loop body's lines are not laid out in source order. On a real
+        // libdeflate trace that was 1,560 lines carrying 142,121,037 Ir,
+        // silently dropped: parsed 610,704,481 against callgrind's own summary
+        // of 752,825,508.
         //
         // This bug PREDATES the call-arc fix in this function and survived it —
         // it was found only because that fix also added the `summary:`
@@ -182,7 +200,8 @@ pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
         }
     }
     // Aggregate duplicate (file,line) rows (calls re-visit lines).
-    let mut agg: std::collections::BTreeMap<(String, u32), (u64, u64)> = std::collections::BTreeMap::new();
+    let mut agg: std::collections::BTreeMap<(String, u32), (u64, u64)> =
+        std::collections::BTreeMap::new();
     for c in out {
         let e = agg.entry((c.file, c.line)).or_insert((0, 0));
         e.0 += c.ir;
@@ -376,7 +395,11 @@ pub fn parse_declared_corpus(json: &str) -> Vec<String> {
         Err(_) => return out,
     };
     for set in ["gate", "tune"] {
-        if let Some(files) = v.get(set).and_then(|s| s.get("files")).and_then(|f| f.as_array()) {
+        if let Some(files) = v
+            .get(set)
+            .and_then(|s| s.get("files"))
+            .and_then(|f| f.as_array())
+        {
             for f in files {
                 if let Some(name) = f.as_str() {
                     out.push(name.to_string());
@@ -442,8 +465,12 @@ fn derive(
                     .to_string()
             })?;
             let lib = repo.join("scripts/campaign/lib.sh");
-            let body = std::fs::read_to_string(&lib)
-                .map_err(|e| format!("cannot read the declared rival table {} ({e}); pass --rival-cmd", lib.display()))?;
+            let body = std::fs::read_to_string(&lib).map_err(|e| {
+                format!(
+                    "cannot read the declared rival table {} ({e}); pass --rival-cmd",
+                    lib.display()
+                )
+            })?;
             let declared = parse_declared_rivals(&body);
             if declared.is_empty() {
                 return Err(format!(
@@ -451,22 +478,25 @@ fn derive(
                     lib.display()
                 ));
             }
-            let tmpl = declared
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, t)| t.clone())
-                .ok_or_else(|| {
-                    format!(
+            let tmpl =
+                declared
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, t)| t.clone())
+                    .ok_or_else(|| {
+                        format!(
                         "rival '{name}' is not declared in {} (declared: {}) — a cell measured \
                          against a rival the campaign does not declare cannot be diffed against it",
                         lib.display(),
                         declared.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
                     )
-                })?;
+                    })?;
             // The one shell indirection the table uses: the locally built igzip.
             let local_igzip = repo.join("vendor/isa-l/build/igzip");
             let tmpl = if tmpl.starts_with('$') {
-                let (_var, rest) = tmpl.split_once(char::is_whitespace).unwrap_or((tmpl.as_str(), ""));
+                let (_var, rest) = tmpl
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((tmpl.as_str(), ""));
                 let bin = if local_igzip.is_file() {
                     local_igzip.display().to_string()
                 } else {
@@ -490,8 +520,12 @@ fn derive(
                     .to_string()
             })?;
             let split = repo.join("corpus_split.json");
-            let body = std::fs::read_to_string(&split)
-                .map_err(|e| format!("cannot read the declared corpus split {} ({e}); pass --corpus", split.display()))?;
+            let body = std::fs::read_to_string(&split).map_err(|e| {
+                format!(
+                    "cannot read the declared corpus split {} ({e}); pass --corpus",
+                    split.display()
+                )
+            })?;
             let declared = parse_declared_corpus(&body);
             if !declared.iter().any(|d| d == name) {
                 return Err(format!(
@@ -601,7 +635,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    println!("WHY {cell} — vendor diff at L{level} T{threads} on {}", corpus.display());
+    println!(
+        "WHY {cell} — vendor diff at L{level} T{threads} on {}",
+        corpus.display()
+    );
     let mut layers_ran = 0;
 
     // ---- Layer 1: STRUCTURE ------------------------------------------------
@@ -656,14 +693,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
         let mut ok = true;
         let mut reports = Vec::new();
         for (name, cmdline) in [("ours", &ours_cmd), ("rival", &rival_full)] {
-            let outfile = std::env::temp_dir().join(format!("fulcrum-why-cg-{name}-{}", std::process::id()));
+            let outfile =
+                std::env::temp_dir().join(format!("fulcrum-why-cg-{name}-{}", std::process::id()));
             let vg = format!(
                 "valgrind --tool=callgrind --callgrind-out-file={} --collect-systime=no {} > /dev/null",
                 outfile.display(),
                 cmdline
             );
             match sh_capture(&vg).and_then(|_| {
-                std::fs::read_to_string(&outfile).map_err(|e| format!("read {}: {e}", outfile.display()))
+                std::fs::read_to_string(&outfile)
+                    .map_err(|e| format!("read {}: {e}", outfile.display()))
             }) {
                 Ok(body) => {
                     let (costs, summary) = parse_callgrind_checked(&body);
@@ -731,15 +770,30 @@ pub fn cmd(args: &[String]) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         println!("\n[3 COUNTERS] paired hw-counter diff, threads MATCHED at T{threads}:");
+        // COMPRESS mode is mandatory here and was MISSING for the entire
+        // encoder campaign: without it counterdiff inherited the decode
+        // defaults — the subject ran `-d -c` (decompressing!) and the oracle
+        // ran `gzip -dc` on the PLAIN corpus, so this layer refused every
+        // encoder cell with "oracle 'gzip' exited Some(1)" and the counter
+        // layer never ran once. The comparator template must NOT carry
+        // `{input}` — counterdiff appends the corpus itself, and a rival
+        // command with the file named twice compresses it twice.
+        let rival_counters = rival_full
+            .replace(&corpus.display().to_string(), "")
+            .trim()
+            .to_string();
         let cd_args: Vec<String> = vec![
             "--subject-bin".into(),
             ours.clone(),
+            "--compress".into(),
+            "--gz-args".into(),
+            format!("-{level} -c -p {{t}}"),
             "--comparator-cmd".into(),
-            rival_full.clone(),
+            rival_counters,
             "--corpus".into(),
             corpus.display().to_string(),
             "--threads".into(),
-            format!("{threads},{threads}"),
+            format!("{threads}"),
         ];
         match crate::counterdiff::parse_args(&cd_args) {
             Ok(cfg) => match crate::counterdiff::run(cfg) {
@@ -826,6 +880,14 @@ fn=(2) build_codes
 fl=(1)
 fn=(3) other
 100 25 5 1
+fl=(2)
+fn=(4) caller_with_calls
+70 11 2 1
+cfn=(2) build_codes
+calls=3 40
+70 999999 5555 77
+71 13 3 1
+-1 7 1 0
 ";
 
 pub fn selftest() -> ExitCode {
@@ -844,18 +906,45 @@ pub fn selftest() -> ExitCode {
     let costs = parse_callgrind(FIXTURE_CALLGRIND);
     check(
         "callgrind: events order respected (Ir first col, Dr second)",
-        costs.iter().any(|c| c.file.ends_with("huffman.rs") && c.line == 40 && c.ir == 100 && c.dr == 40),
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("huffman.rs") && c.line == 40 && c.ir == 100 && c.dr == 40),
     );
     check(
         "callgrind: '+N' and '*' position compression resolved (102 and repeat-102)",
-        costs.iter().any(|c| c.line == 102 && c.ir == 300 + 200 && c.dr == 100 + 50),
+        costs
+            .iter()
+            .any(|c| c.line == 102 && c.ir == 300 + 200 && c.dr == 100 + 50),
     );
     check(
         "callgrind: fl=(N) back-reference re-selects the earlier file",
-        costs.iter().any(|c| c.file.ends_with("matchfinder.rs") && c.line == 100 && c.ir == 500 + 25),
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("matchfinder.rs") && c.line == 100 && c.ir == 500 + 25),
     );
-    check("callgrind: sorted by Ir descending", costs.windows(2).all(|w| w[0].ir >= w[1].ir));
-    check("callgrind: total Ir sums every line", total_ir(&costs) == 500 + 25 + 300 + 200 + 100);
+    check(
+        "callgrind: sorted by Ir descending",
+        costs.windows(2).all(|w| w[0].ir >= w[1].ir),
+    );
+    check(
+        "callgrind: total Ir sums every SELF line",
+        total_ir(&costs) == 500 + 25 + 300 + 200 + 100 + 11 + 13 + 7,
+    );
+    // REGRESSION GUARD: '-N' is a NEGATIVE relative position, valid callgrind syntax.
+    // The row-start test omitted '-', so those rows were dropped ENTIRELY.
+    check(
+        "callgrind: '-N' negative relative positions are parsed, not dropped",
+        // line 70 of file (2) carries 11 from its own row plus 7 from the `-1`
+        // relative row that resolves back to it; duplicates aggregate, so 18.
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("huffman.rs") && c.line == 70 && c.ir == 18),
+    );
+    // REGRESSION GUARD: the row after `calls=` is the callee's INCLUSIVE subtree cost.
+    check(
+        "callgrind: the row after `calls=` (inclusive) is NOT counted as a self cost",
+        !costs.iter().any(|c| c.ir == 999999) && total_ir(&costs) < 999999,
+    );
 
     // ---- the call-arc fixture: this parser was GREEN for months without it --
     // FIXTURE_CALLGRIND above contains no `calls=` directive, so no assertion
@@ -927,9 +1016,17 @@ summary: 100
     );
     check(
         "callgrind: work's 900 lands on work.rs ONCE, not once per call site",
-        arc_costs.iter().filter(|c| c.file == "/src/work.rs").map(|c| c.ir).sum::<u64>() == 900,
+        arc_costs
+            .iter()
+            .filter(|c| c.file == "/src/work.rs")
+            .map(|c| c.ir)
+            .sum::<u64>()
+            == 900,
     );
-    check("callgrind: line-info guard accepts real tables", has_line_info(&costs));
+    check(
+        "callgrind: line-info guard accepts real tables",
+        has_line_info(&costs),
+    );
     check(
         "callgrind: line-info guard refuses an opaque capture (no -g)",
         !has_line_info(&parse_callgrind("events: Ir\nfl=???\n0 1000\n")),
@@ -1001,14 +1098,17 @@ summary: 100
     );
     check(
         "rivals: the template is the FULL declared command, flags included",
-        rivals.iter().any(|(n, t)| n == "pigz" && t == "pigz -{level} -p {threads} -c {input}"),
+        rivals
+            .iter()
+            .any(|(n, t)| n == "pigz" && t == "pigz -{level} -p {threads} -c {input}"),
     );
     check(
         "rivals: the helper's own body (`--rival \"$name=$tmpl\"`) is not a rival",
         !rivals.iter().any(|(n, _)| n.contains('$')),
     );
 
-    const SPLIT: &str = r#"{"gate":{"files":["sil40","access.log"]},"tune":{"files":["dd79_text6"]}}"#;
+    const SPLIT: &str =
+        r#"{"gate":{"files":["sil40","access.log"]},"tune":{"files":["dd79_text6"]}}"#;
     let corpora = parse_declared_corpus(SPLIT);
     check(
         "corpus: gate AND tune members are both declared (a gate-only view hides half the board)",
@@ -1050,7 +1150,12 @@ summary: 100
     );
     check(
         "derive: explicit --ours/--rival-cmd/--corpus need no repo and are passed through",
-        explicit == Ok(("/bin/ours".into(), "rival -{level}".into(), std::path::PathBuf::from("/tmp/in"))),
+        explicit
+            == Ok((
+                "/bin/ours".into(),
+                "rival -{level}".into(),
+                std::path::PathBuf::from("/tmp/in"),
+            )),
     );
     let _ = std::fs::remove_dir_all(&tmp);
 

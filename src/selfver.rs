@@ -204,7 +204,10 @@ pub fn selftest() -> ExitCode {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     // 1. A stale binary earlier on PATH is SEEN, and flagged as not-the-running-one.
-    std::env::set_var("PATH", format!("{}:{}", shadow_dir.display(), empty_dir.display()));
+    std::env::set_var(
+        "PATH",
+        format!("{}:{}", shadow_dir.display(), empty_dir.display()),
+    );
     let found = path_installs();
     check(
         "PATH: a shadowing fulcrum is found",
@@ -283,7 +286,11 @@ pub fn cmd_version(args: &[String]) -> ExitCode {
         );
     } else {
         println!("fulcrum {}", env!("CARGO_PKG_VERSION"));
-        println!("  commit : {}{}", COMMIT, if is_dirty() { " (DIRTY TREE)" } else { "" });
+        println!(
+            "  commit : {}{}",
+            COMMIT,
+            if is_dirty() { " (DIRTY TREE)" } else { "" }
+        );
         println!("  built  : {}", fmt_build_time());
         println!("  origin : {ORIGIN}");
         println!("  source : {SRC_DIR}");
@@ -297,7 +304,11 @@ pub fn cmd_version(args: &[String]) -> ExitCode {
                 println!(
                     "    {}{}",
                     p.display(),
-                    if *running { "   <- the one running" } else { "" }
+                    if *running {
+                        "   <- the one running"
+                    } else {
+                        ""
+                    }
                 );
             }
             if !installs.iter().any(|(_, r)| *r) {
@@ -318,7 +329,11 @@ pub fn cmd_version(args: &[String]) -> ExitCode {
             eprintln!(
                 "version: MISMATCH — deployed binary is {} but expected {want}{}",
                 stamp(),
-                if is_dirty() { " (and the build tree was dirty)" } else { "" }
+                if is_dirty() {
+                    " (and the build tree was dirty)"
+                } else {
+                    ""
+                }
             );
             return ExitCode::FAILURE;
         }
@@ -345,7 +360,9 @@ pub enum CmdClass {
 }
 
 fn run_with_timeout(mut cmd: Command, limit: Duration) -> Option<String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
     let mut child = cmd.spawn().ok()?;
     let start = Instant::now();
     loop {
@@ -519,7 +536,10 @@ pub fn enforce(class: CmdClass, argv: &[String]) -> Result<(), String> {
         };
     }
     let Some(remote) = remote_main_sha() else {
-        eprintln!("selfver: origin/main unreachable — proceeding with baked provenance {}", stamp());
+        eprintln!(
+            "selfver: origin/main unreachable — proceeding with baked provenance {}",
+            stamp()
+        );
         return Ok(());
     };
     if remote == COMMIT && !is_dirty() {
@@ -527,7 +547,10 @@ pub fn enforce(class: CmdClass, argv: &[String]) -> Result<(), String> {
     }
     if is_dirty() {
         // A dirty build is honest (stamped -dirty) but never current.
-        eprintln!("selfver: WARNING — running a DIRTY build ({}); artifacts are stamped -dirty", stamp());
+        eprintln!(
+            "selfver: WARNING — running a DIRTY build ({}); artifacts are stamped -dirty",
+            stamp()
+        );
     }
     if remote == COMMIT {
         return Ok(());
