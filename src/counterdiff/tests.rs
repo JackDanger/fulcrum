@@ -432,7 +432,10 @@ fn compress_mode_refuses_an_unpinned_subject() {
         ])
     })
     .unwrap_err();
-    assert!(err.contains("-p"), "refusal must name the missing pin: {err}");
+    assert!(
+        err.contains("-p"),
+        "refusal must name the missing pin: {err}"
+    );
     assert!(
         err.contains("--subject-single-threaded"),
         "refusal must name the escape hatch: {err}"
@@ -505,8 +508,14 @@ fn compress_comparator_pin_guard() {
     assert!(check_compress_comparator_pin(&split_args("gzip -6 -c")).is_ok());
     assert!(check_compress_comparator_pin(&split_args("pigz -6 -c")).is_err());
     assert!(check_compress_comparator_pin(&split_args("pigz -6 -p1 -c")).is_ok());
-    assert!(check_compress_comparator_pin(&split_args("/root/gzippy/target/release/gzippy -6 -c")).is_err());
-    assert!(check_compress_comparator_pin(&split_args("/root/gzippy/target/release/gzippy -6 -c -p {t}")).is_ok());
+    assert!(
+        check_compress_comparator_pin(&split_args("/root/gzippy/target/release/gzippy -6 -c"))
+            .is_err()
+    );
+    assert!(check_compress_comparator_pin(&split_args(
+        "/root/gzippy/target/release/gzippy -6 -c -p {t}"
+    ))
+    .is_ok());
 }
 
 /// REGRESSION GUARD (2026-08-01): the compress-mode round-trip verifier piped
@@ -537,13 +546,19 @@ fn compress_verify_survives_outputs_larger_than_a_pipe_buffer() {
     let want_sha = hex32(&sha256(&raw));
 
     let oracle = split_args("gzip -dc");
-    let got = with_watchdog(120, "run_arm_sha compress round-trip on an 8 MiB corpus", move || {
-        run_arm_sha("gzip", &[], &split_args("-1 -c"), &corpus_s, Some(&oracle))
-    });
+    let got = with_watchdog(
+        120,
+        "run_arm_sha compress round-trip on an 8 MiB corpus",
+        move || run_arm_sha("gzip", &[], &split_args("-1 -c"), &corpus_s, Some(&oracle)),
+    );
     let _ = std::fs::remove_file(&corpus);
     let _ = std::fs::remove_dir(&dir);
     let (sha, n) = got.expect("round-trip verify");
-    assert_eq!(n, raw.len(), "verifier must yield the decompressed byte count");
+    assert_eq!(
+        n,
+        raw.len(),
+        "verifier must yield the decompressed byte count"
+    );
     assert_eq!(sha, want_sha, "round-trip sha must equal the input sha");
 }
 

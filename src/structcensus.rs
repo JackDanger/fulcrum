@@ -271,11 +271,17 @@ fn run_cmd(args: &[String]) -> ExitCode {
     }
 
     let Some(ours) = ours else {
-        eprintln!("structcensus: --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' is required\n\n{}", usage());
+        eprintln!(
+            "structcensus: --ours 'CMD -{{level}} -p {{threads}} -c {{input}}' is required\n\n{}",
+            usage()
+        );
         return ExitCode::from(2);
     };
     if corpora.is_empty() {
-        eprintln!("structcensus: at least one --corpus is required\n\n{}", usage());
+        eprintln!(
+            "structcensus: at least one --corpus is required\n\n{}",
+            usage()
+        );
         return ExitCode::from(2);
     }
     // GUARD, from the sizecensus incident: a census that measures the subject and
@@ -297,8 +303,14 @@ fn run_cmd(args: &[String]) -> ExitCode {
     let mut arms: Vec<(String, String)> = vec![("ours".to_string(), ours)];
     arms.extend(rivals);
 
-    println!("STRUCTCENSUS level={level} threads={threads} corpora={}", corpora.len());
-    println!("{:<14} {:>12} {:>10} {:>16}  {}", "binary", "input", "allocs", "bytes", "corpus");
+    println!(
+        "STRUCTCENSUS level={level} threads={threads} corpora={}",
+        corpora.len()
+    );
+    println!(
+        "{:<14} {:>12} {:>10} {:>16}  {}",
+        "binary", "input", "allocs", "bytes", "corpus"
+    );
 
     let mut samples: std::collections::BTreeMap<String, Vec<(u64, u64)>> = Default::default();
     let mut any_void = false;
@@ -320,12 +332,18 @@ fn run_cmd(args: &[String]) -> ExitCode {
                         println!("{name:<14} {input_len:>12} {status:>10} {:>16}  {c}", "-");
                         continue;
                     }
-                    samples.entry(name.clone()).or_default().push((input_len, allocs));
+                    samples
+                        .entry(name.clone())
+                        .or_default()
+                        .push((input_len, allocs));
                     println!("{name:<14} {input_len:>12} {allocs:>10} {bytes:>16}  {c}");
                 }
                 None => {
                     any_void = true;
-                    println!("{name:<14} {input_len:>12} {:>10} {:>16}  {c}", "RIVAL-UNAVAIL", "-");
+                    println!(
+                        "{name:<14} {input_len:>12} {:>10} {:>16}  {c}",
+                        "RIVAL-UNAVAIL", "-"
+                    );
                 }
             }
         }
@@ -434,7 +452,10 @@ pub fn selftest() -> ExitCode {
 
     check(
         "classify: rival not installed -> RIVAL-UNAVAILABLE, never silently dropped",
-        matches!(classify_cell(false, true, true, 3), ("RIVAL-UNAVAILABLE", false)),
+        matches!(
+            classify_cell(false, true, true, 3),
+            ("RIVAL-UNAVAILABLE", false)
+        ),
     );
     check(
         "classify: rival cannot run this level -> ABSENT, distinct from unavailable",

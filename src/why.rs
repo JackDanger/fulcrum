@@ -48,6 +48,36 @@ pub struct LineCost {
 /// are `line events…`. Handles the compressed `fl=(N) name` id form and bare
 /// `fl=(N)` back-references.
 pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
+    parse_callgrind_checked(body).0
+}
+
+/// `parse_callgrind`, plus the file's own `summary:`/`totals:` line — the
+/// denominator callgrind itself computed. Returned so the caller can VERIFY
+/// the parse instead of trusting it.
+///
+/// WHY THIS EXISTS. This parser summed EVERY cost-shaped line, including the
+/// inclusive-cost line that callgrind emits after each `calls=<N> <pos>`
+/// directive. That cost is the callee's, already recorded in full under the
+/// callee's own section, so summing it adds one extra copy per ancestor
+/// call-site on the path to every instruction.
+///
+/// RECEIPT (2026-08-01, gzippy L2 dickens on the trainer box): this layer
+/// reported `ours total Ir 10,307,929,423` and `rival 5,987,049,889`, a
+/// 1.72x ratio, and it was quoted as a finding. callgrind's OWN `summary:`
+/// for the same two runs read 886,643,354 and 752,825,508 — a ratio of
+/// **1.178**. The inflation was 11.6x on one arm and 7.95x on the other:
+/// ASYMMETRIC, because it scales with call depth, which differs between a
+/// Rust binary and a C one. An asymmetric error on a RATIO is the worst
+/// possible failure mode for a vendor diff, and nothing in the output looked
+/// wrong.
+///
+/// `behavior.rs::parse_callgrind_symbolized` documents this exact bug (its
+/// "bug 2") and fixes it with a `pending_call_arc` flag. That fix was written
+/// after measuring 9.02x inflation on an igzip trace. This parser, in the
+/// same binary, never got it — a lesson learned in one module and not carried
+/// to its sibling. Hence the `summary:` cross-check below: a fix that can
+/// silently rot is the same defect one refactor later.
+pub fn parse_callgrind_checked(body: &str) -> (Vec<LineCost>, Option<u64>) {
     #[allow(unused_assignments)]
     let mut events: Vec<String> = Vec::new();
     let mut ir_idx = None;
@@ -56,14 +86,34 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
     let mut cur_file = String::new();
     let mut out: Vec<LineCost> = Vec::new();
     let mut last_line = 0u32;
-    let mut skip_next_cost_row = false;
+    let mut summary_ir: Option<u64> = None;
+    // Set by `calls=`, consumed and cleared by the very next cost line — which
+    // is that call arc's INCLUSIVE cost, not self-cost, and must not be summed.
+    // Cleared early by any position-defining line (`fn=`/`cfn=`/...): only the
+    // row IMMEDIATELY after `calls=` is the inclusive cost.
+    let mut pending_call_arc = false;
     for raw in body.lines() {
         let l = raw.trim();
         if let Some(ev) = l.strip_prefix("events:") {
             events = ev.split_whitespace().map(|s| s.to_string()).collect();
             ir_idx = events.iter().position(|e| e == "Ir");
             dr_idx = events.iter().position(|e| e == "Dr");
-        } else if let Some(fl) = l.strip_prefix("fl=").or_else(|| l.strip_prefix("fi=")).or_else(|| l.strip_prefix("fe=")) {
+        } else if l.starts_with("calls=") {
+            pending_call_arc = true;
+        } else if let Some(rest) = l
+            .strip_prefix("summary:")
+            .or_else(|| l.strip_prefix("totals:"))
+        {
+            let vals: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u64>().ok())
+                .collect();
+            summary_ir = ir_idx.and_then(|i| vals.get(i)).copied();
+        } else if let Some(fl) = l
+            .strip_prefix("fl=")
+            .or_else(|| l.strip_prefix("fi="))
+            .or_else(|| l.strip_prefix("fe="))
+        {
             let fl = fl.trim();
             if let Some(rest) = fl.strip_prefix('(') {
                 if let Some((id, name)) = rest.split_once(')') {
@@ -79,7 +129,7 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
                 cur_file = fl.to_string();
             }
             last_line = 0;
-            skip_next_cost_row = false;
+            pending_call_arc = false;
         } else if l.starts_with("fn=")
             || l.starts_with("cfn=")
             || l.starts_with("cfi=")
@@ -90,26 +140,29 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
             // after `calls=` is the inclusive cost. Without this, a `cfn=`/`fn=` between
             // them would let the skip consume an unrelated SELF row (measured: 93,108,494
             // vs a cachegrind truth of 100,723,312 — 7% low).
-            skip_next_cost_row = false;
-        } else if l.starts_with("calls=") {
-            // CALLGRIND FORMAT: the cost row IMMEDIATELY AFTER a `calls=` line is the
-            // callee's INCLUSIVE subtree cost, attributed at the call site — not a self
-            // cost. Summing it double-counts every call at every level of the chain.
-            // Measured before this guard existed: gzippy/dickens/L6 reported
-            // 16,710,714,581 Ir against a hand-measured cachegrind truth of
-            // 1,385,371,628 (x12.06), and libdeflate x8.04 — asymmetric, because deep
-            // Rust call chains re-count more often than flat C, which turned a true
-            // 1.20 ratio into a reported 1.80.
-            skip_next_cost_row = true;
+            pending_call_arc = false;
+        // A cost line begins with an instruction position: an absolute number,
+        // `+N`/`-N` relative to the previous line, or `*` (repeat).
+        //
+        // `-N` WAS MISSING and cost up to 18.9% of a total. Callgrind emits
+        // NEGATIVE relative positions whenever the next annotated line is
+        // BACKWARD from the previous one — constant in optimised code, where a
+        // loop body's lines are not laid out in source order. On a real
+        // libdeflate trace that was 1,560 lines carrying 142,121,037 Ir,
+        // silently dropped: parsed 610,704,481 against callgrind's own summary
+        // of 752,825,508.
+        //
+        // This bug PREDATES the call-arc fix in this function and survived it —
+        // it was found only because that fix also added the `summary:`
+        // cross-check, which REFUSED the layer and printed both numbers. The
+        // cross-check has now caught more bugs than the fix it was written to
+        // protect. Verify a parse against the file's own total; never trust it.
         } else if !l.is_empty()
             && (l.starts_with(|c: char| c.is_ascii_digit())
                 || l.starts_with('+')
                 || l.starts_with('-')
                 || l.starts_with('*'))
         {
-            // '-N' is a NEGATIVE relative position and is valid callgrind syntax. It was
-            // omitted here, so those rows were dropped entirely: on a real capture that
-            // silently lost 1,761 rows carrying 7,088,324 Ir (7% of the file's total).
             let mut parts = l.split_whitespace();
             let pos = parts.next().unwrap_or("0");
             let line = if pos == "*" {
@@ -117,19 +170,25 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
             } else if let Some(d) = pos.strip_prefix('+') {
                 last_line + d.parse::<u32>().unwrap_or(0)
             } else if let Some(d) = pos.strip_prefix('-') {
+                // Backward relative position. Saturating: a malformed file must
+                // not panic a measurement, and line 0 is already the "unknown"
+                // sentinel everywhere else in this parser.
                 last_line.saturating_sub(d.parse::<u32>().unwrap_or(0))
             } else {
                 pos.parse().unwrap_or(0)
             };
             last_line = line;
+            // The cost line right after `calls=` is the call arc's INCLUSIVE
+            // cost — the callee's own instructions, recorded again under the
+            // callee's section. Skip it; summing it inflates the total once
+            // per ancestor call-site (11.6x on a real Rust trace).
+            if pending_call_arc {
+                pending_call_arc = false;
+                continue;
+            }
             let vals: Vec<u64> = parts.map(|v| v.parse().unwrap_or(0)).collect();
             let ir = ir_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
             let dr = dr_idx.and_then(|i| vals.get(i)).copied().unwrap_or(0);
-            if skip_next_cost_row {
-                // inclusive cost of the call declared by the preceding `calls=`
-                skip_next_cost_row = false;
-                continue;
-            }
             if ir > 0 || dr > 0 {
                 out.push(LineCost {
                     file: cur_file.clone(),
@@ -141,7 +200,8 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
         }
     }
     // Aggregate duplicate (file,line) rows (calls re-visit lines).
-    let mut agg: std::collections::BTreeMap<(String, u32), (u64, u64)> = std::collections::BTreeMap::new();
+    let mut agg: std::collections::BTreeMap<(String, u32), (u64, u64)> =
+        std::collections::BTreeMap::new();
     for c in out {
         let e = agg.entry((c.file, c.line)).or_insert((0, 0));
         e.0 += c.ir;
@@ -152,7 +212,7 @@ pub fn parse_callgrind(body: &str) -> Vec<LineCost> {
         .map(|((file, line), (ir, dr))| LineCost { file, line, ir, dr })
         .collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.ir));
-    v
+    (v, summary_ir)
 }
 
 /// Sum of Ir over all lines — the denominator every per-line share is
@@ -335,7 +395,11 @@ pub fn parse_declared_corpus(json: &str) -> Vec<String> {
         Err(_) => return out,
     };
     for set in ["gate", "tune"] {
-        if let Some(files) = v.get(set).and_then(|s| s.get("files")).and_then(|f| f.as_array()) {
+        if let Some(files) = v
+            .get(set)
+            .and_then(|s| s.get("files"))
+            .and_then(|f| f.as_array())
+        {
             for f in files {
                 if let Some(name) = f.as_str() {
                     out.push(name.to_string());
@@ -401,8 +465,12 @@ fn derive(
                     .to_string()
             })?;
             let lib = repo.join("scripts/campaign/lib.sh");
-            let body = std::fs::read_to_string(&lib)
-                .map_err(|e| format!("cannot read the declared rival table {} ({e}); pass --rival-cmd", lib.display()))?;
+            let body = std::fs::read_to_string(&lib).map_err(|e| {
+                format!(
+                    "cannot read the declared rival table {} ({e}); pass --rival-cmd",
+                    lib.display()
+                )
+            })?;
             let declared = parse_declared_rivals(&body);
             if declared.is_empty() {
                 return Err(format!(
@@ -410,22 +478,25 @@ fn derive(
                     lib.display()
                 ));
             }
-            let tmpl = declared
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, t)| t.clone())
-                .ok_or_else(|| {
-                    format!(
+            let tmpl =
+                declared
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, t)| t.clone())
+                    .ok_or_else(|| {
+                        format!(
                         "rival '{name}' is not declared in {} (declared: {}) — a cell measured \
                          against a rival the campaign does not declare cannot be diffed against it",
                         lib.display(),
                         declared.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
                     )
-                })?;
+                    })?;
             // The one shell indirection the table uses: the locally built igzip.
             let local_igzip = repo.join("vendor/isa-l/build/igzip");
             let tmpl = if tmpl.starts_with('$') {
-                let (_var, rest) = tmpl.split_once(char::is_whitespace).unwrap_or((tmpl.as_str(), ""));
+                let (_var, rest) = tmpl
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((tmpl.as_str(), ""));
                 let bin = if local_igzip.is_file() {
                     local_igzip.display().to_string()
                 } else {
@@ -449,8 +520,12 @@ fn derive(
                     .to_string()
             })?;
             let split = repo.join("corpus_split.json");
-            let body = std::fs::read_to_string(&split)
-                .map_err(|e| format!("cannot read the declared corpus split {} ({e}); pass --corpus", split.display()))?;
+            let body = std::fs::read_to_string(&split).map_err(|e| {
+                format!(
+                    "cannot read the declared corpus split {} ({e}); pass --corpus",
+                    split.display()
+                )
+            })?;
             let declared = parse_declared_corpus(&body);
             if !declared.iter().any(|d| d == name) {
                 return Err(format!(
@@ -560,7 +635,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    println!("WHY {cell} — vendor diff at L{level} T{threads} on {}", corpus.display());
+    println!(
+        "WHY {cell} — vendor diff at L{level} T{threads} on {}",
+        corpus.display()
+    );
     let mut layers_ran = 0;
 
     // ---- Layer 1: STRUCTURE ------------------------------------------------
@@ -615,17 +693,40 @@ pub fn cmd(args: &[String]) -> ExitCode {
         let mut ok = true;
         let mut reports = Vec::new();
         for (name, cmdline) in [("ours", &ours_cmd), ("rival", &rival_full)] {
-            let outfile = std::env::temp_dir().join(format!("fulcrum-why-cg-{name}-{}", std::process::id()));
+            let outfile =
+                std::env::temp_dir().join(format!("fulcrum-why-cg-{name}-{}", std::process::id()));
             let vg = format!(
                 "valgrind --tool=callgrind --callgrind-out-file={} --collect-systime=no {} > /dev/null",
                 outfile.display(),
                 cmdline
             );
             match sh_capture(&vg).and_then(|_| {
-                std::fs::read_to_string(&outfile).map_err(|e| format!("read {}: {e}", outfile.display()))
+                std::fs::read_to_string(&outfile)
+                    .map_err(|e| format!("read {}: {e}", outfile.display()))
             }) {
                 Ok(body) => {
-                    let costs = parse_callgrind(&body);
+                    let (costs, summary) = parse_callgrind_checked(&body);
+                    // SELF-CHECK: callgrind computes its own grand total. If our
+                    // per-line sum disagrees with it, the parse is wrong and every
+                    // percentage below is wrong — REFUSE rather than print it. The
+                    // call-arc bug this catches produced an 11.6x/7.95x ASYMMETRIC
+                    // inflation that turned a true 1.178 ratio into 1.72, and looked
+                    // completely ordinary on screen.
+                    if let Some(sum) = summary {
+                        let got = total_ir(&costs);
+                        let drift = (got as f64 - sum as f64).abs() / (sum.max(1) as f64);
+                        if drift > 0.01 {
+                            println!(
+                                "\n[2 LINES] REFUSED for {name} — parsed Ir {got} disagrees with \
+                                 callgrind's own summary {sum} by {:.1}%. The per-line attribution \
+                                 is not trustworthy and no percentage from it may be quoted.",
+                                100.0 * drift
+                            );
+                            ok = false;
+                            let _ = std::fs::remove_file(&outfile);
+                            continue;
+                        }
+                    }
                     if !has_line_info(&costs) {
                         println!(
                             "\n[2 LINES] REFUSED for {name} — no line tables in the binary (built without -g?): \
@@ -805,24 +906,32 @@ pub fn selftest() -> ExitCode {
     let costs = parse_callgrind(FIXTURE_CALLGRIND);
     check(
         "callgrind: events order respected (Ir first col, Dr second)",
-        costs.iter().any(|c| c.file.ends_with("huffman.rs") && c.line == 40 && c.ir == 100 && c.dr == 40),
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("huffman.rs") && c.line == 40 && c.ir == 100 && c.dr == 40),
     );
     check(
         "callgrind: '+N' and '*' position compression resolved (102 and repeat-102)",
-        costs.iter().any(|c| c.line == 102 && c.ir == 300 + 200 && c.dr == 100 + 50),
+        costs
+            .iter()
+            .any(|c| c.line == 102 && c.ir == 300 + 200 && c.dr == 100 + 50),
     );
     check(
         "callgrind: fl=(N) back-reference re-selects the earlier file",
-        costs.iter().any(|c| c.file.ends_with("matchfinder.rs") && c.line == 100 && c.ir == 500 + 25),
+        costs
+            .iter()
+            .any(|c| c.file.ends_with("matchfinder.rs") && c.line == 100 && c.ir == 500 + 25),
     );
-    check("callgrind: sorted by Ir descending", costs.windows(2).all(|w| w[0].ir >= w[1].ir));
+    check(
+        "callgrind: sorted by Ir descending",
+        costs.windows(2).all(|w| w[0].ir >= w[1].ir),
+    );
     check(
         "callgrind: total Ir sums every SELF line",
         total_ir(&costs) == 500 + 25 + 300 + 200 + 100 + 11 + 13 + 7,
     );
     // REGRESSION GUARD: '-N' is a NEGATIVE relative position, valid callgrind syntax.
-    // The row-start test omitted '-', so those rows were dropped ENTIRELY — on a real
-    // capture that silently lost 1,761 rows carrying 7,088,324 Ir, 7% of the total.
+    // The row-start test omitted '-', so those rows were dropped ENTIRELY.
     check(
         "callgrind: '-N' negative relative positions are parsed, not dropped",
         // line 70 of file (2) carries 11 from its own row plus 7 from the `-1`
@@ -832,15 +941,92 @@ pub fn selftest() -> ExitCode {
             .any(|c| c.file.ends_with("huffman.rs") && c.line == 70 && c.ir == 18),
     );
     // REGRESSION GUARD: the row after `calls=` is the callee's INCLUSIVE subtree cost.
-    // Counting it as a self cost double-counts every call at every level of the chain.
-    // It inflated real captures ASYMMETRICALLY (gzippy x12.06, libdeflate x8.04 on
-    // dickens/L6), turning a true 1.20 instruction ratio into a reported 1.80. The old
-    // fixture had no `calls=` line at all, so Gate-0 passed while the parser was wrong.
     check(
         "callgrind: the row after `calls=` (inclusive) is NOT counted as a self cost",
         !costs.iter().any(|c| c.ir == 999999) && total_ir(&costs) < 999999,
     );
-    check("callgrind: line-info guard accepts real tables", has_line_info(&costs));
+
+    // ---- the call-arc fixture: this parser was GREEN for months without it --
+    // FIXTURE_CALLGRIND above contains no `calls=` directive, so no assertion
+    // over it could ever have caught the inclusive-cost double-count. The bug
+    // shipped a 1.72x ratio (true: 1.178) with 18/18 selftests passing. A
+    // fixture that cannot express the defect certifies it.
+    //
+    // Shape below: `main` (self 100) calls `work` twice; `work`'s self cost is
+    // 900 total, recorded under its own fn=. The line after `calls=2` is that
+    // call's INCLUSIVE cost (900) — the SAME instructions, a second time.
+    // Correct total = 100 + 900 = 1000, which is what `summary:` says.
+    // The naive sum is 1900.
+    const FIXTURE_CALL_ARC: &str = "\
+events: Ir Dr
+fl=(1) /src/main.rs
+fn=(1) main
+10 100 0
+cfl=(2) /src/work.rs
+cfn=(2) work
+calls=2 20
+10 900 0
+fl=(2) /src/work.rs
+fn=(2) work
+20 900 0
+summary: 1000 0
+";
+    // ---- negative relative positions: 18.9% of a real trace ----------------
+    // `-N` means "N lines BACKWARD from the previous position". Optimised code
+    // emits these constantly because line order is not source order. The parser
+    // did not recognise them as cost lines AT ALL, so they were dropped.
+    // Shape below: 100, then +5 => 105, then -3 => 102, then * => 102.
+    // Correct total = 10+20+30+40 = 100, which is what `summary:` says.
+    const FIXTURE_NEG_POS: &str = "\
+events: Ir
+fl=(1) /src/loop.rs
+fn=(1) hot
+100 10
++5 20
+-3 30
+* 40
+summary: 100
+";
+    let (neg_costs, neg_summary) = parse_callgrind_checked(FIXTURE_NEG_POS);
+    check(
+        "callgrind: `-N` backward relative positions are COST LINES, not skipped",
+        total_ir(&neg_costs) == 100,
+    );
+    check(
+        "callgrind: `-N` resolves to previous_line - N (105 - 3 = 102)",
+        neg_costs.iter().any(|c| c.line == 102 && c.ir == 30 + 40),
+    );
+    check(
+        "callgrind: negative-position total agrees with the file's own summary",
+        neg_summary.is_some_and(|s| total_ir(&neg_costs) == s),
+    );
+
+    let (arc_costs, arc_summary) = parse_callgrind_checked(FIXTURE_CALL_ARC);
+    check(
+        "callgrind: the cost line after `calls=` is a call arc and is NOT summed as self-cost",
+        total_ir(&arc_costs) == 1000,
+    );
+    check(
+        "callgrind: `summary:` is parsed, so the total can be VERIFIED not trusted",
+        arc_summary == Some(1000),
+    );
+    check(
+        "callgrind: parsed total agrees with callgrind's own summary (the refuse-guard's input)",
+        arc_summary.is_some_and(|s| total_ir(&arc_costs) == s),
+    );
+    check(
+        "callgrind: work's 900 lands on work.rs ONCE, not once per call site",
+        arc_costs
+            .iter()
+            .filter(|c| c.file == "/src/work.rs")
+            .map(|c| c.ir)
+            .sum::<u64>()
+            == 900,
+    );
+    check(
+        "callgrind: line-info guard accepts real tables",
+        has_line_info(&costs),
+    );
     check(
         "callgrind: line-info guard refuses an opaque capture (no -g)",
         !has_line_info(&parse_callgrind("events: Ir\nfl=???\n0 1000\n")),
@@ -912,14 +1098,17 @@ pub fn selftest() -> ExitCode {
     );
     check(
         "rivals: the template is the FULL declared command, flags included",
-        rivals.iter().any(|(n, t)| n == "pigz" && t == "pigz -{level} -p {threads} -c {input}"),
+        rivals
+            .iter()
+            .any(|(n, t)| n == "pigz" && t == "pigz -{level} -p {threads} -c {input}"),
     );
     check(
         "rivals: the helper's own body (`--rival \"$name=$tmpl\"`) is not a rival",
         !rivals.iter().any(|(n, _)| n.contains('$')),
     );
 
-    const SPLIT: &str = r#"{"gate":{"files":["sil40","access.log"]},"tune":{"files":["dd79_text6"]}}"#;
+    const SPLIT: &str =
+        r#"{"gate":{"files":["sil40","access.log"]},"tune":{"files":["dd79_text6"]}}"#;
     let corpora = parse_declared_corpus(SPLIT);
     check(
         "corpus: gate AND tune members are both declared (a gate-only view hides half the board)",
@@ -961,7 +1150,12 @@ pub fn selftest() -> ExitCode {
     );
     check(
         "derive: explicit --ours/--rival-cmd/--corpus need no repo and are passed through",
-        explicit == Ok(("/bin/ours".into(), "rival -{level}".into(), std::path::PathBuf::from("/tmp/in"))),
+        explicit
+            == Ok((
+                "/bin/ours".into(),
+                "rival -{level}".into(),
+                std::path::PathBuf::from("/tmp/in"),
+            )),
     );
     let _ = std::fs::remove_dir_all(&tmp);
 
