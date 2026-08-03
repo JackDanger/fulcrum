@@ -9,7 +9,9 @@
 //! `B`(egin), `E`(nd), or `i`(nstant). The loader tolerates a partial array
 //! (a trailing comma, or no closing `]`) so a timeline that was being
 //! streamed and cut short still parses — the same forgiving handling a
-//! line-by-line trace writer needs.
+//! line-by-line trace writer needs. A timeline made of complete (`ph:"X"`)
+//! events with no B/E pairs is REFUSED at load ([`X_ONLY_REFUSAL`]) — the
+//! pairing layer would silently render it as 0 ms everywhere.
 //!
 //! The bundled [`probe`](crate::probe) module emits exactly this format when
 //! `FULCRUM_TRACE=/path.json` is set, but any producer of Chrome-trace JSON
@@ -93,6 +95,20 @@ impl Span {
 }
 
 /// Load + repair + parse a Chrome-trace JSON file.
+/// Refusal text for a timeline of complete (`ph:"X"`) events with no B/E
+/// pairs. An instrument must refuse what it cannot measure: `pair_spans`
+/// reconciles B/E pairs only, so an X-only timeline used to pass every
+/// loader and then read as 0 ms EVERYWHERE downstream (2026-08-03
+/// incident) — an all-zero report that looked like a measurement.
+pub const X_ONLY_REFUSAL: &str = "this timeline uses complete (ph:X) events; the parser \
+     reconciles B/E pairs — re-emit as B/E";
+
+/// True when the timeline contains `ph:"X"` events and NOT ONE `B`/`E`
+/// event — the shape [`pair_spans`] silently renders as zero spans.
+fn x_only_timeline(events: &[Event]) -> bool {
+    events.iter().any(|e| e.ph == "X") && !events.iter().any(|e| e.ph == "B" || e.ph == "E")
+}
+
 pub fn load_events(path: &Path) -> std::io::Result<Vec<Event>> {
     let raw = std::fs::read_to_string(path)?;
     let raw = raw.trim();
@@ -118,6 +134,12 @@ pub fn load_events(path: &Path) -> std::io::Result<Vec<Event>> {
             format!("trace parse {}: {e}", path.display()),
         )
     })?;
+    if x_only_timeline(&events) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {X_ONLY_REFUSAL}", path.display()),
+        ));
+    }
     Ok(events)
 }
 
@@ -427,14 +449,21 @@ fn parse_trace_text(s: &str, path: &Path) -> Result<Vec<Event>, InstrumentError>
     }
     let trimmed = s.trim_end().trim_end_matches(',').trim_end();
     let s = format!("{trimmed}\n]");
-    serde_json::from_str(&s).map_err(|e| {
+    let events: Vec<Event> = serde_json::from_str(&s).map_err(|e| {
         InstrumentError::Malformed(format!(
             "malformed trace JSON in {}: {e}. Expected a Chrome-trace array of \
              B/E span events (the streamed, possibly-unclosed array the probe \
              emits).",
             path.display()
         ))
-    })
+    })?;
+    if x_only_timeline(&events) {
+        return Err(InstrumentError::Refused(format!(
+            "{}: {X_ONLY_REFUSAL}",
+            path.display()
+        )));
+    }
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1344,59 @@ mod tests {
             Err(InstrumentError::Empty(_)) => {}
             other => panic!("expected InstrumentError::Empty, got {other:?}"),
         }
+    }
+
+    // --- 8b: X-ONLY timeline is REFUSED, never an all-zero report.
+    // 2026-08-03 incident: a timeline emitted with complete (`ph:"X"`) events
+    // sailed through both loaders, paired zero spans, and every `fulcrum
+    // trace` view rendered 0 ms EVERYWHERE while passing. An instrument must
+    // refuse what it cannot measure.
+    #[test]
+    fn t8b_x_only_timeline_is_refused_by_both_loaders() {
+        let d = tmpdir("xonly");
+        let p = d.join("trace_xonly.json");
+        std::fs::write(
+            &p,
+            r#"[
+{"name":"worker.decode","ph":"X","ts":100.0,"dur":900.0,"pid":1,"tid":1},
+{"name":"consumer.writev","ph":"X","ts":1000.0,"dur":200.0,"pid":1,"tid":1}
+]"#,
+        )
+        .unwrap();
+        // Checked loader: a Refused carrying the re-emit instruction.
+        match load_events_checked(&p) {
+            Err(InstrumentError::Refused(msg)) => {
+                assert!(
+                    msg.contains("ph:X") && msg.contains("re-emit as B/E"),
+                    "refusal must name the mechanism and the fix; got: {msg}"
+                );
+            }
+            other => panic!("expected InstrumentError::Refused for X-only trace, got {other:?}"),
+        }
+        // io loader (the `fulcrum trace` subcommand path): same refusal.
+        match load_events(&p) {
+            Err(e) => assert!(
+                e.to_string().contains("ph:X"),
+                "io-loader refusal must name ph:X; got: {e}"
+            ),
+            Ok(_) => panic!("load_events must refuse an X-only trace"),
+        }
+
+        // Control: a trace with B/E pairs PLUS a stray X event still loads —
+        // the refusal is scoped to the zero-B/E shape that pairs to nothing.
+        let p2 = d.join("trace_mixed.json");
+        std::fs::write(
+            &p2,
+            r#"[
+{"name":"worker.decode","ph":"B","ts":100.0,"pid":1,"tid":1},
+{"name":"worker.decode","ph":"E","ts":900.0,"pid":1,"tid":1},
+{"name":"stray","ph":"X","ts":1000.0,"dur":5.0,"pid":1,"tid":1}
+]"#,
+        )
+        .unwrap();
+        let ev = load_events_checked(&p2).expect("mixed B/E + X trace must still load");
+        assert_eq!(pair_spans(&ev).len(), 1, "the B/E pair still pairs");
+        assert!(load_events(&p2).is_ok());
     }
 
     // --- 9: contaminated run marked non-production by analyze().
