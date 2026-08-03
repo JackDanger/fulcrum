@@ -378,32 +378,79 @@ enum ArmPin {
 }
 
 /// Run the pin-gate probe for one arm, `reps` times, and fold the reps into
-/// one [`ArmPin`] verdict. "ALL reps must pass" (module doc's original
-/// intent) now means: any measured-and-outside-window rep is an immediate
-/// `Violated`; otherwise at least one measured-and-inside rep yields `Ok`;
-/// only when EVERY rep came back unmeasurable is the arm `Unmeasurable`.
+/// one [`ArmPin`] verdict — see [`fold_pin_probes`] for the fold rule.
 fn probe_arm_pin(cmd: &str, threads: u32, reps: usize) -> ArmPin {
-    let mut last_measured = f64::NAN;
-    let mut violated: Option<f64> = None;
+    fold_pin_probes(|| cpu_pct_of_arm(cmd), threads, reps)
+}
+
+/// Fold up to `reps` probe results (plus at most ONE retry) into an
+/// [`ArmPin`] verdict.
+///
+/// THE FOLD RULE (2026-08-03 fix): `Violated` requires UNANIMITY — every rep
+/// that measured at all must sit outside the window, and a single retry probe
+/// must fail to land inside it. Any single measured-and-inside rep is `Ok`:
+/// the arm demonstrably CAN run at the declared concurrency, so an
+/// out-of-window rep alongside it is scheduler noise, not a violation.
+///
+/// WHY (measured incident, 2026-08-03): every full-grid wall census returned
+/// 15-25 pigz cells VOID from pin-gate failures — DIFFERENT cells each run,
+/// i.e. probe flakiness, not real violations. The old fold declared
+/// `Violated` on ANY single out-of-window rep, which inverts robustness for
+/// a probe whose number is (user+sys)/wall over the WHOLE process lifetime:
+/// pigz's pipeline has single-threaded read/write phases and per-block
+/// worker granularity, so on a small or loaded cell its whole-run cpu% dips
+/// below the T4 floor transiently. EXECUTED (this Mac, wait4-rusage repro,
+/// `pigz -6 -p 4`): a 4 MB file under 8-way background load read 3/12 reps
+/// OUT of [200,640] (161-189% on the dips) — with pin_reps=3 and the old
+/// any-rep-fails fold that is a >50% chance of a spurious VOID per cell,
+/// exactly the observed different-cells-each-run pattern. A GENUINE
+/// violation is structural (the command's flags are wrong) and reproduces
+/// on every rep: unpinned `pigz -3` read 452-553% on EVERY rep in the
+/// 2026-07-26 incident, and an inherently-T1 command at declared T4 reads
+/// ~100% every rep — unanimity plus one retry still convicts both, so
+/// `Violated` is never masked.
+///
+/// `Unmeasurable` (no rep produced a number) also gets the one retry before
+/// the verdict is returned; it remains NEVER a violation on its own.
+fn fold_pin_probes<F: FnMut() -> PinProbe>(mut probe: F, threads: u32, reps: usize) -> ArmPin {
+    let mut last_out = f64::NAN; // last measured-and-outside-window pct
+    let mut measured_out = false;
     let mut reasons: Vec<String> = Vec::new();
     for _ in 0..reps.max(1) {
-        match cpu_pct_of_arm(cmd) {
+        match probe() {
             PinProbe::Measured(pct) => {
-                last_measured = pct;
-                if !pin_gate_ok(pct, threads) {
-                    violated = Some(pct);
+                if pin_gate_ok(pct, threads) {
+                    // One real in-window measurement proves the arm can hit
+                    // the declared concurrency; further reps cannot change
+                    // the verdict (Violated requires unanimity), so stop.
+                    return ArmPin::Ok(pct);
                 }
+                last_out = pct;
+                measured_out = true;
             }
             PinProbe::Unmeasurable(reason) => reasons.push(reason),
         }
     }
-    if let Some(pct) = violated {
-        return ArmPin::Violated(pct);
+    // No in-window rep yet: one retry before any negative verdict. A real
+    // violation reproduces here too; a transient dip usually does not.
+    match probe() {
+        PinProbe::Measured(pct) => {
+            if pin_gate_ok(pct, threads) {
+                return ArmPin::Ok(pct);
+            }
+            ArmPin::Violated(pct)
+        }
+        PinProbe::Unmeasurable(reason) => {
+            if measured_out {
+                // Every number we ever got was outside the window; the
+                // retry's hiccup does not soften a unanimous violation.
+                ArmPin::Violated(last_out)
+            } else {
+                reasons.push(reason);
+                ArmPin::Unmeasurable(reasons.join("; "))
+            }
+        }
     }
-    if last_measured.is_nan() {
-        return ArmPin::Unmeasurable(reasons.join("; "));
-    }
-    ArmPin::Ok(last_measured)
 }
 
 /// `(numeric_pct_or_nan, human_readable_descriptor)` for a cell's
@@ -1492,11 +1539,12 @@ pub fn selftest() -> ExitCode {
         let ctr = base.join("probe-hiccup-ctr");
         let _ = fs::remove_file(&ctr);
         let ctr_s = ctr.display();
-        // First call ever (the pin probe) exits 9 -> Unmeasurable. Every
+        // First TWO calls (the pin probe's single rep, `pin_reps=1`, PLUS
+        // the 2026-08-03 fold's one retry) exit 9 -> Unmeasurable. Every
         // subsequent call (the real paired engine) takes the gzip branch.
         let flaky_probe_then_clean = format!(
             "N=$(cat {ctr_s} 2>/dev/null || echo 0); echo $((N+1)) > {ctr_s}; \
-             if [ \"$N\" = \"0\" ]; then exit 9; fi; gzip -6 -c {{input}}"
+             if [ \"$N\" -lt \"2\" ]; then exit 9; fi; gzip -6 -c {{input}}"
         );
         let rival = Rival {
             name: "gzip".to_string(),
@@ -1518,7 +1566,7 @@ pub fn selftest() -> ExitCode {
         };
         let cell = measure_cell(&cfg, &rival, true, 6, 1, &fixture, &input_sha);
         check(
-            "e2e unmeasurable: a probe that failed ONCE (Unmeasurable) is flagged \
+            "e2e unmeasurable: a probe whose rep AND retry failed (Unmeasurable) is flagged \
              pin_unmeasurable=true",
             cell.pin_unmeasurable,
         );
@@ -1550,6 +1598,131 @@ pub fn selftest() -> ExitCode {
             cell.pin_ok && cell.pin_unmeasurable,
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // -- 6c. fold_pin_probes: the flaky-probe fold rule (2026-08-03 fix) -----
+    // Every full-grid wall census returned 15-25 pigz cells VOID from
+    // pin-gate failures, DIFFERENT cells each run — the old fold declared
+    // Violated on ANY single out-of-window rep, but the probe's number is
+    // (user+sys)/wall over the whole process lifetime, which transiently
+    // dips below the T4 floor for pigz on small/loaded cells (EXECUTED:
+    // 3/12 reps OUT on a 4 MB file under 8-way background load). The fold
+    // is deterministic pure logic, so it is driven here with scripted probe
+    // sequences; the shell-level retry path is exercised right after with a
+    // real stateful fake command.
+    {
+        // Scripted probe: pops the next result off a queue each call.
+        let scripted = |seq: Vec<PinProbe>| {
+            let mut q = std::collections::VecDeque::from(seq);
+            move || q.pop_front().expect("fold asked for more probes than scripted")
+        };
+        check(
+            "fold: one in-window rep -> Ok (and no further probes consumed)",
+            fold_pin_probes(scripted(vec![PinProbe::Measured(100.0)]), 1, 3)
+                == ArmPin::Ok(100.0),
+        );
+        check(
+            "fold: a flaky dip (OUT) rescued by an in-window RETRY -> Ok, never Violated \
+             (the different-cells-each-run pigz incident)",
+            fold_pin_probes(
+                scripted(vec![PinProbe::Measured(20.0), PinProbe::Measured(100.0)]),
+                1,
+                1,
+            ) == ArmPin::Ok(100.0),
+        );
+        check(
+            "fold: OUT on every rep AND the retry -> Violated (a real violation reproduces; \
+             never masked)",
+            fold_pin_probes(
+                scripted(vec![
+                    PinProbe::Measured(20.0),
+                    PinProbe::Measured(21.0),
+                    PinProbe::Measured(22.0),
+                ]),
+                1,
+                2,
+            ) == ArmPin::Violated(22.0),
+        );
+        check(
+            "fold: mixed OUT-then-IN inside the reps -> Ok without needing the retry \
+             (Violated requires unanimity)",
+            fold_pin_probes(
+                scripted(vec![PinProbe::Measured(20.0), PinProbe::Measured(100.0)]),
+                1,
+                2,
+            ) == ArmPin::Ok(100.0),
+        );
+        check(
+            "fold: unanimous OUT reps + an Unmeasurable retry -> still Violated (a probe \
+             hiccup does not soften a unanimous violation)",
+            fold_pin_probes(
+                scripted(vec![
+                    PinProbe::Measured(700.0),
+                    PinProbe::Unmeasurable("hiccup".into()),
+                ]),
+                1,
+                1,
+            ) == ArmPin::Violated(700.0),
+        );
+        check(
+            "fold: nothing ever measured (reps + retry all Unmeasurable) -> Unmeasurable, \
+             NEVER a violation",
+            matches!(
+                fold_pin_probes(
+                    scripted(vec![
+                        PinProbe::Unmeasurable("a".into()),
+                        PinProbe::Unmeasurable("b".into()),
+                        PinProbe::Unmeasurable("c".into()),
+                    ]),
+                    1,
+                    2,
+                ),
+                ArmPin::Unmeasurable(_)
+            ),
+        );
+        check(
+            "fold: unmeasurable reps rescued by a Measured in-window retry -> Ok",
+            fold_pin_probes(
+                scripted(vec![
+                    PinProbe::Unmeasurable("a".into()),
+                    PinProbe::Measured(100.0),
+                ]),
+                1,
+                1,
+            ) == ArmPin::Ok(100.0),
+        );
+
+        // Shell-level retry path with a REAL stateful fake command: the FIRST
+        // invocation sleeps (cpu% ~0 -> OUT of the T1 window), every later
+        // invocation busy-loops (~100% -> IN). With pin_reps=1 the single rep
+        // fails, so ONLY the retry can rescue the arm — asserting Ok proves
+        // the retry executed the command a second time.
+        if Path::new("/bin/sh").exists() {
+            let base = std::env::temp_dir().join(format!(
+                "fulcrum-wallcensus-flaky-pin-st-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&base);
+            let _ = fs::create_dir_all(&base);
+            let ctr = base.join("flaky-pin-ctr");
+            let ctr_s = ctr.display();
+            let flaky_then_busy = format!(
+                "N=$(cat {ctr_s} 2>/dev/null || echo 0); echo $((N+1)) > {ctr_s}; \
+                 if [ \"$N\" = \"0\" ]; then sleep 0.25; exit 0; fi; \
+                 i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done"
+            );
+            check(
+                "fold e2e: a fake command whose FIRST run dips out-of-window and whose \
+                 RETRY runs pinned -> Ok (the retry path, executed through sh)",
+                matches!(probe_arm_pin(&flaky_then_busy, 1, 1), ArmPin::Ok(_)),
+            );
+            check(
+                "fold e2e control: a command that ALWAYS sleeps (cpu% ~0 on rep AND retry) \
+                 at declared T1 -> Violated (retry does not mask a reproducing violation)",
+                matches!(probe_arm_pin("sleep 0.25", 1, 1), ArmPin::Violated(_)),
+            );
+            let _ = fs::remove_dir_all(&base);
+        }
     }
 
     // -- 7. resume: VOID is ALWAYS re-run; a valid cell is reused -------------
