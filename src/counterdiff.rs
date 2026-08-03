@@ -1742,6 +1742,41 @@ fn out_path_for(out: &Option<String>, corpus: &str, thread: usize, label: &str) 
     }
 }
 
+/// Write one artifact JSON to `path`, creating the parent directory if it
+/// does not exist. Returns `Ok(true)` when written, `Ok(false)` when skipped
+/// with a warning, `Err` when the failure is a hard error.
+///
+/// `explicit` is true when `--out` was given on the command line. 2026-08-03
+/// incident: `--out` pointing into a not-yet-created directory lost EVERY
+/// artifact of a run behind "# warn: cannot write artifact ... No such file
+/// or directory" lines — an asked-for artifact that cannot be written is a
+/// FAILURE, not a warning. Without `--out` (the /dev/shm-or-tmp default) a
+/// write failure stays a warning: the numbers were already rendered and the
+/// caller never named a destination.
+fn persist_artifact(path: &Path, json: &str, explicit: bool) -> Result<bool, String> {
+    let attempt = || -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("cannot create artifact dir {}: {e}", parent.display())
+                })?;
+            }
+        }
+        std::fs::write(path, json)
+            .map_err(|e| format!("cannot write artifact {}: {e}", path.display()))
+    };
+    match attempt() {
+        Ok(()) => Ok(true),
+        Err(e) if explicit => Err(format!(
+            "{e} — --out was explicitly given, so a lost artifact is a hard error"
+        )),
+        Err(e) => {
+            eprintln!("# warn: {e}");
+            Ok(false)
+        }
+    }
+}
+
 // ── Top-level driver ────────────────────────────────────────────────────────
 
 pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
@@ -1844,9 +1879,7 @@ pub fn run(mut cfg: CounterConfig) -> Result<bool, String> {
                 let path = out_path_for(&cfg.out, corpus, thread, &comp.label);
                 match serde_json::to_string_pretty(&art) {
                     Ok(json) => {
-                        if let Err(e) = std::fs::write(&path, json) {
-                            eprintln!("# warn: cannot write artifact {}: {e}", path.display());
-                        } else {
+                        if persist_artifact(&path, &json, cfg.out.is_some())? {
                             paths.push(path);
                         }
                     }

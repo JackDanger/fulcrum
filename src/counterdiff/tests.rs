@@ -585,3 +585,52 @@ fn decode_oracle_failure_names_compress_mode() {
         "decode-mode oracle failure on a plain corpus must point at --compress: {err}"
     );
 }
+
+// ── persist_artifact (fs, temp-dir only — the one deliberate exception to
+//    this file's no-fs rule, because the 2026-08-03 defect WAS an fs path:
+//    `--out` into a not-yet-created directory lost every artifact behind
+//    "# warn: cannot write artifact ... No such file or directory") ─────────
+
+#[test]
+fn persist_artifact_creates_missing_parent_dirs() {
+    let base = std::env::temp_dir().join(format!("fulcrum-cd-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    // Two levels deep, neither exists — the exact --out shape that lost artifacts.
+    let path = base.join("deep/nested/artifact.json");
+    let wrote = persist_artifact(&path, "{\"k\":1}", true).expect("mkdir -p + write must succeed");
+    assert!(wrote, "artifact must be reported as written");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"k\":1}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn persist_artifact_explicit_out_failure_is_a_hard_error() {
+    let base = std::env::temp_dir().join(format!("fulcrum-cd-persist-hard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // Make the would-be parent a FILE so create_dir_all cannot succeed.
+    let blocker = base.join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    let path = blocker.join("artifact.json");
+    let err = persist_artifact(&path, "{}", true).expect_err("explicit --out failure must be Err");
+    assert!(
+        err.contains("--out"),
+        "the hard error must say WHY it is hard (--out was explicit); got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn persist_artifact_default_destination_failure_stays_a_warning() {
+    let base = std::env::temp_dir().join(format!("fulcrum-cd-persist-warn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let blocker = base.join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    let path = blocker.join("artifact.json");
+    // Same failure, but --out was NOT given: warn and continue, never abort a
+    // run whose numbers were already rendered.
+    let wrote = persist_artifact(&path, "{}", false).expect("default-dest failure is not an Err");
+    assert!(!wrote, "nothing was written");
+    let _ = std::fs::remove_dir_all(&base);
+}

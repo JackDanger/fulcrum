@@ -150,16 +150,36 @@ pub fn build_arm(
     if !ok || commit.is_empty() {
         return Err(format!("cannot resolve git ref '{git_ref}'"));
     }
-    let wt = workdir.join(format!("arm-{}", &commit[..12.min(commit.len())]));
+    let short = &commit[..12.min(commit.len())];
+    let wt = workdir.join(format!("arm-{short}"));
+    // Progress, before AND after the build (2026-08-03): a `fulcrum try` run
+    // was silent for 5+ minutes while both arms compiled — indistinguishable
+    // from a hang. stderr is unbuffered, so each line lands immediately.
+    eprintln!("try: building arm {git_ref} ({short})...");
+    let t0 = std::time::Instant::now();
     if !wt.exists() {
-        let (_, ok) = sh(&format!(
+        let add_cmd = format!(
             "cd {} && git worktree add --detach {} {} 2>&1",
             repo.display(),
             wt.display(),
             commit
-        ));
+        );
+        let (out1, ok) = sh(&add_cmd);
         if !ok {
-            return Err(format!("git worktree add failed for {commit}"));
+            // A killed prior run leaves a stale registration in
+            // .git/worktrees that blocks re-adding the path ("missing but
+            // already registered worktree", 2026-08-03 incident). Prune the
+            // stale registrations and retry ONCE; if it still fails, name
+            // the colliding path — never just the sha.
+            let _ = sh(&format!("cd {} && git worktree prune 2>&1", repo.display()));
+            let (out2, ok2) = sh(&add_cmd);
+            if !ok2 {
+                return Err(format!(
+                    "git worktree add failed for {commit} at {} even after `git worktree \
+                     prune` — first attempt: [{out1}]; retry: [{out2}]",
+                    wt.display()
+                ));
+            }
         }
         // Submodules are not populated in a fresh worktree; the vendored
         // sources are needed to build, so borrow the primary repo's.
@@ -185,6 +205,11 @@ pub fn build_arm(
     if !built || !bin.exists() {
         return Err(format!("build failed for {git_ref} ({commit})"));
     }
+    eprintln!(
+        "try: built arm {git_ref} ({short}) in {:.0}s -> {}",
+        t0.elapsed().as_secs_f64(),
+        bin.display()
+    );
     let sha = sha_file(&bin);
     Ok((
         bin,
@@ -616,5 +641,94 @@ pub fn selftest() -> ExitCode {
     } else {
         eprintln!("ABLATE SELFTEST=FAIL ({fails})");
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_fake_repo(base: &Path) -> PathBuf {
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (_, ok) = sh(&format!(
+            "cd {} && git init -q . && git config user.email t@t && git config user.name t \
+             && echo hi > f.txt && git add f.txt && git commit -qm init",
+            repo.display()
+        ));
+        assert!(ok, "fake repo init failed");
+        repo
+    }
+
+    fn head_short(repo: &Path) -> String {
+        let (commit, ok) = sh(&format!("cd {} && git rev-parse HEAD", repo.display()));
+        assert!(ok);
+        commit[..12].to_string()
+    }
+
+    /// 2026-08-03 incident: a killed `fulcrum try` run leaves a stale
+    /// registration in `.git/worktrees` (directory gone, registration
+    /// present), and the NEXT run died with "git worktree add failed for
+    /// <sha>". `build_arm` must prune and retry once — here the retry
+    /// succeeds, so the error (the fake repo has no cargo project) comes
+    /// from the BUILD step, proving the worktree stage recovered.
+    #[test]
+    fn stale_worktree_registration_is_pruned_and_retried() {
+        let base = std::env::temp_dir().join(format!("fulcrum-ablate-stale-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = init_fake_repo(&base);
+        let workdir = base.join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let wt = workdir.join(format!("arm-{}", head_short(&repo)));
+        // Simulate the killed run: register the worktree, then delete only
+        // its directory so the registration goes stale.
+        let (_, ok) = sh(&format!(
+            "cd {} && git worktree add --detach {} HEAD 2>&1",
+            repo.display(),
+            wt.display()
+        ));
+        assert!(ok, "fixture worktree add failed");
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        let err = build_arm(&repo, "HEAD", &workdir).expect_err("no cargo project; build must fail");
+        assert!(
+            err.contains("build failed"),
+            "expected the BUILD-step error (worktree stage recovered via prune+retry); got: {err}"
+        );
+        assert!(
+            !err.contains("worktree add failed"),
+            "the stale registration must have been pruned and the add retried; got: {err}"
+        );
+        assert!(wt.exists(), "the retried worktree add must have recreated {}", wt.display());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When prune+retry CANNOT recover (a locked registration survives
+    /// `git worktree prune`), the error must name the colliding PATH — a
+    /// bare sha gives the operator nothing to delete.
+    #[test]
+    fn unrecoverable_worktree_collision_names_the_path() {
+        let base = std::env::temp_dir().join(format!("fulcrum-ablate-locked-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = init_fake_repo(&base);
+        let workdir = base.join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let wt = workdir.join(format!("arm-{}", head_short(&repo)));
+        let (_, ok) = sh(&format!(
+            "cd {} && git worktree add --detach {} HEAD 2>&1 && git worktree lock {} 2>&1",
+            repo.display(),
+            wt.display(),
+            wt.display()
+        ));
+        assert!(ok, "fixture worktree add+lock failed");
+        std::fs::remove_dir_all(&wt).unwrap(); // stale AND locked: prune skips it
+
+        let err = build_arm(&repo, "HEAD", &workdir).expect_err("locked stale registration must fail");
+        assert!(
+            err.contains("worktree add failed") && err.contains(&wt.display().to_string()),
+            "error must name the colliding path {}; got: {err}",
+            wt.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
