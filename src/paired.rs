@@ -801,6 +801,32 @@ pub fn ab_verdict(lr_ci: &Ci) -> &'static str {
     }
 }
 
+/// Render the point-estimate field of a verdict line — or REFUSE to.
+///
+/// An unresolved verdict must NEVER print a point ratio. Receipt: a NOISY
+/// +2.5-3.4% wall reading was quoted as a point estimate and cost a session
+/// chasing a layout artifact. When the log-ratio CI straddles 0 (i.e. the
+/// ratio CI straddles 1.0 — exactly `ab_verdict`'s NOISY condition), the field
+/// is ONLY the CI in ratio space, `ci=[0.956,1.034]`, with no `ratio=` key a
+/// reader could quote. RESOLVED verdicts keep their `ratio=` point estimate.
+/// A NaN CI (cell never reached the paired engine) keeps the old rendering —
+/// it prints `ratio=NaN`, which nobody can mistake for a finding.
+pub fn ratio_field(ratio: f64, logratio_ci: &[f64; 2]) -> String {
+    let straddles = logratio_ci[0].is_finite()
+        && logratio_ci[1].is_finite()
+        && logratio_ci[0] <= 0.0
+        && logratio_ci[1] >= 0.0;
+    if straddles {
+        format!(
+            "ci=[{:.3},{:.3}]",
+            logratio_ci[0].exp(),
+            logratio_ci[1].exp()
+        )
+    } else {
+        format!("ratio={ratio:.4}")
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairedResult {
     /// The measuring instrument's own provenance (selfver stamp,
@@ -1167,8 +1193,10 @@ pub fn print_machine_line(r: &PairedResult) {
     } else {
         String::new()
     };
+    // NOISY (or any CI straddling ratio 1.0) prints ONLY the CI — never a
+    // point `ratio=` a reader could quote (see `ratio_field`'s receipt).
     println!(
-        "PAIRED={} verdict={} ratio={:.4} logratio_ci=[{:.4},{:.4}] \
+        "PAIRED={} verdict={} {} logratio_ci=[{:.4},{:.4}] \
          delta_median_ms={:.3} delta_ci95=[{:.3},{:.3}] a_median={:.3} b_median={:.3} \
          n={} sign={} spread={:.4} aa_ratio_ci=[{:.4},{:.4}] aa_bias={:.4} sha_ok={} \
          a_peak_rss_mb={:.1} b_peak_rss_mb={:.1} rss_reps={}{} \
@@ -1176,7 +1204,7 @@ pub fn print_machine_line(r: &PairedResult) {
          method=\"{}\"",
         r.status,
         r.verdict,
-        r.ratio,
+        ratio_field(r.ratio, &r.logratio_ci),
         r.logratio_ci[0],
         r.logratio_ci[1],
         r.delta_median_ms,
@@ -1256,6 +1284,23 @@ pub fn selftest() -> ExitCode {
     check(
         "tcrit(51)==2.009 (df=50, the ~n=51 anchor)",
         (tcrit(51) - 2.009).abs() < 1e-12,
+    );
+
+    // 1b. NOISY verdicts never print point ratios (ratio_field). Receipt: a
+    //     NOISY +2.5-3.4% wall reading quoted as a point estimate cost a
+    //     session chasing a layout artifact.
+    check(
+        "ratio_field: NOISY (CI straddles 1.0) prints ONLY the CI — no ratio= point estimate",
+        ratio_field(1.0290, &[-0.0450, 0.0334]) == "ci=[0.956,1.034]",
+    );
+    check(
+        "ratio_field: RESOLVED verdicts keep their point ratio",
+        ratio_field(1.0500, &[0.0210, 0.0770]) == "ratio=1.0500"
+            && ratio_field(0.9500, &[-0.0700, -0.0300]) == "ratio=0.9500",
+    );
+    check(
+        "ratio_field: a NaN CI never masquerades as a resolved ratio band",
+        ratio_field(f64::NAN, &[f64::NAN, f64::NAN]).starts_with("ratio="),
     );
 
     // 2. file sink rejected (SINK LAW)

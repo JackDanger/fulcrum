@@ -223,7 +223,7 @@ pub const COMMANDS: &[Cmd] = &[
             "fulcrum layout calibrate --repo ~/www/gzippy --ref origin/main --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar --levels 2,6,9 --threads 1,4 --out /tmp/layout-floors",
             Class::Measurement,
         )),
-        "fulcrum try <ref> … --layout-floors <out>/layout_floors.tsv   (screens within-envelope deltas as UNDECIDED — never acquits)",
+        "fulcrum try <ref> … --layout-floors <out>/layout_floors.tsv   (screens within-envelope deltas as UNDECIDED — never acquits, never borrows a floor across coordinates); then fulcrum layout confirm --repo … --a <base> --b <after> --corpus F --level N --layout-floors <tsv>   (THE DECIDER: REAL vs LAYOUT-ARTIFACT vs UNDECIDED)",
     ),
     // ---- correctness / goal axes ------------------------------------------
     then(

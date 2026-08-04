@@ -2351,10 +2351,15 @@ THE PRIMITIVES:\n\
                 locate|model|vs|vs-sweep|dispatchgap\n\
                                 span-trace views over a Chrome-trace timeline — the\n\
                                 starvation/causation tooling reserved for the T>1 encoder.\n\
-  fulcrum layout calibrate …    per-cell layout-jitter floors: how much wall-ratio movement\n\
-                                pure binary code layout produces (sha-distinct binaries,\n\
-                                sha-identical outputs). `try --layout-floors` SCREENS with\n\
-                                them — within-envelope deltas go UNDECIDED, never acquitted.\n\
+  fulcrum layout calibrate|confirm …\n\
+                                calibrate: per-cell layout-jitter floors — how much wall-ratio\n\
+                                movement pure binary code layout produces (sha-distinct\n\
+                                binaries, sha-identical outputs). `try --layout-floors` SCREENS\n\
+                                with them — within-envelope deltas go UNDECIDED, never\n\
+                                acquitted, and a floor is never borrowed across coordinates.\n\
+                                confirm: THE DECIDER for a screened suspect — re-measures the\n\
+                                cell across re-linked layouts of BOTH arms; cross-layout median\n\
+                                + sign agreement => REAL / LAYOUT-ARTIFACT / UNDECIDED.\n\
   fulcrum sentinel pin|check    box pre-flight: pin a small set of known-stable paired wall\n\
                                 cells (+ box identity + binary sha) to a TSV; `check` re-runs\n\
                                 them and REFUSES/FAILS if the box no longer reproduces them.\n\
