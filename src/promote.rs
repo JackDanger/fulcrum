@@ -24,6 +24,17 @@
 //! NOISY cells, missing architectures). Never a guess, never a table the
 //! operator has to adjudicate.
 //!
+//! `--layout-floors <tsv>` (opt-in; see `layout.rs`): pure binary code layout
+//! moves paired-wall ratios ±0.5-0.7% (up to +3.4% on small-binary T4 cells)
+//! while clause 5's budget is a flat 0.005 — so a stable layout delta convicts
+//! exactly like a real regression. With floors, a within-envelope erosion or
+//! confirmed wall flip is SCREENED: it becomes UNDECIDED ("within layout
+//! envelope — requires cross-layout confirmation"), never a pass. The envelope
+//! screens; it never acquits — a real regression smaller than the floor must
+//! not slip through, so the decider is `fulcrum layout confirm` (reserved).
+//! WITHOUT the flag behaviour is byte-identical to before: the promotion-rule
+//! amendment is the user's call, and this flag is the mechanism awaiting it.
+//!
 //! The clause engine ([`adjudicate`]) is pure and fixture-testable; the
 //! Gate-0 selftest drives every clause and every refusal path synthetically.
 
@@ -83,6 +94,13 @@ pub struct Adjudication {
     /// before any verdict is meaningful.
     pub rerun: Vec<String>,
     pub failed_clause: Option<String>,
+    /// Wall deltas screened by `--layout-floors`: within the cell's measured
+    /// layout-jitter envelope, so NOT decidable as a regression — and NOT
+    /// acquitted either. Any entry here forces UNDECIDED (unless another
+    /// clause convicts outright); the decider is cross-layout re-measurement
+    /// (`fulcrum layout confirm`, reserved).
+    #[serde(default)]
+    pub layout_undecided: Vec<String>,
 }
 
 /// Clause 5's erosion budget: a passing cell may degrade only by the smaller
@@ -94,7 +112,9 @@ pub fn erosion_budget(old_ratio: f64) -> f64 {
 /// Apply promotion-rule clauses 3-6 (+8's decidability demand) to the cells.
 /// `verify_failures` is clause 1's failure count (0 required). `noop` is
 /// clause 2 (identical binary hashes). `archs_covered`/`archs_required`
-/// drive clause 7.
+/// drive clause 7. `floors` (opt-in, from `--layout-floors`) SCREENS wall
+/// deltas within the cell's measured layout-jitter envelope into UNDECIDED —
+/// it never acquits; `None` reproduces pre-floors behaviour exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn adjudicate(
     cells: &[TryCell],
@@ -102,10 +122,25 @@ pub fn adjudicate(
     noop: bool,
     archs_covered: &[String],
     archs_required: &[String],
+    floors: Option<&crate::layout::LayoutFloors>,
 ) -> Adjudication {
     let mut clauses = Vec::new();
     let mut rerun = Vec::new();
+    let mut layout_undecided: Vec<String> = Vec::new();
     let mut failed: Option<String> = None;
+    // Envelope screen: Some((floor, from_file, log_delta)) iff floors are in
+    // force, the cell is WALL-axis (size is exact — layout cannot move it),
+    // and the base->after delta sits within the cell's floor (missing cells
+    // use the file's median, stated in the clause line).
+    let screen = |c: &TryCell| -> Option<(f64, bool, f64)> {
+        let f = floors?;
+        if c.axis != "wall" {
+            return None;
+        }
+        let (floor, from_file) = f.floor_for(&c.rival, &c.corpus, c.level, c.threads);
+        let delta = crate::layout::log_delta(c.base_ratio, c.after_ratio);
+        (delta <= floor + 1e-12).then_some((floor, from_file, delta))
+    };
     let fail = |failed: &mut Option<String>, clauses: &mut Vec<String>, c: String| {
         if failed.is_none() {
             *failed = Some(c.clone());
@@ -123,6 +158,7 @@ pub fn adjudicate(
             ],
             rerun: Vec::new(),
             failed_clause: Some("clause 2 (no-op)".into()),
+            layout_undecided: Vec::new(),
         };
     }
     clauses.push("clause 2 OK: arms differ (binary hashes distinct)".into());
@@ -161,17 +197,69 @@ pub fn adjudicate(
         );
     }
 
-    // Clause 3: no pass→fail flips. Not one.
-    let flips: Vec<String> = decided
+    // Clause 3: no pass→fail flips. Not one. With floors in force, a
+    // CONFIRMED wall flip whose delta sits within the cell's layout envelope
+    // is NOT decidable as a regression (layout alone produces deltas that
+    // size) — but it is NOT acquitted either: it goes to `layout_undecided`
+    // and forces UNDECIDED pending cross-layout confirmation.
+    let mut flips: Vec<String> = Vec::new();
+    let mut screened_flips: Vec<String> = Vec::new();
+    for c in decided
         .iter()
         .filter(|c| !c.base_failing && c.after_failing)
-        .map(|c| format!("{} ({:.4} -> {:.4})", c.id(), c.base_ratio, c.after_ratio))
-        .collect();
-    if flips.is_empty() {
+    {
+        match screen(c) {
+            Some((floor, from_file, delta)) => screened_flips.push(format!(
+                "{} ({:.4} -> {:.4}, Δln {:.4} <= floor {:.4}{})",
+                c.id(),
+                c.base_ratio,
+                c.after_ratio,
+                delta,
+                floor,
+                if from_file {
+                    ""
+                } else {
+                    " = file median (cell not in floors file)"
+                }
+            )),
+            None => flips.push(format!(
+                "{} ({:.4} -> {:.4})",
+                c.id(),
+                c.base_ratio,
+                c.after_ratio
+            )),
+        }
+    }
+    if !screened_flips.is_empty() {
         clauses.push(format!(
-            "clause 3 OK: no pass->fail flips across {} decidable cells",
-            decided.len()
+            "clause 3: {} confirmed flip(s) WITHIN LAYOUT ENVELOPE — not decidable as a \
+             regression, NOT acquitted; requires cross-layout confirmation (`fulcrum layout \
+             confirm`, reserved): {}",
+            screened_flips.len(),
+            screened_flips.join(", ")
         ));
+        for s in &screened_flips {
+            layout_undecided.push(format!("flip {s}"));
+            rerun.push(format!(
+                "{s} — within layout envelope: confirm across re-linked layouts of BOTH arms \
+                 before any verdict"
+            ));
+        }
+    }
+    if flips.is_empty() {
+        clauses.push(if screened_flips.is_empty() {
+            format!(
+                "clause 3 OK: no pass->fail flips across {} decidable cells",
+                decided.len()
+            )
+        } else {
+            format!(
+                "clause 3: no CONVICTING flip across {} decidable cells ({} within-envelope \
+                 suspect(s) above — UNDECIDED, not OK)",
+                decided.len(),
+                screened_flips.len()
+            )
+        });
     } else {
         fail(
             &mut failed,
@@ -218,23 +306,68 @@ pub fn adjudicate(
         );
     }
 
-    // Clause 5: erosion budget on passing cells.
-    let eroded: Vec<String> = decided
+    // Clause 5: erosion budget on passing cells. With floors in force, a
+    // beyond-budget WALL erosion within the cell's layout envelope is not
+    // decidable as a regression — screened to UNDECIDED, never excused to
+    // pass. Beyond-envelope erosions convict exactly as before. Size cells
+    // are never screened: size is exact and layout cannot move it.
+    let mut eroded: Vec<String> = Vec::new();
+    let mut screened_erosions: Vec<String> = Vec::new();
+    for c in decided
         .iter()
         .filter(|c| !c.base_failing && !c.after_failing)
         .filter(|c| c.after_ratio - c.base_ratio > erosion_budget(c.base_ratio) + 1e-12)
-        .map(|c| {
-            format!(
+    {
+        match screen(c) {
+            Some((floor, from_file, delta)) => screened_erosions.push(format!(
+                "{} ({:.4} -> {:.4}, budget {:.4}, Δln {:.4} <= floor {:.4}{})",
+                c.id(),
+                c.base_ratio,
+                c.after_ratio,
+                erosion_budget(c.base_ratio),
+                delta,
+                floor,
+                if from_file {
+                    ""
+                } else {
+                    " = file median (cell not in floors file)"
+                }
+            )),
+            None => eroded.push(format!(
                 "{} ({:.4} -> {:.4}, budget {:.4})",
                 c.id(),
                 c.base_ratio,
                 c.after_ratio,
                 erosion_budget(c.base_ratio)
-            )
-        })
-        .collect();
+            )),
+        }
+    }
+    if !screened_erosions.is_empty() {
+        clauses.push(format!(
+            "clause 5: {} beyond-budget erosion(s) WITHIN LAYOUT ENVELOPE — not decidable as \
+             a regression, NOT acquitted; requires cross-layout confirmation (`fulcrum layout \
+             confirm`, reserved): {}",
+            screened_erosions.len(),
+            screened_erosions.join(", ")
+        ));
+        for s in &screened_erosions {
+            layout_undecided.push(format!("erosion {s}"));
+            rerun.push(format!(
+                "{s} — within layout envelope: confirm across re-linked layouts of BOTH arms \
+                 before any verdict"
+            ));
+        }
+    }
     if eroded.is_empty() {
-        clauses.push("clause 5 OK: every passing cell inside its erosion budget".into());
+        clauses.push(if screened_erosions.is_empty() {
+            "clause 5 OK: every passing cell inside its erosion budget".into()
+        } else {
+            format!(
+                "clause 5: no CONVICTING erosion ({} within-envelope suspect(s) above — \
+                 UNDECIDED, not OK)",
+                screened_erosions.len()
+            )
+        });
     } else {
         fail(
             &mut failed,
@@ -293,9 +426,13 @@ pub fn adjudicate(
             .into(),
     );
 
+    // Within-envelope suspects force UNDECIDED when nothing else convicts:
+    // the envelope SCREENS (a delta layout could have produced cannot convict)
+    // but never ACQUITS (a real regression smaller than the floor must not
+    // slip through as a SHIP).
     let verdict = if failed.is_some() {
         Verdict::NoShip
-    } else if !rerun.is_empty() || !missing.is_empty() {
+    } else if !rerun.is_empty() || !missing.is_empty() || !layout_undecided.is_empty() {
         Verdict::Undecided
     } else {
         Verdict::Ship
@@ -315,6 +452,7 @@ pub fn adjudicate(
         clauses,
         rerun,
         failed_clause: failed,
+        layout_undecided,
     }
 }
 
@@ -334,6 +472,61 @@ pub fn check_level_set(levels: &[u32]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Margin tiers (reporting only — no verdict change)
+// ---------------------------------------------------------------------------
+
+/// "Did we actually WIN, or are we squatting on a knife edge?" — for every
+/// passing wall cell (after arm), how far below 1.0 the ratio sits, banded by
+/// what layout jitter alone can move it: a pass within the band is a
+/// knife-edge that a re-link could flip; a pass beyond it is a won-with-margin
+/// cell. Reporting only: verdicts never read this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginTiers {
+    /// The band width: the floors file's median floor, or 0.03 when no floors
+    /// file was given (the measured worst small-binary T4 layout delta).
+    pub band: f64,
+    pub band_source: String,
+    pub won_with_margin: Vec<String>,
+    /// Passing wall cells within `band` of ratio 1.0 — listed by id + ratio.
+    pub knife_edge: Vec<String>,
+    pub failing: Vec<String>,
+}
+
+/// Bucket the decidable WALL cells of the after arm. Size cells are exact
+/// integers — margin banding is a wall concept only.
+pub fn margin_tiers(
+    cells: &[TryCell],
+    floors: Option<&crate::layout::LayoutFloors>,
+) -> MarginTiers {
+    let (band, band_source) = match floors {
+        Some(f) => (f.median, "median layout floor".to_string()),
+        None => (0.03, "default 3% (no --layout-floors file)".to_string()),
+    };
+    let mut t = MarginTiers {
+        band,
+        band_source,
+        won_with_margin: Vec::new(),
+        knife_edge: Vec::new(),
+        failing: Vec::new(),
+    };
+    for c in cells
+        .iter()
+        .filter(|c| c.axis == "wall" && c.base_status == "OK" && c.after_status == "OK")
+    {
+        if c.after_failing {
+            t.failing.push(format!("{} ({:.4})", c.id(), c.after_ratio));
+        } else if c.after_ratio <= 1.0 - band {
+            t.won_with_margin
+                .push(format!("{} ({:.4})", c.id(), c.after_ratio));
+        } else {
+            t.knife_edge
+                .push(format!("{} ({:.4})", c.id(), c.after_ratio));
+        }
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
@@ -349,6 +542,9 @@ pub struct TryConfig {
     pub out_dir: PathBuf,
     pub archs_required: Vec<String>,
     pub skip_wall: bool,
+    /// `--layout-floors <tsv>`: opt-in envelope screening (see module doc).
+    /// `None` = behaviour byte-identical to before the flag existed.
+    pub layout_floors: Option<PathBuf>,
 }
 
 /// The roundtrip command both censuses VOID against.
@@ -563,8 +759,16 @@ fn confirm_wall_flips(
     Ok(Some((note, serde_json::Value::Array(detail))))
 }
 
-pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::Value), String> {
+pub fn run(
+    cfg: &TryConfig,
+) -> Result<(Adjudication, Vec<TryCell>, MarginTiers, serde_json::Value), String> {
     check_level_set(&cfg.levels)?;
+    // Load floors FIRST: a malformed/empty floors file must refuse before
+    // hours of builds and censuses, not after.
+    let floors = match &cfg.layout_floors {
+        Some(p) => Some(crate::layout::load_floors(p)?),
+        None => None,
+    };
     if cfg.rivals.is_empty() {
         return Err(
             "REFUSED: at least one --rival is required — the board is per-label vs rivals".into(),
@@ -678,10 +882,12 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
         noop,
         std::slice::from_ref(&arch),
         &cfg.archs_required,
+        floors.as_ref(),
     );
     if let Some((note, _)) = &confirmation {
         adj.clauses.insert(0, note.clone());
     }
+    let tiers = margin_tiers(&cells, floors.as_ref());
 
     let mut artifact = serde_json::json!({
         "base": { "git_ref": cfg.base_ref, "commit": base_prov.resolved_commit, "bin_sha": base_prov.binary_sha256 },
@@ -695,13 +901,21 @@ pub fn run(cfg: &TryConfig) -> Result<(Adjudication, Vec<TryCell>, serde_json::V
         "verify_failures": verify_failures,
         "cells": cells,
         "wall_flip_confirmation": confirmation.as_ref().map(|(_, d)| d.clone()).unwrap_or(serde_json::Value::Null),
-        "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause },
+        "layout_floors": floors.as_ref().map(|f| serde_json::json!({
+            "path": f.path,
+            "median_floor": f.median,
+            "cells_in_file": f.floors.len(),
+            "screened_undecided": adj.layout_undecided,
+            "semantics": "envelope screens to UNDECIDED; never acquits",
+        })).unwrap_or(serde_json::Value::Null),
+        "margin_tiers": tiers,
+        "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided },
         "verdict": match adj.verdict { Verdict::Ship => "SHIP", Verdict::NoShip => "NO-SHIP", Verdict::Undecided => "UNDECIDED" },
     });
     for (k, v) in crate::selfver::artifact_fields() {
         artifact[k] = serde_json::Value::String(v);
     }
-    Ok((adj, cells, artifact))
+    Ok((adj, cells, tiers, artifact))
 }
 
 fn which(name: &str) -> bool {
@@ -715,7 +929,7 @@ fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn render(adj: &Adjudication, cells: &[TryCell]) -> String {
+pub fn render(adj: &Adjudication, cells: &[TryCell], tiers: &MarginTiers) -> String {
     let mut s = String::new();
     let decided = cells
         .iter()
@@ -729,6 +943,26 @@ pub fn render(adj: &Adjudication, cells: &[TryCell]) -> String {
     ));
     for c in &adj.clauses {
         s.push_str(&format!("  {c}\n"));
+    }
+    // Margin tiers: reporting only — "did we WIN, or are we on a knife edge a
+    // re-link could flip?" Never feeds the verdict.
+    if !tiers.won_with_margin.is_empty()
+        || !tiers.knife_edge.is_empty()
+        || !tiers.failing.is_empty()
+    {
+        s.push_str(&format!(
+            "  wall margin tiers (band {:.4} = {}): {} won-with-margin, {} knife-edge{}, {} failing\n",
+            tiers.band,
+            tiers.band_source,
+            tiers.won_with_margin.len(),
+            tiers.knife_edge.len(),
+            if tiers.knife_edge.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", tiers.knife_edge.join(", "))
+            },
+            tiers.failing.len(),
+        ));
     }
     if !adj.rerun.is_empty() {
         s.push_str("  RE-RUN BEFORE ANY VERDICT:\n");
@@ -766,6 +1000,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut out_dir: Option<PathBuf> = None;
     let mut archs_required: Vec<String> = vec![std::env::consts::ARCH.to_string()];
     let mut skip_wall = false;
+    let mut layout_floors: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -835,6 +1070,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 }
             }
             "--size-only" => skip_wall = true,
+            "--layout-floors" => {
+                i += 1;
+                layout_floors = args.get(i).map(PathBuf::from);
+            }
             "--no-self-update" => {}
             "--help" | "-h" => {
                 eprintln!("{}", usage());
@@ -869,10 +1108,11 @@ pub fn cmd(args: &[String]) -> ExitCode {
         out_dir: out_dir.clone(),
         archs_required,
         skip_wall,
+        layout_floors,
     };
     match run(&cfg) {
-        Ok((adj, cells, artifact)) => {
-            print!("{}", render(&adj, &cells));
+        Ok((adj, cells, tiers, artifact)) => {
+            print!("{}", render(&adj, &cells, &tiers));
             let path = out_dir.join("try.json");
             if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&artifact).unwrap())
             {
@@ -897,6 +1137,7 @@ fn usage() -> String {
      \x20   --rival name='CMD -{level} -p {threads} -c {input}' [--rival …]\n\
      \x20   --corpus FILE [--corpus …] [--levels 2,6,9] [--threads 1]\n\
      \x20   [--n 15] [--out DIR] [--archs a,b] [--size-only]\n\
+     \x20   [--layout-floors layout_floors.tsv]\n\
      \n\
      The whole promotion evaluation in one command: builds both arms from git refs\n\
      (stale controls impossible, NO-OPs refused), verifies roundtrip correctness,\n\
@@ -904,7 +1145,20 @@ fn usage() -> String {
      level set (must span shallow<=4 and deep>=6 — single-level verdicts are\n\
      REFUSED), then applies docs/promotion-rule.md clause by clause.\n\
      Verdict: SHIP / NO-SHIP (with the failed clause and numbers) / UNDECIDED\n\
-     (with exactly what to re-run). selftest = Gate-0.\n"
+     (with exactly what to re-run). selftest = Gate-0.\n\
+     \n\
+     --layout-floors: consult per-cell layout-jitter floors (from `fulcrum layout\n\
+     calibrate`) during adjudication. A beyond-budget wall erosion or confirmed\n\
+     wall flip whose delta sits WITHIN the cell's floor is SCREENED: reported as\n\
+     'within layout envelope', not decidable as a regression — the verdict becomes\n\
+     UNDECIDED, never SHIP. Floors screen, they never acquit; the decider for a\n\
+     within-envelope suspect is re-measurement across re-linked layouts of both\n\
+     arms (`fulcrum layout confirm`, reserved). Beyond-floor deltas convict exactly\n\
+     as without the flag. WITHOUT the flag, behaviour is unchanged — the\n\
+     promotion-rule amendment is the user's call; this flag is the mechanism\n\
+     awaiting that call. Also adds a wall margin-tier line (won-with-margin vs\n\
+     knife-edge, banded by the median floor; 3% default without floors) —\n\
+     reporting only, no verdict change.\n"
         .to_string()
 }
 
@@ -987,7 +1241,7 @@ pub fn selftest() -> ExitCode {
     }
 
     // Clause 2: NO-OP.
-    let a = adjudicate(&[], 0, true, &arch, &arch);
+    let a = adjudicate(&[], 0, true, &arch, &arch, None);
     check(
         "clause 2: identical binaries => NO-SHIP(no-op), nothing else evaluated",
         a.verdict == Verdict::NoShip && a.failed_clause.as_deref() == Some("clause 2 (no-op)"),
@@ -1000,6 +1254,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "clause 1: any roundtrip failure => NO-SHIP",
@@ -1020,6 +1275,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "clause 3: one pass->fail flip => NO-SHIP regardless of other wins",
@@ -1037,6 +1293,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "clause 4: nothing closed, gap unchanged => NO-SHIP",
@@ -1062,6 +1319,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "clause 5: a within-noise-looking erosion beyond budget => NO-SHIP (death by a thousand cuts)",
@@ -1078,6 +1336,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     // Note: the wall cell above erodes 0.005 > budget 0.0025 so clause 5
     // fires first — assert that ordering is stable (first failed clause wins).
@@ -1099,6 +1358,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "clause 6: improvement < 2x harm => NO-SHIP even when each erosion is in budget",
@@ -1119,6 +1379,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "ship: closes a cell, no flips/erosion/harm => SHIP",
@@ -1132,6 +1393,7 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &["x86_64".to_string(), "aarch64".to_string()],
+        None,
     );
     check(
         "clause 7: missing architecture => UNDECIDED, never a single-arch SHIP",
@@ -1147,10 +1409,164 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
+        None,
     );
     check(
         "decidability: a VOID cell forces UNDECIDED + names the re-run",
         a.verdict == Verdict::Undecided && a.rerun.iter().any(|r| r.contains("VOID")),
+    );
+
+    // ---- layout-envelope screening (--layout-floors) ----------------------
+    // The envelope SCREENS (within-floor deltas are not decidable as
+    // regressions) but never ACQUITS (they force UNDECIDED, never SHIP).
+    let floors = |entries: &[(&str, u32, u32, f64)], median: f64| crate::layout::LayoutFloors {
+        path: "synthetic".into(),
+        median,
+        floors: entries
+            .iter()
+            .map(|(corpus, level, threads, f)| {
+                (
+                    crate::layout::floor_key("pigz", corpus, *level, *threads),
+                    *f,
+                )
+            })
+            .collect(),
+    };
+    // (a) beyond-budget wall erosion WITHIN its cell's floor => UNDECIDED,
+    // never SHIP, never a clause-5 conviction.
+    let fl = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
+    let cs = vec![
+        cell("size", 6, 1.010, true, 0.999, false), // closes a cell
+        cell("wall", 2, 0.999, false, 1.0035, false), // Δln 0.0045 > budget, <= floor
+    ];
+    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
+    check(
+        "floors: within-envelope erosion => UNDECIDED (screened, NOT acquitted to SHIP)",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided.len() == 1
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("WITHIN LAYOUT ENVELOPE")),
+    );
+    // (b) the SAME erosion beyond a smaller floor convicts exactly as today.
+    let fl = floors(&[("c.bin", 2, 1, 0.001)], 0.001);
+    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
+    check(
+        "floors: beyond-envelope erosion => NO-SHIP clause 5 (convicts as before)",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 5")
+            && a.layout_undecided.is_empty(),
+    );
+    // (c) a cell MISSING from the floors file uses the file's median, and the
+    // clause line says so.
+    let fl = floors(&[("other.bin", 9, 4, 0.005)], 0.005);
+    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
+    check(
+        "floors: missing cell defaults to the file median (stated in the clause line)",
+        a.verdict == Verdict::Undecided
+            && a.layout_undecided.len() == 1
+            && a.clauses.iter().any(|c| c.contains("file median")),
+    );
+    // (d) a confirmed wall pass->fail flip within its floor is downgraded:
+    // not decidable as a regression, does NOT fail clause 3 — and does NOT
+    // pass either (UNDECIDED).
+    let flip_cells = vec![
+        cell("size", 6, 1.010, true, 0.999, false), // closes a cell
+        cell("wall", 9, 0.998, false, 1.001, true), // flip, Δln ~0.003
+    ];
+    let fl = floors(&[("c.bin", 9, 1, 0.005)], 0.005);
+    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
+    check(
+        "floors: within-envelope confirmed flip => UNDECIDED, clause 3 does not convict",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided.iter().any(|s| s.starts_with("flip"))
+            && a.rerun.iter().any(|r| r.contains("layout envelope")),
+    );
+    // (e) the SAME flip beyond a smaller floor convicts clause 3 as before.
+    let fl = floors(&[("c.bin", 9, 1, 0.001)], 0.001);
+    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
+    check(
+        "floors: beyond-envelope flip => NO-SHIP clause 3 (convicts as before)",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 3"),
+    );
+    // (f) floors present but nothing eroded/flipped: still SHIP — the screen
+    // must not manufacture UNDECIDED out of clean cells.
+    let fl = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.010, true, 0.999, false),
+            cell("wall", 2, 0.95, false, 0.95, false),
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl),
+    );
+    check(
+        "floors: clean cells with floors present => still SHIP",
+        a.verdict == Verdict::Ship && a.layout_undecided.is_empty(),
+    );
+    // (g) SIZE cells are never screened: size is exact, layout cannot move it.
+    let fl = floors(&[("c.bin", 2, 1, 1.0)], 1.0); // absurdly generous floor
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.05, true, 1.02, true),      // gap progress
+            cell("size", 2, 0.999, false, 1.0035, false), // size erosion beyond budget
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl),
+    );
+    check(
+        "floors: a size erosion is NEVER screened (convicts even under a generous floor)",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 5"),
+    );
+
+    // ---- margin tiers (reporting only) ------------------------------------
+    let tier_cells = vec![
+        cell("wall", 6, 0.95, false, 0.90, false), // won with margin
+        cell("wall", 2, 0.999, false, 0.999, false), // knife-edge
+        cell("wall", 9, 1.05, true, 1.05, true),   // failing
+        cell("size", 6, 0.90, false, 0.90, false), // size: never tiered
+    ];
+    let fl = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
+    let t = margin_tiers(&tier_cells, Some(&fl));
+    check(
+        "margin tiers: banded by the floors median — 1 won-with-margin, 1 knife-edge, 1 failing; size ignored",
+        (t.band - 0.005).abs() < 1e-12
+            && t.won_with_margin.len() == 1
+            && t.knife_edge.len() == 1
+            && t.failing.len() == 1,
+    );
+    let t = margin_tiers(&tier_cells, None);
+    check(
+        "margin tiers: without floors the band is the default 3% (0.90 still wins, 0.999 knife-edge)",
+        (t.band - 0.03).abs() < 1e-12
+            && t.band_source.contains("default 3%")
+            && t.won_with_margin.len() == 1
+            && t.knife_edge.len() == 1,
+    );
+    let a = adjudicate(&tier_cells, 0, false, &arch, &arch, None);
+    check(
+        "margin tiers: render carries the one-line summary; tiers never change the verdict",
+        render(&a, &tier_cells, &t).contains("wall margin tiers")
+            && a.clauses.iter().all(|c| !c.contains("margin")),
     );
 
     println!("try selftest: {pass} passed, {fail} failed");

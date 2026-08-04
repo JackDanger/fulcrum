@@ -2351,6 +2351,10 @@ THE PRIMITIVES:\n\
                 locate|model|vs|vs-sweep|dispatchgap\n\
                                 span-trace views over a Chrome-trace timeline — the\n\
                                 starvation/causation tooling reserved for the T>1 encoder.\n\
+  fulcrum layout calibrate …    per-cell layout-jitter floors: how much wall-ratio movement\n\
+                                pure binary code layout produces (sha-distinct binaries,\n\
+                                sha-identical outputs). `try --layout-floors` SCREENS with\n\
+                                them — within-envelope deltas go UNDECIDED, never acquitted.\n\
   fulcrum bank finding|ledger|scoreboard\n\
                                 read/append the banked-artifact stores (citable findings,\n\
                                 results ledger, legacy scoreboard render/diff/recertify).\n\
@@ -2620,7 +2624,7 @@ fn classify(sub: &str, rest: &[String]) -> CmdClass {
         "version" | "help" | "--help" | "-h" | "selftest" | "freeze" | "guide" | "commands" => {
             CmdClass::Exempt
         }
-        "why" | "try" | "verify" | "dropin" | "ab" | "profile" => CmdClass::Measurement,
+        "why" | "try" | "layout" | "verify" | "dropin" | "ab" | "profile" => CmdClass::Measurement,
         "board" => match rest.first().map(|s| s.as_str()) {
             // Deriving the board measures; reading/adjudicating it analyses.
             Some("size") | Some("wall") => CmdClass::Measurement,
@@ -2703,6 +2707,7 @@ fn dispatch(sub: &str, rest: &[String]) -> ExitCode {
         "why" => fulcrum::why::cmd(rest),
         "candidates" => fulcrum::candidates::cmd(rest),
         "try" => fulcrum::promote::cmd(rest),
+        "layout" => fulcrum::layout::cmd(rest),
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "verify" => fulcrum::verify::cmd(rest),
         "dropin" => fulcrum::dropin::cmd(rest),

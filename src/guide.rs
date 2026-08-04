@@ -185,6 +185,16 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum try my-branch --base origin/main --repo ~/www/gzippy --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar --levels 2,6,9",
         Class::Measurement,
     )),
+    then(
+        gated("layout calibrate", C(
+            "layout calibrate",
+            "How much wall-ratio jitter can pure binary code layout produce, per cell?",
+            "--repo PATH, --rival name=CMD, --corpus FILE",
+            "fulcrum layout calibrate --repo ~/www/gzippy --ref origin/main --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar --levels 2,6,9 --threads 1,4 --out /tmp/layout-floors",
+            Class::Measurement,
+        )),
+        "fulcrum try <ref> … --layout-floors <out>/layout_floors.tsv   (screens within-envelope deltas as UNDECIDED — never acquits)",
+    ),
     // ---- correctness / goal axes ------------------------------------------
     then(
         gated("verify", C(

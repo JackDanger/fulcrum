@@ -78,6 +78,7 @@ pub mod insn;
 pub mod insn_attr;
 pub mod invariants;
 pub mod labels;
+pub mod layout;
 pub mod ledger;
 pub mod levelsweep;
 pub mod locate;
