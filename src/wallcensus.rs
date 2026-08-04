@@ -148,6 +148,22 @@ where
     Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
 }
 
+fn f64x2_nan() -> [f64; 2] {
+    [f64::NAN, f64::NAN]
+}
+
+fn de_f64x2_nan_null<'de, D>(d: D) -> Result<[f64; 2], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // The array flavour of the same guard: NaN serializes to JSON `null`, so
+    // a plain [f64; 2] field fails to reload [null, null].
+    match Option::<Vec<Option<f64>>>::deserialize(d)? {
+        Some(v) if v.len() == 2 => Ok([v[0].unwrap_or(f64::NAN), v[1].unwrap_or(f64::NAN)]),
+        _ => Ok(f64x2_nan()),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CensusCell {
     pub rival: String,
@@ -171,6 +187,12 @@ pub struct CensusCell {
     /// ours/rival wall ratio (`PairedResult::ratio`). NaN when not measured.
     #[serde(default = "f64_nan", deserialize_with = "de_f64_nan_null")]
     pub wall_ratio: f64,
+    /// 95% CI on the mean paired log-ratio (`PairedResult::logratio_ci`).
+    /// [NaN,NaN] when the cell never reached the paired engine. Carried so a
+    /// NOISY cell can be RENDERED as its CI — a NOISY point ratio must never
+    /// be printed where it can be quoted (see `paired::ratio_field`).
+    #[serde(default = "f64x2_nan", deserialize_with = "de_f64x2_nan_null")]
+    pub logratio_ci: [f64; 2],
     /// True iff `status == "OK" && wall_class == "LOSS"` — ours resolved
     /// SLOWER than the rival beyond the paired significance gate. The
     /// wallcensus analogue of sizecensus's `bigger`.
@@ -316,6 +338,7 @@ fn placeholder_cell(
         wall_verdict: String::new(),
         wall_class: String::new(),
         wall_ratio: f64::NAN,
+        logratio_ci: f64x2_nan(),
         slower: false,
         a_median_ms: f64::NAN,
         b_median_ms: f64::NAN,
@@ -570,6 +593,7 @@ fn measure_cell(
                 wall_verdict: pr.verdict.clone(),
                 wall_class: wall_class.to_string(),
                 wall_ratio: pr.ratio,
+                logratio_ci: pr.logratio_ci,
                 slower,
                 a_median_ms: pr.a_median,
                 b_median_ms: pr.b_median,
@@ -697,10 +721,7 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
                         );
                     }
                     let cell = measure_cell(cfg, rival, avail, level, threads, corpus, &input_sha);
-                    eprintln!(
-                        "wallcensus: {id} -> {} (wall_ratio={:.4} pin_ok={} pin_unmeasurable={})",
-                        cell.status, cell.wall_ratio, cell.pin_ok, cell.pin_unmeasurable
-                    );
+                    eprintln!("wallcensus: {id} -> {}", progress_fields(&cell));
                     save_cell(&cell_path, &cell);
                     cells.push(cell);
                 }
@@ -741,6 +762,26 @@ pub fn run_census(cfg: &CensusConfig) -> Result<CensusArtifact, String> {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// The per-cell progress-line fields. Pure so Gate-0 can pin the rendering
+/// rule: a NOISY (or otherwise CI-straddling) wall cell prints ONLY its CI —
+/// this line is exactly where a NOISY point ratio used to be printed, quoted
+/// as a point estimate, and cost a session chasing a layout artifact. Resolved
+/// cells keep `ratio=`.
+pub fn progress_fields(cell: &CensusCell) -> String {
+    format!(
+        "{} (verdict={} {} pin_ok={} pin_unmeasurable={})",
+        cell.status,
+        if cell.wall_verdict.is_empty() {
+            "-"
+        } else {
+            &cell.wall_verdict
+        },
+        crate::paired::ratio_field(cell.wall_ratio, &cell.logratio_ci),
+        cell.pin_ok,
+        cell.pin_unmeasurable
+    )
+}
 
 pub fn write_tsv(cells: &[CensusCell], path: &Path) -> Result<(), String> {
     let mut s = String::from(
@@ -1327,6 +1368,11 @@ pub fn selftest() -> ExitCode {
             "TIE".to_string()
         },
         wall_ratio: if slower { 1.2 } else { 1.0 },
+        logratio_ci: if slower {
+            [0.15, 0.21]
+        } else {
+            [-0.01, 0.01]
+        },
         slower,
         a_median_ms: 1.0,
         b_median_ms: 1.0,
@@ -1358,6 +1404,25 @@ pub fn selftest() -> ExitCode {
             c
         },
     ];
+    // Progress-line rendering discipline: a NOISY cell must never print a
+    // point ratio (a NOISY point estimate got quoted and cost a session
+    // chasing a layout artifact) — it prints ONLY the CI. Resolved cells
+    // keep their ratio.
+    {
+        let noisy = mk("libdeflate", "a", 1, "OK", false); // NOISY, ci=[-0.01,0.01]
+        let line = progress_fields(&noisy);
+        check(
+            "progress line: NOISY cell prints ci=[..], NEVER a ratio= point estimate",
+            line.contains("verdict=NOISY") && line.contains("ci=[") && !line.contains("ratio="),
+        );
+        let resolved = mk("libdeflate", "a", 1, "OK", true); // RESOLVED-a-slower
+        let line = progress_fields(&resolved);
+        check(
+            "progress line: RESOLVED cell keeps its point ratio",
+            line.contains("ratio=1.2000") && !line.contains("ci=["),
+        );
+    }
+
     let s = summarize(&synth_cells);
     check("summarize: declared counts every cell", s.declared == 5);
     check("summarize: absent counted separately", s.absent == 1);
@@ -2008,6 +2073,7 @@ mod tests {
             wall_verdict: "RESOLVED-b-slower".to_string(),
             wall_class: "WIN".to_string(),
             wall_ratio: 0.8,
+            logratio_ci: [-0.25, -0.20],
             slower: false,
             a_median_ms: 10.0,
             b_median_ms: 12.5,

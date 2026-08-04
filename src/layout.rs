@@ -23,9 +23,18 @@
 //! WHAT THE FLOOR MAY BE USED FOR: `fulcrum try --layout-floors <tsv>` SCREENS
 //! with it — a within-envelope erosion or confirmed flip becomes UNDECIDED
 //! ("within layout envelope — requires cross-layout confirmation"), never a
-//! pass. The envelope screens; it never acquits. The decider for a
-//! within-envelope suspect is re-measurement across re-linked layouts of both
-//! arms (`fulcrum layout confirm`, reserved — not yet implemented).
+//! pass. The envelope screens; it never acquits. A floor applies ONLY to the
+//! exact coordinate it was measured at — a coordinate with no row is REFUSED
+//! ("no floor coverage"), never handed another coordinate's floor or the file
+//! median: floors are level- and file-dependent (armexe L1/T1 = 0.031 vs its
+//! L2-L8 at 0.003-0.007), so a borrowed floor acquits real regressions.
+//!
+//! THE DECIDER for a within-envelope suspect is `fulcrum layout confirm`:
+//! re-measure the suspect cell across K re-linked layouts of BOTH arms and
+//! decide by the CROSS-LAYOUT MEDIAN of paired log-ratios with a sign-
+//! agreement requirement (see `confirm_decide`). A delta that survives every
+//! layout is REAL; one that shrinks under the floor or flips sign across
+//! re-links is LAYOUT-ARTIFACT.
 //!
 //! The rival column in the floors file is a JOIN KEY so rows match `try` cell
 //! ids: layout jitter is a property of OUR binary at (corpus, level, threads);
@@ -130,20 +139,41 @@ pub fn floor_key(rival: &str, corpus: &str, level: u32, threads: u32) -> String 
 #[derive(Clone, Debug)]
 pub struct LayoutFloors {
     pub path: String,
-    /// Median of the finite floors — the stated default for cells missing
-    /// from the file.
+    /// Median of the finite floors. REPORTING ONLY (the margin-tier band) —
+    /// it is NEVER a substitute floor for a coordinate the file does not
+    /// cover; see `floor_for`.
     pub median: f64,
     /// `rival:corpus:L<level>:T<threads>` -> floor. NaN floors are NOT here.
     pub floors: BTreeMap<String, f64>,
 }
 
 impl LayoutFloors {
-    /// (floor, came_from_file). A missing or NaN cell gets the file's median.
-    pub fn floor_for(&self, rival: &str, corpus: &str, level: u32, threads: u32) -> (f64, bool) {
-        match self.floors.get(&floor_key(rival, corpus, level, threads)) {
-            Some(f) => (*f, true),
-            None => (self.median, false),
-        }
+    /// The floor measured at EXACTLY this coordinate, or None. There is NO
+    /// fallback: floors are level- and file-dependent (armexe's L1/T1 floor
+    /// measured 0.031 while its L2-L8 floors are 0.003-0.007), so applying
+    /// another coordinate's floor — or the file median, which this method
+    /// once returned — acquits real regressions at high-jitter coordinates
+    /// and convicts layout noise at low-jitter ones. A missing coordinate
+    /// must surface as "no floor coverage", never as a borrowed number.
+    pub fn floor_for(&self, rival: &str, corpus: &str, level: u32, threads: u32) -> Option<f64> {
+        self.floors
+            .get(&floor_key(rival, corpus, level, threads))
+            .copied()
+    }
+
+    /// Coordinate lookup ignoring the rival join key: jitter is a property of
+    /// OUR binary at (corpus, level, threads); the rival column exists only so
+    /// rows join `try` cell ids. Returns the MAX across rivals at the
+    /// coordinate (they are written identical by `calibrate`; max is the
+    /// conservative choice if a hand-edited file disagrees). Still refuses a
+    /// missing coordinate — never a borrowed number.
+    pub fn floor_at(&self, corpus: &str, level: u32, threads: u32) -> Option<f64> {
+        let suffix = format!(":{corpus}:L{level}:T{threads}");
+        self.floors
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix))
+            .map(|(_, f)| *f)
+            .fold(None, |acc, f| Some(acc.map_or(f, |a: f64| a.max(f))))
     }
 }
 
@@ -580,6 +610,325 @@ pub fn run_calibrate(cfg: &CalibrateConfig) -> Result<(PathBuf, PathBuf), String
 }
 
 // ---------------------------------------------------------------------------
+// Confirm: the DECIDER for within-envelope suspects
+// ---------------------------------------------------------------------------
+
+/// The pure decision core of `layout confirm`, Gate-0-driven.
+///
+/// Inputs: one paired ln(A/B) per layout pair (NaN = that pair's cell VOIDed),
+/// the coordinate's own calibrated floor, and the minimum number of decidable
+/// pairs required. Rule:
+///
+/// * fewer than `min_pairs` finite log-ratios      -> UNDECIDED (with reason)
+/// * sign agreement below ceil(0.8 * pairs)        -> LAYOUT-ARTIFACT
+///   (the delta flips direction across re-links — layout luck, e.g. 3/5)
+/// * median |ln| <= floor                          -> LAYOUT-ARTIFACT
+///   (re-linking alone produces this much at this coordinate)
+/// * median |ln| > floor AND >=ceil(0.8*pairs) same sign -> REAL
+///   (the delta survives every layout — adjudicate it as a real regression)
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfirmDecision {
+    /// REAL | LAYOUT-ARTIFACT | UNDECIDED
+    pub decision: String,
+    pub reason: String,
+    /// Median paired log-ratio across decidable pairs (NaN when none).
+    pub median_logratio: f64,
+    /// Pairs agreeing with the median's sign / decidable pairs.
+    pub agree_k: usize,
+    pub finite_n: usize,
+    pub total_pairs: usize,
+    pub floor: f64,
+}
+
+/// ceil(0.8 * n): the ">=4/5 variants same sign" requirement, generalised.
+pub fn sign_agreement_needed(n: usize) -> usize {
+    (4 * n).div_ceil(5)
+}
+
+pub fn confirm_decide(pair_logratios: &[f64], floor: f64, min_pairs: usize) -> ConfirmDecision {
+    let total = pair_logratios.len();
+    let finite: Vec<f64> = pair_logratios
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+    let mut d = ConfirmDecision {
+        decision: String::new(),
+        reason: String::new(),
+        median_logratio: median_of(finite.clone()),
+        agree_k: 0,
+        finite_n: finite.len(),
+        total_pairs: total,
+        floor,
+    };
+    if finite.len() < min_pairs {
+        d.decision = "UNDECIDED".into();
+        d.reason = format!(
+            "only {} of {} layout pairs produced a decidable paired wall (need >= {}) — \
+             fix the failed builds/runs or add --variants and re-run",
+            finite.len(),
+            total,
+            min_pairs
+        );
+        return d;
+    }
+    let med = d.median_logratio;
+    let agree = finite
+        .iter()
+        .filter(|x| **x != 0.0 && x.signum() == med.signum())
+        .count();
+    d.agree_k = agree;
+    let needed = sign_agreement_needed(finite.len());
+    if med == 0.0 || agree < needed {
+        d.decision = "LAYOUT-ARTIFACT".into();
+        d.reason = format!(
+            "sign agreement {}/{} is below the required {} — the delta flips direction \
+             across re-linked layouts, which a real regression cannot do",
+            agree,
+            finite.len(),
+            needed
+        );
+        return d;
+    }
+    if med.abs() <= floor + 1e-12 {
+        d.decision = "LAYOUT-ARTIFACT".into();
+        d.reason = format!(
+            "cross-layout median |ln(A/B)| {:.4} is within the calibrated floor {:.4} for \
+             this coordinate — re-linking alone produces deltas this size",
+            med.abs(),
+            floor
+        );
+        return d;
+    }
+    d.decision = "REAL".into();
+    d.reason = format!(
+        "cross-layout median |ln(A/B)| {:.4} exceeds the calibrated floor {:.4} with {}/{} \
+         sign agreement — the delta is layout-stable; adjudicate it as a real regression",
+        med.abs(),
+        floor,
+        agree,
+        finite.len()
+    );
+    d
+}
+
+/// One measured layout pair, for the per-variant table and the artifact.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfirmPair {
+    /// 0 = the pristine pair; i>0 = probe-i re-linked pair.
+    pub pair: usize,
+    pub layout: String,
+    pub a_bin_sha12: String,
+    pub b_bin_sha12: String,
+    pub status: String,
+    pub verdict: String,
+    /// A/B wall ratio (NaN when the cell VOIDed).
+    pub ratio: f64,
+    pub logratio_ci: [f64; 2],
+    /// ln(ratio) — the quantity the decision aggregates. NaN when VOID.
+    pub logratio: f64,
+}
+
+pub struct ConfirmConfig {
+    pub repo: PathBuf,
+    pub ref_a: String,
+    pub ref_b: String,
+    pub corpus: PathBuf,
+    pub level: u32,
+    pub threads: u32,
+    /// Re-linked layout variants per side; pairs measured = variants + 1
+    /// (the pristine pair is pair 0). Default 4 => the 4/5 rule.
+    pub variants: usize,
+    pub n: usize,
+    pub min_pairs: usize,
+    /// The coordinate's own calibrated floor (from `--layout-floors`, exact
+    /// coordinate only — never borrowed — or an explicit `--floor`).
+    pub floor: f64,
+    pub floor_source: String,
+    pub out_dir: PathBuf,
+}
+
+pub fn run_confirm(cfg: &ConfirmConfig) -> Result<(ConfirmDecision, Vec<ConfirmPair>), String> {
+    if !cfg.corpus.is_file() {
+        return Err(format!(
+            "REFUSED: corpus {} does not exist — a gate may only cite a dataset that exists",
+            cfg.corpus.display()
+        ));
+    }
+    std::fs::create_dir_all(&cfg.out_dir)
+        .map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
+
+    // Pristine arms of both refs.
+    let (a_bin, a_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_a, &cfg.out_dir)?;
+    let (b_bin, b_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_b, &cfg.out_dir)?;
+    if a_prov.binary_sha256 == b_prov.binary_sha256 {
+        return Err(format!(
+            "REFUSED: both refs compile to the SAME binary (sha256 {}) — there is no delta \
+             to confirm",
+            a_prov.binary_sha256
+        ));
+    }
+    let a_out = output_sha(&a_bin, cfg.level, &cfg.corpus)?;
+    let b_out = output_sha(&b_bin, cfg.level, &cfg.corpus)?;
+
+    // K re-linked variants of EACH side, each verified (sha-distinct binary,
+    // sha-identical output vs its own pristine).
+    let mut pairs_bins: Vec<(usize, String, PathBuf, String, PathBuf, String)> = vec![(
+        0,
+        "pristine".to_string(),
+        a_bin.clone(),
+        a_prov.binary_sha256.clone(),
+        b_bin.clone(),
+        b_prov.binary_sha256.clone(),
+    )];
+    for i in 1..=cfg.variants {
+        let (a_var, a_sha) = build_variant(&cfg.repo, &a_prov.resolved_commit, &cfg.out_dir, i)?;
+        verify_perturbation(
+            &a_prov.binary_sha256,
+            &a_sha,
+            &a_out,
+            &output_sha(&a_var, cfg.level, &cfg.corpus)?,
+        )?;
+        let (b_var, b_sha) = build_variant(&cfg.repo, &b_prov.resolved_commit, &cfg.out_dir, i)?;
+        verify_perturbation(
+            &b_prov.binary_sha256,
+            &b_sha,
+            &b_out,
+            &output_sha(&b_var, cfg.level, &cfg.corpus)?,
+        )?;
+        eprintln!(
+            "layout confirm: pair {i} VERIFIED — both sides re-linked (sha-distinct), \
+             outputs identical to their pristines"
+        );
+        pairs_bins.push((i, format!("probe-{i}"), a_var, a_sha, b_var, b_sha));
+    }
+
+    // Paired A/B wall per layout pair.
+    let mut rows = Vec::new();
+    for (i, layout, a, a_sha, b, b_sha) in &pairs_bins {
+        eprintln!(
+            "layout confirm: [{}/{}] measuring pair {i} ({layout}), n={}...",
+            i + 1,
+            pairs_bins.len(),
+            cfg.n
+        );
+        let wc = crate::wallcensus::CensusConfig {
+            ours_tmpl: tmpl_for(a),
+            rivals: vec![Rival {
+                name: "B".to_string(),
+                tmpl: tmpl_for(b),
+            }],
+            levels: vec![cfg.level],
+            threads: vec![cfg.threads],
+            corpora: vec![cfg.corpus.clone()],
+            out_dir: cfg.out_dir.join(format!("confirm-pair-{i}")),
+            roundtrip_cmd: format!("{} -dc", a.display()),
+            n: cfg.n,
+            warmup: 2,
+            sink: PathBuf::from("/dev/null"),
+            pin_reps: 3,
+            ours_commit: Some(a_prov.resolved_commit.clone()),
+        };
+        let (status, verdict, ratio, ci) = match crate::wallcensus::run_census(&wc) {
+            Ok(art) => match art.cells.into_iter().next() {
+                Some(c) => (c.status, c.wall_verdict, c.wall_ratio, c.logratio_ci),
+                None => ("VOID".into(), "no cell".into(), f64::NAN, [f64::NAN; 2]),
+            },
+            Err(e) => ("VOID".into(), format!("census error: {e}"), f64::NAN, [
+                f64::NAN;
+                2
+            ]),
+        };
+        let lr = if status == "OK" && ratio.is_finite() {
+            ratio.ln()
+        } else {
+            f64::NAN
+        };
+        rows.push(ConfirmPair {
+            pair: *i,
+            layout: layout.clone(),
+            a_bin_sha12: a_sha.chars().take(12).collect(),
+            b_bin_sha12: b_sha.chars().take(12).collect(),
+            status,
+            verdict,
+            ratio,
+            logratio_ci: ci,
+            logratio: lr,
+        });
+    }
+
+    let lrs: Vec<f64> = rows.iter().map(|r| r.logratio).collect();
+    let decision = confirm_decide(&lrs, cfg.floor, cfg.min_pairs);
+
+    let mut artifact = serde_json::json!({
+        "cell": format!("{}:L{}:T{}", basename_of(&cfg.corpus), cfg.level, cfg.threads),
+        "a": { "git_ref": cfg.ref_a, "commit": a_prov.resolved_commit, "bin_sha": a_prov.binary_sha256 },
+        "b": { "git_ref": cfg.ref_b, "commit": b_prov.resolved_commit, "bin_sha": b_prov.binary_sha256 },
+        "floor": cfg.floor,
+        "floor_source": cfg.floor_source,
+        "n": cfg.n,
+        "pairs": rows,
+        "decision": decision,
+        "method": "cross-layout median of paired log-ratios; >=ceil(0.8*pairs) sign agreement AND \
+                   median |ln| > coordinate floor => REAL; below floor or signs split => \
+                   LAYOUT-ARTIFACT; insufficient pairs => UNDECIDED",
+    });
+    for (k, v) in crate::selfver::artifact_fields() {
+        artifact[k] = serde_json::Value::String(v);
+    }
+    let json_path = cfg.out_dir.join("layout_confirm.json");
+    std::fs::write(&json_path, serde_json::to_string_pretty(&artifact).unwrap())
+        .map_err(|e| format!("write {}: {e}", json_path.display()))?;
+    eprintln!("layout confirm: artifact {}", json_path.display());
+    Ok((decision, rows))
+}
+
+fn basename_of(p: &Path) -> String {
+    p.file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// The per-variant table + decision line.
+pub fn render_confirm(cfg_line: &str, rows: &[ConfirmPair], d: &ConfirmDecision) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("LAYOUT-CONFIRM {cfg_line}\n"));
+    s.push_str("  pair  layout     A/B                 ln(A/B)   paired verdict\n");
+    for r in rows {
+        s.push_str(&format!(
+            "  {:<5} {:<10} {:<19} {:<9} {}\n",
+            r.pair,
+            r.layout,
+            // NOISY pairs render as their CI — never a quotable point ratio.
+            crate::paired::ratio_field(r.ratio, &r.logratio_ci),
+            if r.logratio.is_finite() {
+                format!("{:+.4}", r.logratio)
+            } else {
+                "-".to_string()
+            },
+            if r.verdict.is_empty() { &r.status } else { &r.verdict },
+        ));
+    }
+    s.push_str(&format!(
+        "DECISION: {} — {} (median ln {:+.4}, sign {}/{} pairs, floor {:.4})\n",
+        d.decision, d.reason, d.median_logratio, d.agree_k, d.finite_n, d.floor
+    ));
+    s.push_str(match d.decision.as_str() {
+        "REAL" => {
+            "  NEXT ACTION: treat the suspect cell as a REAL wall change; adjudicate it under \
+             the promotion rule (it is not layout luck).\n"
+        }
+        "LAYOUT-ARTIFACT" => {
+            "  NEXT ACTION: do not convict the suspect cell — the delta is what re-linking \
+             alone produces at this coordinate. Re-judge the change without it.\n"
+        }
+        _ => "  NEXT ACTION: see the reason above; the suspect stays UNDECIDED until enough \
+              pairs decide.\n",
+    });
+    s
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -587,21 +936,175 @@ pub fn cmd(args: &[String]) -> ExitCode {
     match args.first().map(|s| s.as_str()) {
         Some("selftest") => selftest(),
         Some("calibrate") => cmd_calibrate(&args[1..]),
-        Some("confirm") => {
-            eprintln!(
-                "layout confirm: RESERVED, not yet implemented. It will be the DECIDER for \
-                 `try` cells screened as 'within layout envelope': re-measure the suspect \
-                 cell across re-linked layouts of BOTH arms so a layout-stable delta can be \
-                 distinguished from layout luck. Until then a screened cell stays UNDECIDED."
-            );
-            ExitCode::from(2)
-        }
+        Some("confirm") => cmd_confirm(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             eprintln!("{}", usage());
             ExitCode::SUCCESS
         }
         Some(other) => {
             eprintln!("layout: unknown subcommand '{other}'\n\n{}", usage());
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_confirm(args: &[String]) -> ExitCode {
+    let mut repo: Option<PathBuf> = None;
+    let mut ref_a: Option<String> = None;
+    let mut ref_b: Option<String> = None;
+    let mut corpus: Option<PathBuf> = None;
+    let mut level: Option<u32> = None;
+    let mut threads = 1u32;
+    let mut variants = 4usize;
+    let mut n = 15usize;
+    let mut min_pairs = 3usize;
+    let mut floors_path: Option<PathBuf> = None;
+    let mut floor_override: Option<f64> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo" => {
+                i += 1;
+                repo = args.get(i).map(PathBuf::from);
+            }
+            "--a" | "--base" => {
+                i += 1;
+                ref_a = args.get(i).cloned();
+            }
+            "--b" | "--after" => {
+                i += 1;
+                ref_b = args.get(i).cloned();
+            }
+            "--corpus" => {
+                i += 1;
+                corpus = args.get(i).map(PathBuf::from);
+            }
+            "--level" => {
+                i += 1;
+                level = args.get(i).and_then(|v| v.parse().ok());
+            }
+            "--threads" => {
+                i += 1;
+                threads = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(threads);
+            }
+            "--variants" => {
+                i += 1;
+                variants = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(variants);
+            }
+            "--n" => {
+                i += 1;
+                n = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(n);
+            }
+            "--min-pairs" => {
+                i += 1;
+                min_pairs = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(min_pairs);
+            }
+            "--layout-floors" => {
+                i += 1;
+                floors_path = args.get(i).map(PathBuf::from);
+            }
+            "--floor" => {
+                i += 1;
+                floor_override = args.get(i).and_then(|v| v.parse().ok());
+            }
+            "--out" => {
+                i += 1;
+                out_dir = args.get(i).map(PathBuf::from);
+            }
+            "--no-self-update" => {}
+            "--help" | "-h" => {
+                eprintln!("{}", usage());
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("layout confirm: unknown arg '{other}'\n\n{}", usage());
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let (Some(repo), Some(ref_a), Some(ref_b), Some(corpus), Some(level)) =
+        (repo, ref_a, ref_b, corpus, level)
+    else {
+        eprintln!(
+            "layout confirm: --repo, --a, --b, --corpus and --level are required\n\n{}",
+            usage()
+        );
+        return ExitCode::from(2);
+    };
+    // The floor for EXACTLY this coordinate — no borrowing, ever. Floors are
+    // level- and file-dependent (armexe L1/T1 = 0.031 vs 0.003-0.007 at
+    // L2-L8); a borrowed floor acquits real regressions.
+    let corpus_name = basename_of(&corpus);
+    let (floor, floor_source) = match (floor_override, &floors_path) {
+        (Some(f), _) => (f, "--floor (explicit)".to_string()),
+        (None, Some(p)) => {
+            let fl = match load_floors(p) {
+                Ok(fl) => fl,
+                Err(e) => {
+                    eprintln!("layout confirm: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            match fl.floor_at(&corpus_name, level, threads) {
+                Some(f) => (f, format!("{} at {corpus_name}:L{level}:T{threads}", fl.path)),
+                None => {
+                    eprintln!(
+                        "layout confirm: REFUSED — no floor coverage at this coordinate \
+                         ({corpus_name}:L{level}:T{threads}) in {}. Floors are level- and \
+                         file-dependent and are NEVER borrowed from another coordinate; run \
+                         `fulcrum layout calibrate` at exactly this coordinate, or pass an \
+                         explicit --floor.",
+                        fl.path
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        (None, None) => {
+            eprintln!(
+                "layout confirm: a floor is required — pass --layout-floors <tsv> (the \
+                 coordinate's calibrated floor) or an explicit --floor\n\n{}",
+                usage()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let out_dir = out_dir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("fulcrum-layout-confirm-{}", std::process::id()))
+    });
+    let cfg = ConfirmConfig {
+        repo,
+        ref_a,
+        ref_b,
+        corpus,
+        level,
+        threads,
+        variants,
+        n,
+        min_pairs,
+        floor,
+        floor_source,
+        out_dir,
+    };
+    match run_confirm(&cfg) {
+        Ok((decision, rows)) => {
+            let head = format!(
+                "{corpus_name}:L{level}:T{threads}  A={} vs B={}  floor {:.4} ({})",
+                cfg.ref_a, cfg.ref_b, cfg.floor, cfg.floor_source
+            );
+            print!("{}", render_confirm(&head, &rows, &decision));
+            match decision.decision.as_str() {
+                "REAL" | "LAYOUT-ARTIFACT" => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(e) => {
+            eprintln!("layout confirm: {e}");
             ExitCode::from(2)
         }
     }
@@ -734,6 +1237,10 @@ fn usage() -> String {
     "fulcrum layout calibrate --repo <gzippy-repo> [--ref origin/main]\n\
      \x20   --rival name=CMD [--rival …] --corpus FILE [--corpus …]\n\
      \x20   [--levels 2,6,9] [--threads 1] [--variants 2] [--n 25] [--out DIR]\n\
+     fulcrum layout confirm --repo <gzippy-repo> --a <refA> --b <refB>\n\
+     \x20   --corpus FILE --level N [--threads 1]\n\
+     \x20   (--layout-floors layout_floors.tsv | --floor 0.0031)\n\
+     \x20   [--variants 4] [--n 15] [--min-pairs 3] [--out DIR]\n\
      \n\
      Measures the PER-CELL wall-ratio jitter pure binary code layout can produce:\n\
      builds one pristine binary of --ref plus --variants perturbed ones (an\n\
@@ -749,8 +1256,19 @@ fn usage() -> String {
      --threads/--corpus sets; progress is emitted per cell per variant.\n\
      \n\
      Consumed by `fulcrum try … --layout-floors <tsv>`: floors SCREEN\n\
-     (within-envelope deltas become UNDECIDED pending cross-layout confirmation,\n\
-     `fulcrum layout confirm`, reserved); they never acquit.\n\
+     (within-envelope deltas become UNDECIDED pending cross-layout confirmation);\n\
+     they never acquit, and a floor is never borrowed across coordinates — a\n\
+     coordinate with no row is REFUSED ('no floor coverage').\n\
+     \n\
+     `layout confirm` is THE DECIDER for a screened suspect: builds K re-linked\n\
+     layout variants of EACH arm (pair 0 = the pristine pair, so pairs = K+1;\n\
+     every variant verified sha-distinct with sha-identical output), runs the\n\
+     paired wall engine per pair, and decides by the CROSS-LAYOUT MEDIAN of\n\
+     paired log-ratios: median |ln(A/B)| > the coordinate's calibrated floor\n\
+     AND >= ceil(0.8*pairs) same-sign => REAL; median within floor or signs\n\
+     split => LAYOUT-ARTIFACT; too few decidable pairs => UNDECIDED (exit 1).\n\
+     The floor comes from --layout-floors at EXACTLY this coordinate (missing\n\
+     coverage is REFUSED, never borrowed) or an explicit --floor.\n\
      selftest = Gate-0.\n"
         .to_string()
 }
@@ -874,20 +1392,23 @@ pub fn selftest() -> ExitCode {
                     "tsv: median of finite floors (0.004, 0.006, 0.034) = 0.006",
                     (fl.median - 0.006).abs() < 1e-9,
                 );
-                let (f, from_file) = fl.floor_for("libdeflate", "silesia.tar", 6, 4);
                 check(
-                    "lookup: present cell returns its own floor, marked from-file",
-                    from_file && (f - 0.034).abs() < 1e-9,
+                    "lookup: present cell returns its own floor",
+                    matches!(fl.floor_for("libdeflate", "silesia.tar", 6, 4), Some(f) if (f - 0.034).abs() < 1e-9),
                 );
-                let (f, from_file) = fl.floor_for("pigz", "missing.bin", 3, 8);
                 check(
-                    "lookup: missing cell falls back to the median, marked default",
-                    !from_file && (f - fl.median).abs() < 1e-12,
+                    "lookup: missing coordinate returns None — floors are level- and \
+                     file-dependent and are NEVER borrowed (no median fallback)",
+                    fl.floor_for("pigz", "missing.bin", 3, 8).is_none(),
                 );
-                let (f, from_file) = fl.floor_for("libdeflate", "data.csv", 9, 1);
                 check(
-                    "lookup: a VOID (NaN) row behaves like a missing cell (median default)",
-                    !from_file && (f - fl.median).abs() < 1e-12,
+                    "lookup: a VOID (NaN) row refuses like a missing coordinate",
+                    fl.floor_for("libdeflate", "data.csv", 9, 1).is_none(),
+                );
+                check(
+                    "lookup: floor_at joins the coordinate across rivals (rival is a join key)",
+                    matches!(fl.floor_at("silesia.tar", 6, 4), Some(f) if (f - 0.034).abs() < 1e-9)
+                        && fl.floor_at("missing.bin", 3, 8).is_none(),
                 );
             }
             Err(e) => {
@@ -914,6 +1435,61 @@ pub fn selftest() -> ExitCode {
             load_floors(&empty).is_err(),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // confirm_decide: the pure decision core of `layout confirm`.
+    check(
+        "confirm: sign_agreement_needed = ceil(0.8n) (4/5, 4/4, 3/3, 8/10)",
+        sign_agreement_needed(5) == 4
+            && sign_agreement_needed(4) == 4
+            && sign_agreement_needed(3) == 3
+            && sign_agreement_needed(10) == 8,
+    );
+    let d = confirm_decide(&[0.020, 0.030, 0.025, 0.028, 0.022], 0.005, 3);
+    check(
+        "confirm: median above floor + full sign agreement => REAL",
+        d.decision == "REAL" && d.agree_k == 5 && (d.median_logratio - 0.025).abs() < 1e-12,
+    );
+    let d = confirm_decide(&[0.020, 0.030, 0.025, -0.001, 0.022], 0.005, 3);
+    check(
+        "confirm: exactly 4/5 same sign still clears the agreement bar => REAL",
+        d.decision == "REAL" && d.agree_k == 4,
+    );
+    let d = confirm_decide(&[0.020, -0.030, 0.025, -0.028, 0.022], 0.005, 3);
+    check(
+        "confirm: signs split across layouts => LAYOUT-ARTIFACT even above the floor",
+        d.decision == "LAYOUT-ARTIFACT" && d.reason.contains("sign"),
+    );
+    let d = confirm_decide(&[0.002, 0.003, 0.001, 0.004, 0.002], 0.005, 3);
+    check(
+        "confirm: median within the coordinate's floor => LAYOUT-ARTIFACT",
+        d.decision == "LAYOUT-ARTIFACT" && d.reason.contains("within the calibrated floor"),
+    );
+    let d = confirm_decide(&[0.020, f64::NAN, f64::NAN, f64::NAN, f64::NAN], 0.005, 3);
+    check(
+        "confirm: insufficient decidable pairs => UNDECIDED with the shortfall named",
+        d.decision == "UNDECIDED" && d.reason.contains("1 of 5") && d.finite_n == 1,
+    );
+    // Rendering: a NOISY pair renders as its CI, and the decision line names
+    // median/sign/floor so the table is quotable without a point estimate.
+    {
+        let rows = vec![ConfirmPair {
+            pair: 0,
+            layout: "pristine".into(),
+            a_bin_sha12: "aaaaaaaaaaaa".into(),
+            b_bin_sha12: "bbbbbbbbbbbb".into(),
+            status: "OK".into(),
+            verdict: "NOISY".into(),
+            ratio: 1.012,
+            logratio_ci: [-0.004, 0.028],
+            logratio: 0.0119,
+        }];
+        let d = confirm_decide(&[0.0119], 0.005, 3);
+        let out = render_confirm("cell", &rows, &d);
+        check(
+            "confirm: render — NOISY pair prints ci=[..] not ratio=, and DECISION line present",
+            out.contains("ci=[") && !out.contains("ratio=") && out.contains("DECISION: UNDECIDED"),
+        );
     }
 
     // log_delta: the comparison space floors live in.

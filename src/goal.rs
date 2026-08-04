@@ -2328,6 +2328,7 @@ pub fn selftest() -> ExitCode {
                 wall_verdict: verdict.to_string(),
                 wall_class: String::new(),
                 wall_ratio: ratio,
+                logratio_ci: [f64::NAN, f64::NAN],
                 slower: verdict == "RESOLVED-a-slower",
                 a_median_ms: 1.0,
                 b_median_ms: 1.0,
