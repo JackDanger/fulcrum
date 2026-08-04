@@ -33,6 +33,7 @@ fn registry() -> Vec<(&'static str, Gate0)> {
         ("why", crate::why::selftest),
         ("candidates", crate::candidates::selftest),
         ("try", crate::promote::selftest),
+        ("layout calibrate", crate::layout::selftest),
         (
             "profile counters (counterdiff)",
             crate::counterdiff::selftest,
