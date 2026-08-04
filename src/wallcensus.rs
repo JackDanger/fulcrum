@@ -81,7 +81,7 @@
 //!       --rival name='CMD -{level} -p {threads} -c {input}' [--rival ...] \
 //!       --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus FILE ...] \
 //!       --out DIR [--n 9] [--warmup 1] [--pin-reps 1] \
-//!       [--roundtrip-cmd 'gzip -dc'] [--ours-commit SHA]
+//!       [--roundtrip-cmd 'gzip -dc'] [--ours-commit SHA] [--sentinel sentinels.tsv]
 //!   fulcrum wallcensus report --out DIR [--out DIR2 ...]   (merge banked runs)
 //!   fulcrum wallcensus selftest                            (Gate-0)
 //!
@@ -947,7 +947,7 @@ fn usage() -> ExitCode {
          \x20     --rival name='CMD -{{level}} -p {{threads}} -c {{input}}' [--rival ...] \\\n\
          \x20     --levels 1-9 --threads 1,4,8,16 --corpus FILE [--corpus FILE2 ...] --out DIR \\\n\
          \x20     [--n 9] [--warmup 1] [--pin-reps 1] [--sink /dev/null] \\\n\
-         \x20     [--roundtrip-cmd 'gzip -dc'] [--ours-commit SHA]\n\
+         \x20     [--roundtrip-cmd 'gzip -dc'] [--ours-commit SHA] [--sentinel sentinels.tsv]\n\
          \x20 fulcrum wallcensus report --out DIR [--out DIR2 ...]   merge banked runs\n\
          \x20                                                        (refuses on sha mismatch)\n\
          \x20 fulcrum wallcensus selftest                            Gate-0\n\
@@ -958,6 +958,9 @@ fn usage() -> ExitCode {
          explicit thread-pin substitution ({{threads}}) — a rival with no such flag still gets\n\
          measured, and if it can't actually hit the declared concurrency the pin gate VOIDs it\n\
          with the observed CPU%% named.\n\
+         \n\
+         --sentinel: run `fulcrum sentinel check` on the named pin file BEFORE the grid and\n\
+         abort on refusal/failure (opt-in box pre-flight; pin with `fulcrum sentinel pin`).\n\
          \n\
          Emits DIR/census.json (provenance+cells), DIR/census.tsv, DIR/summary.txt, and prints\n\
          the human summary (failing cells first, denominator stated). Resumable per cell via\n\
@@ -1037,6 +1040,26 @@ fn run_cmd(args: &[String]) -> ExitCode {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let ours_commit = cli_flag(args, "--ours-commit").map(|s| s.to_string());
+
+    // ---- SENTINEL PRE-FLIGHT (opt-in) --------------------------------------
+    // Prove the box still reproduces its pinned sentinel walls BEFORE the
+    // grid burns hours on it (receipt: a rebooted, unfrozen box produced 20
+    // spurious VOIDs across two full-grid runs before anyone noticed). A
+    // failure aborts here with nothing measured.
+    if let Some(sf) = cli_flag(args, "--sentinel") {
+        let sf = PathBuf::from(sf);
+        println!("wallcensus: sentinel pre-flight against {} …", sf.display());
+        match crate::sentinel::preflight(&sf) {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!(
+                    "wallcensus: SENTINEL PRE-FLIGHT FAILED — the box does not match its \
+                     pin; the census was NOT run.\n{e}"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let cfg = CensusConfig {
         ours_tmpl: ours.to_string(),

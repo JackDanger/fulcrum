@@ -1001,6 +1001,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut archs_required: Vec<String> = vec![std::env::consts::ARCH.to_string()];
     let mut skip_wall = false;
     let mut layout_floors: Option<PathBuf> = None;
+    let mut sentinel_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1074,6 +1075,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 i += 1;
                 layout_floors = args.get(i).map(PathBuf::from);
             }
+            "--sentinel" => {
+                i += 1;
+                sentinel_file = args.get(i).map(PathBuf::from);
+            }
             "--no-self-update" => {}
             "--help" | "-h" => {
                 eprintln!("{}", usage());
@@ -1096,6 +1101,24 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let out_dir = out_dir.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("fulcrum-try-{}", std::process::id()))
     });
+    // ---- SENTINEL PRE-FLIGHT (opt-in) --------------------------------------
+    // Before ANY grid work: prove the box still reproduces its pinned sentinel
+    // walls. Receipt: a freshly-rebooted, unfrozen box once produced 20
+    // spurious VOIDs across two burned full-grid runs before anyone noticed.
+    // A failed pre-flight aborts here — nothing is built, nothing is measured.
+    if let Some(sf) = &sentinel_file {
+        println!("try: sentinel pre-flight against {} …", sf.display());
+        match crate::sentinel::preflight(sf) {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!(
+                    "try: SENTINEL PRE-FLIGHT FAILED — the box does not match its pin; \
+                     the grid was NOT run.\n{e}"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let cfg = TryConfig {
         repo,
         base_ref,
@@ -1137,7 +1160,7 @@ fn usage() -> String {
      \x20   --rival name='CMD -{level} -p {threads} -c {input}' [--rival …]\n\
      \x20   --corpus FILE [--corpus …] [--levels 2,6,9] [--threads 1]\n\
      \x20   [--n 15] [--out DIR] [--archs a,b] [--size-only]\n\
-     \x20   [--layout-floors layout_floors.tsv]\n\
+     \x20   [--layout-floors layout_floors.tsv] [--sentinel sentinels.tsv]\n\
      \n\
      The whole promotion evaluation in one command: builds both arms from git refs\n\
      (stale controls impossible, NO-OPs refused), verifies roundtrip correctness,\n\
@@ -1158,7 +1181,12 @@ fn usage() -> String {
      promotion-rule amendment is the user's call; this flag is the mechanism\n\
      awaiting that call. Also adds a wall margin-tier line (won-with-margin vs\n\
      knife-edge, banded by the median floor; 3% default without floors) —\n\
-     reporting only, no verdict change.\n"
+     reporting only, no verdict change.\n\
+     \n\
+     --sentinel: run `fulcrum sentinel check` on the named pin file BEFORE the grid\n\
+     and ABORT on refusal or failure — a box that no longer reproduces its pinned\n\
+     sentinel walls would spend the whole run producing unconfirmed noise. Opt-in;\n\
+     without the flag nothing changes. Pin with `fulcrum sentinel pin …`.\n"
         .to_string()
 }
 

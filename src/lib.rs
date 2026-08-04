@@ -44,6 +44,11 @@ pub mod why;
 pub mod selftest;
 pub mod selfver;
 
+// Cross-cutting: the box pre-flight (pinned sentinel cells) and the uniform
+// `--done-marker` EXIT:<code> scope guard for external monitors.
+pub mod donemarker;
+pub mod sentinel;
+
 // The TASK INDEX: questions -> runnable command lines, and the machine-readable
 // command registry that `--help` and `main.rs`'s dispatch list are derived from.
 pub mod guide;

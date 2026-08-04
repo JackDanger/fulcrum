@@ -186,6 +186,36 @@ pub const COMMANDS: &[Cmd] = &[
         Class::Measurement,
     )),
     then(
+        gated("sentinel", C(
+            "sentinel",
+            "Is this box still the box the walls were pinned on? (pre-flight before a grid run)",
+            "a verb: pin|check|selftest",
+            "fulcrum sentinel check ~/sentinels.tsv",
+            Class::Measurement,
+        )),
+        "fulcrum try <ref> … --sentinel FILE  /  fulcrum board wall … --sentinel FILE   (gate the grid on it)",
+    ),
+    then(
+        C(
+            "sentinel pin",
+            "Bank the sentinel cells: paired walls of known-stable cells + box identity + binary sha.",
+            "--ours CMD, --rival name=CMD, --corpus FILE, --cells L2:T1,…, -o FILE",
+            "fulcrum sentinel pin --ours '~/www/gzippy/target/release/gzippy -{level} -p {threads} -c {input}' --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar --cells L2:T1,L6:T1,L9:T1 -o ~/sentinels.tsv",
+            Class::Measurement,
+        ),
+        "fulcrum sentinel check ~/sentinels.tsv   (run it before EVERY grid run on this box)",
+    ),
+    then(
+        C(
+            "sentinel check",
+            "Does the box still reproduce its pinned sentinel walls? (REFUSES on identity mismatch)",
+            "the sentinels.tsv path from `sentinel pin`",
+            "fulcrum sentinel check ~/sentinels.tsv",
+            Class::Measurement,
+        ),
+        "on PASS, run the grid; on FAIL the box is not the pinned box — re-freeze or re-pin, never measure through it",
+    ),
+    then(
         gated("layout calibrate", C(
             "layout calibrate",
             "How much wall-ratio jitter can pure binary code layout produce, per cell?",

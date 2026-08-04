@@ -2355,6 +2355,10 @@ THE PRIMITIVES:\n\
                                 pure binary code layout produces (sha-distinct binaries,\n\
                                 sha-identical outputs). `try --layout-floors` SCREENS with\n\
                                 them — within-envelope deltas go UNDECIDED, never acquitted.\n\
+  fulcrum sentinel pin|check    box pre-flight: pin a small set of known-stable paired wall\n\
+                                cells (+ box identity + binary sha) to a TSV; `check` re-runs\n\
+                                them and REFUSES/FAILS if the box no longer reproduces them.\n\
+                                `try --sentinel F` / `board wall --sentinel F` gate on it.\n\
   fulcrum bank finding|ledger|scoreboard\n\
                                 read/append the banked-artifact stores (citable findings,\n\
                                 results ledger, legacy scoreboard render/diff/recertify).\n\
@@ -2364,6 +2368,9 @@ THE PRIMITIVES:\n\
                                 baked provenance: commit, dirty flag, build time. --expect\n\
                                 exits non-zero on mismatch (the deployment check).\n\
 \n\
+`<any command> --done-marker` appends a final machine-readable `EXIT:<code>` line to\n\
+stdout at process end — success, failure, or panic — so background monitors tailing\n\
+a log never wait on a job that already died.\n\
 Every command checks its own staleness against origin/main at startup (cached 60s,\n\
 2.5s network cap): analysis commands self-update+re-exec when safe; MEASUREMENT\n\
 commands REFUSE to run stale. `--no-self-update` pins a reproduction.\n\
@@ -2624,7 +2631,9 @@ fn classify(sub: &str, rest: &[String]) -> CmdClass {
         "version" | "help" | "--help" | "-h" | "selftest" | "freeze" | "guide" | "commands" => {
             CmdClass::Exempt
         }
-        "why" | "try" | "layout" | "verify" | "dropin" | "ab" | "profile" => CmdClass::Measurement,
+        "why" | "try" | "layout" | "verify" | "dropin" | "ab" | "profile" | "sentinel" => {
+            CmdClass::Measurement
+        }
         "board" => match rest.first().map(|s| s.as_str()) {
             // Deriving the board measures; reading/adjudicating it analyses.
             Some("size") | Some("wall") => CmdClass::Measurement,
@@ -2635,7 +2644,29 @@ fn classify(sub: &str, rest: &[String]) -> CmdClass {
 }
 
 fn main() -> ExitCode {
+    // ---- `--done-marker` is UNIFORM AND CENTRAL ---------------------------
+    // Stripped here, before any command parses its argv, so every subcommand
+    // accepts it and none can reject or forget it. When present, a scope
+    // guard prints exactly one `EXIT:<code>` line to stdout at process end —
+    // success, failure, or panic (the guard's Drop runs during unwind and
+    // emits EXIT:101, the panic exit code). External monitors tail for it.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, want_done_marker) = fulcrum::donemarker::strip_flag(args);
+    let marker = want_done_marker.then(fulcrum::donemarker::DoneMarker::arm);
+    let code = main_inner(args);
+    if let Some(m) = marker {
+        m.finish(code); // prints EXIT:<code> as the guard drops
+    }
+    code
+}
+
+fn main_inner(args: Vec<String>) -> ExitCode {
+    // Selftest-only hook (`lib donemarker` Gate-0): prove the --done-marker
+    // scope guard fires on a REAL panic through the shipped dispatch path.
+    // Inert unless the env var is set by the Gate-0 subprocess.
+    if std::env::var("FULCRUM_DONEMARKER_PANIC").is_ok() {
+        panic!("induced panic (FULCRUM_DONEMARKER_PANIC — donemarker Gate-0)");
+    }
     let Some(sub) = args.first().cloned() else {
         return usage();
     };
@@ -2707,6 +2738,7 @@ fn dispatch(sub: &str, rest: &[String]) -> ExitCode {
         "why" => fulcrum::why::cmd(rest),
         "candidates" => fulcrum::candidates::cmd(rest),
         "try" => fulcrum::promote::cmd(rest),
+        "sentinel" => fulcrum::sentinel::cmd(rest),
         "layout" => fulcrum::layout::cmd(rest),
         "freeze" => fulcrum::freeze::cmd_freeze(rest),
         "verify" => fulcrum::verify::cmd(rest),
