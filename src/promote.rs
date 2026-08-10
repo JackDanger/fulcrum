@@ -16,7 +16,7 @@
 //!      and generalising is precisely how an L6/L9 regression shipped.
 //!      A single-level verdict is REFUSED, not warned about.
 //!   5. Apply docs/promotion-rule.md clause by clause (3: no pass→fail flips;
-//!      4: progress; 5: erosion budget; 6: net improvement ≥2×; 7:
+//!      4: progress; 5: margin-floor erosion rule; 6: net improvement ≥2×; 7:
 //!      cross-arch; 8: fixed statistical method) over the per-label cells.
 //!
 //! Output: SHIP / NO-SHIP with the exact clause that failed and the numbers
@@ -24,21 +24,43 @@
 //! NOISY cells, missing architectures). Never a guess, never a table the
 //! operator has to adjudicate.
 //!
-//! `--layout-floors <tsv>` (opt-in; see `layout.rs`): pure binary code layout
-//! moves paired-wall ratios ±0.5-0.7% (up to +3.4% on small-binary T4 cells)
-//! while clause 5's budget is a flat 0.005 — so a stable layout delta convicts
-//! exactly like a real regression. With floors, a within-envelope erosion or
-//! confirmed wall flip is SCREENED: it becomes UNDECIDED ("within layout
-//! envelope — requires cross-layout confirmation"), never a pass. The envelope
-//! screens; it never acquits — a real regression smaller than the floor must
-//! not slip through, so the decider is `fulcrum layout confirm`. A floor
-//! applies ONLY at the exact coordinate it was measured: a suspect at a
-//! coordinate with no floor row is UNDECIDED ("no floor coverage at this
-//! coordinate"), NEVER judged by another coordinate's floor or the file
-//! median — floors are level- and file-dependent (armexe L1/T1 = 0.031 vs
-//! 0.003-0.007 at L2-L8), so borrowing acquits real regressions.
-//! WITHOUT the flag behaviour is byte-identical to before: the promotion-rule
-//! amendment is the user's call, and this flag is the mechanism awaiting it.
+//! CLAUSE 5 IS THE MARGIN-FLOOR RULE (campaign owner's delegated redesign,
+//! 2026-08-10; receipts: the #295/#296/#310 adjudications and the 2/2
+//! LAYOUT-ARTIFACT `layout confirm` verdicts on tested drivers). The old rule
+//! was a flat 0.005 erosion budget on every passing wall cell; measured
+//! reality was (a) most convictions were single-layout lottery rolls — FAIL
+//! lists contained cells whose code was byte-identical between arms — and
+//! (b) genuinely real 2-9% erosions were vetoed on cells won by 4-5x, where
+//! the campaign goal says margin is capital to spend. The redesign:
+//!
+//!   * CONVICTIONS REQUIRE CONFIRMATION. A beyond-budget WALL erosion suspect
+//!     (and a wall pass→fail flip that survives the 3x-n re-measure) only
+//!     convicts after `layout confirm`'s cross-layout machinery says REAL.
+//!     `try` runs the confirms AUTOMATICALLY — one run per suspect
+//!     (corpus, level, threads) coordinate, capped at [`CONFIRM_CAP`]; the
+//!     cap and any overflow are stated in the output, and overflow suspects
+//!     stay UNDECIDED, never convicted. LAYOUT-ARTIFACT acquits with the
+//!     confirm numbers printed. Confirms that cannot change the verdict
+//!     (another clause already convicts) are skipped and say so.
+//!   * MARGIN-FLOOR BUDGET for confirmed-real erosions. A winning wall cell
+//!     (pre-lever ratio <= 0.80) may spend margin: the erosion is ACCEPTABLE
+//!     iff the post-lever ratio still clears the floor,
+//!     `post <= min(0.80, 1 - 3*layout_floor(cell))`. Thin-margin cells
+//!     (pre-lever ratio > 0.80) keep the old flat budget exactly as before.
+//!   * Clause 3 (no pass→fail flip) remains ABSOLUTE — a CONFIRMED-REAL flip
+//!     convicts regardless of margin. SIZE cells are exact integers: size has
+//!     no layout noise, so size flips and size erosions convict directly
+//!     under the pre-existing rules, no confirmation involved.
+//!
+//! Floors (`--layout-floors <tsv>`, from `fulcrum layout calibrate`) supply
+//! both the confirm boundary and the margin-floor term. A floor applies ONLY
+//! at the exact coordinate it was measured: a suspect at a coordinate with no
+//! floor row is UNDECIDED ("no floor coverage at this coordinate"), NEVER
+//! judged by another coordinate's floor or the file median — floors are
+//! level- and file-dependent (armexe L1/T1 = 0.031 vs 0.003-0.007 at L2-L8),
+//! so borrowing acquits real regressions. WITHOUT floors a wall suspect can
+//! neither be confirmed nor margin-priced, so it is UNDECIDED with the
+//! calibrate command named — never convicted on a single-layout reading.
 //!
 //! The clause engine ([`adjudicate`]) is pure and fixture-testable; the
 //! Gate-0 selftest drives every clause and every refusal path synthetically.
@@ -143,18 +165,139 @@ pub struct Adjudication {
     pub layout_undecided: Vec<String>,
 }
 
-/// Clause 5's erosion budget: a passing cell may degrade only by the smaller
-/// of a quarter of its margin and 0.5%.
+/// Clause 5's flat erosion budget: the smaller of a quarter of the cell's
+/// margin and 0.5%. Since the margin-floor redesign (2026-08-10) this plays
+/// two roles: it is the CENSUS FLAG that makes a wall erosion a suspect at
+/// all, and it is the budget a THIN-MARGIN cell (base ratio > 0.80) is still
+/// judged against after confirmation — thin margins stay protected exactly
+/// as before. Winning cells (base <= 0.80) are judged by the margin floor
+/// instead. Size cells use this budget directly, unchanged: size is exact.
 pub fn erosion_budget(old_ratio: f64) -> f64 {
     (0.25 * (1.0 - old_ratio)).min(0.005)
+}
+
+// ---------------------------------------------------------------------------
+// Clause 5 margin-floor machinery (the 2026-08-10 redesign)
+// ---------------------------------------------------------------------------
+
+/// The margin-floor cap: a winning wall cell may spend margin down to this
+/// post-lever ratio, never past it; and a cell whose PRE-lever ratio already
+/// exceeds it is "thin-margin" and keeps the flat [`erosion_budget`].
+pub const MARGIN_FLOOR_CAP: f64 = 0.80;
+
+/// Cross-layout confirm runs per `try` invocation. One run covers EVERY rival
+/// at the same (corpus, level, threads) coordinate — the rival never executes
+/// in a confirm, so suspects are deduplicated by coordinate before the cap is
+/// applied. Overflow suspects stay UNDECIDED, never convicted.
+pub const CONFIRM_CAP: usize = 12;
+
+/// The margin floor for a winning cell: `min(0.80, 1 - 3*layout_floor)`.
+/// A confirmed-real erosion is acceptable iff the post-lever ratio still
+/// clears this. The `1 - 3*floor` term keeps three layout-jitter envelopes of
+/// daylight between the post-lever ratio and the pass/fail line at
+/// high-jitter coordinates; at typical floors (0.003-0.03) the 0.80 cap is
+/// the binding term.
+pub fn margin_floor_threshold(layout_floor: f64) -> f64 {
+    (1.0 - 3.0 * layout_floor).min(MARGIN_FLOOR_CAP)
+}
+
+/// Thin margin: the pre-lever ratio already exceeds the margin-floor cap, so
+/// there is no margin to spend — the flat budget protects it exactly as the
+/// pre-redesign rule did.
+pub fn is_thin_margin(base_ratio: f64) -> bool {
+    base_ratio > MARGIN_FLOOR_CAP
+}
+
+/// One suspect's cross-layout confirmation outcome, keyed by cell id in
+/// [`ConfirmSet`]. A serializable mirror of `layout::ConfirmDecision` so
+/// try.json carries the per-cell confirm results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellConfirm {
+    /// REAL | LAYOUT-ARTIFACT | UNDECIDED
+    pub decision: String,
+    pub reason: String,
+    /// Cross-layout median ln(after/base) — positive = after arm slower.
+    pub median_logratio: f64,
+    pub agree_k: usize,
+    pub finite_n: usize,
+    pub floor: f64,
+}
+
+impl From<&crate::layout::ConfirmDecision> for CellConfirm {
+    fn from(d: &crate::layout::ConfirmDecision) -> Self {
+        CellConfirm {
+            decision: d.decision.clone(),
+            reason: d.reason.clone(),
+            median_logratio: d.median_logratio,
+            agree_k: d.agree_k,
+            finite_n: d.finite_n,
+            floor: d.floor,
+        }
+    }
+}
+
+/// The confirm results handed to [`adjudicate`]. `Default` = nothing
+/// confirmed: every suspect that needs confirmation is then UNDECIDED —
+/// a suspect with no confirm result is NEVER convicted and NEVER acquitted.
+#[derive(Debug, Clone, Default)]
+pub struct ConfirmSet {
+    /// cell id -> outcome. One confirm run at a coordinate fills the entry
+    /// for every suspect cell at that coordinate.
+    pub results: BTreeMap<String, CellConfirm>,
+    /// Suspect cell ids selected for confirmation but beyond [`CONFIRM_CAP`]
+    /// — stated in the output, UNDECIDED-listed, never convicted.
+    pub overflow: Vec<String>,
+    /// The cap in force (for output); 0 in a default/empty set.
+    pub cap: usize,
+    /// Set when confirms were deliberately not run because they could not
+    /// change the verdict (another clause already convicts).
+    pub skipped: Option<String>,
+}
+
+/// Indices of decidable WALL cells that need cross-layout confirmation before
+/// any clause-3/5 conviction: pass->fail flips (post 3x-n re-measure) and
+/// beyond-flat-budget erosions that the margin floor does not already accept.
+/// Suspects at coordinates with NO floor coverage are excluded — they cannot
+/// be confirmed (confirm needs the coordinate's floor) and are UNDECIDED by
+/// refusal, never judged on a borrowed floor.
+pub fn confirm_queue(cells: &[TryCell], floors: Option<&crate::layout::LayoutFloors>) -> Vec<usize> {
+    let mut q = Vec::new();
+    for (i, c) in cells.iter().enumerate() {
+        if c.axis != "wall" || c.base_status != "OK" || c.after_status != "OK" || c.base_failing {
+            continue;
+        }
+        let Some(floor) =
+            floors.and_then(|f| f.floor_for(&c.rival, &c.corpus, c.level, c.threads))
+        else {
+            continue;
+        };
+        if c.after_failing {
+            q.push(i); // flip suspect: conviction requires confirmation
+            continue;
+        }
+        if c.after_ratio - c.base_ratio <= erosion_budget(c.base_ratio) + 1e-12 {
+            continue; // within the flat budget: not a suspect
+        }
+        // Winning cells whose census post already clears the margin floor are
+        // ACCEPTED outright — no conviction possible, so no confirm needed.
+        if !is_thin_margin(c.base_ratio)
+            && c.after_ratio <= margin_floor_threshold(floor) + 1e-12
+        {
+            continue;
+        }
+        q.push(i);
+    }
+    q
 }
 
 /// Apply promotion-rule clauses 3-6 (+8's decidability demand) to the cells.
 /// `verify_failures` is clause 1's failure count (0 required). `noop` is
 /// clause 2 (identical binary hashes). `archs_covered`/`archs_required`
-/// drive clause 7. `floors` (opt-in, from `--layout-floors`) SCREENS wall
-/// deltas within the cell's measured layout-jitter envelope into UNDECIDED —
-/// it never acquits; `None` reproduces pre-floors behaviour exactly.
+/// drive clause 7. `floors` (from `--layout-floors`) supplies the per-cell
+/// layout-jitter floor the margin-floor rule and the confirm chain need;
+/// `confirms` carries the cross-layout confirmation outcomes for wall
+/// suspects. A wall suspect with no confirm result is UNDECIDED — never
+/// convicted, never acquitted by silence.
 #[allow(clippy::too_many_arguments)]
 pub fn adjudicate(
     cells: &[TryCell],
@@ -163,45 +306,40 @@ pub fn adjudicate(
     archs_covered: &[String],
     archs_required: &[String],
     floors: Option<&crate::layout::LayoutFloors>,
+    confirms: &ConfirmSet,
 ) -> Adjudication {
     let mut clauses = Vec::new();
     let mut rerun = Vec::new();
     let mut layout_undecided: Vec<String> = Vec::new();
     let mut failed: Option<String> = None;
-    // Envelope screen for a suspect WALL delta (size is exact — layout cannot
-    // move it, so size cells are never screened):
-    //   Within      — delta sits inside THIS coordinate's own measured floor.
-    //   NoCoverage  — floors are in force but the file has NO row at this
-    //                 coordinate. REFUSE to decide; NEVER apply another
-    //                 coordinate's floor or the file median — floors are
-    //                 level- and file-dependent (armexe L1/T1 = 0.031 vs its
-    //                 L2-L8 at 0.003-0.007), so a borrowed floor acquits real
-    //                 regressions.
-    //   Unscreened  — no floors in force / size axis / delta beyond the
-    //                 coordinate's floor: convict exactly as without floors.
-    enum Screen {
-        Within { floor: f64, delta: f64 },
-        NoCoverage,
-        Unscreened,
+    // The coordinate's own floor, or None. NEVER another coordinate's floor
+    // and NEVER the file median — floors are level- and file-dependent
+    // (armexe L1/T1 = 0.031 vs its L2-L8 at 0.003-0.007), so a borrowed
+    // floor acquits real regressions and convicts layout noise.
+    let floor_of = |c: &TryCell| -> Option<f64> {
+        floors.and_then(|f| f.floor_for(&c.rival, &c.corpus, c.level, c.threads))
+    };
+    // The confirm stage of a suspect's chain: the outcome if one exists, or
+    // the exact reason none does (cap overflow / skipped / not run).
+    enum ConfirmStage<'a> {
+        Outcome(&'a CellConfirm),
+        NotRun(String),
     }
-    let screen = |c: &TryCell| -> Screen {
-        let Some(f) = floors else {
-            return Screen::Unscreened;
-        };
-        if c.axis != "wall" {
-            return Screen::Unscreened;
+    let confirm_of = |id: &str| -> ConfirmStage<'_> {
+        if let Some(cc) = confirms.results.get(id) {
+            return ConfirmStage::Outcome(cc);
         }
-        match f.floor_for(&c.rival, &c.corpus, c.level, c.threads) {
-            None => Screen::NoCoverage,
-            Some(floor) => {
-                let delta = crate::layout::log_delta(c.base_ratio, c.after_ratio);
-                if delta <= floor + 1e-12 {
-                    Screen::Within { floor, delta }
-                } else {
-                    Screen::Unscreened
-                }
-            }
+        if confirms.overflow.iter().any(|o| o == id) {
+            return ConfirmStage::NotRun(format!(
+                "NOT RUN — beyond the {}-coordinate confirm cap for this run",
+                confirms.cap
+            ));
         }
+        ConfirmStage::NotRun(match &confirms.skipped {
+            Some(why) => format!("NOT RUN — {why}"),
+            None => "NOT RUN — awaiting cross-layout confirmation (`fulcrum layout confirm`)"
+                .to_string(),
+        })
     };
     let fail = |failed: &mut Option<String>, clauses: &mut Vec<String>, c: String| {
         if failed.is_none() {
@@ -259,87 +397,153 @@ pub fn adjudicate(
         );
     }
 
-    // Clause 3: no pass→fail flips. Not one. With floors in force, a
-    // CONFIRMED wall flip whose delta sits within the cell's layout envelope
-    // is NOT decidable as a regression (layout alone produces deltas that
-    // size) — but it is NOT acquitted either: it goes to `layout_undecided`
-    // and forces UNDECIDED pending cross-layout confirmation.
+    // Clause 3: no pass→fail flips — ABSOLUTE. A SIZE flip is an exact
+    // integer and convicts directly. A WALL flip is a timing claim on the
+    // one noisy axis, and the receipts say the noise convicts: cross-layout
+    // confirmation went 2/2 LAYOUT-ARTIFACT on real adjudication FAIL lists
+    // that included cells whose code was byte-identical between arms. So a
+    // wall flip that survived the 3x-n re-measure still only convicts when
+    // the confirm chain says REAL (and slower); LAYOUT-ARTIFACT acquits with
+    // the numbers printed; anything less is UNDECIDED — never convicted,
+    // never acquitted by silence. Each suspect's full chain is printed:
+    // census reading -> floor screen -> confirm verdict.
     let mut flips: Vec<String> = Vec::new();
-    let mut screened_flips: Vec<String> = Vec::new();
-    let mut uncovered_flips: Vec<String> = Vec::new();
+    let mut flip_suspects = 0usize;
+    let mut flip_undecided = 0usize;
     for c in decided
         .iter()
         .filter(|c| !c.base_failing && c.after_failing)
     {
-        match screen(c) {
-            Screen::Within { floor, delta } => screened_flips.push(format!(
-                "{} ({} -> {}, Δln {:.4} <= floor {:.4})",
-                c.id(),
-                c.base_field(),
-                c.after_field(),
-                delta,
-                floor,
-            )),
-            Screen::NoCoverage => uncovered_flips.push(format!(
-                "{} ({} -> {})",
+        if c.axis != "wall" {
+            flips.push(format!(
+                "{} ({} -> {}, size is exact — no confirmation applies)",
                 c.id(),
                 c.base_field(),
                 c.after_field()
-            )),
-            Screen::Unscreened => flips.push(format!(
-                "{} ({} -> {})",
-                c.id(),
-                c.base_field(),
-                c.after_field()
-            )),
-        }
-    }
-    if !screened_flips.is_empty() {
-        clauses.push(format!(
-            "clause 3: {} confirmed flip(s) WITHIN LAYOUT ENVELOPE — not decidable as a \
-             regression, NOT acquitted; requires cross-layout confirmation (`fulcrum layout \
-             confirm`): {}",
-            screened_flips.len(),
-            screened_flips.join(", ")
-        ));
-        for s in &screened_flips {
-            layout_undecided.push(format!("flip {s}"));
-            rerun.push(format!(
-                "{s} — within layout envelope: confirm across re-linked layouts of BOTH arms \
-                 (`fulcrum layout confirm`) before any verdict"
             ));
+            continue;
         }
-    }
-    if !uncovered_flips.is_empty() {
-        clauses.push(format!(
-            "clause 3: {} confirmed flip(s) with NO FLOOR COVERAGE AT THIS COORDINATE — not \
-             decidable while floors are in force, and another coordinate's floor is NEVER \
-             borrowed (floors are level- and file-dependent): {}",
-            uncovered_flips.len(),
-            uncovered_flips.join(", ")
-        ));
-        for s in &uncovered_flips {
-            layout_undecided.push(format!("flip {s} — no floor coverage at this coordinate"));
-            rerun.push(format!(
-                "{s} — no floor coverage at this coordinate: run `fulcrum layout calibrate` \
-                 at exactly this (corpus, level, threads) before any verdict"
-            ));
+        flip_suspects += 1;
+        let mut chain = format!(
+            "{}: census {} -> {} (pass->fail)",
+            c.id(),
+            c.base_field(),
+            c.after_field()
+        );
+        match floor_of(c) {
+            None => {
+                let why = if floors.is_some() {
+                    "no floor coverage at this coordinate (a floor is NEVER borrowed)"
+                } else {
+                    "no --layout-floors file"
+                };
+                chain.push_str(&format!(
+                    "; floor screen: {why}; confirm: cannot run without this coordinate's \
+                     floor -> UNDECIDED"
+                ));
+                clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                layout_undecided
+                    .push(format!("flip {} — no floor coverage at this coordinate", c.id()));
+                rerun.push(format!(
+                    "{}: run `fulcrum layout calibrate` at exactly this (corpus, level, \
+                     threads) and re-run try with --layout-floors before any verdict",
+                    c.id()
+                ));
+                flip_undecided += 1;
+            }
+            Some(fl) => {
+                let dl = crate::layout::log_delta(c.base_ratio, c.after_ratio);
+                chain.push_str(&format!(
+                    "; floor screen: Δln {:+.4} vs floor {:.4} ({} envelope)",
+                    dl,
+                    fl,
+                    if dl.abs() <= fl + 1e-12 { "within" } else { "beyond" }
+                ));
+                match confirm_of(&c.id()) {
+                    ConfirmStage::Outcome(cc) if cc.decision == "REAL" => {
+                        if cc.median_logratio > 0.0 {
+                            chain.push_str(&format!(
+                                "; confirm: REAL (median ln {:+.4}, sign {}/{}, floor {:.4}) \
+                                 -> CONVICTED (clause 3 is ABSOLUTE — no margin arithmetic \
+                                 for a flip)",
+                                cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor
+                            ));
+                            clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                            flips.push(format!(
+                                "{} (confirmed REAL, median ln {:+.4})",
+                                c.id(),
+                                cc.median_logratio
+                            ));
+                        } else {
+                            // A layout-stable delta in the WRONG direction:
+                            // the after arm is confirmed FASTER, so the
+                            // census flip reading is not supported.
+                            chain.push_str(&format!(
+                                "; confirm: REAL but NEGATIVE (median ln {:+.4} — the after \
+                                 arm is layout-stably FASTER; the census flip is not \
+                                 supported) -> ACQUITTED",
+                                cc.median_logratio
+                            ));
+                            clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                        }
+                    }
+                    ConfirmStage::Outcome(cc) if cc.decision == "LAYOUT-ARTIFACT" => {
+                        chain.push_str(&format!(
+                            "; confirm: LAYOUT-ARTIFACT (median ln {:+.4}, sign {}/{}, floor \
+                             {:.4} — {}) -> ACQUITTED",
+                            cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor, cc.reason
+                        ));
+                        clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                    }
+                    ConfirmStage::Outcome(cc) => {
+                        chain.push_str(&format!(
+                            "; confirm: UNDECIDED ({}) -> UNDECIDED",
+                            cc.reason
+                        ));
+                        clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                        layout_undecided.push(format!("flip {}", c.id()));
+                        rerun.push(format!(
+                            "{}: cross-layout confirmation was UNDECIDED — re-run `fulcrum \
+                             layout confirm` with more variants before any verdict",
+                            c.id()
+                        ));
+                        flip_undecided += 1;
+                    }
+                    ConfirmStage::NotRun(why) => {
+                        chain.push_str(&format!("; confirm: {why} -> UNDECIDED"));
+                        clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                        layout_undecided.push(format!("flip {}", c.id()));
+                        rerun.push(format!(
+                            "{}: confirm across re-linked layouts of BOTH arms (`fulcrum \
+                             layout confirm`) before any verdict",
+                            c.id()
+                        ));
+                        flip_undecided += 1;
+                    }
+                }
+            }
         }
     }
     if flips.is_empty() {
-        let suspects = screened_flips.len() + uncovered_flips.len();
-        clauses.push(if suspects == 0 {
+        clauses.push(if flip_suspects == 0 {
             format!(
                 "clause 3 OK: no pass->fail flips across {} decidable cells",
                 decided.len()
             )
+        } else if flip_undecided == 0 {
+            format!(
+                "clause 3 OK: {} wall flip suspect(s) all acquitted by cross-layout \
+                 confirmation (chains above); no convicting flip across {} decidable cells",
+                flip_suspects,
+                decided.len()
+            )
         } else {
             format!(
-                "clause 3: no CONVICTING flip across {} decidable cells ({} within-envelope / \
-                 {} no-coverage suspect(s) above — UNDECIDED, not OK)",
+                "clause 3: no CONVICTING flip across {} decidable cells ({} of {} wall \
+                 suspect(s) UNDECIDED above — not OK)",
                 decided.len(),
-                screened_flips.len(),
-                uncovered_flips.len()
+                flip_undecided,
+                flip_suspects
             )
         });
     } else {
@@ -388,87 +592,205 @@ pub fn adjudicate(
         );
     }
 
-    // Clause 5: erosion budget on passing cells. With floors in force, a
-    // beyond-budget WALL erosion within the cell's layout envelope is not
-    // decidable as a regression — screened to UNDECIDED, never excused to
-    // pass. Beyond-envelope erosions convict exactly as before. Size cells
-    // are never screened: size is exact and layout cannot move it.
+    // Clause 5 (margin-floor): erosion on passing cells. SIZE cells are
+    // exact — any beyond-budget size erosion convicts directly, unchanged.
+    // WALL erosion suspects (beyond the flat census budget) walk the chain
+    // census reading -> floor screen -> confirm verdict -> margin-floor
+    // arithmetic, printed in full per suspect so a NO-SHIP is auditable at
+    // a glance:
+    //   * winning cell (base <= 0.80): ACCEPTABLE iff post <= min(0.80,
+    //     1 - 3*floor). A census post already under the floor is accepted
+    //     without confirmation (no conviction is possible). Otherwise a
+    //     conviction requires CONFIRMED-REAL, and the arithmetic runs on the
+    //     CONFIRMED post ratio (base * exp(median ln)).
+    //   * thin-margin cell (base > 0.80): the flat budget protects it
+    //     exactly as before, but conviction still requires CONFIRMED-REAL
+    //     and judges the confirmed delta.
     let mut eroded: Vec<String> = Vec::new();
-    let mut screened_erosions: Vec<String> = Vec::new();
-    let mut uncovered_erosions: Vec<String> = Vec::new();
+    let mut erosion_suspects = 0usize;
+    let mut erosion_undecided = 0usize;
+    let mut erosion_accepted = 0usize;
+    let mut erosion_acquitted = 0usize;
     for c in decided
         .iter()
         .filter(|c| !c.base_failing && !c.after_failing)
         .filter(|c| c.after_ratio - c.base_ratio > erosion_budget(c.base_ratio) + 1e-12)
     {
-        match screen(c) {
-            Screen::Within { floor, delta } => screened_erosions.push(format!(
-                "{} ({} -> {}, budget {:.4}, Δln {:.4} <= floor {:.4})",
+        let budget = erosion_budget(c.base_ratio);
+        if c.axis != "wall" {
+            eroded.push(format!(
+                "{} ({} -> {}, budget {:.4}, size is exact — no confirmation applies)",
                 c.id(),
                 c.base_field(),
                 c.after_field(),
-                erosion_budget(c.base_ratio),
-                delta,
-                floor,
-            )),
-            Screen::NoCoverage => uncovered_erosions.push(format!(
-                "{} ({} -> {}, budget {:.4})",
-                c.id(),
-                c.base_field(),
-                c.after_field(),
-                erosion_budget(c.base_ratio)
-            )),
-            Screen::Unscreened => eroded.push(format!(
-                "{} ({} -> {}, budget {:.4})",
-                c.id(),
-                c.base_field(),
-                c.after_field(),
-                erosion_budget(c.base_ratio)
-            )),
-        }
-    }
-    if !screened_erosions.is_empty() {
-        clauses.push(format!(
-            "clause 5: {} beyond-budget erosion(s) WITHIN LAYOUT ENVELOPE — not decidable as \
-             a regression, NOT acquitted; requires cross-layout confirmation (`fulcrum layout \
-             confirm`): {}",
-            screened_erosions.len(),
-            screened_erosions.join(", ")
-        ));
-        for s in &screened_erosions {
-            layout_undecided.push(format!("erosion {s}"));
-            rerun.push(format!(
-                "{s} — within layout envelope: confirm across re-linked layouts of BOTH arms \
-                 (`fulcrum layout confirm`) before any verdict"
+                budget
             ));
+            continue;
         }
-    }
-    if !uncovered_erosions.is_empty() {
-        clauses.push(format!(
-            "clause 5: {} beyond-budget erosion(s) with NO FLOOR COVERAGE AT THIS COORDINATE \
-             — not decidable while floors are in force, and another coordinate's floor is \
-             NEVER borrowed (floors are level- and file-dependent): {}",
-            uncovered_erosions.len(),
-            uncovered_erosions.join(", ")
-        ));
-        for s in &uncovered_erosions {
-            layout_undecided.push(format!("erosion {s} — no floor coverage at this coordinate"));
-            rerun.push(format!(
-                "{s} — no floor coverage at this coordinate: run `fulcrum layout calibrate` \
-                 at exactly this (corpus, level, threads) before any verdict"
-            ));
+        erosion_suspects += 1;
+        let thin = is_thin_margin(c.base_ratio);
+        let mut chain = format!(
+            "{}: census {} -> {} (Δ {:+.4} > flat budget {:.4}; {})",
+            c.id(),
+            c.base_field(),
+            c.after_field(),
+            c.after_ratio - c.base_ratio,
+            budget,
+            if thin {
+                format!("thin margin, base > {MARGIN_FLOOR_CAP}")
+            } else {
+                format!("winning cell, base <= {MARGIN_FLOOR_CAP}")
+            }
+        );
+        match floor_of(c) {
+            None => {
+                let why = if floors.is_some() {
+                    "no floor coverage at this coordinate (a floor is NEVER borrowed)"
+                } else {
+                    "no --layout-floors file"
+                };
+                chain.push_str(&format!(
+                    "; floor screen: {why}; confirm: cannot run without this coordinate's \
+                     floor -> UNDECIDED"
+                ));
+                clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                layout_undecided.push(format!(
+                    "erosion {} — no floor coverage at this coordinate",
+                    c.id()
+                ));
+                rerun.push(format!(
+                    "{}: run `fulcrum layout calibrate` at exactly this (corpus, level, \
+                     threads) and re-run try with --layout-floors before any verdict",
+                    c.id()
+                ));
+                erosion_undecided += 1;
+            }
+            Some(fl) => {
+                let dl = crate::layout::log_delta(c.base_ratio, c.after_ratio);
+                let thr = margin_floor_threshold(fl);
+                chain.push_str(&format!(
+                    "; floor screen: Δln {:+.4} vs floor {:.4} ({} envelope)",
+                    dl,
+                    fl,
+                    if dl.abs() <= fl + 1e-12 { "within" } else { "beyond" }
+                ));
+                if !thin && c.after_ratio <= thr + 1e-12 {
+                    chain.push_str(&format!(
+                        "; margin floor: census post {:.4} <= min({MARGIN_FLOOR_CAP}, \
+                         1-3x{:.4}) = {:.4} -> ACCEPTED (margin spent; no confirmation \
+                         needed — no conviction is possible)",
+                        c.after_ratio, fl, thr
+                    ));
+                    clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                    erosion_accepted += 1;
+                    continue;
+                }
+                match confirm_of(&c.id()) {
+                    ConfirmStage::Outcome(cc) if cc.decision == "REAL" => {
+                        let post = c.base_ratio * cc.median_logratio.exp();
+                        chain.push_str(&format!(
+                            "; confirm: REAL (median ln {:+.4}, sign {}/{}, floor {:.4})",
+                            cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor
+                        ));
+                        if thin {
+                            let cdelta = post - c.base_ratio;
+                            if cdelta > budget + 1e-12 {
+                                chain.push_str(&format!(
+                                    "; margin floor: thin margin keeps the flat budget — \
+                                     confirmed Δ {cdelta:+.4} > {budget:.4} -> REJECTED"
+                                ));
+                                clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                                eroded.push(format!(
+                                    "{} (confirmed Δ {:+.4} > flat budget {:.4} on a \
+                                     thin-margin cell)",
+                                    c.id(),
+                                    cdelta,
+                                    budget
+                                ));
+                            } else {
+                                chain.push_str(&format!(
+                                    "; margin floor: confirmed Δ {cdelta:+.4} <= flat budget \
+                                     {budget:.4} -> ACCEPTED (the census delta did not \
+                                     survive cross-layout re-measurement)"
+                                ));
+                                clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                                erosion_accepted += 1;
+                            }
+                        } else if post <= thr + 1e-12 {
+                            chain.push_str(&format!(
+                                "; margin floor: confirmed post {post:.4} <= min(\
+                                 {MARGIN_FLOOR_CAP}, 1-3x{fl:.4}) = {thr:.4} -> ACCEPTED \
+                                 (real erosion, margin spent within the floor)"
+                            ));
+                            clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                            erosion_accepted += 1;
+                        } else {
+                            chain.push_str(&format!(
+                                "; margin floor: confirmed post {post:.4} > min(\
+                                 {MARGIN_FLOOR_CAP}, 1-3x{fl:.4}) = {thr:.4} -> REJECTED"
+                            ));
+                            clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                            eroded.push(format!(
+                                "{} (confirmed post {:.4} > margin floor {:.4})",
+                                c.id(),
+                                post,
+                                thr
+                            ));
+                        }
+                    }
+                    ConfirmStage::Outcome(cc) if cc.decision == "LAYOUT-ARTIFACT" => {
+                        chain.push_str(&format!(
+                            "; confirm: LAYOUT-ARTIFACT (median ln {:+.4}, sign {}/{}, floor \
+                             {:.4} — {}) -> ACQUITTED",
+                            cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor, cc.reason
+                        ));
+                        clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                        erosion_acquitted += 1;
+                    }
+                    ConfirmStage::Outcome(cc) => {
+                        chain.push_str(&format!(
+                            "; confirm: UNDECIDED ({}) -> UNDECIDED",
+                            cc.reason
+                        ));
+                        clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                        layout_undecided.push(format!("erosion {}", c.id()));
+                        rerun.push(format!(
+                            "{}: cross-layout confirmation was UNDECIDED — re-run `fulcrum \
+                             layout confirm` with more variants before any verdict",
+                            c.id()
+                        ));
+                        erosion_undecided += 1;
+                    }
+                    ConfirmStage::NotRun(why) => {
+                        chain.push_str(&format!("; confirm: {why} -> UNDECIDED"));
+                        clauses.push(format!("clause 5 [margin-floor]: {chain}"));
+                        layout_undecided.push(format!("erosion {}", c.id()));
+                        rerun.push(format!(
+                            "{}: confirm across re-linked layouts of BOTH arms (`fulcrum \
+                             layout confirm`) before any verdict",
+                            c.id()
+                        ));
+                        erosion_undecided += 1;
+                    }
+                }
+            }
         }
     }
     if eroded.is_empty() {
-        let suspects = screened_erosions.len() + uncovered_erosions.len();
-        clauses.push(if suspects == 0 {
+        clauses.push(if erosion_suspects == 0 {
             "clause 5 OK: every passing cell inside its erosion budget".into()
+        } else if erosion_undecided == 0 {
+            format!(
+                "clause 5 OK: {} wall erosion suspect(s) resolved without conviction \
+                 ({} accepted under the margin floor, {} acquitted as layout artifact — \
+                 chains above)",
+                erosion_suspects, erosion_accepted, erosion_acquitted
+            )
         } else {
             format!(
-                "clause 5: no CONVICTING erosion ({} within-envelope / {} no-coverage \
-                 suspect(s) above — UNDECIDED, not OK)",
-                screened_erosions.len(),
-                uncovered_erosions.len()
+                "clause 5: no CONVICTING erosion ({} of {} wall suspect(s) UNDECIDED above \
+                 — not OK; {} accepted, {} acquitted)",
+                erosion_undecided, erosion_suspects, erosion_accepted, erosion_acquitted
             )
         });
     } else {
@@ -476,7 +798,7 @@ pub fn adjudicate(
             &mut failed,
             &mut clauses,
             format!(
-                "clause 5 FAIL: erosion budget exceeded: {}",
+                "clause 5 FAIL: margin-floor rule violated: {}",
                 eroded.join(", ")
             ),
         );
@@ -866,6 +1188,150 @@ fn confirm_wall_flips(
     Ok(Some((note, serde_json::Value::Array(detail))))
 }
 
+/// Cross-layout confirmation for clause-3/5 wall suspects (the margin-floor
+/// redesign): CONVICTIONS REQUIRE CONFIRMATION, so `try` runs the `layout
+/// confirm` machinery automatically on every suspect that could change the
+/// verdict. Suspects are deduplicated by (corpus, level, threads) — the
+/// rival never executes in a confirm, so one run covers every rival at the
+/// coordinate — and the batch is capped at [`CONFIRM_CAP`] coordinates;
+/// overflow suspects stay UNDECIDED-listed, never convicted. When the
+/// verdict is already NO-SHIP independent of the suspects (a suspect with no
+/// confirm result never convicts, so the pre-verdict's conviction came from
+/// elsewhere), the whole batch is skipped and the output says so.
+fn auto_confirm(
+    cells: &[TryCell],
+    floors: Option<&crate::layout::LayoutFloors>,
+    verify_failures: usize,
+    arch: &str,
+    cfg: &TryConfig,
+) -> ConfirmSet {
+    let queue = confirm_queue(cells, floors);
+    let mut set = ConfirmSet {
+        cap: CONFIRM_CAP,
+        ..ConfirmSet::default()
+    };
+    if queue.is_empty() {
+        return set;
+    }
+    let arch_owned = vec![arch.to_string()];
+    let pre = adjudicate(
+        cells,
+        verify_failures,
+        false,
+        &arch_owned,
+        &cfg.archs_required,
+        floors,
+        &ConfirmSet::default(),
+    );
+    if pre.verdict == Verdict::NoShip {
+        set.skipped = Some(format!(
+            "confirmation skipped: the verdict is already NO-SHIP on {} independent of the \
+             {} wall suspect(s), so cross-layout confirmation cannot change it",
+            pre.failed_clause.as_deref().unwrap_or("another clause"),
+            queue.len()
+        ));
+        return set;
+    }
+    // Deduplicate by coordinate, in deterministic (BTreeMap) cell order.
+    let mut coords: Vec<(String, u32, u32)> = Vec::new();
+    let mut by_coord: BTreeMap<(String, u32, u32), Vec<usize>> = BTreeMap::new();
+    for &i in &queue {
+        let c = &cells[i];
+        let key = (c.corpus.clone(), c.level, c.threads);
+        if !by_coord.contains_key(&key) {
+            coords.push(key.clone());
+        }
+        by_coord.entry(key).or_default().push(i);
+    }
+    let total = coords.len().min(CONFIRM_CAP);
+    for (k, key) in coords.iter().enumerate() {
+        let idxs = &by_coord[key];
+        if k >= CONFIRM_CAP {
+            for &i in idxs {
+                set.overflow.push(cells[i].id());
+            }
+            continue;
+        }
+        let (corpus_name, level, threads) = (key.0.clone(), key.1, key.2);
+        // The coordinate's own floor (max across rivals — `calibrate` writes
+        // them identical; the rival column is a join key). The queue only
+        // admits floored suspects, so this is present by construction.
+        let floor = floors.and_then(|f| f.floor_at(&corpus_name, level, threads));
+        let corpus_path = cfg.corpora.iter().find(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy() == corpus_name.as_str())
+                .unwrap_or(false)
+        });
+        let outcome = match (floor, corpus_path) {
+            (Some(fl), Some(corpus_path)) => {
+                eprintln!(
+                    "try: cross-layout confirm [{}/{total}] {corpus_name}:L{level}:T{threads} \
+                     (floor {fl:.4}, 4 re-linked variants + pristine pair, n={}) ...",
+                    k + 1,
+                    cfg.n
+                );
+                let ccfg = crate::layout::ConfirmConfig {
+                    repo: cfg.repo.clone(),
+                    // A = after, B = base: the median ln(A/B) is then
+                    // positive when the AFTER arm is slower, matching the
+                    // sign of the census delta the chain prints.
+                    ref_a: cfg.after_ref.clone(),
+                    ref_b: cfg.base_ref.clone(),
+                    corpus: corpus_path.clone(),
+                    level,
+                    threads,
+                    variants: 4,
+                    n: cfg.n,
+                    min_pairs: 3,
+                    floor: fl,
+                    floor_source: "try --layout-floors, exact coordinate".into(),
+                    out_dir: cfg
+                        .out_dir
+                        .join(format!("clause-confirm-{corpus_name}-L{level}-T{threads}")),
+                    build_dir: Some(cfg.out_dir.join("clause-confirm-builds")),
+                };
+                match crate::layout::run_confirm(&ccfg) {
+                    Ok((d, _rows)) => CellConfirm::from(&d),
+                    // A failed confirm run leaves the suspect UNDECIDED with
+                    // the error named — it must not abort the adjudication
+                    // (the other cells' verdicts are still meaningful) and
+                    // must never convict or acquit by failure.
+                    Err(e) => CellConfirm {
+                        decision: "UNDECIDED".into(),
+                        reason: format!("confirm run failed: {e}"),
+                        median_logratio: f64::NAN,
+                        agree_k: 0,
+                        finite_n: 0,
+                        floor: fl,
+                    },
+                }
+            }
+            (None, _) => CellConfirm {
+                decision: "UNDECIDED".into(),
+                reason: "no floor at this coordinate (defensive; the queue should not have \
+                         admitted it)"
+                    .into(),
+                median_logratio: f64::NAN,
+                agree_k: 0,
+                finite_n: 0,
+                floor: f64::NAN,
+            },
+            (Some(fl), None) => CellConfirm {
+                decision: "UNDECIDED".into(),
+                reason: format!("corpus file '{corpus_name}' not found among --corpus paths"),
+                median_logratio: f64::NAN,
+                agree_k: 0,
+                finite_n: 0,
+                floor: fl,
+            },
+        };
+        for &i in idxs {
+            set.results.insert(cells[i].id(), outcome.clone());
+        }
+    }
+    set
+}
+
 pub fn run(
     cfg: &TryConfig,
 ) -> Result<(Adjudication, Vec<TryCell>, MarginTiers, serde_json::Value), String> {
@@ -985,6 +1451,17 @@ pub fn run(
     };
 
     let arch = std::env::consts::ARCH.to_string();
+
+    // Cross-layout confirmation of clause-3/5 wall suspects (margin-floor
+    // rule): convictions require confirmation, so run the confirms BEFORE
+    // the final adjudication. NO-OP and --size-only runs have no wall
+    // suspects to confirm.
+    let confirm_set = if noop || cfg.skip_wall {
+        ConfirmSet::default()
+    } else {
+        auto_confirm(&cells, floors.as_ref(), verify_failures, &arch, cfg)
+    };
+
     let mut adj = adjudicate(
         &cells,
         verify_failures,
@@ -992,6 +1469,7 @@ pub fn run(
         std::slice::from_ref(&arch),
         &cfg.archs_required,
         floors.as_ref(),
+        &confirm_set,
     );
     if let Some((note, _)) = &confirmation {
         adj.clauses.insert(0, note.clone());
@@ -1014,9 +1492,16 @@ pub fn run(
             "path": f.path,
             "median_floor": f.median,
             "cells_in_file": f.floors.len(),
-            "screened_undecided": adj.layout_undecided,
-            "semantics": "envelope screens to UNDECIDED; never acquits",
+            "suspects_undecided": adj.layout_undecided,
+            "semantics": "floors feed the margin floor (min(0.80, 1-3*floor)) and the confirm boundary; a missing coordinate is UNDECIDED, never borrowed",
         })).unwrap_or(serde_json::Value::Null),
+        "clause5_margin_floor": {
+            "rule": "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size cells exact and unchanged",
+            "confirm_cap": CONFIRM_CAP,
+            "skipped": confirm_set.skipped,
+            "overflow": confirm_set.overflow,
+            "confirms": confirm_set.results,
+        },
         "margin_tiers": tiers,
         "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided },
         "verdict": match adj.verdict { Verdict::Ship => "SHIP", Verdict::NoShip => "NO-SHIP", Verdict::Undecided => "UNDECIDED" },
@@ -1279,21 +1764,33 @@ fn usage() -> String {
      Verdict: SHIP / NO-SHIP (with the failed clause and numbers) / UNDECIDED\n\
      (with exactly what to re-run). selftest = Gate-0.\n\
      \n\
-     --layout-floors: consult per-cell layout-jitter floors (from `fulcrum layout\n\
-     calibrate`) during adjudication. A beyond-budget wall erosion or confirmed\n\
-     wall flip whose delta sits WITHIN the cell's floor is SCREENED: reported as\n\
-     'within layout envelope', not decidable as a regression — the verdict becomes\n\
-     UNDECIDED, never SHIP. Floors screen, they never acquit; the decider for a\n\
-     within-envelope suspect is re-measurement across re-linked layouts of both\n\
-     arms (`fulcrum layout confirm`). A suspect at a coordinate the floors file\n\
-     does not cover is UNDECIDED ('no floor coverage at this coordinate') — a\n\
-     floor is NEVER borrowed from another coordinate or the file median (floors\n\
-     are level- and file-dependent; borrowing acquits real regressions).\n\
-     Beyond-floor deltas convict exactly\n\
-     as without the flag. WITHOUT the flag, behaviour is unchanged — the\n\
-     promotion-rule amendment is the user's call; this flag is the mechanism\n\
-     awaiting that call. Also adds a wall margin-tier line (won-with-margin vs\n\
-     knife-edge, banded by the median floor; 3% default without floors) —\n\
+     CLAUSE 5 IS THE MARGIN-FLOOR RULE (the campaign owner's delegated redesign,\n\
+     2026-08-10). Wall convictions require cross-layout confirmation: a\n\
+     beyond-budget wall erosion suspect, and a wall pass->fail flip that survives\n\
+     the 3x-n re-measure, is AUTOMATICALLY confirmed via the `layout confirm`\n\
+     machinery (one run per (corpus,level,threads) coordinate, capped at 12 per\n\
+     try; overflow is stated and stays UNDECIDED, never convicted). Only\n\
+     CONFIRMED-REAL suspects proceed to judgment; LAYOUT-ARTIFACT acquits with\n\
+     the confirm numbers printed. A confirmed-real erosion on a WINNING cell\n\
+     (pre-lever ratio <= 0.80) is acceptable iff the confirmed post-lever ratio\n\
+     still clears the margin floor: post <= min(0.80, 1 - 3*layout_floor(cell)).\n\
+     THIN-MARGIN cells (pre-lever ratio > 0.80) keep the old flat 0.005 budget.\n\
+     Clause 3 (no pass->fail flip) remains ABSOLUTE for confirmed-real flips.\n\
+     SIZE cells are exact and unchanged: size flips and size erosions convict\n\
+     directly, no confirmation involved. Each suspect prints its full chain:\n\
+     census reading -> floor screen -> confirm verdict -> margin-floor\n\
+     arithmetic, so a NO-SHIP is auditable at a glance.\n\
+     \n\
+     --layout-floors: the per-cell layout-jitter floors (from `fulcrum layout\n\
+     calibrate`) that feed both the confirm boundary and the margin-floor term.\n\
+     A suspect at a coordinate the floors file does not cover is UNDECIDED ('no\n\
+     floor coverage at this coordinate') — a floor is NEVER borrowed from\n\
+     another coordinate or the file median (floors are level- and\n\
+     file-dependent; borrowing acquits real regressions). WITHOUT the flag a\n\
+     wall suspect can be neither confirmed nor margin-priced, so it is\n\
+     UNDECIDED with the calibrate command named — never convicted on a\n\
+     single-layout reading. Also adds a wall margin-tier line (won-with-margin\n\
+     vs knife-edge, banded by the median floor; 3% default without floors) —\n\
      reporting only, no verdict change.\n\
      \n\
      --sentinel: run `fulcrum sentinel check` on the named pin file BEFORE the grid\n\
@@ -1383,8 +1880,42 @@ pub fn selftest() -> ExitCode {
         );
     }
 
+    // Confirm-set helpers for the margin-floor checks below.
+    let none = ConfirmSet::default();
+    let confirmed = |id: &str, decision: &str, med: f64| -> ConfirmSet {
+        let mut s = ConfirmSet {
+            cap: CONFIRM_CAP,
+            ..ConfirmSet::default()
+        };
+        s.results.insert(
+            id.to_string(),
+            CellConfirm {
+                decision: decision.to_string(),
+                reason: "synthetic".into(),
+                median_logratio: med,
+                agree_k: 5,
+                finite_n: 5,
+                floor: 0.005,
+            },
+        );
+        s
+    };
+    let floors = |entries: &[(&str, u32, u32, f64)], median: f64| crate::layout::LayoutFloors {
+        path: "synthetic".into(),
+        median,
+        floors: entries
+            .iter()
+            .map(|(corpus, level, threads, f)| {
+                (
+                    crate::layout::floor_key("pigz", corpus, *level, *threads),
+                    *f,
+                )
+            })
+            .collect(),
+    };
+
     // Clause 2: NO-OP.
-    let a = adjudicate(&[], 0, true, &arch, &arch, None);
+    let a = adjudicate(&[], 0, true, &arch, &arch, None, &none);
     check(
         "clause 2: identical binaries => NO-SHIP(no-op), nothing else evaluated",
         a.verdict == Verdict::NoShip && a.failed_clause.as_deref() == Some("clause 2 (no-op)"),
@@ -1398,6 +1929,7 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
         "clause 1: any roundtrip failure => NO-SHIP",
@@ -1408,20 +1940,76 @@ pub fn selftest() -> ExitCode {
                 .contains("clause 1"),
     );
 
-    // Clause 3: one flip blocks even with big wins elsewhere.
+    // Clause 3: a CONFIRMED-REAL wall flip blocks even with big wins
+    // elsewhere — clause 3 is ABSOLUTE; no margin arithmetic for a flip.
+    let flip_cells = vec![
+        cell("size", 6, 1.40, true, 1.00, false), // huge win
+        cell("wall", 9, 0.98, false, 1.01, true), // one flip
+    ];
+    let fl9 = floors(&[("c.bin", 9, 1, 0.005)], 0.005);
+    let a = adjudicate(
+        &flip_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl9),
+        &confirmed("pigz:c.bin:L9:T1:wall", "REAL", 0.0305),
+    );
+    check(
+        "clause 3: a CONFIRMED-REAL pass->fail flip => NO-SHIP regardless of other wins",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 3"),
+    );
+    // Same flip, confirm says LAYOUT-ARTIFACT => acquitted with the confirm
+    // numbers printed; verdict SHIP (the size cell closes).
+    let a = adjudicate(
+        &flip_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl9),
+        &confirmed("pigz:c.bin:L9:T1:wall", "LAYOUT-ARTIFACT", 0.001),
+    );
+    check(
+        "clause 3: a LAYOUT-ARTIFACT flip is ACQUITTED with the confirm numbers printed => SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("clause 3 [flip-suspect]")
+                    && c.contains("LAYOUT-ARTIFACT")
+                    && c.contains("ACQUITTED")
+                    && c.contains("median ln")
+            }),
+    );
+    // Same flip, no confirm result => UNDECIDED — a wall flip is NEVER
+    // convicted on a single-layout census reading.
+    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl9), &none);
+    check(
+        "clause 3: an unconfirmed wall flip suspect => UNDECIDED, never convicted by default",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided.iter().any(|s| s.starts_with("flip"))
+            && a.rerun.iter().any(|r| r.contains("layout confirm")),
+    );
+    // A SIZE flip needs no confirmation: size is exact.
     let a = adjudicate(
         &[
-            cell("size", 6, 1.20, true, 1.00, false), // huge win
-            cell("wall", 9, 0.98, false, 1.01, true), // one flip
+            cell("size", 6, 1.40, true, 1.00, false),
+            cell("size", 9, 0.98, false, 1.01, true), // size flip
         ],
         0,
         false,
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
-        "clause 3: one pass->fail flip => NO-SHIP regardless of other wins",
+        "clause 3: a SIZE flip convicts directly — exact integers need no confirmation",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
@@ -1437,6 +2025,7 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
         "clause 4: nothing closed, gap unchanged => NO-SHIP",
@@ -1447,42 +2036,290 @@ pub fn selftest() -> ExitCode {
                 .contains("clause 4"),
     );
 
-    // Clause 5: erosion budget.
+    // ---- Clause 5: the margin-floor rule ----------------------------------
     check(
-        "clause 5: budget = min(quarter-margin, 0.5%)",
+        "clause 5: flat budget = min(quarter-margin, 0.5%) (census flag + thin-margin budget)",
         (erosion_budget(0.9) - 0.005).abs() < 1e-12
             && (erosion_budget(0.999) - 0.00025).abs() < 1e-12,
     );
+    check(
+        "clause 5: margin floor = min(0.80, 1 - 3*layout_floor)",
+        (margin_floor_threshold(0.005) - 0.80).abs() < 1e-12
+            && (margin_floor_threshold(0.08) - 0.76).abs() < 1e-12,
+    );
+    check(
+        "clause 5: thin margin begins strictly above 0.80",
+        !is_thin_margin(0.80) && is_thin_margin(0.8001),
+    );
+
+    // Confirm-queue selection: flips and would-convict erosions only.
+    {
+        let fl = floors(&[("c.bin", 2, 1, 0.005), ("c.bin", 9, 1, 0.005)], 0.005);
+        let cs = vec![
+            cell("wall", 2, 0.20, false, 0.25, false), // winning, post clears the floor: accepted, NO confirm
+            cell("wall", 9, 0.70, false, 0.85, false), // winning, post > 0.80: confirm
+            cell("wall", 3, 0.95, false, 0.96, false), // thin, beyond budget, NO floor coverage: excluded (UNDECIDED by refusal)
+            cell("size", 2, 0.99, false, 1.05, false), // size: never confirmed
+            cell("wall", 2, 0.90, false, 0.9009, false), // within flat budget: not a suspect
+            cell("wall", 9, 0.99, false, 1.01, true),  // wall flip with coverage: confirm
+        ];
+        check(
+            "confirm queue: would-convict erosions + covered flips only (accepted/uncovered/size/in-budget excluded)",
+            confirm_queue(&cs, Some(&fl)) == vec![1, 5],
+        );
+        check(
+            "confirm queue: empty without floors — nothing can be confirmed on a borrowed floor",
+            confirm_queue(&cs, None).is_empty(),
+        );
+    }
+
+    // (5a) A real 2-9% erosion on a cell won 4-5x is ACCEPTED outright: the
+    // census post already clears the margin floor, so no conviction is
+    // possible and no confirmation is needed. This is THE case the flat
+    // 0.005 budget got wrong (receipts: #295/#296/#310).
+    let fl2 = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
     let a = adjudicate(
         &[
-            cell("size", 6, 1.05, true, 1.02, true), // progress on the gap
-            cell("wall", 2, 0.999, false, 1.0035, false), // eroded 0.35% > 0.025% budget, no flip
+            cell("size", 6, 1.15, true, 0.999, false), // closes a cell
+            cell("wall", 2, 0.20, false, 0.25, false), // won 5x, erodes 5pp
         ],
         0,
         false,
         &arch,
         &arch,
-        None,
+        Some(&fl2),
+        &none,
     );
     check(
-        "clause 5: a within-noise-looking erosion beyond budget => NO-SHIP (death by a thousand cuts)",
-        a.verdict == Verdict::NoShip && a.failed_clause.as_deref().unwrap_or("").contains("clause 5"),
+        "margin-floor: erosion on a 5x-won cell, census post 0.25 <= 0.80 => ACCEPTED outright, SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("clause 5 [margin-floor]")
+                    && c.contains("ACCEPTED")
+                    && c.contains("no confirmation needed")
+            }),
     );
 
-    // Clause 6: net improvement 2x.
+    // (5b) confirmed-real-WITHIN-floor accepted: census post 0.85 breaches
+    // the floor, but the CONFIRMED post (base * exp(median ln)) is 0.78 —
+    // the arithmetic runs on the confirmed number and accepts.
+    let real_within = confirmed("pigz:c.bin:L2:T1:wall", "REAL", (0.78f64 / 0.70).ln());
+    let fat_cells = vec![
+        cell("size", 6, 1.40, true, 0.999, false), // closes; big enough for clause 6
+        cell("wall", 2, 0.70, false, 0.85, false),
+    ];
+    let a = adjudicate(
+        &fat_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &real_within,
+    );
+    check(
+        "margin-floor: CONFIRMED-REAL erosion with confirmed post 0.78 <= floor 0.80 => ACCEPTED, SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("confirm: REAL")
+                    && c.contains("confirmed post 0.7800")
+                    && c.contains("ACCEPTED")
+            }),
+    );
+
+    // (5c) confirmed-real-BELOW-floor rejected: confirmed post 0.85 > 0.80.
+    let real_below = confirmed("pigz:c.bin:L2:T1:wall", "REAL", (0.85f64 / 0.70).ln());
+    let a = adjudicate(&fat_cells, 0, false, &arch, &arch, Some(&fl2), &real_below);
+    check(
+        "margin-floor: CONFIRMED-REAL erosion with confirmed post 0.85 > floor 0.80 => NO-SHIP clause 5",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 5")
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("REJECTED") && c.contains("margin floor")),
+    );
+
+    // (5d) artifact-acquittal: the same suspect, confirm says the delta flips
+    // sign across re-links => ACQUITTED with the numbers printed, SHIP.
+    let a = adjudicate(
+        &fat_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &confirmed("pigz:c.bin:L2:T1:wall", "LAYOUT-ARTIFACT", 0.002),
+    );
+    check(
+        "margin-floor: LAYOUT-ARTIFACT erosion => ACQUITTED with confirm numbers, SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("clause 5 [margin-floor]")
+                    && c.contains("LAYOUT-ARTIFACT")
+                    && c.contains("ACQUITTED")
+                    && c.contains("median ln")
+            }),
+    );
+
+    // (5e) thin-margin cells keep the flat budget: base 0.95 erodes 0.01 —
+    // trivially acceptable on a winning cell — and the confirmed delta is
+    // beyond the flat 0.005, so the thin cell CONVICTS.
+    let thin_cells = vec![
+        cell("size", 6, 1.40, true, 0.999, false),
+        cell("wall", 2, 0.95, false, 0.96, false),
+    ];
+    let a = adjudicate(
+        &thin_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &confirmed("pigz:c.bin:L2:T1:wall", "REAL", (0.96f64 / 0.95).ln()),
+    );
+    check(
+        "margin-floor: thin-margin cell (base 0.95 > 0.80) keeps the flat budget => confirmed Δ 0.01 convicts",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 5")
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("thin margin keeps the flat budget")),
+    );
+    // (5e2) the same thin suspect whose confirmed delta lands INSIDE the flat
+    // budget is accepted: the census delta did not survive re-measurement.
+    let a = adjudicate(
+        &thin_cells,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &confirmed("pigz:c.bin:L2:T1:wall", "REAL", 0.003),
+    );
+    check(
+        "margin-floor: thin suspect whose confirmed Δ is inside the flat budget => ACCEPTED, SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("confirmed Δ") && c.contains("ACCEPTED")),
+    );
+
+    // (5f) an unconfirmed erosion suspect => UNDECIDED — never convicted on a
+    // single-layout reading, never acquitted by silence.
+    let a = adjudicate(&fat_cells, 0, false, &arch, &arch, Some(&fl2), &none);
+    check(
+        "margin-floor: unconfirmed erosion suspect => UNDECIDED (awaiting cross-layout confirmation)",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided.iter().any(|s| s.starts_with("erosion"))
+            && a.rerun.iter().any(|r| r.contains("layout confirm")),
+    );
+
+    // (5g) confirm-cap overflow stays UNDECIDED with the cap stated.
+    let overflowed = ConfirmSet {
+        cap: CONFIRM_CAP,
+        overflow: vec!["pigz:c.bin:L2:T1:wall".to_string()],
+        ..ConfirmSet::default()
+    };
+    let a = adjudicate(&fat_cells, 0, false, &arch, &arch, Some(&fl2), &overflowed);
+    check(
+        "margin-floor: confirm-cap overflow => UNDECIDED with the cap stated, never convicted",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("confirm cap") && c.contains(&CONFIRM_CAP.to_string()))
+            && a.layout_undecided.iter().any(|s| s.starts_with("erosion")),
+    );
+
+    // (5h) a coordinate MISSING from the floors file is REFUSED, never given
+    // another coordinate's floor: the erosion goes UNDECIDED with the reason
+    // "no floor coverage at this coordinate". The other coordinate's floor is
+    // deliberately HUGE — if it (or the median) were borrowed, the margin
+    // floor would collapse and the judgment would change.
+    let fl_other = floors(&[("other.bin", 9, 4, 0.5)], 0.5);
+    let a = adjudicate(&fat_cells, 0, false, &arch, &arch, Some(&fl_other), &none);
+    check(
+        "margin-floor: missing-coordinate erosion => UNDECIDED 'no floor coverage' — a floor is NEVER borrowed",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided
+                .iter()
+                .any(|s| s.starts_with("erosion") && s.contains("no floor coverage at this coordinate"))
+            && a.rerun.iter().any(|r| r.contains("layout calibrate")),
+    );
+    // Same refusal WITHOUT any floors file.
+    let a = adjudicate(&fat_cells, 0, false, &arch, &arch, None, &none);
+    check(
+        "margin-floor: erosion suspect without --layout-floors => UNDECIDED with calibrate named, never convicted",
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.clauses.iter().any(|c| c.contains("no --layout-floors file"))
+            && a.rerun.iter().any(|r| r.contains("layout calibrate")),
+    );
+
+    // (5i) flips at a coordinate with NO floor row are UNDECIDED — proven in
+    // BOTH would-be-borrow directions (a huge floor elsewhere must not screen
+    // them; a tiny floor elsewhere must not convict them).
+    let uncovered_flip = vec![
+        cell("size", 6, 1.40, true, 0.999, false),
+        cell("wall", 9, 0.998, false, 1.001, true),
+    ];
+    let undecided_no_coverage = |a: &Adjudication| {
+        a.verdict == Verdict::Undecided
+            && a.failed_clause.is_none()
+            && a.layout_undecided
+                .iter()
+                .any(|s| s.starts_with("flip") && s.contains("no floor coverage at this coordinate"))
+            && a.rerun.iter().any(|r| r.contains("layout calibrate"))
+    };
+    let a = adjudicate(
+        &uncovered_flip,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&floors(&[("other.bin", 9, 4, 0.5)], 0.5)),
+        &none,
+    );
+    check(
+        "margin-floor: missing-coordinate flip => UNDECIDED, not screened by a huge floor elsewhere",
+        undecided_no_coverage(&a),
+    );
+    let a = adjudicate(
+        &uncovered_flip,
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&floors(&[("other.bin", 9, 4, 0.0001)], 0.0001)),
+        &none,
+    );
+    check(
+        "margin-floor: missing-coordinate flip => UNDECIDED, not convicted by a tiny floor elsewhere",
+        undecided_no_coverage(&a),
+    );
+
+    // Clause ordering: with a clause-5 conviction AND clause-6 arithmetic in
+    // range, the FIRST failed clause names the verdict.
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 1.000, false), // +0.010 improvement, closes a cell
-            cell("wall", 2, 0.990, false, 0.9950, false), // 0.005 harm, within budget (margin/4=0.0025? no: budget=min(0.0025,0.005)=0.0025)
+            cell("wall", 2, 0.990, false, 0.995, false), // thin, confirmed erosion 0.005 > budget 0.0025
         ],
         0,
         false,
         &arch,
         &arch,
-        None,
+        Some(&fl2),
+        &confirmed("pigz:c.bin:L2:T1:wall", "REAL", (0.995f64 / 0.990).ln()),
     );
-    // Note: the wall cell above erodes 0.005 > budget 0.0025 so clause 5
-    // fires first — assert that ordering is stable (first failed clause wins).
     check(
         "clause ordering: the FIRST failed clause names the verdict",
         a.verdict == Verdict::NoShip
@@ -1491,6 +2328,8 @@ pub fn selftest() -> ExitCode {
                 .unwrap_or("")
                 .contains("clause 5"),
     );
+
+    // Clause 6: net improvement 2x (erosions within budget are not suspects).
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004 (gap 0.010->0.006 = -40%)
@@ -1502,6 +2341,7 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
         "clause 6: improvement < 2x harm => NO-SHIP even when each erosion is in budget",
@@ -1523,6 +2363,7 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
         "ship: closes a cell, no flips/erosion/harm => SHIP",
@@ -1537,6 +2378,7 @@ pub fn selftest() -> ExitCode {
         &arch,
         &["x86_64".to_string(), "aarch64".to_string()],
         None,
+        &none,
     );
     check(
         "clause 7: missing architecture => UNDECIDED, never a single-arch SHIP",
@@ -1553,130 +2395,11 @@ pub fn selftest() -> ExitCode {
         &arch,
         &arch,
         None,
+        &none,
     );
     check(
         "decidability: a VOID cell forces UNDECIDED + names the re-run",
         a.verdict == Verdict::Undecided && a.rerun.iter().any(|r| r.contains("VOID")),
-    );
-
-    // ---- layout-envelope screening (--layout-floors) ----------------------
-    // The envelope SCREENS (within-floor deltas are not decidable as
-    // regressions) but never ACQUITS (they force UNDECIDED, never SHIP).
-    let floors = |entries: &[(&str, u32, u32, f64)], median: f64| crate::layout::LayoutFloors {
-        path: "synthetic".into(),
-        median,
-        floors: entries
-            .iter()
-            .map(|(corpus, level, threads, f)| {
-                (
-                    crate::layout::floor_key("pigz", corpus, *level, *threads),
-                    *f,
-                )
-            })
-            .collect(),
-    };
-    // (a) beyond-budget wall erosion WITHIN its cell's floor => UNDECIDED,
-    // never SHIP, never a clause-5 conviction.
-    let fl = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
-    let cs = vec![
-        cell("size", 6, 1.010, true, 0.999, false), // closes a cell
-        cell("wall", 2, 0.999, false, 1.0035, false), // Δln 0.0045 > budget, <= floor
-    ];
-    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: within-envelope erosion => UNDECIDED (screened, NOT acquitted to SHIP)",
-        a.verdict == Verdict::Undecided
-            && a.failed_clause.is_none()
-            && a.layout_undecided.len() == 1
-            && a.clauses
-                .iter()
-                .any(|c| c.contains("WITHIN LAYOUT ENVELOPE")),
-    );
-    // (b) the SAME erosion beyond a smaller floor convicts exactly as today.
-    let fl = floors(&[("c.bin", 2, 1, 0.001)], 0.001);
-    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: beyond-envelope erosion => NO-SHIP clause 5 (convicts as before)",
-        a.verdict == Verdict::NoShip
-            && a.failed_clause
-                .as_deref()
-                .unwrap_or("")
-                .contains("clause 5")
-            && a.layout_undecided.is_empty(),
-    );
-    // (c) a coordinate MISSING from the floors file is REFUSED, never given
-    // another coordinate's floor: the erosion goes UNDECIDED with the reason
-    // "no floor coverage at this coordinate". The other coordinate's floor is
-    // deliberately HUGE — if it (or the median) were borrowed, the suspect
-    // would be screened as within-envelope instead.
-    let fl = floors(&[("other.bin", 9, 4, 0.5)], 0.5);
-    let a = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: missing-coordinate erosion => UNDECIDED 'no floor coverage at this \
-         coordinate' — a huge floor elsewhere is NEVER borrowed",
-        a.verdict == Verdict::Undecided
-            && a.failed_clause.is_none()
-            && a.layout_undecided.len() == 1
-            && a.layout_undecided[0].contains("no floor coverage at this coordinate")
-            && a.clauses.iter().any(|c| c.contains("NO FLOOR COVERAGE"))
-            && a.clauses.iter().all(|c| !c.contains("WITHIN LAYOUT ENVELOPE"))
-            && a.rerun.iter().any(|r| r.contains("layout calibrate")),
-    );
-    // (d) a confirmed wall pass->fail flip within its floor is downgraded:
-    // not decidable as a regression, does NOT fail clause 3 — and does NOT
-    // pass either (UNDECIDED).
-    let flip_cells = vec![
-        cell("size", 6, 1.010, true, 0.999, false), // closes a cell
-        cell("wall", 9, 0.998, false, 1.001, true), // flip, Δln ~0.003
-    ];
-    let fl = floors(&[("c.bin", 9, 1, 0.005)], 0.005);
-    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: within-envelope confirmed flip => UNDECIDED, clause 3 does not convict",
-        a.verdict == Verdict::Undecided
-            && a.failed_clause.is_none()
-            && a.layout_undecided.iter().any(|s| s.starts_with("flip"))
-            && a.rerun.iter().any(|r| r.contains("layout envelope")),
-    );
-    // (e) the SAME flip beyond a smaller floor convicts clause 3 as before.
-    let fl = floors(&[("c.bin", 9, 1, 0.001)], 0.001);
-    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: beyond-envelope flip => NO-SHIP clause 3 (convicts as before)",
-        a.verdict == Verdict::NoShip
-            && a.failed_clause
-                .as_deref()
-                .unwrap_or("")
-                .contains("clause 3"),
-    );
-    // (e2) a flip at a coordinate with NO floor row is UNDECIDED — proven in
-    // BOTH would-be-borrow directions. Floors are level- and file-dependent
-    // (armexe L1/T1 = 0.031 vs 0.003-0.007 at L2-L8): borrowing a big floor
-    // acquits real regressions, borrowing a small one convicts layout noise.
-    // Direction 1: the only covered coordinate has a HUGE floor (borrowing
-    // would screen the flip as within-envelope).
-    let fl = floors(&[("other.bin", 9, 4, 0.5)], 0.5);
-    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
-    let undecided_no_coverage = |a: &Adjudication| {
-        a.verdict == Verdict::Undecided
-            && a.failed_clause.is_none()
-            && a.layout_undecided
-                .iter()
-                .any(|s| s.starts_with("flip") && s.contains("no floor coverage at this coordinate"))
-            && a.rerun.iter().any(|r| r.contains("no floor coverage"))
-    };
-    check(
-        "floors: missing-coordinate flip => UNDECIDED, not screened by a huge floor elsewhere",
-        undecided_no_coverage(&a)
-            && a.clauses.iter().all(|c| !c.contains("WITHIN LAYOUT ENVELOPE")),
-    );
-    // Direction 2: the only covered coordinate has a TINY floor (borrowing
-    // would convict the flip as beyond-envelope). Still UNDECIDED.
-    let fl = floors(&[("other.bin", 9, 4, 0.0001)], 0.0001);
-    let a = adjudicate(&flip_cells, 0, false, &arch, &arch, Some(&fl));
-    check(
-        "floors: missing-coordinate flip => UNDECIDED, not convicted by a tiny floor elsewhere",
-        undecided_no_coverage(&a),
     );
 
     // ---- NOISY rendering discipline ----------------------------------------
@@ -1694,15 +2417,16 @@ pub fn selftest() -> ExitCode {
             &arch,
             &arch,
             None,
+            &none,
         );
         let flip_line = a
             .clauses
             .iter()
-            .find(|c| c.contains("clause 3 FAIL"))
+            .find(|c| c.contains("clause 3 [flip-suspect]"))
             .cloned()
             .unwrap_or_default();
         check(
-            "NOISY rendering: a straddling-CI arm prints ci=[..] in clause lines, never ratio=",
+            "NOISY rendering: a straddling-CI arm prints ci=[..] in the suspect chain, never ratio=",
             flip_line.contains("ci=[") && flip_line.contains("-> ratio=1.0160"),
         );
         let mut knife = cell("wall", 2, 0.999, false, 0.999, false);
@@ -1715,9 +2439,8 @@ pub fn selftest() -> ExitCode {
                 && !t.knife_edge[0].contains("ratio="),
         );
     }
-    // (f) floors present but nothing eroded/flipped: still SHIP — the screen
+    // Floors present but nothing eroded/flipped: still SHIP — the machinery
     // must not manufacture UNDECIDED out of clean cells.
-    let fl = floors(&[("c.bin", 2, 1, 0.005)], 0.005);
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 0.999, false),
@@ -1727,14 +2450,15 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
-        Some(&fl),
+        Some(&fl2),
+        &none,
     );
     check(
         "floors: clean cells with floors present => still SHIP",
         a.verdict == Verdict::Ship && a.layout_undecided.is_empty(),
     );
-    // (g) SIZE cells are never screened: size is exact, layout cannot move it.
-    let fl = floors(&[("c.bin", 2, 1, 1.0)], 1.0); // absurdly generous floor
+    // SIZE cells are exact: a size erosion convicts directly even under an
+    // absurdly generous floor and with no confirm result.
     let a = adjudicate(
         &[
             cell("size", 6, 1.05, true, 1.02, true),      // gap progress
@@ -1744,10 +2468,11 @@ pub fn selftest() -> ExitCode {
         false,
         &arch,
         &arch,
-        Some(&fl),
+        Some(&floors(&[("c.bin", 2, 1, 1.0)], 1.0)),
+        &none,
     );
     check(
-        "floors: a size erosion is NEVER screened (convicts even under a generous floor)",
+        "size: a size erosion convicts directly — exact integers need no floors and no confirmation",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
@@ -1779,11 +2504,11 @@ pub fn selftest() -> ExitCode {
             && t.won_with_margin.len() == 1
             && t.knife_edge.len() == 1,
     );
-    let a = adjudicate(&tier_cells, 0, false, &arch, &arch, None);
+    let a = adjudicate(&tier_cells, 0, false, &arch, &arch, None, &none);
     check(
         "margin tiers: render carries the one-line summary; tiers never change the verdict",
         render(&a, &tier_cells, &t).contains("wall margin tiers")
-            && a.clauses.iter().all(|c| !c.contains("margin")),
+            && a.clauses.iter().all(|c| !c.contains("margin tier")),
     );
 
     println!("try selftest: {pass} passed, {fail} failed");

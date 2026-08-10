@@ -5,11 +5,16 @@
 //! WHY THIS EXISTS (measured motivation): sha-distinct binaries of the SAME
 //! source — differing only in text layout — produce paired-wall ratios of
 //! ±0.5-0.7% typically and up to +3.4% on small-binary T4 cells on the frozen
-//! Zen2 box, while the promotion rule's clause-5 erosion budget is a flat 0.005
-//! and its flip confirmation re-measures the SAME binary pair (so a stable
-//! layout delta confirms exactly like a real regression). Two lever PRs failed
-//! adjudication on what is at least partly layout luck. Artifacts:
-//! /root/lay-*.json on solvency.
+//! Zen2 box, while the promotion rule's clause-5 erosion budget was a flat
+//! 0.005 and its flip confirmation re-measures the SAME binary pair (so a
+//! stable layout delta confirms exactly like a real regression). Two lever PRs
+//! failed adjudication on what is at least partly layout luck, and `confirm`
+//! went 2/2 LAYOUT-ARTIFACT on tested drivers. Artifacts: /root/lay-*.json on
+//! solvency. Since the 2026-08-10 margin-floor redesign, clause 5 CONSUMES
+//! these floors: `try` auto-runs `confirm` on wall suspects (convictions
+//! require CONFIRMED-REAL) and prices winning cells' erosions against
+//! `min(0.80, 1 - 3*floor)`; the flat 0.005 budget survives only for
+//! thin-margin cells (base ratio > 0.80).
 //!
 //! WHAT IT DOES: builds N+1 binaries of ONE ref — one pristine, and N whose
 //! only difference is an unreachable-but-unstrippable probe function appended
@@ -20,21 +25,22 @@
 //! max |ln(variant_wall/pristine_wall)| across variants — an ENVELOPE of what
 //! layout alone can do at that coordinate.
 //!
-//! WHAT THE FLOOR MAY BE USED FOR: `fulcrum try --layout-floors <tsv>` SCREENS
-//! with it — a within-envelope erosion or confirmed flip becomes UNDECIDED
-//! ("within layout envelope — requires cross-layout confirmation"), never a
-//! pass. The envelope screens; it never acquits. A floor applies ONLY to the
-//! exact coordinate it was measured at — a coordinate with no row is REFUSED
-//! ("no floor coverage"), never handed another coordinate's floor or the file
-//! median: floors are level- and file-dependent (armexe L1/T1 = 0.031 vs its
-//! L2-L8 at 0.003-0.007), so a borrowed floor acquits real regressions.
+//! WHAT THE FLOOR IS USED FOR: `fulcrum try --layout-floors <tsv>` consumes it
+//! twice — as the REAL/LAYOUT-ARTIFACT boundary for the cross-layout confirms
+//! it auto-runs on wall suspects, and as the margin-floor term
+//! `min(0.80, 1 - 3*floor)` a confirmed-real erosion on a winning cell is
+//! priced against. A floor applies ONLY to the exact coordinate it was
+//! measured at — a coordinate with no row is REFUSED ("no floor coverage"),
+//! never handed another coordinate's floor or the file median: floors are
+//! level- and file-dependent (armexe L1/T1 = 0.031 vs its L2-L8 at
+//! 0.003-0.007), so a borrowed floor acquits real regressions.
 //!
-//! THE DECIDER for a within-envelope suspect is `fulcrum layout confirm`:
-//! re-measure the suspect cell across K re-linked layouts of BOTH arms and
-//! decide by the CROSS-LAYOUT MEDIAN of paired log-ratios with a sign-
-//! agreement requirement (see `confirm_decide`). A delta that survives every
-//! layout is REAL; one that shrinks under the floor or flips sign across
-//! re-links is LAYOUT-ARTIFACT.
+//! THE DECIDER for any wall suspect is `fulcrum layout confirm` (run
+//! automatically by `try`, or by hand): re-measure the suspect cell across K
+//! re-linked layouts of BOTH arms and decide by the CROSS-LAYOUT MEDIAN of
+//! paired log-ratios with a sign-agreement requirement (see
+//! `confirm_decide`). A delta that survives every layout is REAL; one that
+//! shrinks under the floor or flips sign across re-links is LAYOUT-ARTIFACT.
 //!
 //! The rival column in the floors file is a JOIN KEY so rows match `try` cell
 //! ids: layout jitter is a property of OUR binary at (corpus, level, threads);
@@ -746,6 +752,14 @@ pub struct ConfirmConfig {
     pub floor: f64,
     pub floor_source: String,
     pub out_dir: PathBuf,
+    /// Where arms and re-linked variants are BUILT (worktrees + cargo
+    /// targets). `None` = `out_dir`. `fulcrum try`'s auto-confirm batches
+    /// several coordinates and passes one shared build dir so the (identical)
+    /// binaries are built once, while each coordinate keeps its own
+    /// `out_dir` — census artifacts must never be shared across coordinates
+    /// (the census RESUMES from its out dir, and a resumed foreign cell
+    /// would be scored as this coordinate's).
+    pub build_dir: Option<PathBuf>,
 }
 
 pub fn run_confirm(cfg: &ConfirmConfig) -> Result<(ConfirmDecision, Vec<ConfirmPair>), String> {
@@ -757,10 +771,13 @@ pub fn run_confirm(cfg: &ConfirmConfig) -> Result<(ConfirmDecision, Vec<ConfirmP
     }
     std::fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
+    let build_dir = cfg.build_dir.clone().unwrap_or_else(|| cfg.out_dir.clone());
+    std::fs::create_dir_all(&build_dir)
+        .map_err(|e| format!("mkdir {}: {e}", build_dir.display()))?;
 
     // Pristine arms of both refs.
-    let (a_bin, a_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_a, &cfg.out_dir)?;
-    let (b_bin, b_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_b, &cfg.out_dir)?;
+    let (a_bin, a_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_a, &build_dir)?;
+    let (b_bin, b_prov) = crate::ablate::build_arm(&cfg.repo, &cfg.ref_b, &build_dir)?;
     if a_prov.binary_sha256 == b_prov.binary_sha256 {
         return Err(format!(
             "REFUSED: both refs compile to the SAME binary (sha256 {}) — there is no delta \
@@ -782,14 +799,14 @@ pub fn run_confirm(cfg: &ConfirmConfig) -> Result<(ConfirmDecision, Vec<ConfirmP
         b_prov.binary_sha256.clone(),
     )];
     for i in 1..=cfg.variants {
-        let (a_var, a_sha) = build_variant(&cfg.repo, &a_prov.resolved_commit, &cfg.out_dir, i)?;
+        let (a_var, a_sha) = build_variant(&cfg.repo, &a_prov.resolved_commit, &build_dir, i)?;
         verify_perturbation(
             &a_prov.binary_sha256,
             &a_sha,
             &a_out,
             &output_sha(&a_var, cfg.level, &cfg.corpus)?,
         )?;
-        let (b_var, b_sha) = build_variant(&cfg.repo, &b_prov.resolved_commit, &cfg.out_dir, i)?;
+        let (b_var, b_sha) = build_variant(&cfg.repo, &b_prov.resolved_commit, &build_dir, i)?;
         verify_perturbation(
             &b_prov.binary_sha256,
             &b_sha,
@@ -1090,6 +1107,7 @@ fn cmd_confirm(args: &[String]) -> ExitCode {
         floor,
         floor_source,
         out_dir,
+        build_dir: None,
     };
     match run_confirm(&cfg) {
         Ok((decision, rows)) => {
@@ -1249,18 +1267,21 @@ fn usage() -> String {
      the paired wall engine variant-vs-pristine per cell. Writes layout_floors.tsv\n\
      (+ .json twin): floor = max |ln(variant/pristine)| across variants.\n\
      Motivation (measured): layout alone moves paired-wall ratios ±0.5-0.7%%,\n\
-     up to +3.4%% on small-binary T4 cells, vs a flat 0.005 clause-5 budget.\n\
+     up to +3.4%% on small-binary T4 cells — which under the old flat 0.005\n\
+     clause-5 budget convicted like a real regression.\n\
      \n\
      RUNTIME: cost = corpora x levels x threads x variants paired runs — a full\n\
      grid x 2 variants at n=25 is HOURS. Bound it with restricted --levels/\n\
      --threads/--corpus sets; progress is emitted per cell per variant.\n\
      \n\
-     Consumed by `fulcrum try … --layout-floors <tsv>`: floors SCREEN\n\
-     (within-envelope deltas become UNDECIDED pending cross-layout confirmation);\n\
-     they never acquit, and a floor is never borrowed across coordinates — a\n\
-     coordinate with no row is REFUSED ('no floor coverage').\n\
+     Consumed by `fulcrum try … --layout-floors <tsv>` (the margin-floor rule):\n\
+     floors set both the confirm boundary and the margin floor min(0.80,\n\
+     1-3*floor) for winning cells' erosions; `try` auto-runs `layout confirm`\n\
+     on wall suspects — convictions require CONFIRMED-REAL. A floor is never\n\
+     borrowed across coordinates — a coordinate with no row is REFUSED ('no\n\
+     floor coverage') and the suspect stays UNDECIDED.\n\
      \n\
-     `layout confirm` is THE DECIDER for a screened suspect: builds K re-linked\n\
+     `layout confirm` is THE DECIDER for a wall suspect: builds K re-linked\n\
      layout variants of EACH arm (pair 0 = the pristine pair, so pairs = K+1;\n\
      every variant verified sha-distinct with sha-identical output), runs the\n\
      paired wall engine per pair, and decides by the CROSS-LAYOUT MEDIAN of\n\
