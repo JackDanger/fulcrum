@@ -6,6 +6,43 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — clause 5 is now the MARGIN-FLOOR rule (`fulcrum try`)
+
+The campaign owner's delegated redesign (2026-08-10). Receipts: the
+#295/#296/#310 adjudications (most clause-5 convictions were single-layout
+lottery rolls; FAIL lists contained cells whose code was byte-identical
+between arms) and the 2/2 LAYOUT-ARTIFACT `layout confirm` verdicts on
+tested drivers, while genuinely real 2-9% erosions were vetoed on cells won
+by 4-5x where the rival-anchored goal says margin is capital to spend.
+
+- **Convictions require confirmation.** A beyond-budget WALL erosion
+  suspect, and a wall pass→fail flip that survives the existing 3x-n
+  re-measure, only convicts after the cross-layout confirm machinery
+  (`layout confirm`) says REAL. `try` runs the confirms automatically —
+  one per suspect (corpus, level, threads) coordinate, capped at 12 per
+  run; the cap and any overflow are stated in the output and overflow
+  suspects stay UNDECIDED, never convicted. LAYOUT-ARTIFACT acquits with
+  the confirm numbers printed. Confirms that cannot change the verdict
+  (another clause already convicts) are skipped and say so.
+- **Margin-floor budget** replaces the flat 0.005 for confirmed-real
+  erosions on WINNING cells (pre-lever ratio ≤ 0.80): acceptable iff the
+  confirmed post-lever ratio still clears `min(0.80, 1 − 3·layout_floor)`.
+  Thin-margin cells (pre-lever ratio > 0.80) keep the old flat budget
+  exactly as before. Clause 3 (no pass→fail flip) remains ABSOLUTE for
+  confirmed-real flips. SIZE cells are exact integers and are unchanged.
+- **Auditable chains:** every wall suspect prints census reading → floor
+  screen → confirm verdict → margin-floor arithmetic on one line, and
+  `try.json` gains `clause5_margin_floor` with the per-cell confirm
+  results, the cap, any overflow and any skip reason.
+- Floors are still never borrowed: a suspect at a coordinate the floors
+  file does not cover — or with no `--layout-floors` at all — is
+  UNDECIDED with `layout calibrate` named, never convicted on a
+  single-layout reading and never judged by another coordinate's floor.
+- `layout::ConfirmConfig` gains `build_dir` so `try`'s batched confirms
+  build the re-linked variants once and share them across coordinates,
+  while each coordinate keeps its own census out-dir (censuses resume from
+  their out-dir; sharing one would score a foreign cell).
+
 ### Changed — BREAKING: the 2026-07 command consolidation
 
 - **~90 subcommands → 13, organised by the question each answers** (see

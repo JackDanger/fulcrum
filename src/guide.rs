@@ -223,7 +223,7 @@ pub const COMMANDS: &[Cmd] = &[
             "fulcrum layout calibrate --repo ~/www/gzippy --ref origin/main --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar --levels 2,6,9 --threads 1,4 --out /tmp/layout-floors",
             Class::Measurement,
         )),
-        "fulcrum try <ref> … --layout-floors <out>/layout_floors.tsv   (screens within-envelope deltas as UNDECIDED — never acquits, never borrows a floor across coordinates); then fulcrum layout confirm --repo … --a <base> --b <after> --corpus F --level N --layout-floors <tsv>   (THE DECIDER: REAL vs LAYOUT-ARTIFACT vs UNDECIDED)",
+        "fulcrum try <ref> … --layout-floors <out>/layout_floors.tsv   (floors feed clause 5's margin floor min(0.80, 1-3*floor) and the confirm boundary; try AUTO-RUNS `layout confirm` on wall suspects — convictions require CONFIRMED-REAL; a missing coordinate is UNDECIDED, never borrowed)",
     ),
     // ---- correctness / goal axes ------------------------------------------
     then(
@@ -779,7 +779,10 @@ pub const INTENTS: &[Intent] = &[
         note: "Builds BOTH arms from git refs (a stale control is impossible, a NO-OP is refused), verifies \
                roundtrip, runs size+wall censuses at a shallow AND a deep level (single-level verdicts are \
                REFUSED — measuring L2 alone once shipped a 6.2% L6 and 9.9% L9 regression), then applies \
-               the promotion rule clause by clause.",
+               the promotion rule clause by clause. Clause 5 is the MARGIN-FLOOR rule: wall convictions \
+               (erosions AND flips) require cross-layout CONFIRMED-REAL (try auto-runs `layout confirm`, \
+               capped at 12 coordinates); a confirmed-real erosion on a winning cell is acceptable while \
+               post <= min(0.80, 1-3*layout_floor); thin margins (base > 0.80) keep the flat 0.005 budget.",
     },
     Intent {
         id: "correct",
