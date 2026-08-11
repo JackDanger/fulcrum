@@ -6,6 +6,40 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — clause 6 prices only RESIDUAL harm (`fulcrum try`)
+
+The margin-coherence fix (2026-08-11). Receipt: the #310 run accepted 54
+erosions as margin-spend under clause 5's margin floor (clean audit chains,
+zero convictions) and then failed clause 6 — "improvement 1.5619 < 2x harm
+1.3537" — because clause 6's harm aggregate still summed the very erosions
+clause 5 had just ACCEPTED (0.7487 of that 1.3537). Double-counting
+authorized spend made clause 6 the new flat budget in disguise.
+
+- **Harm counts only what the clause-3/5 chains left standing:**
+  confirmed-real unaccepted erosions and flips (charged at their CONFIRMED
+  deltas, not the census reading), exact size regressions on passing cells
+  (sub-budget or not — size has no layout noise), and — conservatively —
+  UNDECIDED wall suspects at their census deltas, so missing floor coverage
+  or confirm overflow never becomes free.
+- **Excluded and itemized, never silent:** clause-5-ACCEPTED margin-spend
+  (priced by the floor), LAYOUT-ARTIFACT acquittals (measured cross-layout
+  noise), and sub-budget wall census drift (priced by clause 5's flat
+  budget; single-layout readings). The clause-6 output line carries the
+  full accounting — improvement, residual harm, the three-way harm
+  breakdown, and each excluded bucket with its cell count — and `try.json`
+  gains `adjudication.clause6` with the same ledger.
+- **Improvement is unchanged:** the summed census ratio gains on cells that
+  were FAILING at base (closed or narrowed), the same quantity clause 4's
+  fail-gap tracks.
+- **The confirm short-circuit now skips only when truly independent:** the
+  pre-adjudication that decides whether cross-layout confirms can change
+  the verdict runs under `best_case_confirms` (every confirmable suspect
+  acquitted) instead of an empty set. With residual-harm accounting, a
+  suspect's acquittal shrinks clause-6 harm, so the old empty-set pre-check
+  would have skipped confirms exactly when they could rescue the verdict —
+  the #310 run's own skip reason cited the clause-6 failure the confirms
+  might have dissolved.
+
 ### Changed — clause 5 is now the MARGIN-FLOOR rule (`fulcrum try`)
 
 The campaign owner's delegated redesign (2026-08-10). Receipts: the

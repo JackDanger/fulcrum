@@ -782,7 +782,11 @@ pub const INTENTS: &[Intent] = &[
                the promotion rule clause by clause. Clause 5 is the MARGIN-FLOOR rule: wall convictions \
                (erosions AND flips) require cross-layout CONFIRMED-REAL (try auto-runs `layout confirm`, \
                capped at 12 coordinates); a confirmed-real erosion on a winning cell is acceptable while \
-               post <= min(0.80, 1-3*layout_floor); thin margins (base > 0.80) keep the flat 0.005 budget.",
+               post <= min(0.80, 1-3*layout_floor); thin margins (base > 0.80) keep the flat 0.005 budget. \
+               Clause 6 prices only RESIDUAL harm (confirmed-real unaccepted + exact size regressions + \
+               undecided suspects, conservatively): clause-5-ACCEPTED margin-spend, layout-artifact \
+               acquittals and sub-budget census drift are excluded and itemized on the clause-6 line — \
+               counting accepted spend again is the flat budget in disguise (the #310 failure mode).",
     },
     Intent {
         id: "correct",

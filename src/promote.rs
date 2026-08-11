@@ -51,6 +51,20 @@
 //!     convicts regardless of margin. SIZE cells are exact integers: size has
 //!     no layout noise, so size flips and size erosions convict directly
 //!     under the pre-existing rules, no confirmation involved.
+//!   * CLAUSE 6 PRICES ONLY RESIDUAL HARM (the margin-coherence fix,
+//!     2026-08-11; receipt: the #310 adjudication accepted 54 erosions as
+//!     margin-spend under clause 5 and then failed clause 6 on "harm" 1.3537
+//!     of which 0.7487 was that same accepted spend — double-counting
+//!     authorized spend made clause 6 the new flat budget in disguise).
+//!     Clause 6's harm now counts exactly what the clause-3/5 chains left
+//!     standing: confirmed-real unaccepted erosions/flips (at their CONFIRMED
+//!     deltas), exact size regressions on passing cells, and — conservatively
+//!     — UNDECIDED suspects at their census deltas (missing floor coverage or
+//!     confirm overflow never becomes free). Excluded and itemized on the
+//!     clause-6 line: clause-5-ACCEPTED margin-spend (priced by the floor),
+//!     LAYOUT-ARTIFACT acquittals (measured noise), and sub-budget census
+//!     drift (priced by clause 5's flat budget). Improvement is unchanged:
+//!     the summed census ratio gains on cells that were FAILING at base.
 //!
 //! Floors (`--layout-floors <tsv>`, from `fulcrum layout calibrate`) supply
 //! both the confirm boundary and the margin-floor term. A floor applies ONLY
@@ -163,6 +177,46 @@ pub struct Adjudication {
     /// (`fulcrum layout confirm`) or calibrating the missing coordinate.
     #[serde(default)]
     pub layout_undecided: Vec<String>,
+    /// Clause 6's itemized accounting — machine-readable mirror of the
+    /// clause-6 output line, for the same reason clause 5 carries its chains.
+    #[serde(default)]
+    pub clause6: Clause6Accounting,
+}
+
+/// Clause 6's rival-anchored Pareto ledger. `harm` is the RESIDUAL total
+/// (`confirmed_real + size + undecided`); the `excluded_*` fields itemize
+/// what clause 5 already priced and clause 6 therefore must NOT count again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Clause6Accounting {
+    /// Summed census ratio gains on cells FAILING at base (unchanged rule).
+    pub improvement: f64,
+    /// Residual harm: `confirmed_real + size + undecided`.
+    pub harm: f64,
+    /// Confirmed-real wall erosions/flips NOT accepted by clause 5, charged
+    /// at their CONFIRMED deltas (thin-margin flat-budget convictions,
+    /// floor-rejected winning cells, confirmed-real flips).
+    pub confirmed_real: f64,
+    pub confirmed_real_cells: usize,
+    /// Exact size regressions on passing cells — size has no layout noise,
+    /// so every positive size delta is real harm, sub-budget or not.
+    pub size: f64,
+    pub size_cells: usize,
+    /// UNDECIDED wall suspects at their census deltas — conservative, so
+    /// missing floor coverage / confirm overflow never becomes free.
+    pub undecided: f64,
+    pub undecided_cells: usize,
+    /// Clause-5-ACCEPTED margin-spend, EXCLUDED from harm (priced by the
+    /// margin floor). Census deltas, for the audit line.
+    pub excluded_margin_spend: f64,
+    pub excluded_margin_spend_cells: usize,
+    /// LAYOUT-ARTIFACT acquittals, EXCLUDED (measured cross-layout noise).
+    pub excluded_acquitted: f64,
+    pub excluded_acquitted_cells: usize,
+    /// Positive wall census drift within clause 5's flat budget, EXCLUDED
+    /// (priced by that budget; single-layout readings). Itemized so the
+    /// exclusion is auditable, never silent.
+    pub excluded_sub_budget: f64,
+    pub excluded_sub_budget_cells: usize,
 }
 
 /// Clause 5's flat erosion budget: the smaller of a quarter of the cell's
@@ -359,6 +413,7 @@ pub fn adjudicate(
             rerun: Vec::new(),
             failed_clause: Some("clause 2 (no-op)".into()),
             layout_undecided: Vec::new(),
+            clause6: Clause6Accounting::default(),
         };
     }
     clauses.push("clause 2 OK: arms differ (binary hashes distinct)".into());
@@ -397,6 +452,15 @@ pub fn adjudicate(
         );
     }
 
+    // Clause-6 harm ledger — filled by the clause-3/5 suspect chains below so
+    // clause 6 prices exactly what those clauses adjudicated: ACCEPTED
+    // margin-spend and LAYOUT-ARTIFACT acquittals are excluded (clause 5
+    // already priced them; counting them again is the flat budget in
+    // disguise), confirmed-real convictions are charged at their CONFIRMED
+    // deltas, and anything unresolved is charged CONSERVATIVELY at its
+    // census delta.
+    let mut c6 = Clause6Accounting::default();
+
     // Clause 3: no pass→fail flips — ABSOLUTE. A SIZE flip is an exact
     // integer and convicts directly. A WALL flip is a timing claim on the
     // one noisy axis, and the receipts say the noise convicts: cross-layout
@@ -424,6 +488,7 @@ pub fn adjudicate(
             continue;
         }
         flip_suspects += 1;
+        let census_delta = (c.after_ratio - c.base_ratio).max(0.0);
         let mut chain = format!(
             "{}: census {} -> {} (pass->fail)",
             c.id(),
@@ -450,6 +515,8 @@ pub fn adjudicate(
                     c.id()
                 ));
                 flip_undecided += 1;
+                c6.undecided += census_delta;
+                c6.undecided_cells += 1;
             }
             Some(fl) => {
                 let dl = crate::layout::log_delta(c.base_ratio, c.after_ratio);
@@ -474,6 +541,9 @@ pub fn adjudicate(
                                 c.id(),
                                 cc.median_logratio
                             ));
+                            c6.confirmed_real +=
+                                (c.base_ratio * (cc.median_logratio.exp() - 1.0)).max(0.0);
+                            c6.confirmed_real_cells += 1;
                         } else {
                             // A layout-stable delta in the WRONG direction:
                             // the after arm is confirmed FASTER, so the
@@ -485,6 +555,8 @@ pub fn adjudicate(
                                 cc.median_logratio
                             ));
                             clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                            c6.excluded_acquitted += census_delta;
+                            c6.excluded_acquitted_cells += 1;
                         }
                     }
                     ConfirmStage::Outcome(cc) if cc.decision == "LAYOUT-ARTIFACT" => {
@@ -494,6 +566,8 @@ pub fn adjudicate(
                             cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor, cc.reason
                         ));
                         clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
+                        c6.excluded_acquitted += census_delta;
+                        c6.excluded_acquitted_cells += 1;
                     }
                     ConfirmStage::Outcome(cc) => {
                         chain.push_str(&format!(
@@ -508,6 +582,8 @@ pub fn adjudicate(
                             c.id()
                         ));
                         flip_undecided += 1;
+                        c6.undecided += census_delta;
+                        c6.undecided_cells += 1;
                     }
                     ConfirmStage::NotRun(why) => {
                         chain.push_str(&format!("; confirm: {why} -> UNDECIDED"));
@@ -519,6 +595,8 @@ pub fn adjudicate(
                             c.id()
                         ));
                         flip_undecided += 1;
+                        c6.undecided += census_delta;
+                        c6.undecided_cells += 1;
                     }
                 }
             }
@@ -628,6 +706,7 @@ pub fn adjudicate(
             continue;
         }
         erosion_suspects += 1;
+        let census_delta = (c.after_ratio - c.base_ratio).max(0.0);
         let thin = is_thin_margin(c.base_ratio);
         let mut chain = format!(
             "{}: census {} -> {} (Δ {:+.4} > flat budget {:.4}; {})",
@@ -664,6 +743,8 @@ pub fn adjudicate(
                     c.id()
                 ));
                 erosion_undecided += 1;
+                c6.undecided += census_delta;
+                c6.undecided_cells += 1;
             }
             Some(fl) => {
                 let dl = crate::layout::log_delta(c.base_ratio, c.after_ratio);
@@ -683,6 +764,8 @@ pub fn adjudicate(
                     ));
                     clauses.push(format!("clause 5 [margin-floor]: {chain}"));
                     erosion_accepted += 1;
+                    c6.excluded_margin_spend += census_delta;
+                    c6.excluded_margin_spend_cells += 1;
                     continue;
                 }
                 match confirm_of(&c.id()) {
@@ -707,6 +790,8 @@ pub fn adjudicate(
                                     cdelta,
                                     budget
                                 ));
+                                c6.confirmed_real += cdelta.max(0.0);
+                                c6.confirmed_real_cells += 1;
                             } else {
                                 chain.push_str(&format!(
                                     "; margin floor: confirmed Δ {cdelta:+.4} <= flat budget \
@@ -715,6 +800,8 @@ pub fn adjudicate(
                                 ));
                                 clauses.push(format!("clause 5 [margin-floor]: {chain}"));
                                 erosion_accepted += 1;
+                                c6.excluded_margin_spend += census_delta;
+                                c6.excluded_margin_spend_cells += 1;
                             }
                         } else if post <= thr + 1e-12 {
                             chain.push_str(&format!(
@@ -724,6 +811,8 @@ pub fn adjudicate(
                             ));
                             clauses.push(format!("clause 5 [margin-floor]: {chain}"));
                             erosion_accepted += 1;
+                            c6.excluded_margin_spend += census_delta;
+                            c6.excluded_margin_spend_cells += 1;
                         } else {
                             chain.push_str(&format!(
                                 "; margin floor: confirmed post {post:.4} > min(\
@@ -736,6 +825,8 @@ pub fn adjudicate(
                                 post,
                                 thr
                             ));
+                            c6.confirmed_real += (post - c.base_ratio).max(0.0);
+                            c6.confirmed_real_cells += 1;
                         }
                     }
                     ConfirmStage::Outcome(cc) if cc.decision == "LAYOUT-ARTIFACT" => {
@@ -746,6 +837,8 @@ pub fn adjudicate(
                         ));
                         clauses.push(format!("clause 5 [margin-floor]: {chain}"));
                         erosion_acquitted += 1;
+                        c6.excluded_acquitted += census_delta;
+                        c6.excluded_acquitted_cells += 1;
                     }
                     ConfirmStage::Outcome(cc) => {
                         chain.push_str(&format!(
@@ -760,6 +853,8 @@ pub fn adjudicate(
                             c.id()
                         ));
                         erosion_undecided += 1;
+                        c6.undecided += census_delta;
+                        c6.undecided_cells += 1;
                     }
                     ConfirmStage::NotRun(why) => {
                         chain.push_str(&format!("; confirm: {why} -> UNDECIDED"));
@@ -771,6 +866,8 @@ pub fn adjudicate(
                             c.id()
                         ));
                         erosion_undecided += 1;
+                        c6.undecided += census_delta;
+                        c6.undecided_cells += 1;
                     }
                 }
             }
@@ -804,27 +901,73 @@ pub fn adjudicate(
         );
     }
 
-    // Clause 6: net improvement — gains on failing cells >= 2x harm on
-    // passing cells.
-    let improvement: f64 = decided
+    // Clause 6: net improvement — gains on failing cells >= 2x the RESIDUAL
+    // harm on passing cells. Harm counts only what the clause-3/5 chains left
+    // standing: confirmed-real unaccepted erosions/flips (at their confirmed
+    // deltas, accumulated above), exact size regressions, and UNDECIDED
+    // suspects at their census deltas (conservative — missing coverage never
+    // becomes free). Clause-5-ACCEPTED margin-spend is priced by the floor,
+    // NOT harm: counting it again made clause 6 the flat budget in disguise
+    // (receipt: #310 failed clause 6 on "harm" 1.3537 of which 0.7487 was
+    // accepted spend). LAYOUT-ARTIFACT acquittals are measured noise, and
+    // sub-budget wall census drift is priced by clause 5's flat budget —
+    // both excluded, both itemized so no exclusion is silent.
+    c6.improvement = decided
         .iter()
         .filter(|c| c.base_failing)
         .map(|c| (c.base_ratio - c.after_ratio).max(0.0))
         .sum();
-    let harm: f64 = decided
-        .iter()
-        .filter(|c| !c.base_failing)
-        .map(|c| (c.after_ratio - c.base_ratio).max(0.0))
-        .sum();
-    if harm <= 0.0 || improvement >= 2.0 * harm {
+    for c in decided.iter().filter(|c| !c.base_failing) {
+        let d = c.after_ratio - c.base_ratio;
+        if d <= 0.0 {
+            continue;
+        }
+        if c.axis != "wall" {
+            // Size is exact: every positive delta on a passing size cell is
+            // real harm, sub-budget or not (beyond-budget ones also convict
+            // clause 5 above; the ledger prices them either way).
+            c6.size += d;
+            c6.size_cells += 1;
+        } else if !c.after_failing && d <= erosion_budget(c.base_ratio) + 1e-12 {
+            // Within clause 5's flat budget: never a suspect, priced by that
+            // budget. Itemized; not charged.
+            c6.excluded_sub_budget += d;
+            c6.excluded_sub_budget_cells += 1;
+        }
+        // Beyond-budget wall deltas and wall flips were adjudicated by the
+        // clause-3/5 chains above and are already in the ledger.
+    }
+    c6.harm = c6.confirmed_real + c6.size + c6.undecided;
+    let breakdown = format!(
+        "harm = confirmed-real {:.4} [{}] + size {:.4} [{}] + undecided-conservative {:.4} \
+         [{}]; excluded as clause-5-priced: accepted margin-spend {:.4} [{}], \
+         layout-artifact acquittals {:.4} [{}], sub-budget census drift {:.4} [{}]",
+        c6.confirmed_real,
+        c6.confirmed_real_cells,
+        c6.size,
+        c6.size_cells,
+        c6.undecided,
+        c6.undecided_cells,
+        c6.excluded_margin_spend,
+        c6.excluded_margin_spend_cells,
+        c6.excluded_acquitted,
+        c6.excluded_acquitted_cells,
+        c6.excluded_sub_budget,
+        c6.excluded_sub_budget_cells
+    );
+    if c6.harm <= 0.0 || c6.improvement >= 2.0 * c6.harm {
         clauses.push(format!(
-            "clause 6 OK: improvement {improvement:.4} vs harm {harm:.4} (>=2x or no harm)"
+            "clause 6 OK: improvement {:.4} vs residual harm {:.4} (>=2x or no harm; {breakdown})",
+            c6.improvement, c6.harm
         ));
     } else {
         fail(
             &mut failed,
             &mut clauses,
-            format!("clause 6 FAIL: improvement {improvement:.4} < 2x harm {harm:.4}"),
+            format!(
+                "clause 6 FAIL: improvement {:.4} < 2x residual harm {:.4} ({breakdown})",
+                c6.improvement, c6.harm
+            ),
         );
     }
 
@@ -878,7 +1021,43 @@ pub fn adjudicate(
         rerun,
         failed_clause: failed,
         layout_undecided,
+        clause6: c6,
     }
+}
+
+/// The BEST-CASE hypothetical confirm set: every confirmable suspect
+/// acquitted as LAYOUT-ARTIFACT. Used ONLY to decide whether running the
+/// real confirms could change the verdict — with residual-harm accounting, a
+/// suspect's confirm outcome moves clause 6 (undecided harm shrinks on
+/// acquittal), so the skip decision must adjudicate the suspects' most
+/// favorable outcome, not their absence. (The pre-fix skip used an EMPTY
+/// set; once clause 6 counted undecided suspects conservatively that would
+/// have skipped confirms exactly when they could rescue the verdict.)
+/// Unconfirmable suspects (no floor coverage) stay undecided here too —
+/// confirms genuinely cannot help them.
+pub fn best_case_confirms(
+    cells: &[TryCell],
+    floors: Option<&crate::layout::LayoutFloors>,
+) -> ConfirmSet {
+    let mut set = ConfirmSet {
+        cap: CONFIRM_CAP,
+        ..ConfirmSet::default()
+    };
+    for i in confirm_queue(cells, floors) {
+        set.results.insert(
+            cells[i].id(),
+            CellConfirm {
+                decision: "LAYOUT-ARTIFACT".into(),
+                reason: "hypothetical best case — skip decision only, never a printed chain"
+                    .into(),
+                median_logratio: 0.0,
+                agree_k: 0,
+                finite_n: 0,
+                floor: 0.0,
+            },
+        );
+    }
+    set
 }
 
 /// The required level set must span shallow and deep. REFUSE otherwise —
@@ -1195,9 +1374,10 @@ fn confirm_wall_flips(
 /// rival never executes in a confirm, so one run covers every rival at the
 /// coordinate — and the batch is capped at [`CONFIRM_CAP`] coordinates;
 /// overflow suspects stay UNDECIDED-listed, never convicted. When the
-/// verdict is already NO-SHIP independent of the suspects (a suspect with no
-/// confirm result never convicts, so the pre-verdict's conviction came from
-/// elsewhere), the whole batch is skipped and the output says so.
+/// verdict is NO-SHIP even under [`best_case_confirms`] (every confirmable
+/// suspect acquitted — the most favorable outcome confirms could deliver),
+/// the whole batch is skipped and the output says so; anything short of
+/// that means a confirm could change the verdict, so the confirms RUN.
 fn auto_confirm(
     cells: &[TryCell],
     floors: Option<&crate::layout::LayoutFloors>,
@@ -1214,6 +1394,12 @@ fn auto_confirm(
         return set;
     }
     let arch_owned = vec![arch.to_string()];
+    // Skip only when confirms are TRULY independent of the verdict: the
+    // pre-adjudication runs under the BEST-CASE hypothetical (every
+    // confirmable suspect acquitted). If the verdict is NO-SHIP even then,
+    // no confirm outcome can change it. An empty set here would over-count
+    // the suspects as conservative clause-6 harm and skip confirms exactly
+    // when they could rescue the verdict (the #310 failure mode).
     let pre = adjudicate(
         cells,
         verify_failures,
@@ -1221,12 +1407,13 @@ fn auto_confirm(
         &arch_owned,
         &cfg.archs_required,
         floors,
-        &ConfirmSet::default(),
+        &best_case_confirms(cells, floors),
     );
     if pre.verdict == Verdict::NoShip {
         set.skipped = Some(format!(
-            "confirmation skipped: the verdict is already NO-SHIP on {} independent of the \
-             {} wall suspect(s), so cross-layout confirmation cannot change it",
+            "confirmation skipped: the verdict is NO-SHIP on {} even if all {} wall \
+             suspect(s) were acquitted (best-case confirms), so cross-layout confirmation \
+             cannot change it",
             pre.failed_clause.as_deref().unwrap_or("another clause"),
             queue.len()
         ));
@@ -1503,7 +1690,7 @@ pub fn run(
             "confirms": confirm_set.results,
         },
         "margin_tiers": tiers,
-        "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided },
+        "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided, "clause6": adj.clause6 },
         "verdict": match adj.verdict { Verdict::Ship => "SHIP", Verdict::NoShip => "NO-SHIP", Verdict::Undecided => "UNDECIDED" },
     });
     for (k, v) in crate::selfver::artifact_fields() {
@@ -2191,6 +2378,14 @@ pub fn selftest() -> ExitCode {
                 .iter()
                 .any(|c| c.contains("thin margin keeps the flat budget")),
     );
+    // ...and clause 6 charges that conviction at its CONFIRMED delta
+    // (0.95 * (0.96/0.95 - 1) = 0.0100), itemized as confirmed-real.
+    check(
+        "clause 6: a thin-margin confirmed-real erosion is charged at its confirmed delta",
+        a.clauses
+            .iter()
+            .any(|c| c.contains("clause 6") && c.contains("confirmed-real 0.0100 [1]")),
+    );
     // (5e2) the same thin suspect whose confirmed delta lands INSIDE the flat
     // budget is accepted: the census delta did not survive re-measurement.
     let a = adjudicate(
@@ -2329,12 +2524,16 @@ pub fn selftest() -> ExitCode {
                 .contains("clause 5"),
     );
 
-    // Clause 6: net improvement 2x (erosions within budget are not suspects).
+    // ---- Clause 6: margin-coherence residual-harm accounting ---------------
+    // (6a) Sub-budget WALL census drift is priced by clause 5's flat budget
+    // and is NOT clause-6 harm — the old accounting summed it (this exact
+    // scenario was pinned NO-SHIP) and made clause 6 a flat budget in
+    // disguise. The exclusion is itemized, never silent.
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004 (gap 0.010->0.006 = -40%)
-            cell("wall", 2, 0.900, false, 0.905, false), // harm 0.005, budget min(0.025,0.005)=0.005 OK
-            cell("wall", 9, 0.900, false, 0.9049, false), // harm ~0.0049 within budget
+            cell("wall", 2, 0.900, false, 0.905, false), // Δ 0.005 within flat budget
+            cell("wall", 9, 0.900, false, 0.9049, false), // Δ ~0.0049 within flat budget
         ],
         0,
         false,
@@ -2344,13 +2543,169 @@ pub fn selftest() -> ExitCode {
         &none,
     );
     check(
-        "clause 6: improvement < 2x harm => NO-SHIP even when each erosion is in budget",
+        "clause 6: sub-budget wall drift is clause-5-priced — itemized, not harm => SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("clause 6 OK")
+                    && c.contains("sub-budget census drift 0.0099 [2]")
+                    && c.contains("residual harm 0.0000")
+            }),
+    );
+    // (6b) SIZE is exact: a size regression on a winning cell is harm even
+    // INSIDE the flat budget (clause 5 tolerates it; clause 6 still prices it).
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
+            cell("size", 2, 0.990, false, 0.9924, false), // +0.0024 <= budget 0.0025
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        None,
+        &none,
+    );
+    check(
+        "clause 6: an exact size regression on a winning cell is harm even inside the flat budget => NO-SHIP",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 6")
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("clause 6 FAIL") && c.contains("size 0.0024 [1]")),
+    );
+    // (6c) The #310 shape: LARGE accepted margin-spend + modest real harm.
+    // Old accounting: harm 0.0524 -> improvement 0.10 < 2x -> FAIL. New:
+    // accepted spend is EXCLUDED (priced by the floor) and itemized, so the
+    // verdict turns on the residual: 0.10 >= 2x 0.0024 -> clause 6 OK, SHIP.
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.15, true, 1.05, true), // improvement 0.10 (gap progress)
+            cell("wall", 2, 0.20, false, 0.25, false), // accepted spend 0.05 (post clears floor)
+            cell("size", 2, 0.990, false, 0.9924, false), // modest real size harm 0.0024
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &none,
+    );
+    check(
+        "clause 6 (#310 shape): accepted margin-spend EXCLUDED and itemized; improvement >= 2x residual => SHIP",
+        a.verdict == Verdict::Ship
+            && a.clauses.iter().any(|c| {
+                c.contains("clause 6 OK")
+                    && c.contains("accepted margin-spend 0.0500 [1]")
+                    && c.contains("residual harm 0.0024")
+            }),
+    );
+    // (6c') ...and the SAME shape still fails when improvement < 2x the
+    // residual — the exclusion buys nothing beyond what clause 5 priced.
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
+            cell("wall", 2, 0.20, false, 0.25, false), // accepted spend 0.05
+            cell("size", 2, 0.990, false, 0.9924, false), // residual size harm 0.0024
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&fl2),
+        &none,
+    );
+    check(
+        "clause 6 (#310 shape): passes IFF improvement >= 2x residual — 0.004 < 0.0048 => NO-SHIP",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
                 .unwrap_or("")
                 .contains("clause 6"),
     );
+    // (6d) An UNDECIDED erosion suspect counts CONSERVATIVELY at its census
+    // delta — missing floor coverage never becomes free.
+    let a = adjudicate(
+        &[
+            cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
+            cell("wall", 2, 0.20, false, 0.25, false), // suspect, NO floor coverage
+        ],
+        0,
+        false,
+        &arch,
+        &arch,
+        Some(&floors(&[("other.bin", 9, 4, 0.005)], 0.005)),
+        &none,
+    );
+    check(
+        "clause 6: an UNDECIDED suspect (no floor coverage) is conservative harm => NO-SHIP, itemized",
+        a.verdict == Verdict::NoShip
+            && a.failed_clause
+                .as_deref()
+                .unwrap_or("")
+                .contains("clause 6")
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("clause 6 FAIL") && c.contains("undecided-conservative 0.0500 [1]")),
+    );
+
+    // ---- Confirm short-circuit: skip only when truly independent -----------
+    // (6e) A suspect-driven clause-6 FAIL is NOT independent of the confirms:
+    // acquittal moves its conservative harm to the excluded column and the
+    // verdict flips — so the best-case pre-adjudication SHIPs and the
+    // confirms MUST run. (The old empty-set pre-check would have skipped.)
+    {
+        let cs = vec![
+            cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
+            cell("wall", 2, 0.70, false, 0.85, false), // suspect with floor coverage
+        ];
+        let empty = adjudicate(&cs, 0, false, &arch, &arch, Some(&fl2), &none);
+        let best = adjudicate(
+            &cs,
+            0,
+            false,
+            &arch,
+            &arch,
+            Some(&fl2),
+            &best_case_confirms(&cs, Some(&fl2)),
+        );
+        check(
+            "short-circuit: a suspect-driven clause-6 conviction — best-case confirms SHIP, so confirms are decisive and must RUN",
+            empty.verdict == Verdict::NoShip
+                && empty
+                    .failed_clause
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("clause 6")
+                && best.verdict == Verdict::Ship,
+        );
+        // (6f) Truly independent: clause 4 fails no matter what the confirms
+        // say — best-case is still NO-SHIP, so skipping is correct.
+        let cs2 = vec![
+            cell("size", 6, 1.010, true, 1.010, true), // no close, no gap progress
+            cell("wall", 2, 0.70, false, 0.85, false), // suspect with floor coverage
+        ];
+        let best2 = adjudicate(
+            &cs2,
+            0,
+            false,
+            &arch,
+            &arch,
+            Some(&fl2),
+            &best_case_confirms(&cs2, Some(&fl2)),
+        );
+        check(
+            "short-circuit: clause-4 NO-SHIP stands under best-case confirms — truly independent, skip is correct",
+            best2.verdict == Verdict::NoShip
+                && best2
+                    .failed_clause
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("clause 4"),
+        );
+    }
 
     // SHIP path.
     let a = adjudicate(
