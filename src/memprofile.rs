@@ -27,8 +27,8 @@
 //!                        count of R-state tasks per sample). Answers "are all T
 //!                        workers fed?" directly, without a trace.
 //!
-//! GATE-0 (instrument self-validation) is baked in as `fulcrum memprofile
-//! selftest`: it profiles a built-in memory HOG (`fulcrum memprofile __hog`)
+//! GATE-0 (instrument self-validation) is baked in as `fulcrum profile rss
+//! selftest`: it profiles a built-in memory HOG (`fulcrum profile rss __hog`)
 //! whose resident set (≈ --mb), thread count, and minor-fault count are KNOWN,
 //! and asserts the profiler is NON-INERT (peak_rss in the expected window, ≥N
 //! samples, mean_running_threads ≈ the spun thread count, minflt ≳ pages touched,
@@ -787,9 +787,14 @@ pub fn selftest() -> ExitCode {
         let hold_ms = 500u64;
         let opts = RunOpts {
             label: "selftest-hog".to_string(),
+            // `profile rss`, not the legacy `memprofile` spelling: the 2026-07
+            // consolidation turned legacy names into an exit-2 migration hint,
+            // so the old argv made the hog die instantly and this Gate-0 fail
+            // on every Linux box (macOS skips it, which hid the break).
             argv: vec![
                 exe.to_string_lossy().to_string(),
-                "memprofile".to_string(),
+                "profile".to_string(),
+                "rss".to_string(),
                 "__hog".to_string(),
                 "--mb".to_string(),
                 mb.to_string(),
