@@ -31,9 +31,11 @@
 //! selftest`: it profiles a built-in memory HOG (`fulcrum profile rss __hog`)
 //! whose resident set (≈ --mb), thread count, and minor-fault count are KNOWN,
 //! and asserts the profiler is NON-INERT (peak_rss in the expected window, ≥N
-//! samples, mean_running_threads ≈ the spun thread count, minflt ≳ pages touched,
-//! strace saw ≥1 mmap) and CONSERVING (every busy_fraction ∈ [0,1.05];
-//! mean_running_threads ≤ nproc). Prints SELFTEST=PASS / SELFTEST=FAIL <reason>.
+//! samples, peak_running_threads = the spun thread count with the mean above
+//! ~1 — peak, not mean ≈ spun: the mean is wall-weighted and a slow strace'd
+//! box spends most of the wall in the single-threaded prefault — minflt ≳
+//! pages touched, strace saw ≥1 mmap) and CONSERVING (every busy_fraction ∈
+//! [0,1.05]; peak_running ≤ nproc). Prints SELFTEST=PASS / SELFTEST=FAIL <reason>.
 //! The hog is self-contained (no python/cc), so the selftest runs anywhere Linux
 //! /proc + strace exist. On non-Linux the subcommand is a loud no-op.
 
@@ -842,11 +844,24 @@ pub fn selftest() -> ExitCode {
         if p.sample_count < 5 {
             fails.push(format!("only {} RSS samples (<5)", p.sample_count));
         }
-        // NON-INERT: occupancy actually saw the spun threads running
-        if p.mean_running_threads < (threads as f64 - 1.5) {
+        // NON-INERT: occupancy actually saw the spun threads running. PEAK,
+        // not mean: the mean is weighted by the whole wall, and on a slow
+        // strace'd box the single-threaded 200 MiB prefault dominates it
+        // (trainer measured mean 1.13 with a clean peak of 4 — the sampler
+        // was fine; the phase weighting was machine-dependent). An inert
+        // sampler cannot produce a peak equal to the spun count.
+        if p.peak_running_threads < threads.min(nproc as usize) {
             fails.push(format!(
-                "mean_running_threads {:.2} << spun {} (occupancy sampling inert?)",
-                p.mean_running_threads, threads
+                "peak_running_threads {} < spun {} (occupancy sampling inert?)",
+                p.peak_running_threads, threads
+            ));
+        }
+        // ...and the mean must still show MULTI-threading during the run —
+        // a sampler stuck on one thread would report ~1.0 forever.
+        if p.mean_running_threads < 1.05 {
+            fails.push(format!(
+                "mean_running_threads {:.2} never left ~1 (occupancy sampling inert?)",
+                p.mean_running_threads
             ));
         }
         // CONSERVATION: running count never exceeds nproc
