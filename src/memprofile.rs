@@ -31,11 +31,13 @@
 //! selftest`: it profiles a built-in memory HOG (`fulcrum profile rss __hog`)
 //! whose resident set (≈ --mb), thread count, and minor-fault count are KNOWN,
 //! and asserts the profiler is NON-INERT (peak_rss in the expected window, ≥N
-//! samples, peak_running_threads = the spun thread count with the mean above
-//! ~1 — peak, not mean ≈ spun: the mean is wall-weighted and a slow strace'd
-//! box spends most of the wall in the single-threaded prefault — minflt ≳
-//! pages touched, strace saw ≥1 mmap) and CONSERVING (every busy_fraction ∈
-//! [0,1.05]; peak_running ≤ nproc). Prints SELFTEST=PASS / SELFTEST=FAIL <reason>.
+//! samples, peak_running_threads = the spun thread count — PEAK only, never
+//! the mean: the mean is wall-weighted (a slow strace'd box spends most of
+//! the wall in the single-threaded prefault) and load-sensitive (a busy box
+//! preempts the spin threads; solvency sampled 0.98 with a clean peak of 4)
+//! — minflt ≳ pages touched, strace saw ≥1 mmap) and CONSERVING (every
+//! busy_fraction ∈ [0,1.05]; peak_running ≤ nproc). Prints SELFTEST=PASS /
+//! SELFTEST=FAIL <reason>.
 //! The hog is self-contained (no python/cc), so the selftest runs anywhere Linux
 //! /proc + strace exist. On non-Linux the subcommand is a loud no-op.
 
@@ -856,14 +858,12 @@ pub fn selftest() -> ExitCode {
                 p.peak_running_threads, threads
             ));
         }
-        // ...and the mean must still show MULTI-threading during the run —
-        // a sampler stuck on one thread would report ~1.0 forever.
-        if p.mean_running_threads < 1.05 {
-            fails.push(format!(
-                "mean_running_threads {:.2} never left ~1 (occupancy sampling inert?)",
-                p.mean_running_threads
-            ));
-        }
+        // No mean-based assertion: the mean is LOAD-sensitive, not just
+        // phase-sensitive — inside a full `fulcrum selftest` run on solvency
+        // the hog's spin threads were preempted often enough that the
+        // sampled mean read 0.98 while peak still read a clean 4. A sampler
+        // stuck on one thread reports peak 1, so the peak check above
+        // already catches every inert mode the mean floor did.
         // CONSERVATION: running count never exceeds nproc
         if p.peak_running_threads as f64 > nproc + 0.5 {
             fails.push(format!(
