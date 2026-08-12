@@ -214,16 +214,20 @@ pub fn selftest() -> ExitCode {
     }
 
     // The `--` boundary protects the child argv from the dispatcher's argv
-    // preprocessing: `--done-marker` after `--` is the child's payload (echo
-    // prints it), and `--help` after `--` is executed, not answered.
-    match run(&["supervise", "--", "echo", "--done-marker"]) {
+    // preprocessing: `--done-marker` after `--` is the child's payload, and
+    // `--help` after `--` is executed, not answered. The child is
+    // `printf '%s\n' <flag>` — GNU coreutils' standalone `echo` intercepts
+    // `--help` ITSELF, which made an `echo`-based version of this check fail
+    // on Linux while passing on macOS; printf passes the flag through
+    // literally on both.
+    match run(&["supervise", "--", "printf", "%s\n", "--done-marker"]) {
         None => check("boundary: subprocess ran", false),
         Some((lines, _)) => check(
             "boundary: --done-marker after -- reaches the child verbatim (central strip stops at --)",
             lines.iter().any(|l| l == "--done-marker") && last_line(&lines) == "EXIT:0",
         ),
     }
-    match run(&["supervise", "--", "echo", "--help"]) {
+    match run(&["supervise", "--", "printf", "%s\n", "--help"]) {
         None => check("boundary: subprocess ran", false),
         Some((lines, _)) => check(
             "boundary: --help after -- is the child's flag — supervise runs it instead of printing usage",
