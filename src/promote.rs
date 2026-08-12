@@ -1770,6 +1770,11 @@ pub fn cmd(args: &[String]) -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("selftest") {
         return selftest();
     }
+    // --rescore is a different mode entirely: pure re-adjudication of a stored
+    // artifact, no builds, no measurement. It takes its own (tiny) argv.
+    if args.iter().any(|a| a == "--rescore") {
+        return cmd_rescore(args);
+    }
     let mut after_ref: Option<String> = None;
     let mut base_ref = "origin/main".to_string();
     let mut repo = PathBuf::from(".");
@@ -1942,6 +1947,18 @@ fn usage() -> String {
      \x20   --corpus FILE [--corpus …] [--levels 2,6,9] [--threads 1]\n\
      \x20   [--n 15] [--out DIR] [--archs a,b] [--size-only]\n\
      \x20   [--layout-floors layout_floors.tsv] [--sentinel sentinels.tsv]\n\
+     fulcrum try --rescore <out-dir> [--layout-floors layout_floors.tsv]\n\
+     \n\
+     --rescore: re-run ONLY the adjudication (clauses 1-8, margin-floor logic,\n\
+     flip/erosion classification) against the stored census data in an existing\n\
+     --out dir — no builds, no measurement, no box work. Stored cross-layout\n\
+     confirm results are REUSED; a suspect the current rules flag that has no\n\
+     stored confirm stays UNDECIDED ('rescore cannot measure — rerun confirms\n\
+     live'). Floors come from --layout-floors, else the path the artifact\n\
+     recorded (a recorded path that cannot be loaded is a REFUSAL, never a\n\
+     silent drop). Writes try-rescore.json (then try-rescore-2.json, …) beside\n\
+     the original; try.json is never overwritten. Use it to re-adjudicate old\n\
+     runs after a promotion-rule change instead of burning a 10-hour rerun.\n\
      \n\
      The whole promotion evaluation in one command: builds both arms from git refs\n\
      (stale controls impossible, NO-OPs refused), verifies roundtrip correctness,\n\
@@ -1985,6 +2002,317 @@ fn usage() -> String {
      sentinel walls would spend the whole run producing unconfirmed noise. Opt-in;\n\
      without the flag nothing changes. Pin with `fulcrum sentinel pin …`.\n"
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// `try --rescore <out-dir>` — pure re-adjudication of a stored artifact
+// ---------------------------------------------------------------------------
+//
+// Receipt: three ~10-hour reruns were burned because a verdict could not be
+// recomputed from the stored artifacts after a rule change. The census data in
+// try.json IS sufficient to re-run clauses 1-8, the margin-floor logic and the
+// flip/erosion classification — only the MEASUREMENT steps (builds, censuses,
+// confirms) need a box. Rescore re-runs exactly the adjudication:
+//
+//   * cells, verify_failures, the no-op bit, arch coverage, the wall-flip
+//     re-measure note and the cross-layout CONFIRM RESULTS are all taken from
+//     the stored artifact — nothing is built, nothing executes on a box.
+//   * floors come from --layout-floors if given, else from the path the
+//     artifact recorded. A recorded path that cannot be loaded here is a
+//     REFUSAL, not a silent None — dropping floors would silently change the
+//     margin-floor arithmetic and the verdict with it.
+//   * a suspect the CURRENT rules flag but the stored artifact has no confirm
+//     for stays UNDECIDED with "rescore cannot measure — rerun confirms live":
+//     rescore never launches box work.
+//   * the result is written to a NEW file (try-rescore.json, then
+//     try-rescore-2.json, …) beside the original. try.json is never touched —
+//     artifacts are append-only.
+
+/// The NotRun reason rescore installs for suspects the stored artifact cannot
+/// answer. Rescore adjudicates; it never measures.
+pub const RESCORE_CANNOT_MEASURE: &str =
+    "rescore cannot measure — rerun confirms live (`fulcrum try` without --rescore)";
+
+/// Everything rescore produces, plus the recomputed-vs-stored comparison.
+pub struct RescoreOutcome {
+    pub adj: Adjudication,
+    pub cells: Vec<TryCell>,
+    pub tiers: MarginTiers,
+    pub artifact: serde_json::Value,
+    /// The verdict string the ORIGINAL artifact recorded.
+    pub stored_verdict: String,
+    /// The recomputed verdict, rendered the same way ("SHIP"/"NO-SHIP"/"UNDECIDED").
+    pub verdict: String,
+}
+
+fn verdict_str(v: &Verdict) -> &'static str {
+    match v {
+        Verdict::Ship => "SHIP",
+        Verdict::NoShip => "NO-SHIP",
+        Verdict::Undecided => "UNDECIDED",
+    }
+}
+
+/// The pure adjudication re-run over a parsed try.json value. No IO beyond
+/// what the caller already did; nothing is built or measured.
+pub fn rescore_value(
+    stored: &serde_json::Value,
+    floors: Option<&crate::layout::LayoutFloors>,
+    original_path: &str,
+) -> Result<RescoreOutcome, String> {
+    let cells: Vec<TryCell> = serde_json::from_value(
+        stored
+            .get("cells")
+            .cloned()
+            .ok_or_else(|| "artifact has no 'cells' — not a try.json".to_string())?,
+    )
+    .map_err(|e| format!("artifact 'cells' do not parse as TryCells: {e}"))?;
+    let verify_failures = stored["verify_failures"].as_u64().unwrap_or(0) as usize;
+    let (base_sha, after_sha) = (
+        stored["base"]["bin_sha"].as_str().unwrap_or(""),
+        stored["after"]["bin_sha"].as_str().unwrap_or(""),
+    );
+    let noop = !base_sha.is_empty() && base_sha == after_sha;
+    // The STORED arch, never the machine rescore happens to run on: the
+    // adjudication is of the original measurement.
+    let arch = stored["arch"]
+        .as_str()
+        .ok_or_else(|| "artifact has no 'arch'".to_string())?
+        .to_string();
+    let archs_required: Vec<String> = stored["archs_required"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![arch.clone()]);
+
+    // Reuse the STORED confirm results — rescore never launches box work.
+    let c5 = &stored["clause5_margin_floor"];
+    let mut confirm_set = ConfirmSet {
+        cap: c5["confirm_cap"].as_u64().unwrap_or(CONFIRM_CAP as u64) as usize,
+        skipped: c5["skipped"].as_str().map(str::to_string),
+        ..ConfirmSet::default()
+    };
+    if let Some(m) = c5["confirms"].as_object() {
+        for (id, v) in m {
+            let cc: CellConfirm = serde_json::from_value(v.clone())
+                .map_err(|e| format!("stored confirm for {id} does not parse: {e}"))?;
+            confirm_set.results.insert(id.clone(), cc);
+        }
+    }
+    if let Some(o) = c5["overflow"].as_array() {
+        confirm_set.overflow = o
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    // Suspects the CURRENT rules flag but the artifact has no answer for
+    // (rule drift can enlarge the queue) stay UNDECIDED with the honest
+    // reason. A stored skip reason is kept verbatim — it reproduces the
+    // original chains bit-for-bit.
+    if confirm_set.skipped.is_none() {
+        let unanswered = confirm_queue(&cells, floors).into_iter().any(|i| {
+            let id = cells[i].id();
+            !confirm_set.results.contains_key(&id)
+                && !confirm_set.overflow.iter().any(|o| *o == id)
+        });
+        if unanswered {
+            confirm_set.skipped = Some(RESCORE_CANNOT_MEASURE.to_string());
+        }
+    }
+
+    let mut adj = adjudicate(
+        &cells,
+        verify_failures,
+        noop,
+        std::slice::from_ref(&arch),
+        &archs_required,
+        floors,
+        &confirm_set,
+    );
+    // The clause-8 wall-flip re-measure note, reconstructed from the stored
+    // detail (same format string as `confirm_wall_flips` — the numbers are
+    // all in the artifact).
+    if let Some(detail) = stored["wall_flip_confirmation"].as_array() {
+        if !detail.is_empty() {
+            let confirmed = detail
+                .iter()
+                .filter(|d| d["confirmed"].as_bool() == Some(true))
+                .count();
+            let confirm_n = detail[0]["confirm"]["n"].as_u64().unwrap_or(0);
+            let census_n = stored["n"].as_u64().unwrap_or(0);
+            adj.clauses.insert(
+                0,
+                format!(
+                    "clause 8: {} wall pass->fail flip(s) re-measured at n={confirm_n} (census n={census_n}) — {} confirmed, {} dissolved{}",
+                    detail.len(),
+                    confirmed,
+                    detail.len() - confirmed,
+                    if confirmed == 0 {
+                        "; clause 3 judges the confirmed numbers"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+    }
+    let tiers = margin_tiers(&cells, floors);
+    let stored_verdict = stored["verdict"].as_str().unwrap_or("").to_string();
+    let verdict = verdict_str(&adj.verdict).to_string();
+
+    let mut artifact = serde_json::json!({
+        "mode": "rescore",
+        "rescore_of": original_path,
+        "base": stored["base"],
+        "after": stored["after"],
+        "arch": arch,
+        "archs_required": archs_required,
+        "levels": stored["levels"],
+        "threads": stored["threads"],
+        "n": stored["n"],
+        "method": "RESCORE: pure re-adjudication of the stored census/confirm data under the CURRENT rules — nothing was built or measured",
+        "verify_failures": verify_failures,
+        "cells": cells,
+        "wall_flip_confirmation": stored["wall_flip_confirmation"],
+        "layout_floors": floors.map(|f| serde_json::json!({
+            "path": f.path,
+            "median_floor": f.median,
+            "cells_in_file": f.floors.len(),
+            "suspects_undecided": adj.layout_undecided,
+            "semantics": "floors feed the margin floor (min(0.80, 1-3*floor)) and the confirm boundary; a missing coordinate is UNDECIDED, never borrowed",
+        })).unwrap_or(serde_json::Value::Null),
+        "clause5_margin_floor": {
+            "rule": "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size cells exact and unchanged",
+            "confirm_cap": confirm_set.cap,
+            "skipped": confirm_set.skipped,
+            "overflow": confirm_set.overflow,
+            "confirms": confirm_set.results,
+            "note": "confirm results REUSED from the stored artifact; rescore never launches box work",
+        },
+        "margin_tiers": tiers,
+        "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided, "clause6": adj.clause6 },
+        "stored_verdict": stored_verdict,
+        "verdict": verdict,
+        "verdict_matches_stored": stored_verdict == verdict,
+    });
+    for (k, v) in crate::selfver::artifact_fields() {
+        artifact[k] = serde_json::Value::String(v);
+    }
+    Ok(RescoreOutcome {
+        adj,
+        cells,
+        tiers,
+        artifact,
+        stored_verdict,
+        verdict,
+    })
+}
+
+/// Load `<out_dir>/try.json`, resolve floors, rescore, and write the result to
+/// a NEW file beside the original (append-only: try-rescore.json, then
+/// try-rescore-2.json, …). Returns the outcome and the path written.
+pub fn rescore_dir(
+    out_dir: &std::path::Path,
+    floors_override: Option<&std::path::Path>,
+) -> Result<(RescoreOutcome, PathBuf), String> {
+    let orig = out_dir.join("try.json");
+    let text = std::fs::read_to_string(&orig)
+        .map_err(|e| format!("rescore: cannot read {}: {e}", orig.display()))?;
+    let stored: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("rescore: {} is not valid JSON: {e}", orig.display()))?;
+    let floors = match floors_override {
+        Some(p) => Some(crate::layout::load_floors(p)?),
+        None => match stored["layout_floors"]["path"].as_str() {
+            Some(p) if !p.is_empty() => match crate::layout::load_floors(std::path::Path::new(p)) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    return Err(format!(
+                        "rescore: the artifact was adjudicated with --layout-floors {p}, which \
+                         cannot be loaded here ({e}). Pass --layout-floors <tsv> with the same \
+                         floors — silently dropping them would change the margin-floor \
+                         arithmetic and the verdict with it."
+                    ))
+                }
+            },
+            _ => None,
+        },
+    };
+    let outcome = rescore_value(&stored, floors.as_ref(), &orig.display().to_string())?;
+    // Append-only discipline: never overwrite try.json OR a previous rescore.
+    let mut path = out_dir.join("try-rescore.json");
+    let mut k = 2;
+    while path.exists() {
+        path = out_dir.join(format!("try-rescore-{k}.json"));
+        k += 1;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&outcome.artifact).unwrap(),
+    )
+    .map_err(|e| format!("rescore: cannot write {}: {e}", path.display()))?;
+    Ok((outcome, path))
+}
+
+fn cmd_rescore(args: &[String]) -> ExitCode {
+    let mut dir: Option<PathBuf> = None;
+    let mut floors: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rescore" => {
+                i += 1;
+                dir = args.get(i).map(PathBuf::from);
+            }
+            "--layout-floors" => {
+                i += 1;
+                floors = args.get(i).map(PathBuf::from);
+            }
+            "--no-self-update" => {}
+            other => {
+                eprintln!(
+                    "try --rescore: unknown arg '{other}' — rescore re-adjudicates a stored \
+                     artifact and takes ONLY --rescore <out-dir> [--layout-floors <tsv>]. \
+                     Measurement flags belong to a live `fulcrum try`."
+                );
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(dir) = dir else {
+        eprintln!("try --rescore: an out-dir is required (the directory holding try.json)");
+        return ExitCode::from(2);
+    };
+    match rescore_dir(&dir, floors.as_deref()) {
+        Ok((o, path)) => {
+            println!(
+                "TRY --RESCORE — pure re-adjudication of {} (nothing built, nothing measured)",
+                dir.join("try.json").display()
+            );
+            print!("{}", render(&o.adj, &o.cells, &o.tiers));
+            if o.stored_verdict == o.verdict {
+                println!("  stored verdict {} REPRODUCED under the current rules", o.verdict);
+            } else {
+                println!(
+                    "  stored verdict was {} — rescored to {} under the CURRENT rules \
+                     (the rules or floors changed since the artifact was written)",
+                    o.stored_verdict, o.verdict
+                );
+            }
+            println!("  artifact: {} (original untouched)", path.display());
+            match o.adj.verdict {
+                Verdict::Ship => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(e) => {
+            eprintln!("try --rescore: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2865,6 +3193,189 @@ pub fn selftest() -> ExitCode {
         render(&a, &tier_cells, &t).contains("wall margin tiers")
             && a.clauses.iter().all(|c| !c.contains("margin tier")),
     );
+
+    // ---- `try --rescore`: pure re-adjudication of a stored artifact --------
+    {
+        let root = std::env::temp_dir().join(format!(
+            "fulcrum-rescore-gate0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dir1 = root.join("ship");
+        let dir2 = root.join("tampered");
+        let dir3 = root.join("unconfirmed");
+        for d in [&dir1, &dir2, &dir3] {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let floors_path = root.join("layout_floors.tsv");
+        let _ = std::fs::write(
+            &floors_path,
+            "rival\tcorpus\tlevel\tthreads\tfloor\tstatus\tvariant_ratios\n\
+             pigz\tc.bin\t2\t1\t0.005000\tOK\t1.000000\n",
+        );
+        let file_floors = crate::layout::load_floors(&floors_path).ok();
+        check(
+            "rescore fixture: floors file loads",
+            file_floors.is_some(),
+        );
+
+        // The stored artifact's own adjudication, computed with the SAME pure
+        // engine the original run used — the fixture is honest by construction.
+        let suspect_id = "pigz:c.bin:L2:T1:wall";
+        let real_within_set = confirmed(suspect_id, "REAL", (0.78f64 / 0.70).ln());
+        let stored_adj = adjudicate(
+            &fat_cells,
+            0,
+            false,
+            &arch,
+            &arch,
+            file_floors.as_ref(),
+            &real_within_set,
+        );
+        let stored_artifact = |adj: &Adjudication,
+                               verdict: &str,
+                               confirms: &ConfirmSet,
+                               floors_path: Option<&std::path::Path>|
+         -> serde_json::Value {
+            serde_json::json!({
+                "base": { "git_ref": "origin/main", "commit": "aaaa", "bin_sha": "sha-base" },
+                "after": { "git_ref": "lever", "commit": "bbbb", "bin_sha": "sha-after" },
+                "arch": "x86_64",
+                "archs_required": ["x86_64"],
+                "levels": [2, 6],
+                "threads": [1],
+                "n": 15,
+                "verify_failures": 0,
+                "cells": fat_cells,
+                "wall_flip_confirmation": serde_json::Value::Null,
+                "layout_floors": floors_path.map(|p| serde_json::json!({"path": p.display().to_string()})).unwrap_or(serde_json::Value::Null),
+                "clause5_margin_floor": {
+                    "confirm_cap": CONFIRM_CAP,
+                    "skipped": confirms.skipped,
+                    "overflow": confirms.overflow,
+                    "confirms": confirms.results,
+                },
+                "margin_tiers": margin_tiers(&fat_cells, None),
+                "adjudication": { "clauses": adj.clauses, "rerun": adj.rerun, "failed_clause": adj.failed_clause, "layout_undecided": adj.layout_undecided, "clause6": adj.clause6 },
+                "verdict": verdict,
+            })
+        };
+
+        // (r1) Bit-for-bit reproduction under unchanged rules: same cells,
+        // same floors, same stored confirms => same verdict AND the same
+        // adjudication, clause text included.
+        let art1 = stored_artifact(
+            &stored_adj,
+            verdict_str(&stored_adj.verdict),
+            &real_within_set,
+            Some(&floors_path),
+        );
+        let _ = std::fs::write(
+            dir1.join("try.json"),
+            serde_json::to_string_pretty(&art1).unwrap(),
+        );
+        let orig_bytes = std::fs::read(dir1.join("try.json")).unwrap_or_default();
+        match rescore_dir(&dir1, None) {
+            Err(e) => check(&format!("rescore: fixture rescores ({e})"), false),
+            Ok((o, path)) => {
+                check(
+                    "rescore: reproduces the stored verdict bit-for-bit under unchanged rules",
+                    o.verdict == o.stored_verdict
+                        && o.artifact["adjudication"] == art1["adjudication"]
+                        && o.artifact["verdict_matches_stored"] == serde_json::json!(true),
+                );
+                check(
+                    "rescore: writes try-rescore.json beside the original",
+                    path == dir1.join("try-rescore.json") && path.exists(),
+                );
+                check(
+                    "rescore: the original try.json is untouched, byte for byte",
+                    std::fs::read(dir1.join("try.json")).unwrap_or_default() == orig_bytes,
+                );
+                let again = rescore_dir(&dir1, None);
+                check(
+                    "rescore: append-only — a second rescore writes try-rescore-2.json, overwriting nothing",
+                    matches!(&again, Ok((_, p)) if *p == dir1.join("try-rescore-2.json"))
+                        && path.exists(),
+                );
+            }
+        }
+
+        // (r2) A rule change flips the verdict: the fixture's cells convict
+        // clause 5 under the CURRENT rules (a size erosion beyond budget),
+        // but the stored artifact — written "under the old rules" — says
+        // SHIP. Rescore must RECOMPUTE, never copy.
+        let rule_change_cells = vec![
+            cell("size", 6, 1.05, true, 1.02, true), // gap progress
+            cell("size", 2, 0.999, false, 1.0035, false), // beyond-budget size erosion
+        ];
+        let mut art2 = stored_artifact(&stored_adj, "SHIP", &ConfirmSet::default(), None);
+        art2["cells"] = serde_json::json!(rule_change_cells);
+        art2["adjudication"] = serde_json::json!({
+            "clauses": ["(written under superseded rules)"],
+            "rerun": [], "failed_clause": serde_json::Value::Null,
+            "layout_undecided": [], "clause6": Clause6Accounting::default(),
+        });
+        let _ = std::fs::write(
+            dir2.join("try.json"),
+            serde_json::to_string_pretty(&art2).unwrap(),
+        );
+        check(
+            "rescore: a rule change flips the stored verdict — SHIP artifact rescores NO-SHIP, recomputed not copied",
+            matches!(&rescore_dir(&dir2, None), Ok((o, _)) if o.verdict == "NO-SHIP"
+                && o.stored_verdict == "SHIP"
+                && o.artifact["verdict_matches_stored"] == serde_json::json!(false)
+                && o.adj.failed_clause.as_deref().unwrap_or("").contains("clause 5")),
+        );
+
+        // (r3) A suspect with NO stored confirm stays UNDECIDED with the
+        // honest reason — rescore never launches box work.
+        let art3 = stored_artifact(
+            &stored_adj,
+            "UNDECIDED",
+            &ConfirmSet::default(),
+            Some(&floors_path),
+        );
+        let _ = std::fs::write(
+            dir3.join("try.json"),
+            serde_json::to_string_pretty(&art3).unwrap(),
+        );
+        check(
+            "rescore: a suspect lacking a stored confirm stays UNDECIDED with 'rescore cannot measure — rerun confirms live'",
+            matches!(&rescore_dir(&dir3, None), Ok((o, _)) if o.verdict == "UNDECIDED"
+                && o.adj.clauses.iter().any(|c| c.contains(RESCORE_CANNOT_MEASURE))
+                && o.adj.layout_undecided.iter().any(|s| s.starts_with("erosion"))),
+        );
+
+        // (r4) A recorded floors path that cannot be loaded here is a REFUSAL
+        // with --layout-floors named — never a silent drop to no-floors.
+        let mut art4 = stored_artifact(
+            &stored_adj,
+            "SHIP",
+            &real_within_set,
+            Some(std::path::Path::new("/nonexistent/layout_floors.tsv")),
+        );
+        art4["verdict"] = serde_json::json!("SHIP");
+        let dir4 = root.join("missing-floors");
+        let _ = std::fs::create_dir_all(&dir4);
+        let _ = std::fs::write(
+            dir4.join("try.json"),
+            serde_json::to_string_pretty(&art4).unwrap(),
+        );
+        check(
+            "rescore: an unloadable recorded floors file REFUSES (names --layout-floors), never silently drops floors",
+            matches!(&rescore_dir(&dir4, None), Err(e) if e.contains("--layout-floors")),
+        );
+        check(
+            "rescore: --layout-floors override supplies the floors and the refusal clears",
+            matches!(&rescore_dir(&dir4, Some(&floors_path)), Ok((o, _)) if o.verdict == "SHIP"),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     println!("try selftest: {pass} passed, {fail} failed");
     if fail == 0 {
