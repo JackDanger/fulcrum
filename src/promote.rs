@@ -115,10 +115,20 @@ pub struct TryCell {
     pub base_ci: [f64; 2],
     #[serde(default = "nan_ci", deserialize_with = "de_nan_ci")]
     pub after_ci: [f64; 2],
+    /// `--scope` runs mark out-of-scope SENTINEL cells `false`: they are
+    /// graded ONLY for clause-3 pass->fail flips — never for erosion (clause
+    /// 5), progress (clause 4) or harm/improvement (clause 6). Defaults to
+    /// `true` so unscoped runs and pre-scope artifacts are unchanged.
+    #[serde(default = "default_true")]
+    pub in_scope: bool,
 }
 
 fn nan_ci() -> [f64; 2] {
     [f64::NAN, f64::NAN]
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn de_nan_ci<'de, D>(d: D) -> Result<[f64; 2], D::Error>
@@ -329,6 +339,11 @@ pub fn confirm_queue(cells: &[TryCell], floors: Option<&crate::layout::LayoutFlo
             q.push(i); // flip suspect: conviction requires confirmation
             continue;
         }
+        if !c.in_scope {
+            // Out-of-scope sentinel: graded for clause-3 flips ONLY —
+            // erosion on a sentinel is never judged, so never confirmed.
+            continue;
+        }
         if c.after_ratio - c.base_ratio <= erosion_budget(c.base_ratio) + 1e-12 {
             continue; // within the flat budget: not a suspect
         }
@@ -444,6 +459,15 @@ pub fn adjudicate(
         .iter()
         .filter(|c| c.base_status == "OK" && c.after_status == "OK")
         .collect();
+    // `--scope` sentinel cells: measured normally, graded ONLY by clause 3.
+    let sentinel_count = cells.iter().filter(|c| !c.in_scope).count();
+    if sentinel_count > 0 {
+        clauses.push(format!(
+            "scope: {sentinel_count} out-of-scope SENTINEL cell(s) in this run — graded for \
+             clause-3 pass->fail flips ONLY; out-of-scope erosion, progress and harm are NOT \
+             judged here (the nightly board owns drift)"
+        ));
+    }
     if decided.is_empty() && verify_failures == 0 {
         fail(
             &mut failed,
@@ -478,10 +502,19 @@ pub fn adjudicate(
         .iter()
         .filter(|c| !c.base_failing && c.after_failing)
     {
+        // Clause 3 grades sentinel cells too — that is the whole point of
+        // the sample — but names them, so a scoped NO-SHIP says where the
+        // change acted outside its declaration.
+        let sentinel_tag = if c.in_scope {
+            ""
+        } else {
+            " [OUT-OF-SCOPE SENTINEL]"
+        };
         if c.axis != "wall" {
             flips.push(format!(
-                "{} ({} -> {}, size is exact — no confirmation applies)",
+                "{}{} ({} -> {}, size is exact — no confirmation applies)",
                 c.id(),
+                sentinel_tag,
                 c.base_field(),
                 c.after_field()
             ));
@@ -490,8 +523,9 @@ pub fn adjudicate(
         flip_suspects += 1;
         let census_delta = (c.after_ratio - c.base_ratio).max(0.0);
         let mut chain = format!(
-            "{}: census {} -> {} (pass->fail)",
+            "{}{}: census {} -> {} (pass->fail)",
             c.id(),
+            sentinel_tag,
             c.base_field(),
             c.after_field()
         );
@@ -515,8 +549,10 @@ pub fn adjudicate(
                     c.id()
                 ));
                 flip_undecided += 1;
-                c6.undecided += census_delta;
-                c6.undecided_cells += 1;
+                if c.in_scope {
+                    c6.undecided += census_delta;
+                    c6.undecided_cells += 1;
+                }
             }
             Some(fl) => {
                 let dl = crate::layout::log_delta(c.base_ratio, c.after_ratio);
@@ -537,13 +573,16 @@ pub fn adjudicate(
                             ));
                             clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
                             flips.push(format!(
-                                "{} (confirmed REAL, median ln {:+.4})",
+                                "{}{} (confirmed REAL, median ln {:+.4})",
                                 c.id(),
+                                sentinel_tag,
                                 cc.median_logratio
                             ));
-                            c6.confirmed_real +=
-                                (c.base_ratio * (cc.median_logratio.exp() - 1.0)).max(0.0);
-                            c6.confirmed_real_cells += 1;
+                            if c.in_scope {
+                                c6.confirmed_real +=
+                                    (c.base_ratio * (cc.median_logratio.exp() - 1.0)).max(0.0);
+                                c6.confirmed_real_cells += 1;
+                            }
                         } else {
                             // A layout-stable delta in the WRONG direction:
                             // the after arm is confirmed FASTER, so the
@@ -555,8 +594,10 @@ pub fn adjudicate(
                                 cc.median_logratio
                             ));
                             clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
-                            c6.excluded_acquitted += census_delta;
-                            c6.excluded_acquitted_cells += 1;
+                            if c.in_scope {
+                                c6.excluded_acquitted += census_delta;
+                                c6.excluded_acquitted_cells += 1;
+                            }
                         }
                     }
                     ConfirmStage::Outcome(cc) if cc.decision == "LAYOUT-ARTIFACT" => {
@@ -566,8 +607,10 @@ pub fn adjudicate(
                             cc.median_logratio, cc.agree_k, cc.finite_n, cc.floor, cc.reason
                         ));
                         clauses.push(format!("clause 3 [flip-suspect]: {chain}"));
-                        c6.excluded_acquitted += census_delta;
-                        c6.excluded_acquitted_cells += 1;
+                        if c.in_scope {
+                            c6.excluded_acquitted += census_delta;
+                            c6.excluded_acquitted_cells += 1;
+                        }
                     }
                     ConfirmStage::Outcome(cc) => {
                         chain.push_str(&format!(
@@ -582,8 +625,10 @@ pub fn adjudicate(
                             c.id()
                         ));
                         flip_undecided += 1;
-                        c6.undecided += census_delta;
-                        c6.undecided_cells += 1;
+                        if c.in_scope {
+                            c6.undecided += census_delta;
+                            c6.undecided_cells += 1;
+                        }
                     }
                     ConfirmStage::NotRun(why) => {
                         chain.push_str(&format!("; confirm: {why} -> UNDECIDED"));
@@ -595,8 +640,10 @@ pub fn adjudicate(
                             c.id()
                         ));
                         flip_undecided += 1;
-                        c6.undecided += census_delta;
-                        c6.undecided_cells += 1;
+                        if c.in_scope {
+                            c6.undecided += census_delta;
+                            c6.undecided_cells += 1;
+                        }
                     }
                 }
             }
@@ -633,15 +680,17 @@ pub fn adjudicate(
     }
 
     // Clause 4: progress — a failing cell closes, or the fail-gap drops >=1%.
+    // Progress must come from INSIDE the scope: a sentinel that happens to
+    // close is out-of-scope luck, not the lever's declared effect.
     let closed: Vec<String> = decided
         .iter()
-        .filter(|c| c.base_failing && !c.after_failing)
+        .filter(|c| c.in_scope && c.base_failing && !c.after_failing)
         .map(|c| c.id())
         .collect();
     let gap = |sel: fn(&TryCell) -> f64, failing: fn(&TryCell) -> bool| -> f64 {
         decided
             .iter()
-            .filter(|c| failing(c))
+            .filter(|c| c.in_scope && failing(c))
             .map(|c| (sel(c) - 1.0).max(0.0))
             .sum()
     };
@@ -691,7 +740,9 @@ pub fn adjudicate(
     let mut erosion_acquitted = 0usize;
     for c in decided
         .iter()
-        .filter(|c| !c.base_failing && !c.after_failing)
+        // Erosion is judged IN SCOPE only: a sentinel is graded by clause 3
+        // alone. Out-of-scope erosion belongs to the nightly board.
+        .filter(|c| c.in_scope && !c.base_failing && !c.after_failing)
         .filter(|c| c.after_ratio - c.base_ratio > erosion_budget(c.base_ratio) + 1e-12)
     {
         let budget = erosion_budget(c.base_ratio);
@@ -914,10 +965,10 @@ pub fn adjudicate(
     // both excluded, both itemized so no exclusion is silent.
     c6.improvement = decided
         .iter()
-        .filter(|c| c.base_failing)
+        .filter(|c| c.in_scope && c.base_failing)
         .map(|c| (c.base_ratio - c.after_ratio).max(0.0))
         .sum();
-    for c in decided.iter().filter(|c| !c.base_failing) {
+    for c in decided.iter().filter(|c| c.in_scope && !c.base_failing) {
         let d = c.after_ratio - c.base_ratio;
         if d <= 0.0 {
             continue;
@@ -1132,6 +1183,296 @@ pub fn margin_tiers(
 }
 
 // ---------------------------------------------------------------------------
+// Scoped try (`--scope`) — measure a declared sub-grid in full, plus a
+// deterministic out-of-scope sentinel sample graded ONLY for clause-3 flips
+// ---------------------------------------------------------------------------
+//
+// Receipt: every lever verdict was costing ~10 box-hours because `try`
+// measured the full 13-file x L1-9 x T{1,4} x 4-rival grid even for a
+// single-coordinate lever. The scope declares where the change ACTS; that
+// sub-grid is measured normally and judged by every clause. A ~15-cell
+// sentinel sample OUTSIDE the scope (deterministic, seeded by the after-ref
+// commit sha so reruns pick the same cells) catches the change that acts
+// where it was declared not to: a sentinel pass->fail flip blocks exactly as
+// clause 3 always does. Out-of-scope EROSION is deliberately not judged —
+// the nightly board owns drift. The output and the artifact both state
+// loudly what was NOT measured.
+
+/// Default out-of-scope sentinel sample size.
+pub const SCOPE_SENTINEL_DEFAULT: usize = 15;
+
+/// The declared scope: `None` on an axis = the full declared set. Parsed
+/// from `--scope "levels=8,9;threads=4[;corpus=a,b]"` and `--scope-corpus`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Scope {
+    pub levels: Option<Vec<u32>>,
+    pub threads: Option<Vec<u32>>,
+    /// Corpus BASENAMES (the census cell key), not paths.
+    pub corpora: Option<Vec<String>>,
+}
+
+impl Scope {
+    pub fn contains(&self, corpus: &str, level: u32, threads: u32) -> bool {
+        self.levels.as_ref().map_or(true, |ls| ls.contains(&level))
+            && self
+                .threads
+                .as_ref()
+                .map_or(true, |ts| ts.contains(&threads))
+            && self
+                .corpora
+                .as_ref()
+                .map_or(true, |cs| cs.iter().any(|c| c == corpus))
+    }
+
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ls) = &self.levels {
+            parts.push(format!(
+                "levels={}",
+                ls.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",")
+            ));
+        }
+        if let Some(ts) = &self.threads {
+            parts.push(format!(
+                "threads={}",
+                ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+            ));
+        }
+        if let Some(cs) = &self.corpora {
+            parts.push(format!("corpus={}", cs.join(",")));
+        }
+        parts.join(";")
+    }
+}
+
+/// Parse `--scope "levels=8,9;threads=4[;corpus=a.txt,b.bin]"`. Keys:
+/// `levels`, `threads` (both accept the census list/range syntax, e.g.
+/// `5-7`), `corpus` (comma-separated basenames). Unknown keys are REFUSED —
+/// a typo like `level=` silently scoping nothing would judge the wrong grid.
+pub fn parse_scope(spec: &str) -> Result<Scope, String> {
+    let mut s = Scope::default();
+    for part in spec.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            return Err(format!(
+                "bad --scope entry {part:?} (want key=value; keys: levels, threads, corpus)"
+            ));
+        };
+        match k.trim() {
+            "levels" => {
+                s.levels = Some(
+                    crate::sizecensus::parse_threads(v.trim())
+                        .map_err(|e| format!("bad --scope levels: {e}"))?,
+                )
+            }
+            "threads" => {
+                s.threads = Some(
+                    crate::sizecensus::parse_threads(v.trim())
+                        .map_err(|e| format!("bad --scope threads: {e}"))?,
+                )
+            }
+            "corpus" => {
+                s.corpora = Some(
+                    v.split(',')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect(),
+                )
+            }
+            other => {
+                return Err(format!(
+                    "unknown --scope key {other:?} (keys: levels, threads, corpus)"
+                ))
+            }
+        }
+    }
+    if s.levels.is_none() && s.threads.is_none() && s.corpora.is_none() {
+        return Err("--scope parsed to an empty declaration — drop the flag instead".into());
+    }
+    Ok(s)
+}
+
+/// One out-of-scope sentinel cell: a full (rival, corpus, level, threads,
+/// axis) coordinate, measured normally on both arms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeSentinel {
+    pub rival: String,
+    pub corpus: String,
+    pub level: u32,
+    pub threads: u32,
+    pub axis: String,
+}
+
+impl ScopeSentinel {
+    pub fn id(&self) -> String {
+        format!(
+            "{}:{}:L{}:T{}:{}",
+            self.rival, self.corpus, self.level, self.threads, self.axis
+        )
+    }
+}
+
+/// The measurement plan a `--scope` run commits to BEFORE measuring: the
+/// in-scope sub-grid (measured and judged in full) plus the sentinel sample
+/// (measured normally, graded for clause-3 flips only). Recorded verbatim in
+/// try.json so a scoped verdict names what it did NOT look at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopePlan {
+    pub scope: Scope,
+    pub in_levels: Vec<u32>,
+    pub in_threads: Vec<u32>,
+    pub in_corpora: Vec<String>,
+    /// In-scope cell count (rivals x in_corpora x in_levels x in_threads x axes).
+    pub in_total: usize,
+    /// Out-of-scope cell count in the full declared grid.
+    pub out_total: usize,
+    pub sentinels: Vec<ScopeSentinel>,
+    /// The deterministic selection seed (from the after-ref commit sha).
+    pub seed: u64,
+}
+
+/// Deterministic seed from a commit sha (or any ref string): FNV-1a over the
+/// bytes. Same after-ref => same sentinel sample, so reruns match.
+pub fn seed_from_sha(sha: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in sha.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+/// Build the scope plan: validate the scope against the declared grid,
+/// enumerate the out-of-scope cells in deterministic order, and select the
+/// sentinel sample by seeded stratified draw — the out-of-scope list is cut
+/// into `count` equal strata and one cell is drawn from each, so the sample
+/// is SPREAD across the grid rather than clumped, and the same seed always
+/// draws the same cells.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_scope(
+    scope: &Scope,
+    rivals: &[String],
+    corpora: &[String],
+    levels: &[u32],
+    threads: &[u32],
+    axes: &[&str],
+    seed: u64,
+    sentinel_count: usize,
+) -> Result<ScopePlan, String> {
+    // Scope values must be members of the DECLARED grid — a scope level the
+    // grid does not contain would silently judge nothing.
+    if let Some(ls) = &scope.levels {
+        for l in ls {
+            if !levels.contains(l) {
+                return Err(format!(
+                    "REFUSED: --scope level {l} is not in the declared --levels {levels:?} — \
+                     widen --levels to the full grid the scope subsets"
+                ));
+            }
+        }
+    }
+    if let Some(ts) = &scope.threads {
+        for t in ts {
+            if !threads.contains(t) {
+                return Err(format!(
+                    "REFUSED: --scope threads {t} is not in the declared --threads {threads:?}"
+                ));
+            }
+        }
+    }
+    if let Some(cs) = &scope.corpora {
+        for c in cs {
+            if !corpora.iter().any(|k| k == c) {
+                return Err(format!(
+                    "REFUSED: --scope corpus {c:?} is not among the declared --corpus basenames"
+                ));
+            }
+        }
+    }
+    // Enumerate the full declared cell grid, split by scope membership.
+    let mut out: Vec<ScopeSentinel> = Vec::new();
+    let mut in_total = 0usize;
+    for rival in rivals {
+        for corpus in corpora {
+            for &level in levels {
+                for &t in threads {
+                    for axis in axes {
+                        if scope.contains(corpus, level, t) {
+                            in_total += 1;
+                        } else {
+                            out.push(ScopeSentinel {
+                                rival: rival.clone(),
+                                corpus: corpus.clone(),
+                                level,
+                                threads: t,
+                                axis: axis.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if in_total == 0 {
+        return Err("REFUSED: the scope selects zero cells of the declared grid".into());
+    }
+    if out.is_empty() {
+        return Err(
+            "REFUSED: the scope covers the ENTIRE declared grid — drop --scope and run the \
+             full adjudication instead"
+                .into(),
+        );
+    }
+    // Seeded stratified draw: k equal strata over the deterministic
+    // enumeration order, one cell from each.
+    let k = sentinel_count.min(out.len());
+    let mut rng = seed;
+    let mut sentinels = Vec::with_capacity(k);
+    for i in 0..k {
+        let lo = i * out.len() / k;
+        let hi = ((i + 1) * out.len() / k).max(lo + 1);
+        let idx = lo + (splitmix64(&mut rng) as usize) % (hi - lo);
+        sentinels.push(out[idx].clone());
+    }
+    Ok(ScopePlan {
+        scope: scope.clone(),
+        in_levels: scope.levels.clone().unwrap_or_else(|| levels.to_vec()),
+        in_threads: scope.threads.clone().unwrap_or_else(|| threads.to_vec()),
+        in_corpora: scope.corpora.clone().unwrap_or_else(|| corpora.to_vec()),
+        in_total,
+        out_total: out.len(),
+        sentinels,
+        seed,
+    })
+}
+
+/// The `"scope"` block of try.json — the declaration, the sentinel list, and
+/// an explicit statement of what was NOT measured.
+pub fn scope_artifact_json(plan: &ScopePlan) -> serde_json::Value {
+    serde_json::json!({
+        "declaration": plan.scope,
+        "declaration_rendered": plan.scope.render(),
+        "sentinel_seed": plan.seed.to_string(),
+        "sentinels": plan.sentinels.iter().map(|s| s.id()).collect::<Vec<_>>(),
+        "in_scope_cells_measured": plan.in_total,
+        "out_of_scope_cells_total": plan.out_total,
+        "out_of_scope_cells_not_measured": plan.out_total - plan.sentinels.len(),
+        "semantics": "in-scope cells are judged by every clause; sentinel cells are graded ONLY for clause-3 pass->fail flips (out-of-scope erosion is NOT judged — the nightly board owns drift); clause-1 verify still covers the full declared grid",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
@@ -1150,6 +1491,12 @@ pub struct TryConfig {
     /// `--layout-floors <tsv>`: opt-in envelope screening (see module doc).
     /// `None` = behaviour byte-identical to before the flag existed.
     pub layout_floors: Option<PathBuf>,
+    /// `--scope` / `--scope-corpus`: measure the declared sub-grid in full
+    /// plus an out-of-scope sentinel sample. `None` = the whole grid,
+    /// unchanged.
+    pub scope: Option<Scope>,
+    /// Sentinel sample size for scoped runs (`--scope-sentinels`).
+    pub scope_sentinels: usize,
 }
 
 /// The roundtrip command both censuses VOID against.
@@ -1173,54 +1520,140 @@ fn arm_roundtrip_cmd(bin: &std::path::Path) -> String {
     format!("{} -dc", bin.display())
 }
 
-fn arm_cells(
-    bin: &std::path::Path,
-    cfg: &TryConfig,
-    arm_name: &str,
-) -> Result<BTreeMap<String, (String, f64, bool, [f64; 2])>, String> {
-    let tmpl = format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display());
-    let roundtrip_cmd = arm_roundtrip_cmd(bin);
-    let mut map = BTreeMap::new();
-    // SIZE axis.
-    let sc = crate::sizecensus::CensusConfig {
-        ours_tmpl: tmpl.clone(),
-        rivals: cfg.rivals.clone(),
-        levels: cfg.levels.clone(),
-        threads: cfg.threads.clone(),
-        corpora: cfg.corpora.clone(),
-        out_dir: cfg.out_dir.join(format!("{arm_name}-size")),
-        roundtrip_cmd: roundtrip_cmd.clone(),
-        size_reps: 1,
-        ours_commit: None,
+/// One census invocation an arm will run: which rivals, which sub-grid,
+/// which axes. An unscoped run is a single spec over the whole declared
+/// grid; a scoped run is the in-scope spec plus one small spec per sentinel
+/// coordinate group.
+struct MeasureSpec {
+    rivals: Vec<Rival>,
+    levels: Vec<u32>,
+    threads: Vec<u32>,
+    corpora: Vec<PathBuf>,
+    size: bool,
+    wall: bool,
+    /// Distinguishes artifact sub-directories: `{arm}-{tag}-{axis}`.
+    tag: String,
+}
+
+/// The exact set of census invocations a run performs — the scoped plan's
+/// "measure exactly scope + sentinels" contract lives here.
+fn measure_specs(cfg: &TryConfig, plan: Option<&ScopePlan>) -> Result<Vec<MeasureSpec>, String> {
+    let corpus_path = |name: &str| -> Result<PathBuf, String> {
+        cfg.corpora
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .map(|f| f.to_string_lossy() == name)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .ok_or_else(|| format!("scope: corpus {name:?} not among --corpus paths"))
     };
-    let art = crate::sizecensus::run_census(&sc)?;
-    for c in art.cells {
-        map.insert(
-            format!("{}:{}:L{}:T{}:size", c.rival, c.corpus, c.level, c.threads),
-            (c.status, c.ratio, c.bigger, nan_ci()),
-        );
-    }
-    if !cfg.skip_wall {
-        let wc = crate::wallcensus::CensusConfig {
-            ours_tmpl: tmpl,
+    let Some(plan) = plan else {
+        return Ok(vec![MeasureSpec {
             rivals: cfg.rivals.clone(),
             levels: cfg.levels.clone(),
             threads: cfg.threads.clone(),
             corpora: cfg.corpora.clone(),
-            out_dir: cfg.out_dir.join(format!("{arm_name}-wall")),
-            roundtrip_cmd,
-            n: cfg.n,
-            warmup: 2,
-            sink: PathBuf::from("/dev/null"),
-            pin_reps: 3,
-            ours_commit: None,
-        };
-        let art = crate::wallcensus::run_census(&wc)?;
-        for c in art.cells {
-            map.insert(
-                format!("{}:{}:L{}:T{}:wall", c.rival, c.corpus, c.level, c.threads),
-                (c.status, c.wall_ratio, c.slower, c.logratio_ci),
-            );
+            size: true,
+            wall: !cfg.skip_wall,
+            tag: "grid".into(),
+        }]);
+    };
+    let mut specs = vec![MeasureSpec {
+        rivals: cfg.rivals.clone(),
+        levels: plan.in_levels.clone(),
+        threads: plan.in_threads.clone(),
+        corpora: plan
+            .in_corpora
+            .iter()
+            .map(|n| corpus_path(n))
+            .collect::<Result<Vec<_>, _>>()?,
+        size: true,
+        wall: !cfg.skip_wall,
+        tag: "scope".into(),
+    }];
+    // Sentinels grouped by (corpus, level, threads, axis): one tiny census
+    // per group, restricted to exactly the sampled rivals.
+    let mut groups: BTreeMap<(String, u32, u32, String), Vec<String>> = BTreeMap::new();
+    for s in &plan.sentinels {
+        groups
+            .entry((s.corpus.clone(), s.level, s.threads, s.axis.clone()))
+            .or_default()
+            .push(s.rival.clone());
+    }
+    for ((corpus, level, threads, axis), rival_names) in groups {
+        let rivals: Vec<Rival> = cfg
+            .rivals
+            .iter()
+            .filter(|r| rival_names.contains(&r.name))
+            .cloned()
+            .collect();
+        specs.push(MeasureSpec {
+            rivals,
+            levels: vec![level],
+            threads: vec![threads],
+            corpora: vec![corpus_path(&corpus)?],
+            size: axis == "size",
+            wall: axis == "wall" && !cfg.skip_wall,
+            tag: format!("sent-{corpus}-L{level}-T{threads}-{axis}"),
+        });
+    }
+    Ok(specs)
+}
+
+fn arm_cells(
+    bin: &std::path::Path,
+    cfg: &TryConfig,
+    arm_name: &str,
+    specs: &[MeasureSpec],
+) -> Result<BTreeMap<String, (String, f64, bool, [f64; 2])>, String> {
+    let tmpl = format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display());
+    let roundtrip_cmd = arm_roundtrip_cmd(bin);
+    let mut map = BTreeMap::new();
+    for spec in specs {
+        if spec.size {
+            let sc = crate::sizecensus::CensusConfig {
+                ours_tmpl: tmpl.clone(),
+                rivals: spec.rivals.clone(),
+                levels: spec.levels.clone(),
+                threads: spec.threads.clone(),
+                corpora: spec.corpora.clone(),
+                out_dir: cfg.out_dir.join(format!("{arm_name}-{}-size", spec.tag)),
+                roundtrip_cmd: roundtrip_cmd.clone(),
+                size_reps: 1,
+                ours_commit: None,
+            };
+            let art = crate::sizecensus::run_census(&sc)?;
+            for c in art.cells {
+                map.insert(
+                    format!("{}:{}:L{}:T{}:size", c.rival, c.corpus, c.level, c.threads),
+                    (c.status, c.ratio, c.bigger, nan_ci()),
+                );
+            }
+        }
+        if spec.wall {
+            let wc = crate::wallcensus::CensusConfig {
+                ours_tmpl: tmpl.clone(),
+                rivals: spec.rivals.clone(),
+                levels: spec.levels.clone(),
+                threads: spec.threads.clone(),
+                corpora: spec.corpora.clone(),
+                out_dir: cfg.out_dir.join(format!("{arm_name}-{}-wall", spec.tag)),
+                roundtrip_cmd: roundtrip_cmd.clone(),
+                n: cfg.n,
+                warmup: 2,
+                sink: PathBuf::from("/dev/null"),
+                pin_reps: 3,
+                ours_commit: None,
+            };
+            let art = crate::wallcensus::run_census(&wc)?;
+            for c in art.cells {
+                map.insert(
+                    format!("{}:{}:L{}:T{}:wall", c.rival, c.corpus, c.level, c.threads),
+                    (c.status, c.wall_ratio, c.slower, c.logratio_ci),
+                );
+            }
         }
     }
     Ok(map)
@@ -1545,6 +1978,36 @@ pub fn run(
             ));
         }
     }
+    // Validate the scope against the declared grid BEFORE any build: a scope
+    // typo must refuse in seconds, not after two arms compile. (The real
+    // plan is drawn after the builds, seeded by the after commit sha.)
+    let rival_names: Vec<String> = cfg.rivals.iter().map(|r| r.name.clone()).collect();
+    let corpus_names: Vec<String> = cfg
+        .corpora
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .collect();
+    let axes: Vec<&str> = if cfg.skip_wall {
+        vec!["size"]
+    } else {
+        vec!["size", "wall"]
+    };
+    if let Some(s) = &cfg.scope {
+        plan_scope(
+            s,
+            &rival_names,
+            &corpus_names,
+            &cfg.levels,
+            &cfg.threads,
+            &axes,
+            0,
+            cfg.scope_sentinels,
+        )?;
+    }
     std::fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
 
@@ -1553,6 +2016,23 @@ pub fn run(
     let (after_bin, after_prov) =
         crate::ablate::build_arm(&cfg.repo, &cfg.after_ref, &cfg.out_dir)?;
     let noop = base_prov.binary_sha256 == after_prov.binary_sha256;
+
+    // The scoped measurement plan: sentinel selection is seeded by the AFTER
+    // arm's resolved commit sha, so a rerun of the same ref draws the same
+    // sentinel cells.
+    let scope_plan = match &cfg.scope {
+        Some(s) => Some(plan_scope(
+            s,
+            &rival_names,
+            &corpus_names,
+            &cfg.levels,
+            &cfg.threads,
+            &axes,
+            seed_from_sha(&after_prov.resolved_commit),
+            cfg.scope_sentinels,
+        )?),
+        None => None,
+    };
 
     // 3: verify the after arm (clause 1).
     let verify_failures = if noop {
@@ -1585,13 +2065,16 @@ pub fn run(
         rep.failed_cells
     };
 
-    // 4: both arms' boards.
+    // 4: both arms' boards — the SAME spec list for both arms, derived once
+    // from the plan so "measure exactly scope + sentinels" holds by
+    // construction.
+    let specs = measure_specs(cfg, scope_plan.as_ref())?;
     let (base_map, after_map) = if noop {
         (BTreeMap::new(), BTreeMap::new())
     } else {
         (
-            arm_cells(&base_bin, cfg, "base")?,
-            arm_cells(&after_bin, cfg, "after")?,
+            arm_cells(&base_bin, cfg, "base", &specs)?,
+            arm_cells(&after_bin, cfg, "after", &specs)?,
         )
     };
     let mut cells = Vec::new();
@@ -1613,6 +2096,9 @@ pub fn run(
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
         let axis = parts.next().unwrap_or("?").to_string();
+        let in_scope = scope_plan
+            .as_ref()
+            .map_or(true, |p| p.scope.contains(&corpus, level, threads));
         cells.push(TryCell {
             axis,
             rival,
@@ -1627,6 +2113,7 @@ pub fn run(
             after_failing: *af,
             base_ci: *bci,
             after_ci: *aci,
+            in_scope,
         });
     }
 
@@ -1661,6 +2148,31 @@ pub fn run(
     if let Some((note, _)) = &confirmation {
         adj.clauses.insert(0, note.clone());
     }
+    // The scope banner leads the output AND the artifact: a scoped verdict
+    // must state loudly what it did NOT measure.
+    if let Some(p) = &scope_plan {
+        adj.clauses.insert(
+            0,
+            format!(
+                "SCOPED RUN ({}): the declared scope was measured in FULL ({} cells, every \
+                 clause) plus {} out-of-scope SENTINEL cell(s) (seed {}, deterministic per \
+                 after-ref) graded for clause-3 pass->fail flips ONLY",
+                p.scope.render(),
+                p.in_total,
+                p.sentinels.len(),
+                p.seed
+            ),
+        );
+        adj.clauses.insert(
+            1,
+            format!(
+                "NOT MEASURED: {} of {} out-of-scope cells — out-of-scope EROSION is not \
+                 judged by this run; the nightly board owns drift",
+                p.out_total - p.sentinels.len(),
+                p.out_total
+            ),
+        );
+    }
     let tiers = margin_tiers(&cells, floors.as_ref());
 
     let mut artifact = serde_json::json!({
@@ -1673,6 +2185,7 @@ pub fn run(
         "n": cfg.n,
         "method": "paired interleaved per-pair ratios (wallcensus/paired engine); size exact-integer roundtrip-VOIDed",
         "verify_failures": verify_failures,
+        "scope": scope_plan.as_ref().map(scope_artifact_json).unwrap_or(serde_json::Value::Null),
         "cells": cells,
         "wall_flip_confirmation": confirmation.as_ref().map(|(_, d)| d.clone()).unwrap_or(serde_json::Value::Null),
         "layout_floors": floors.as_ref().map(|f| serde_json::json!({
@@ -1788,6 +2301,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut skip_wall = false;
     let mut layout_floors: Option<PathBuf> = None;
     let mut sentinel_file: Option<PathBuf> = None;
+    let mut scope: Option<Scope> = None;
+    let mut scope_corpus: Option<Vec<String>> = None;
+    let mut scope_sentinels = SCOPE_SENTINEL_DEFAULT;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1865,6 +2381,35 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 i += 1;
                 sentinel_file = args.get(i).map(PathBuf::from);
             }
+            "--scope" => {
+                i += 1;
+                match args.get(i).map(|v| parse_scope(v)) {
+                    Some(Ok(s)) => scope = Some(s),
+                    Some(Err(e)) => {
+                        eprintln!("try: {e}");
+                        return ExitCode::from(2);
+                    }
+                    None => {}
+                }
+            }
+            "--scope-corpus" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    scope_corpus = Some(
+                        v.split(',')
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect(),
+                    );
+                }
+            }
+            "--scope-sentinels" => {
+                i += 1;
+                scope_sentinels = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(scope_sentinels);
+            }
             "--no-self-update" => {}
             "--help" | "-h" => {
                 eprintln!("{}", usage());
@@ -1884,6 +2429,20 @@ pub fn cmd(args: &[String]) -> ExitCode {
         eprintln!("{}", usage());
         return ExitCode::from(2);
     };
+    // `--scope-corpus` is corpus subsetting for the scope declaration; it
+    // composes with `--scope levels=…;threads=…` but must not silently
+    // override a corpus= key given inside --scope itself.
+    if let Some(cs) = scope_corpus {
+        let s = scope.get_or_insert_with(Scope::default);
+        if s.corpora.is_some() {
+            eprintln!(
+                "try: corpus scope declared twice (--scope corpus=… AND --scope-corpus) — \
+                 declare it once"
+            );
+            return ExitCode::from(2);
+        }
+        s.corpora = Some(cs);
+    }
     let out_dir = out_dir.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("fulcrum-try-{}", std::process::id()))
     });
@@ -1918,6 +2477,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
         archs_required,
         skip_wall,
         layout_floors,
+        scope,
+        scope_sentinels,
     };
     match run(&cfg) {
         Ok((adj, cells, tiers, artifact)) => {
@@ -1947,7 +2508,21 @@ fn usage() -> String {
      \x20   --corpus FILE [--corpus …] [--levels 2,6,9] [--threads 1]\n\
      \x20   [--n 15] [--out DIR] [--archs a,b] [--size-only]\n\
      \x20   [--layout-floors layout_floors.tsv] [--sentinel sentinels.tsv]\n\
+     \x20   [--scope 'levels=8,9;threads=4'] [--scope-corpus a.txt,b.bin]\n\
+     \x20   [--scope-sentinels 15]\n\
      fulcrum try --rescore <out-dir> [--layout-floors layout_floors.tsv]\n\
+     \n\
+     --scope: measure the declared sub-grid (levels=…;threads=…;corpus=…, each key\n\
+     optional, values must be members of the declared --levels/--threads/--corpus\n\
+     grid) in FULL and judge it by every clause — plus a deterministic SENTINEL\n\
+     SAMPLE outside the scope (default 15 cells, stratified across the out-of-scope\n\
+     grid, seeded by the after-ref commit sha so reruns draw the same cells),\n\
+     measured normally but graded ONLY for clause-3 pass->fail flips: a sentinel\n\
+     flip blocks exactly like any flip; sentinel erosion/progress/harm is NOT\n\
+     judged (the nightly board owns drift). The output and try.json both record\n\
+     the scope declaration, the sentinel list, and what was NOT measured. Clause-1\n\
+     verify still covers the full declared grid. Receipt: a single-coordinate\n\
+     lever was costing ~10 box-hours because try measured the full grid anyway.\n\
      \n\
      --rescore: re-run ONLY the adjudication (clauses 1-8, margin-floor logic,\n\
      flip/erosion classification) against the stored census data in an existing\n\
@@ -2346,6 +2921,7 @@ pub fn selftest() -> ExitCode {
         after_failing: af,
         base_ci: nan_ci(),
         after_ci: nan_ci(),
+        in_scope: true,
     };
     let arch = vec!["x86_64".to_string()];
 
@@ -3375,6 +3951,233 @@ pub fn selftest() -> ExitCode {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- `--scope`: scoped measurement + out-of-scope sentinels ------------
+    {
+        // Parsing.
+        let s = parse_scope("levels=8,9;threads=4");
+        check(
+            "scope parse: levels=8,9;threads=4",
+            matches!(&s, Ok(s) if s.levels == Some(vec![8, 9])
+                && s.threads == Some(vec![4])
+                && s.corpora.is_none()),
+        );
+        check(
+            "scope parse: level ranges use census syntax (levels=5-7)",
+            matches!(parse_scope("levels=5-7"), Ok(s) if s.levels == Some(vec![5, 6, 7])),
+        );
+        check(
+            "scope parse: corpus key",
+            matches!(parse_scope("corpus=a.txt,b.bin"),
+                Ok(s) if s.corpora == Some(vec!["a.txt".to_string(), "b.bin".to_string()])),
+        );
+        check(
+            "scope parse: unknown key REFUSED (a typo must not silently scope nothing)",
+            parse_scope("level=8").is_err(),
+        );
+        check("scope parse: empty declaration REFUSED", parse_scope("").is_err());
+
+        // Planning: the measured set is EXACTLY scope + sentinels.
+        let rivals = vec!["gzip".to_string(), "pigz".to_string()];
+        let corpora = vec!["a.txt".to_string(), "b.bin".to_string()];
+        let levels: Vec<u32> = (1..=9).collect();
+        let threads = vec![1u32, 4];
+        let axes = ["size", "wall"];
+        let sc = parse_scope("levels=8,9;threads=4").unwrap();
+        let plan = plan_scope(&sc, &rivals, &corpora, &levels, &threads, &axes, 42, 15)
+            .expect("plan_scope");
+        check(
+            "scope plan: in-scope grid is the declared sub-grid (2 levels x 1 thread x 2 corpora x 2 rivals x 2 axes = 16 cells)",
+            plan.in_total == 16
+                && plan.in_levels == vec![8, 9]
+                && plan.in_threads == vec![4]
+                && plan.in_corpora == corpora,
+        );
+        check(
+            "scope plan: out-of-scope total is the rest of the grid (144 - 16 = 128)",
+            plan.out_total == 128,
+        );
+        let ids: Vec<String> = plan.sentinels.iter().map(|s| s.id()).collect();
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        check(
+            "scope plan: 15 sentinels, unique, every one OUTSIDE the scope",
+            plan.sentinels.len() == 15
+                && uniq.len() == 15
+                && plan
+                    .sentinels
+                    .iter()
+                    .all(|s| !sc.contains(&s.corpus, s.level, s.threads)),
+        );
+        let replay = plan_scope(&sc, &rivals, &corpora, &levels, &threads, &axes, 42, 15)
+            .expect("plan_scope replay");
+        check(
+            "scope plan: deterministic — same seed draws the same sentinel cells",
+            replay.sentinels == plan.sentinels,
+        );
+        let other = plan_scope(&sc, &rivals, &corpora, &levels, &threads, &axes, 43, 15)
+            .expect("plan_scope other seed");
+        check(
+            "scope plan: a different seed draws a different sample",
+            other.sentinels != plan.sentinels,
+        );
+        check(
+            "scope plan: a sample larger than the out-of-scope grid clamps to it",
+            matches!(
+                plan_scope(&sc, &rivals, &corpora, &levels, &threads, &axes, 1, 10_000),
+                Ok(p) if p.sentinels.len() == 128
+            ),
+        );
+        check(
+            "scope plan: REFUSED when the scope covers the entire grid",
+            plan_scope(
+                &parse_scope("levels=1-9").unwrap(),
+                &rivals,
+                &corpora,
+                &levels,
+                &threads,
+                &axes,
+                1,
+                15
+            )
+            .is_err(),
+        );
+        check(
+            "scope plan: REFUSED when a scope value is outside the declared grid",
+            plan_scope(
+                &parse_scope("levels=10").unwrap(),
+                &rivals,
+                &corpora,
+                &levels,
+                &threads,
+                &axes,
+                1,
+                15
+            )
+            .is_err(),
+        );
+
+        // The scope declaration and sentinel list are RECORDED.
+        let art = scope_artifact_json(&plan);
+        check(
+            "scope artifact: declaration, sentinel list and the not-measured count are recorded",
+            art["declaration"]["levels"] == serde_json::json!([8, 9])
+                && art["declaration"]["threads"] == serde_json::json!([4])
+                && art["sentinels"].as_array().map(|a| a.len()) == Some(15)
+                && art["out_of_scope_cells_not_measured"] == serde_json::json!(128 - 15)
+                && art["sentinel_seed"] == serde_json::json!("42"),
+        );
+
+        // Adjudication: an out-of-scope SENTINEL flip still BLOCKS (clause 3).
+        let sentinel = |axis: &str, level: u32, br: f64, bf: bool, ar: f64, af: bool| {
+            let mut c = cell(axis, level, br, bf, ar, af);
+            c.in_scope = false;
+            c
+        };
+        let a = adjudicate(
+            &[
+                cell("size", 8, 1.05, true, 0.999, false), // in-scope win
+                sentinel("size", 3, 0.99, false, 1.01, true), // out-of-scope flip
+            ],
+            0,
+            false,
+            &arch,
+            &arch,
+            None,
+            &none,
+        );
+        check(
+            "scope: an out-of-scope SENTINEL size flip still blocks — NO-SHIP clause 3, named as sentinel",
+            a.verdict == Verdict::NoShip
+                && a.failed_clause.as_deref().unwrap_or("").contains("clause 3")
+                && a.clauses
+                    .iter()
+                    .any(|c| c.contains("OUT-OF-SCOPE SENTINEL")),
+        );
+        // A CONFIRMED-REAL sentinel wall flip blocks too.
+        let fl3 = floors(&[("c.bin", 3, 1, 0.005)], 0.005);
+        let a = adjudicate(
+            &[
+                cell("size", 8, 1.05, true, 0.999, false),
+                sentinel("wall", 3, 0.99, false, 1.01, true),
+            ],
+            0,
+            false,
+            &arch,
+            &arch,
+            Some(&fl3),
+            &confirmed("pigz:c.bin:L3:T1:wall", "REAL", 0.02),
+        );
+        check(
+            "scope: a CONFIRMED-REAL sentinel wall flip => NO-SHIP clause 3",
+            a.verdict == Verdict::NoShip
+                && a.failed_clause.as_deref().unwrap_or("").contains("clause 3"),
+        );
+
+        // Out-of-scope EROSION is NOT judged: no clause-5 conviction, no
+        // clause-6 harm, no confirm-queue entry.
+        let ero_cells = vec![
+            cell("size", 8, 1.05, true, 0.999, false), // in-scope close
+            sentinel("size", 3, 0.99, false, 1.08, false), // big out-of-scope size erosion
+            sentinel("wall", 3, 0.70, false, 0.95, false), // big out-of-scope wall erosion
+        ];
+        let a = adjudicate(&ero_cells, 0, false, &arch, &arch, Some(&fl3), &none);
+        check(
+            "scope: out-of-scope erosion is NOT judged — SHIP, zero clause-6 harm, sentinel graded by clause 3 only",
+            a.verdict == Verdict::Ship
+                && a.clause6.harm == 0.0
+                && a.clause6.size_cells == 0
+                && a.clauses.iter().any(|c| c.contains("clause-3 pass->fail flips ONLY")),
+        );
+        check(
+            "scope: the confirm queue never admits an out-of-scope erosion (flips only)",
+            confirm_queue(&ero_cells, Some(&fl3)).is_empty(),
+        );
+        let mut sflip = sentinel("wall", 3, 0.99, false, 1.01, true);
+        sflip.corpus = "c.bin".into();
+        let flip_cells = vec![cell("size", 8, 1.05, true, 0.999, false), sflip];
+        check(
+            "scope: the confirm queue still admits an out-of-scope FLIP suspect",
+            confirm_queue(&flip_cells, Some(&fl3)) == vec![1],
+        );
+
+        // Progress must come from INSIDE the scope: a closing sentinel does
+        // not satisfy clause 4.
+        let a = adjudicate(
+            &[
+                cell("size", 8, 0.99, false, 0.99, false), // in-scope: no progress
+                sentinel("size", 3, 1.05, true, 0.99, false), // sentinel closes
+            ],
+            0,
+            false,
+            &arch,
+            &arch,
+            None,
+            &none,
+        );
+        check(
+            "scope: a closing SENTINEL is out-of-scope luck — clause 4 still fails without in-scope progress",
+            a.verdict == Verdict::NoShip
+                && a.failed_clause.as_deref().unwrap_or("").contains("clause 4"),
+        );
+
+        // Round-trip: in_scope survives serde, and pre-scope artifacts
+        // (no field) default to in-scope.
+        let cells = vec![sentinel("size", 3, 0.99, false, 1.01, true)];
+        let json = serde_json::to_string(&cells).unwrap();
+        let back: Vec<TryCell> = serde_json::from_str(&json).unwrap();
+        let legacy: Vec<TryCell> = serde_json::from_str(
+            r#"[{"axis":"size","rival":"pigz","corpus":"c.bin","level":3,"threads":1,
+                 "base_status":"OK","after_status":"OK","base_ratio":0.99,"after_ratio":1.01,
+                 "base_failing":false,"after_failing":true}]"#,
+        )
+        .unwrap();
+        check(
+            "scope serde: in_scope round-trips; a pre-scope artifact defaults to in-scope",
+            !back[0].in_scope && legacy[0].in_scope,
+        );
     }
 
     println!("try selftest: {pass} passed, {fail} failed");
