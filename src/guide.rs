@@ -674,6 +674,13 @@ pub const COMMANDS: &[Cmd] = &[
         "fulcrum bank scoreboard render artifact.json",
         Class::Analysis,
     ),
+    gated("supervise", C(
+        "supervise",
+        "How do I get a guaranteed EXIT:<code> marker even when the child is OOM SIGKILLed?",
+        "-- <cmd …> (everything after -- is the child argv, verbatim)",
+        "fulcrum supervise -- fulcrum try my-branch --repo ~/www/gzippy --rival libdeflate='libdeflate-gzip -{level} -c {input}' --corpus ~/www/gzippy-bench/corpus/silesia.tar",
+        Class::Exempt,
+    )),
     // ---- the instrument itself ------------------------------------------------
     then(
         C(
@@ -947,8 +954,12 @@ pub fn lookup(args: &[String]) -> Option<&'static Cmd> {
 }
 
 /// True when this argv is asking for help (a bare `--help`/`-h`/`help` token).
+/// Scanning stops at the first `--`: everything after it is payload (e.g. a
+/// `supervise`d child's argv), and a child's `--help` must be RUN, not
+/// answered by the registry.
 pub fn is_help_request(args: &[String]) -> bool {
     args.iter()
+        .take_while(|a| a.as_str() != "--")
         .any(|a| a == "--help" || a == "-h" || a == "help")
 }
 

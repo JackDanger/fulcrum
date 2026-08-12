@@ -2633,11 +2633,22 @@ fn classify(sub: &str, rest: &[String]) -> CmdClass {
         // `guide`/`commands` DESCRIBE the surface: they must not probe the
         // network, self-update, or re-exec. Discovery has to work on a stale
         // box, offline, mid-freeze — that is precisely when it is needed.
-        "version" | "help" | "--help" | "-h" | "selftest" | "freeze" | "guide" | "commands" => {
-            CmdClass::Exempt
-        }
-        "why" | "try" | "layout" | "verify" | "dropin" | "ab" | "profile" | "sentinel" => {
+        // `supervise` is a transparent wrapper: the CHILD enforces its own
+        // staleness class; the wrapper must never probe the network or
+        // self-update in between a monitor and its marker.
+        "version" | "help" | "--help" | "-h" | "selftest" | "freeze" | "guide" | "commands"
+        | "supervise" => CmdClass::Exempt,
+        "why" | "layout" | "verify" | "dropin" | "ab" | "profile" | "sentinel" => {
             CmdClass::Measurement
+        }
+        // `try` measures — except `--rescore`, which only re-adjudicates a
+        // banked artifact and must work on a box that measures nothing.
+        "try" => {
+            if rest.iter().any(|a| a == "--rescore") {
+                CmdClass::Analysis
+            } else {
+                CmdClass::Measurement
+            }
         }
         "board" => match rest.first().map(|s| s.as_str()) {
             // Deriving the board measures; reading/adjudicating it analyses.
@@ -2740,6 +2751,7 @@ fn dispatch(sub: &str, rest: &[String]) -> ExitCode {
     match sub {
         "board" => cmd_board(rest),
         "structcensus" => fulcrum::structcensus::cmd(rest),
+        "supervise" => fulcrum::supervise::cmd(rest),
         "why" => fulcrum::why::cmd(rest),
         "candidates" => fulcrum::candidates::cmd(rest),
         "try" => fulcrum::promote::cmd(rest),

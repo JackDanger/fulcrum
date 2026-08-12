@@ -109,6 +109,7 @@ pub mod sizecensus;
 pub mod spans;
 pub mod stats;
 pub mod structcensus;
+pub mod supervise;
 pub mod trace;
 pub mod uarch;
 pub mod verbose_stats;

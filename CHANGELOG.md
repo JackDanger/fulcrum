@@ -6,6 +6,47 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — `fulcrum try --rescore <out-dir>`: re-adjudicate a stored artifact
+
+Receipt: three ~10-hour reruns were burned because a verdict could not be
+recomputed from stored artifacts after a rule change. `--rescore` re-runs
+ONLY the adjudication (clauses 1-8, margin-floor logic, flip/erosion
+classification) against the census data in an existing `--out` dir — no
+builds, no measurement, no box work. Stored cross-layout confirm results are
+reused; a suspect the current rules flag that has no stored confirm stays
+UNDECIDED with "rescore cannot measure — rerun confirms live". Floors come
+from `--layout-floors`, else the path the artifact recorded (an unloadable
+recorded path is a REFUSAL, never a silent drop). The result is written to
+`try-rescore.json` (then `try-rescore-2.json`, …) beside the original;
+`try.json` is never overwritten. Gate-0 pins: bit-for-bit reproduction of a
+stored fixture verdict under unchanged rules, a rule change flipping a
+stored SHIP to NO-SHIP (recomputed, never copied), and the original file
+untouched byte-for-byte.
+
+### Added — `fulcrum supervise -- <cmd …>`: the marker that survives SIGKILL
+
+Receipt: an OOM SIGKILL looked like a hang for an hour — the in-process
+`--done-marker` fires on success, failure and panic, but SIGKILL is never
+delivered to the process's own code. `supervise` is an out-of-process
+supervisor: it spawns the child, waits, and ALWAYS appends a final
+`EXIT:<code>` line to stdout — the child's code, 128+signal on signal death
+(OOM SIGKILL ⇒ `EXIT:137`), 127 on spawn failure — then exits with that same
+code. Gate-0 kills the child with `-9` and asserts the marker still lands.
+`scripts/supervise.sh` is the bash equivalent for boxes on older binaries.
+The dispatcher's argv preprocessing (help interception, `--done-marker`
+stripping) now stops at the first `--`, so a supervised child's flags are
+payload, never parsed.
+
+### Added — `scripts/wave-runner.sh`: hands-free `try` waves from a queue file
+
+Consumes `/root/wave-queue.txt` (one ref per line, `#` comments); for each
+ref it waits for a quiet, warmed-up box (>20 min uptime, no fulcrum
+running), moves old out-dirs aside, runs the try under `supervise` +
+`choom -n -800` with the standard rival/corpus/floors args templated at the
+top, logs to `/tmp/wave-<ref-slug>.log`, and pops the ref once the EXIT
+marker is down. Plain bash, no daemons: run under nohup; exits when the
+queue is empty.
+
 ### Changed — clause 6 prices only RESIDUAL harm (`fulcrum try`)
 
 The margin-coherence fix (2026-08-11). Receipt: the #310 run accepted 54

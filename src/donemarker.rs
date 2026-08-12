@@ -36,9 +36,23 @@ pub const PANIC_CODE: u8 = 101;
 /// Remove every occurrence of `--done-marker` from the argv; report whether it
 /// was present. Central stripping is what makes the flag uniform: no command
 /// parser ever sees it, so none can reject it and none can forget it.
+///
+/// Stripping stops at the first `--`: everything after it is payload — a
+/// `supervise`d child's argv — and stripping the CHILD's `--done-marker`
+/// would silently disarm the child's own marker.
 pub fn strip_flag(args: Vec<String>) -> (Vec<String>, bool) {
-    let present = args.iter().any(|a| a == FLAG);
-    (args.into_iter().filter(|a| a != FLAG).collect(), present)
+    let boundary = args
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(args.len());
+    let present = args[..boundary].iter().any(|a| a == FLAG);
+    let out = args
+        .into_iter()
+        .enumerate()
+        .filter(|(i, a)| *i >= boundary || a != FLAG)
+        .map(|(_, a)| a)
+        .collect();
+    (out, present)
 }
 
 /// Recover the numeric code from a `std::process::ExitCode`, which is opaque
@@ -104,6 +118,23 @@ pub fn selftest() -> ExitCode {
     check(
         "strip_flag: absent flag reported absent, argv untouched",
         strip_flag(vec!["version".into()]) == (vec!["version".to_string()], false),
+    );
+    check(
+        "strip_flag: stops at `--` — a supervised child's --done-marker is payload",
+        strip_flag(vec![
+            "supervise".into(),
+            "--".into(),
+            "echo".into(),
+            FLAG.into(),
+        ]) == (
+            vec![
+                "supervise".to_string(),
+                "--".to_string(),
+                "echo".to_string(),
+                FLAG.to_string(),
+            ],
+            false
+        ),
     );
     check(
         "exit_code_value: roundtrips 0, 1, 2, 101, 255",
