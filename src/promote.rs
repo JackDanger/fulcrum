@@ -49,8 +49,14 @@
 //!     (pre-lever ratio > 0.80) keep the old flat budget exactly as before.
 //!   * Clause 3 (no pass→fail flip) remains ABSOLUTE — a CONFIRMED-REAL flip
 //!     convicts regardless of margin. SIZE cells are exact integers: size has
-//!     no layout noise, so size flips and size erosions convict directly
-//!     under the pre-existing rules, no confirmation involved.
+//!     no layout noise, so nothing on the size axis is ever confirmed — the
+//!     2026-09-05 owner directive ("we can take a <1% hit to compression size
+//!     but we will not lose on wall clock under any conditions") adds the
+//!     authorized size-spend ceiling [`SIZE_SPEND_CEILING`]: a passing size
+//!     cell eroding within 1% of the rival's size is AUTHORIZED SPEND
+//!     (classified `AUTHORIZED-<=1%-SIZE-SPEND`, never LAYOUT-ARTIFACT),
+//!     itemized and excluded from clause-6 harm like the wall margin-spend;
+//!     size erosions >1% and size flips convict directly, as before.
 //!   * CLAUSE 6 PRICES ONLY RESIDUAL HARM (the margin-coherence fix,
 //!     2026-08-11; receipt: the #310 adjudication accepted 54 erosions as
 //!     margin-spend under clause 5 and then failed clause 6 on "harm" 1.3537
@@ -58,13 +64,15 @@
 //!     authorized spend made clause 6 the new flat budget in disguise).
 //!     Clause 6's harm now counts exactly what the clause-3/5 chains left
 //!     standing: confirmed-real unaccepted erosions/flips (at their CONFIRMED
-//!     deltas), exact size regressions on passing cells, and — conservatively
-//!     — UNDECIDED suspects at their census deltas (missing floor coverage or
-//!     confirm overflow never becomes free). Excluded and itemized on the
-//!     clause-6 line: clause-5-ACCEPTED margin-spend (priced by the floor),
-//!     LAYOUT-ARTIFACT acquittals (measured noise), and sub-budget census
-//!     drift (priced by clause 5's flat budget). Improvement is unchanged:
-//!     the summed census ratio gains on cells that were FAILING at base.
+//!     deltas), exact size regressions beyond the authorized 1% spend ceiling
+//!     on passing cells, and — conservatively — UNDECIDED suspects at their
+//!     census deltas (missing floor coverage or confirm overflow never
+//!     becomes free). Excluded and itemized on the clause-6 line:
+//!     clause-5-ACCEPTED margin-spend (priced by the floor), LAYOUT-ARTIFACT
+//!     acquittals (measured noise), sub-budget census drift (priced by
+//!     clause 5's flat budget), and the owner-authorized ≤1% size spend (owner
+//!     directive 2026-09-05). Improvement is unchanged: the summed census
+//!     ratio gains on cells that were FAILING at base.
 //!
 //! Floors (`--layout-floors <tsv>`, from `fulcrum layout calibrate`) supply
 //! both the confirm boundary and the margin-floor term. A floor applies ONLY
@@ -195,7 +203,8 @@ pub struct Adjudication {
 
 /// Clause 6's rival-anchored Pareto ledger. `harm` is the RESIDUAL total
 /// (`confirmed_real + size + undecided`); the `excluded_*` fields itemize
-/// what clause 5 already priced and clause 6 therefore must NOT count again.
+/// what the clause-5 chain or the 2026-09-05 owner directive already priced
+/// and clause 6 therefore must NOT count again.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Clause6Accounting {
     /// Summed census ratio gains on cells FAILING at base (unchanged rule).
@@ -207,8 +216,9 @@ pub struct Clause6Accounting {
     /// floor-rejected winning cells, confirmed-real flips).
     pub confirmed_real: f64,
     pub confirmed_real_cells: usize,
-    /// Exact size regressions on passing cells — size has no layout noise,
-    /// so every positive size delta is real harm, sub-budget or not.
+    /// Size erosions on passing cells beyond the authorized 1% spend ceiling
+    /// ([`SIZE_SPEND_CEILING`]) — size has no layout noise, so a size delta
+    /// the owner has not authorized is real harm (and convicts clause 5).
     pub size: f64,
     pub size_cells: usize,
     /// UNDECIDED wall suspects at their census deltas — conservative, so
@@ -227,6 +237,12 @@ pub struct Clause6Accounting {
     /// exclusion is auditable, never silent.
     pub excluded_sub_budget: f64,
     pub excluded_sub_budget_cells: usize,
+    /// Size erosions on passing cells within the authorized 1% spend ceiling
+    /// (owner directive 2026-09-05: "<1% size hit, wall never loses"),
+    /// EXCLUDED from harm exactly like the wall margin-spend. Itemized so
+    /// the exclusion is auditable, never silent.
+    pub excluded_size_spend: f64,
+    pub excluded_size_spend_cells: usize,
 }
 
 /// Clause 5's flat erosion budget: the smaller of a quarter of the cell's
@@ -235,10 +251,35 @@ pub struct Clause6Accounting {
 /// all, and it is the budget a THIN-MARGIN cell (base ratio > 0.80) is still
 /// judged against after confirmation — thin margins stay protected exactly
 /// as before. Winning cells (base <= 0.80) are judged by the margin floor
-/// instead. Size cells use this budget directly, unchanged: size is exact.
+/// instead. Size cells use this budget as their census flag too (a delta
+/// beyond it enters the clause-5 chains above, whether it convicts or is
+/// authorized spend); since the 2026-09-05 owner directive the size
+/// JUDGMENT is [`SIZE_SPEND_CEILING`], not this budget: within 1% is
+/// authorized spend, >1% and flips convict. WALL arithmetic untouched.
 pub fn erosion_budget(old_ratio: f64) -> f64 {
     (0.25 * (1.0 - old_ratio)).min(0.005)
 }
+
+/// The authorized size-spend ceiling (owner directive 2026-09-05: "we can
+/// take a <1% hit to compression size but we will not lose on wall clock
+/// under any conditions"): 1% of the rival's size, i.e. an absolute ratio
+/// delta — `ours/rival` may rise past its flat budget up to `0.01` on a
+/// passing size cell without convicting. A such erosion is AUTHORIZED SPEND,
+/// classified `AUTHORIZED-<=1%-SIZE-SPEND` (never LAYOUT-ARTIFACT and never
+/// confirmed — size is exact), itemized in the clause-5/6 output and
+/// EXCLUDED from clause-6 residual harm like the wall margin-spend. An
+/// erosion beyond the ceiling, and a size flip (pass->fail: ratio <= 1 at
+/// base, > 1 after), still convict directly. Wall rules are untouched.
+pub const SIZE_SPEND_CEILING: f64 = 0.01;
+
+/// The frozen rule description carried into EVERY artifact's
+/// `clause5_margin_floor.rule` (both `try` and `try --rescore`). It must
+/// state each operative clause verbatim so artifacts are self-describing;
+/// amended 2026-09-05 with the owner's size-spend directive ("I delete the
+/// pick-min and all that terrible two-encode machinery. Aim for the right
+/// solution. We can take a <1% hit to compression size but we will not lose
+/// on wall clock under any conditions."). Wall terms are unchanged prose.
+pub const CLAUSE5_MARGIN_FLOOR_RULE: &str = "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size erosions within 1% are authorized spend (owner directive 2026-09-05: <1% size hit, wall never loses); size erosions >1% and size flips convict directly";
 
 // ---------------------------------------------------------------------------
 // Clause 5 margin-floor machinery (the 2026-08-10 redesign)
@@ -720,7 +761,10 @@ pub fn adjudicate(
     }
 
     // Clause 5 (margin-floor): erosion on passing cells. SIZE cells are
-    // exact — any beyond-budget size erosion convicts directly, unchanged.
+    // exact — no confirmation and no floor ever applies to them (2026-09-05
+    // owner directive: an erosion within 1% of the rival's size is
+    // AUTHORIZED-<=1%-SIZE-SPEND, excluded from clause-6 harm; beyond it a
+    // size erosion convicts directly, unchanged).
     // WALL erosion suspects (beyond the flat census budget) walk the chain
     // census reading -> floor screen -> confirm verdict -> margin-floor
     // arithmetic, printed in full per suspect so a NO-SHIP is auditable at
@@ -738,6 +782,7 @@ pub fn adjudicate(
     let mut erosion_undecided = 0usize;
     let mut erosion_accepted = 0usize;
     let mut erosion_acquitted = 0usize;
+    let mut erosion_size_spend = 0usize;
     for c in decided
         .iter()
         // Erosion is judged IN SCOPE only: a sentinel is graded by clause 3
@@ -747,6 +792,25 @@ pub fn adjudicate(
     {
         let budget = erosion_budget(c.base_ratio);
         if c.axis != "wall" {
+            let delta = c.after_ratio - c.base_ratio;
+            if delta <= SIZE_SPEND_CEILING + 1e-12 {
+                clauses.push(format!(
+                    "clause 5 [size-spend]: {}: census {} -> {} (Δ {:+.4} > flat budget \
+                     {:.4}, <= authorized ceiling {:.4}) -> AUTHORIZED-<=1%-SIZE-SPEND \
+                     (owner directive 2026-09-05: <1% size hit, wall never loses)",
+                    c.id(),
+                    c.base_field(),
+                    c.after_field(),
+                    delta,
+                    budget,
+                    SIZE_SPEND_CEILING
+                ));
+                erosion_size_spend += 1;
+                // The clause-6 ledger loop below charges the size axis
+                // (authorized spend vs harm at the ceiling); clause 5 only
+                // classifies it here — no double charge.
+                continue;
+            }
             eroded.push(format!(
                 "{} ({} -> {}, budget {:.4}, size is exact — no confirmation applies)",
                 c.id(),
@@ -925,20 +989,31 @@ pub fn adjudicate(
         }
     }
     if eroded.is_empty() {
+        // The clause-5 verdicts stay byte-identical for wall-only runs; the
+        // authorized-size-spend count is appended only when one exists.
+        let size_note = if erosion_size_spend == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {} size erosion(s) beyond the flat budget are AUTHORIZED-<=1%-SIZE-SPEND \
+                 (owner directive 2026-09-05)",
+                erosion_size_spend
+            )
+        };
         clauses.push(if erosion_suspects == 0 {
-            "clause 5 OK: every passing cell inside its erosion budget".into()
+            format!("clause 5 OK: every passing cell inside its erosion budget{size_note}")
         } else if erosion_undecided == 0 {
             format!(
                 "clause 5 OK: {} wall erosion suspect(s) resolved without conviction \
                  ({} accepted under the margin floor, {} acquitted as layout artifact — \
-                 chains above)",
+                 chains above){size_note}",
                 erosion_suspects, erosion_accepted, erosion_acquitted
             )
         } else {
             format!(
                 "clause 5: no CONVICTING erosion ({} of {} wall suspect(s) UNDECIDED above \
-                 — not OK; {} accepted, {} acquitted)",
-                erosion_undecided, erosion_suspects, erosion_accepted, erosion_acquitted
+                 — not OK; {} accepted, {} acquitted){}",
+                erosion_undecided, erosion_suspects, erosion_accepted, erosion_acquitted, size_note
             )
         });
     } else {
@@ -955,14 +1030,16 @@ pub fn adjudicate(
     // Clause 6: net improvement — gains on failing cells >= 2x the RESIDUAL
     // harm on passing cells. Harm counts only what the clause-3/5 chains left
     // standing: confirmed-real unaccepted erosions/flips (at their confirmed
-    // deltas, accumulated above), exact size regressions, and UNDECIDED
-    // suspects at their census deltas (conservative — missing coverage never
-    // becomes free). Clause-5-ACCEPTED margin-spend is priced by the floor,
-    // NOT harm: counting it again made clause 6 the flat budget in disguise
-    // (receipt: #310 failed clause 6 on "harm" 1.3537 of which 0.7487 was
-    // accepted spend). LAYOUT-ARTIFACT acquittals are measured noise, and
-    // sub-budget wall census drift is priced by clause 5's flat budget —
-    // both excluded, both itemized so no exclusion is silent.
+    // deltas, accumulated above), size regressions beyond the authorized 1%
+    // spend ceiling, and UNDECIDED suspects at their census deltas
+    // (conservative — missing coverage never becomes free).
+    // Clause-5-ACCEPTED margin-spend is priced by the floor, NOT harm:
+    // counting it again made clause 6 the flat budget in disguise (receipt:
+    // #310 failed clause 6 on "harm" 1.3537 of which 0.7487 was accepted
+    // spend). LAYOUT-ARTIFACT acquittals are measured noise, sub-budget wall
+    // census drift is priced by clause 5's flat budget, and size spends <=1%
+    // are owner-authorized (directive 2026-09-05) — all excluded, all
+    // itemized so no exclusion is silent.
     c6.improvement = decided
         .iter()
         .filter(|c| c.in_scope && c.base_failing)
@@ -974,11 +1051,19 @@ pub fn adjudicate(
             continue;
         }
         if c.axis != "wall" {
-            // Size is exact: every positive delta on a passing size cell is
-            // real harm, sub-budget or not (beyond-budget ones also convict
-            // clause 5 above; the ledger prices them either way).
-            c6.size += d;
-            c6.size_cells += 1;
+            // Size has no layout noise, so the numbers are exact either way —
+            // but since 2026-09-05 an erosion within SIZE_SPEND_CEILING is
+            // authorized spend, itemized and excluded like the wall
+            // margin-spend; only a delta beyond the ceiling is harm (beyond-
+            // ceiling ones also convict clause 5 above; sub-ceiling ones do
+            // not, flag budget notwithstanding).
+            if d <= SIZE_SPEND_CEILING + 1e-12 {
+                c6.excluded_size_spend += d;
+                c6.excluded_size_spend_cells += 1;
+            } else {
+                c6.size += d;
+                c6.size_cells += 1;
+            }
         } else if !c.after_failing && d <= erosion_budget(c.base_ratio) + 1e-12 {
             // Within clause 5's flat budget: never a suspect, priced by that
             // budget. Itemized; not charged.
@@ -992,7 +1077,8 @@ pub fn adjudicate(
     let breakdown = format!(
         "harm = confirmed-real {:.4} [{}] + size {:.4} [{}] + undecided-conservative {:.4} \
          [{}]; excluded as clause-5-priced: accepted margin-spend {:.4} [{}], \
-         layout-artifact acquittals {:.4} [{}], sub-budget census drift {:.4} [{}]",
+         layout-artifact acquittals {:.4} [{}], sub-budget census drift {:.4} [{}]; \
+         authorized size spend <=1% {:.4} [{}]",
         c6.confirmed_real,
         c6.confirmed_real_cells,
         c6.size,
@@ -1004,7 +1090,9 @@ pub fn adjudicate(
         c6.excluded_acquitted,
         c6.excluded_acquitted_cells,
         c6.excluded_sub_budget,
-        c6.excluded_sub_budget_cells
+        c6.excluded_sub_budget_cells,
+        c6.excluded_size_spend,
+        c6.excluded_size_spend_cells
     );
     if c6.harm <= 0.0 || c6.improvement >= 2.0 * c6.harm {
         clauses.push(format!(
@@ -2196,7 +2284,8 @@ pub fn run(
             "semantics": "floors feed the margin floor (min(0.80, 1-3*floor)) and the confirm boundary; a missing coordinate is UNDECIDED, never borrowed",
         })).unwrap_or(serde_json::Value::Null),
         "clause5_margin_floor": {
-            "rule": "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size cells exact and unchanged",
+            // Rule text amended 2026-09-05 (owner directive): authorized size spend.
+            "rule": CLAUSE5_MARGIN_FLOOR_RULE,
             "confirm_cap": CONFIRM_CAP,
             "skipped": confirm_set.skipped,
             "overflow": confirm_set.overflow,
@@ -2555,10 +2644,14 @@ fn usage() -> String {
      still clears the margin floor: post <= min(0.80, 1 - 3*layout_floor(cell)).\n\
      THIN-MARGIN cells (pre-lever ratio > 0.80) keep the old flat 0.005 budget.\n\
      Clause 3 (no pass->fail flip) remains ABSOLUTE for confirmed-real flips.\n\
-     SIZE cells are exact and unchanged: size flips and size erosions convict\n\
-     directly, no confirmation involved. Each suspect prints its full chain:\n\
-     census reading -> floor screen -> confirm verdict -> margin-floor\n\
-     arithmetic, so a NO-SHIP is auditable at a glance.\n\
+     SIZE cells: exact integers, no confirmation, no floors — and since the\n\
+     owner's 2026-09-05 directive an erosion within 1% of the rival's size\n\
+     (<1% size hit, wall never loses) is AUTHORIZED SPEND, classified\n\
+     AUTHORIZED-<=1%-SIZE-SPEND and excluded from clause-6 residual harm like\n\
+     the wall margin-spend; size erosions >1% and size flips convict directly.\n\
+     Each suspect prints its full chain: census reading -> floor screen ->\n\
+     confirm verdict -> margin-floor arithmetic, so a NO-SHIP is auditable at\n\
+     a glance.\n\
      \n\
      --layout-floors: the per-cell layout-jitter floors (from `fulcrum layout\n\
      calibrate`) that feed both the confirm boundary and the margin-floor term.\n\
@@ -2760,7 +2853,8 @@ pub fn rescore_value(
             "semantics": "floors feed the margin floor (min(0.80, 1-3*floor)) and the confirm boundary; a missing coordinate is UNDECIDED, never borrowed",
         })).unwrap_or(serde_json::Value::Null),
         "clause5_margin_floor": {
-            "rule": "winning wall cells (base<=0.80): confirmed erosion acceptable iff post <= min(0.80, 1-3*layout_floor); thin margins (base>0.80): flat budget min(quarter-margin, 0.005); ALL wall convictions (clause 3 flips and clause 5 erosions) require cross-layout CONFIRMED-REAL; size cells exact and unchanged",
+            // Rule text amended 2026-09-05 (owner directive): authorized size spend.
+            "rule": CLAUSE5_MARGIN_FLOOR_RULE,
             "confirm_cap": confirm_set.cap,
             "skipped": confirm_set.skipped,
             "overflow": confirm_set.overflow,
@@ -2950,7 +3044,8 @@ pub fn selftest() -> ExitCode {
 
     // Wall-flip confirmation SELECTION (clause 8 applied to clause 3): only
     // decidable WALL pass->fail flips qualify — size flips are exact integers
-    // and confirm themselves; fail->pass movement is never confirmation-worthy
+    // that convict themselves (never confirmed, 2026-09-05 still absolute);
+    // fail->pass movement is never confirmation-worthy
     // (it cannot fail clause 3); VOID arms already demand their own re-run.
     {
         let cs = vec![
@@ -3455,12 +3550,16 @@ pub fn selftest() -> ExitCode {
                     && c.contains("residual harm 0.0000")
             }),
     );
-    // (6b) SIZE is exact: a size regression on a winning cell is harm even
-    // INSIDE the flat budget (clause 5 tolerates it; clause 6 still prices it).
+    // (6b) SIZE — the 2026-09-05 owner directive narrowed exactness to the
+    // authorized 1% spend ceiling: an erosion within 1% is excluded and
+    // itemized (see the size-spend checks below), but a size regression
+    // BEYOND 1% on a winning cell STILL convicts clause 5 (exact integers,
+    // no confirmation involved) and the ledger still charges its census
+    // delta to harm.
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
-            cell("size", 2, 0.990, false, 0.9924, false), // +0.0024 <= budget 0.0025
+            cell("size", 2, 0.900, false, 0.9200, false), // Δ 0.0200 > ceiling 0.01
         ],
         0,
         false,
@@ -3470,25 +3569,28 @@ pub fn selftest() -> ExitCode {
         &none,
     );
     check(
-        "clause 6: an exact size regression on a winning cell is harm even inside the flat budget => NO-SHIP",
+        "clause 6: a size erosion beyond the authorized 1% convicts clause 5 AND is still harm => NO-SHIP",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
                 .unwrap_or("")
-                .contains("clause 6")
+                .contains("clause 5")
             && a.clauses
                 .iter()
-                .any(|c| c.contains("clause 6 FAIL") && c.contains("size 0.0024 [1]")),
+                .any(|c| c.contains("clause 5 FAIL") && c.contains("size is exact"))
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("clause 6 FAIL") && c.contains("size 0.0200 [1]")),
     );
-    // (6c) The #310 shape: LARGE accepted margin-spend + modest real harm.
-    // Old accounting: harm 0.0524 -> improvement 0.10 < 2x -> FAIL. New:
-    // accepted spend is EXCLUDED (priced by the floor) and itemized, so the
-    // verdict turns on the residual: 0.10 >= 2x 0.0024 -> clause 6 OK, SHIP.
+    // (6c) The #310 shape: LARGE accepted margin-spend + the authorized size
+    // spend. Old accounting: harm 0.0524 -> improvement 0.10 < 2x -> FAIL.
+    // Each spend is EXCLUDED and itemized (priced where it was authorized),
+    // so the verdict turns on the residual: 0.10 >= 2x 0.0000 -> SHIP.
     let a = adjudicate(
         &[
             cell("size", 6, 1.15, true, 1.05, true), // improvement 0.10 (gap progress)
             cell("wall", 2, 0.20, false, 0.25, false), // accepted spend 0.05 (post clears floor)
-            cell("size", 2, 0.990, false, 0.9924, false), // modest real size harm 0.0024
+            cell("size", 2, 0.990, false, 0.9924, false), // authorized size spend 0.0024
         ],
         0,
         false,
@@ -3498,21 +3600,24 @@ pub fn selftest() -> ExitCode {
         &none,
     );
     check(
-        "clause 6 (#310 shape): accepted margin-spend EXCLUDED and itemized; improvement >= 2x residual => SHIP",
+        "clause 6 (#310 shape): accepted margin-spend and authorized size spend EXCLUDED and itemized => SHIP",
         a.verdict == Verdict::Ship
             && a.clauses.iter().any(|c| {
                 c.contains("clause 6 OK")
                     && c.contains("accepted margin-spend 0.0500 [1]")
-                    && c.contains("residual harm 0.0024")
+                    && c.contains("authorized size spend <=1% 0.0024 [1]")
+                    && c.contains("residual harm 0.0000")
             }),
     );
-    // (6c') ...and the SAME shape still fails when improvement < 2x the
-    // residual — the exclusion buys nothing beyond what clause 5 priced.
+    // (6c') ...and the SAME shape still fails when the residual is real and
+    // improvement < 2x it — the exclusion buys nothing beyond what the
+    // rules priced: a >1% size erosion convicts clause 5 first, and clause
+    // 6 still prices its residual harm.
     let a = adjudicate(
         &[
             cell("size", 6, 1.010, true, 1.006, true), // improvement 0.004
             cell("wall", 2, 0.20, false, 0.25, false), // accepted spend 0.05
-            cell("size", 2, 0.990, false, 0.9924, false), // residual size harm 0.0024
+            cell("size", 2, 0.900, false, 0.9200, false), // residual size harm 0.0200
         ],
         0,
         false,
@@ -3522,12 +3627,15 @@ pub fn selftest() -> ExitCode {
         &none,
     );
     check(
-        "clause 6 (#310 shape): passes IFF improvement >= 2x residual — 0.004 < 0.0048 => NO-SHIP",
+        "clause 6 (#310 shape): passes IFF improvement >= 2x residual — 0.004 < 0.0400 => NO-SHIP",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
                 .unwrap_or("")
-                .contains("clause 6"),
+                .contains("clause 5")
+            && a.clauses
+                .iter()
+                .any(|c| c.contains("clause 6 FAIL") && c.contains("2x residual harm 0.0200")),
     );
     // (6d) An UNDECIDED erosion suspect counts CONSERVATIVELY at its census
     // delta — missing floor coverage never becomes free.
@@ -3716,12 +3824,13 @@ pub fn selftest() -> ExitCode {
         "floors: clean cells with floors present => still SHIP",
         a.verdict == Verdict::Ship && a.layout_undecided.is_empty(),
     );
-    // SIZE cells are exact: a size erosion convicts directly even under an
-    // absurdly generous floor and with no confirm result.
+    // SIZE cells are exact: a size erosion BEYOND the authorized 1% ceiling
+    // convicts directly, even under an absurdly generous floor and with no
+    // confirm result (2026-09-05 owner directive: only the first 1% is spend).
     let a = adjudicate(
         &[
             cell("size", 6, 1.05, true, 1.02, true),      // gap progress
-            cell("size", 2, 0.999, false, 1.0035, false), // size erosion beyond budget
+            cell("size", 2, 0.900, false, 0.9200, false), // Δ 0.0200 > ceiling 0.01
         ],
         0,
         false,
@@ -3731,13 +3840,117 @@ pub fn selftest() -> ExitCode {
         &none,
     );
     check(
-        "size: a size erosion convicts directly — exact integers need no floors and no confirmation",
+        "size: a size erosion beyond 1% convicts directly — exact integers need no floors and no confirmation",
         a.verdict == Verdict::NoShip
             && a.failed_clause
                 .as_deref()
                 .unwrap_or("")
                 .contains("clause 5"),
     );
+
+    // ---- the authorized size-spend ceiling (owner directive 2026-09-05) ----
+    // "<1% size hit, wall never loses": a passing size cell eroding within
+    // SIZE_SPEND_CEILING (1% of the rival's size; the ratio is ours/rival, so
+    // the delta reads in rival units) is classified AUTHORIZED-<=1%-SIZE-SPEND
+    // (never LAYOUT-ARTIFACT — no confirmation exists for size), itemized in
+    // the clause-5 chains, and EXCLUDED from clause-6 residual harm like the
+    // wall margin-spend. >1% erosions convict clause 5 and stay harm; a size
+    // pass->fail flip convicts clause 3 even inside the ceiling.
+    //
+    // (a) pins the REAL motivating payload from JackDanger/gzippy#367's
+    // frozen-box receipt: a WON size cell (0.9973, beating the rival by
+    // 0.27%) eroding to an exact tie (1.0000) — the authorized class. The
+    // "1% of a tie" payload ("1.000 -> 1.0027", a tie getting bigger) is a
+    // pass->fail FLIP and convicts clause 3 (asserted next block, (c)).
+    {
+        // (a) net 0.9973 -> 1.0000 (the #367 silesia L2/T1 receipt): an
+        //     authorized spend that stays a PASS — classified and itemized,
+        //     no conviction, no floors consulted.
+        let cs = vec![
+            cell("size", 6, 1.010, true, 1.006, true),   // improvement 0.004
+            cell("size", 2, 0.9973, false, 1.000, false), // Δ 0.0027 <= ceiling 0.01
+        ];
+        let a = adjudicate(&cs, 0, false, &arch, &arch, None, &none);
+        check(
+            "size spend: a 0.27% erosion on a passing size cell is AUTHORIZED-<=1%-SIZE-SPEND — classified and itemized, no confirmation, no floors",
+            a.verdict == Verdict::Ship
+                && a.failed_clause.is_none()
+                && a.clauses.iter().any(|c| {
+                    c.contains("clause 5 [size-spend]")
+                        && c.contains("AUTHORIZED-<=1%-SIZE-SPEND")
+                        && c.contains("owner directive 2026-09-05")
+                })
+                && (a.clause6.excluded_size_spend - 0.0027).abs() < 1e-9
+                && a.clause6.excluded_size_spend_cells == 1,
+        );
+        // (b) a 2% erosion convicts: clause 5 FAIL with the exact-integer
+        //     chain; its census delta stays in the clause-6 ledger.
+        let cs = vec![
+            cell("size", 6, 1.010, true, 1.006, true),   // improvement 0.004
+            cell("size", 2, 0.900, false, 0.9200, false), // Δ 0.0200 > ceiling
+        ];
+        let a = adjudicate(&cs, 0, false, &arch, &arch, None, &none);
+        check(
+            "size spend: a 2% erosion convicts clause 5 and remains harm — exact integers, no confirmation involved",
+            a.verdict == Verdict::NoShip
+                && a.failed_clause
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("clause 5")
+                && a.clauses
+                    .iter()
+                    .any(|c| c.contains("clause 5 FAIL") && c.contains("size is exact"))
+                && a.clause6.size_cells == 1,
+        );
+        // (c) a size pass->fail flip convicts DIRECTLY even when the delta is
+        //     inside the ceiling — the spend authorizes erosions on passing
+        //     cells only, never a fail.
+        let cs = vec![
+            cell("size", 6, 1.010, true, 1.006, true),  // improvement 0.004
+            cell("size", 2, 0.999, false, 1.001, true), // Δ 0.002 <= ceiling, but a flip
+        ];
+        let a = adjudicate(&cs, 0, false, &arch, &arch, None, &none);
+        check(
+            "size spend: a sub-ceiling size FLIP still convicts clause 3 — the spend is for passing cells",
+            a.verdict == Verdict::NoShip
+                && a.failed_clause
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("clause 3")
+                && a.clauses
+                    .iter()
+                    .any(|c| c.contains("size is exact — no confirmation applies")),
+        );
+        // (d) clause 6's harm number EXCLUDES the authorized spend: both
+        //     sub-ceiling size deltas land on the itemized exclusion line
+        //     (with the wall sub-budget drift), harm stays 0.0000.
+        let cs = vec![
+            cell("size", 6, 1.010, true, 1.006, true),   // improvement 0.004
+            cell("size", 2, 0.9973, false, 1.000, false), // authorized spend on a won cell (stays a pass) // was 1.000 -> 1.0027: a tie getting bigger is a pass->fail FLIP, asserted in (c)
+            cell("size", 9, 0.990, false, 0.9924, false), // authorized spend 0.0024
+            cell("wall", 2, 0.900, false, 0.905, false),  // wall drift within flat budget
+        ];
+        let a = adjudicate(&cs, 0, false, &arch, &arch, None, &none);
+        check(
+            "size spend: clause-6 harm EXCLUDES the authorized size spend (itemized instead, never silent)",
+            a.verdict == Verdict::Ship
+                && a.clause6.harm == 0.0
+                && a.clause6.size == 0.0
+                && (a.clause6.excluded_size_spend - 0.0051).abs() < 1e-9
+                && a.clause6.excluded_size_spend_cells == 2
+                && a.clauses
+                    .iter()
+                    .any(|c| c.contains("authorized size spend <=1% 0.0051 [2]")),
+        );
+        // (e) the frozen rule strings state the new policy verbatim (and the
+        //     superseded "size cells exact and unchanged" wording is gone).
+        check(
+            "size spend: the artifact rule strings carry the 2026-09-05 policy verbatim",
+            CLAUSE5_MARGIN_FLOOR_RULE.contains("size erosions within 1% are authorized spend (owner directive 2026-09-05: <1% size hit, wall never loses)")
+                && CLAUSE5_MARGIN_FLOOR_RULE.contains("size erosions >1% and size flips convict directly")
+                && !CLAUSE5_MARGIN_FLOOR_RULE.contains("size cells exact and unchanged"),
+        );
+    }
 
     // ---- margin tiers (reporting only) ------------------------------------
     let tier_cells = vec![
@@ -3881,12 +4094,12 @@ pub fn selftest() -> ExitCode {
         }
 
         // (r2) A rule change flips the verdict: the fixture's cells convict
-        // clause 5 under the CURRENT rules (a size erosion beyond budget),
-        // but the stored artifact — written "under the old rules" — says
-        // SHIP. Rescore must RECOMPUTE, never copy.
+        // clause 5 under the CURRENT rules (a size erosion beyond the
+        // authorized 1% ceiling), but the stored artifact — written "under
+        // the old rules" — says SHIP. Rescore must RECOMPUTE, never copy.
         let rule_change_cells = vec![
             cell("size", 6, 1.05, true, 1.02, true), // gap progress
-            cell("size", 2, 0.999, false, 1.0035, false), // beyond-budget size erosion
+            cell("size", 2, 0.900, false, 0.9200, false), // Δ 0.0200 > authorized 1% ceiling
         ];
         let mut art2 = stored_artifact(&stored_adj, "SHIP", &ConfirmSet::default(), None);
         art2["cells"] = serde_json::json!(rule_change_cells);
