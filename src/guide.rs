@@ -790,10 +790,14 @@ pub const INTENTS: &[Intent] = &[
                (erosions AND flips) require cross-layout CONFIRMED-REAL (try auto-runs `layout confirm`, \
                capped at 12 coordinates); a confirmed-real erosion on a winning cell is acceptable while \
                post <= min(0.80, 1-3*layout_floor); thin margins (base > 0.80) keep the flat 0.005 budget. \
-               Clause 6 prices only RESIDUAL harm (confirmed-real unaccepted + exact size regressions + \
+               Size is exact (no confirmation, no floors): since the owner's 2026-09-05 directive an \
+               erosion within 1% (<1% size hit, wall never loses) is AUTHORIZED-<=1%-SIZE-SPEND — \
+               itemized, excluded from clause-6 harm — while >1% erosions and size flips convict directly. \
+               Clause 6 prices only RESIDUAL harm (confirmed-real unaccepted + >1% size erosions + \
                undecided suspects, conservatively): clause-5-ACCEPTED margin-spend, layout-artifact \
-               acquittals and sub-budget census drift are excluded and itemized on the clause-6 line — \
-               counting accepted spend again is the flat budget in disguise (the #310 failure mode).",
+               acquittals, sub-budget census drift and the authorized size spend are excluded and \
+               itemized on the clause-6 line — counting accepted spend again is the flat budget in \
+               disguise (the #310 failure mode).",
     },
     Intent {
         id: "correct",

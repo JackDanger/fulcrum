@@ -6,6 +6,30 @@ All notable changes to **fulcrum** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — the authorized size-spend ceiling (`fulcrum try`)
+
+The campaign owner's directive (2026-09-05): "I delete the pick-min and all
+that terrible two-encode machinery. Aim for the right solution. We can take
+a <1% hit to compression size but we will not lose on wall clock under any
+conditions."
+
+- A passing size cell may erode up to `SIZE_SPEND_CEILING` (1% of the
+  rival's size = an absolute `ours/rival` ratio delta of 0.01) without
+  convicting. A such erosion is AUTHORIZED SPEND — classified
+  `AUTHORIZED-<=1%-SIZE-SPEND` (size is exact: never LAYOUT-ARTIFACT, never
+  confirmed), printed as a `clause 5 [size-spend]` chain, and EXCLUDED from
+  clause-6 residual harm, itemized as `authorized size spend <=1%` on the
+  clause-6 line and in the ledger's `excluded_size_spend` fields — exactly
+  like the wall margin-spend. Size erosions >1% still convict clause 5 and
+  stay harm; a size pass→fail flip still convicts clause 3 even inside the
+  ceiling.
+- ALL wall rules are untouched: `erosion_budget`, the margin floor, the
+  flat budget, the confirm cap — byte for byte. The clause-5 OK lines gain
+  a suffix only when a size spend exists in the run.
+- The frozen rule text in every artifact's `clause5_margin_floor.rule` is
+  amended to the new policy verbatim (both artifact writers now carry it in
+  the centralized `CLAUSE5_MARGIN_FLOOR_RULE`).
+
 ### Added — `fulcrum try --rescore <out-dir>`: re-adjudicate a stored artifact
 
 Receipt: three ~10-hour reruns were burned because a verdict could not be
