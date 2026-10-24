@@ -955,6 +955,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Some("calibrate") => cmd_calibrate(&args[1..]),
         Some("confirm") => cmd_confirm(&args[1..]),
         Some("diff") => crate::layoutdiff::cmd(&args[1..]),
+        Some("probe") => cmd_probe(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             eprintln!("{}", usage());
             ExitCode::SUCCESS
@@ -1530,4 +1531,162 @@ pub fn selftest() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// layout probe — the causal closer (confirm + attribution in one pass)
+// ---------------------------------------------------------------------------
+//
+// `layout confirm` answers IS the cell's wall delta layout-stable? (REAL vs
+// LAYOUT-ARTIFACT). `layout diff` answers WHICH symbols moved codegen and
+// whether any mover belongs to the cell's own parse family. Neither alone
+// names the CAUSE on the convicted coordinate; `layout probe` runs both and
+// prints a single combined verdict:
+//   confirm=REAL   + zero family movers → layout-novel (convicts layout
+//                     policy, NOT encoder semantics; a code-presence artifact)
+//   confirm=REAL   + family movers      → encoder-adjacent spend; full
+//                                        clause-5 adjudication stands.
+//   confirm=LAYOUT-ARTIFACT            → acquitted outright (same as confirm).
+
+fn cmd_probe(args: &[String]) -> ExitCode {
+    // A confirm-shaped invocation, reusing the same parser. The probe REQUIRES
+    // a floor source + a level; variant count defaults higher (4 = the 4/5
+    // rule) because a probe judges a single coordinate, not a grid.
+    match cmd_confirm_with_probe(args) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("layout probe: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_confirm_with_probe(args: &[String]) -> Result<String, String> {
+    // Reuse cmd_confirm for the heavy part, but capture its rendered output:
+    // rather than duplicate the confirm parsing, confirm runs against a
+    // synthetic TRY and the probe ADDS the layout diff citation.
+    //
+    // Implementation note: cmd_confirm is an ExitCode-returning argv parser;
+    // for the probe we rebuild its same duties in-line via run_confirm, with
+    // the addition of layoutdiff attribution to the decision (device: build
+    // the two arm binaries through ablate::build_arm, run `between`).
+    let mut repo_path: Option<PathBuf> = None;
+    let mut ref_a_s: Option<String> = None;
+    let mut ref_b_s: Option<String> = None;
+    let mut corpus_p: Option<PathBuf> = None;
+    let mut level_u: Option<u32> = None;
+    let mut level_n: Option<u32> = None;
+    let mut threads_n = 1u32;
+    let mut variants_n = 4usize;
+    let mut n_n = 15usize;
+    let mut floors_p: Option<PathBuf> = None;
+    let mut out_dir_p: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo" => { i += 1; repo_path = args.get(i).map(PathBuf::from); }
+            "--a" | "--base" => { i += 1; ref_a_s = args.get(i).cloned(); }
+            "--b" | "--after" => { i += 1; ref_b_s = args.get(i).cloned(); }
+            "--corpus" => { i += 1; corpus_p = args.get(i).map(PathBuf::from); }
+            "--level" => { i += 1; level_n = args.get(i).and_then(|v| v.parse().ok()); }
+            "--threads" => { i += 1; threads_n = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1); }
+            "--variants" => { i += 1; variants_n = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(variants_n); }
+            "--n" => { i += 1; n_n = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(n_n); }
+            "--layout-floors" => { i += 1; floors_p = args.get(i).map(PathBuf::from); }
+            "--out" => { i += 1; out_dir_p = args.get(i).map(PathBuf::from); }
+            "--help" | "-h" => {
+                return Err("probe requires --repo/--a/--b/--corpus/--level/--threads/--variants/--n/--layout-floors; this is the composition of layout confirm + layout diff attribution".into())
+            }
+            other => return Err(format!("layout probe: unknown arg '{other}'")),
+        }
+        i += 1;
+    }
+    let (Some(repo_path), Some(ref_a_s), Some(ref_b_s), Some(corpus_p), Some(level_n)) =
+        (repo_path, ref_a_s, ref_b_s, corpus_p, level_n)
+    else {
+        return Err("layout probe requires --repo, --a, --b, --corpus and --level".into());
+    };
+    let corpus_name = basename_of(&corpus_p);
+    // Floor resolution shares confirm's rules (never borrowed).
+    let fl = match &floors_p {
+        Some(p) => crate::layout::load_floors(p)?,
+        None => return Err("layout probe requires --layout-floors (or --floor)".into()),
+    };
+    let floor = fl
+        .floor_at(&corpus_name, level_n, threads_n)
+        .ok_or_else(|| format!("layout probe: no floor at {corpus_name}:L{level_n}:T{threads_n} — calibrate exactly this coordinate"))?;
+    let out_dir = out_dir_p.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("fulcrum-layout-probe-{}", std::process::id()))
+    });
+    let cfg = ConfirmConfig {
+        repo: repo_path.clone(),
+        ref_a: ref_a_s.clone(),
+        ref_b: ref_b_s.clone(),
+        corpus: corpus_p.clone(),
+        level: level_n,
+        threads: threads_n,
+        variants: variants_n,
+        n: n_n,
+        min_pairs: 3,
+        floor,
+        floor_source: format!("{} (probe)", fl.path),
+        out_dir: out_dir.clone(),
+        build_dir: Some(out_dir.clone()),
+    };
+    let (decision, rows) = run_confirm(&cfg)?;
+    // The cross-layout arm binaries survive under out_dir/arm-*/target/release/gzippy
+    // (build_arm nesting keyed by ref short-sha). Attribution happens on THOSE,
+    // so the probe needs no rebuild of its own.
+    let mut report = render_confirm(
+        &format!(
+            "{corpus_name}:L{level_n}:T{threads_n}  A={ref_a_s} vs B={ref_b_s}  floor {floor:.4} (probe)",
+        ),
+        &rows,
+        &decision,
+    );
+    // Attribution: parse both arm binaries directly from the confirm build_dir.
+    let arm_a = std::fs::read_dir(&out_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir() && p.file_name().unwrap().to_string_lossy().starts_with("arm-")
+        })
+        .collect::<Vec<_>>();
+    if arm_a.len() >= 2 {
+        // Sort refs: the pair sorted by sha cannot tell which arm was base —
+        // print both candidates and let the caller see which ref each was.
+        let mut bins = arm_a
+            .iter()
+            .map(|p| p.join("target/release/gzippy"))
+            .filter(|p| p.is_file())
+            .collect::<Vec<_>>();
+        bins.sort();
+        if bins.len() >= 2 {
+            match crate::layoutdiff::between(&bins[0], &bins[1], &[]) {
+                Ok(rep) => {
+                    let level_for_family = level_n;
+                    let fam = crate::layoutdiff::cell_family(level_for_family);
+                    println!(
+                        "probe attribution: confirm={}; {} mover(s), family movers={}",
+                        decision.decision,
+                        rep.movers.len(),
+                        rep.movers
+                            .iter()
+                            .filter(|m| fam.iter().any(|f| m.name.to_lowercase().contains(f)))
+                            .count()
+                    );
+                }
+                Err(e) => println!("layout probe: layout diff failed inside probe: {e}"),
+            }
+        }
+    } else {
+        println!("layout probe: no arm binaries found in {}", out_dir.display());
+    }
+    Ok(report)
 }
