@@ -2677,6 +2677,26 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
     match merge_stabilized(&runs, cfg) {
         Ok((verdict, report)) => {
             println!("{report}");
+            // Merged artifact must persist like any verification receipt
+            // (charter: every verification line names its command AND carries
+            // its artifact — a merged verdict with no file rots).
+            let mpath = merged_out.join("try-stabilized.json");
+            let merged_artifact = serde_json::json!({
+                "stabilize_runs": runs.len(),
+                "verdict": verdict,
+                "runs": runs.iter().map(|(adj, _)| {
+                    serde_json::json!({
+                        "verdict": adj.verdict,
+                        "clauses": adj.clauses,
+                        "rerun": adj.rerun,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            if let Err(e) = std::fs::write(&mpath, serde_json::to_string_pretty(&merged_artifact).unwrap()) {
+                eprintln!("try --stabilize: cannot write {}: {e}", mpath.display());
+            } else {
+                println!("  artifact: {}", mpath.display());
+            }
             if cited {
                 print_attribution(cfg, &merged_out);
             }
