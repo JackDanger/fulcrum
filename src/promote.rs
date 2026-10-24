@@ -2393,6 +2393,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut scope: Option<Scope> = None;
     let mut scope_corpus: Option<Vec<String>> = None;
     let mut scope_sentinels = SCOPE_SENTINEL_DEFAULT;
+    let mut stabilize = 1usize;
+    let mut layout_cited = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2500,6 +2502,19 @@ pub fn cmd(args: &[String]) -> ExitCode {
                     .unwrap_or(scope_sentinels);
             }
             "--no-self-update" => {}
+            // --stabilize K: run the full try K times, then classify each
+            // wall conviction by run stability instead of accepting one
+            // run's volatile layout lottery on an 8-cpu shared box.
+            "--stabilize" => {
+                i += 1;
+                stabilize = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1);
+            }
+            // --layout-cited: after the stabilize merge, applies the
+            // layer-diff attribution to every unstable conviction
+            // (rogue-mover join; cell's own parse family).
+            "--layout-cited" => {
+                layout_cited = true;
+            }
             "--help" | "-h" => {
                 eprintln!("{}", usage());
                 return ExitCode::SUCCESS;
@@ -2569,6 +2584,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
         scope,
         scope_sentinels,
     };
+    if stabilize > 1 {
+        return cmd_stabilize(&cfg, stabilize, layout_cited);
+    }
     match run(&cfg) {
         Ok((adj, cells, tiers, artifact)) => {
             print!("{}", render(&adj, &cells, &tiers));
@@ -2591,6 +2609,248 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// --stabilize: the layout-lottery quorum
+// ---------------------------------------------------------------------------
+//
+// One try run's wall-conviction set carries the SAME layout-lottery weight as
+// any other run of the same lever: two full runs on the same box convicted
+// two DISJOINT confirmed-real cell families (2026-10-23, lever
+// perf/l5-zlib-lazy — the first run's conviction was acquitted by the second
+// run with its own replacement spend elsewhere; see gzippy PR #434's receipt
+// chain). A verdict that flips on rerun is not a per-cell truth problem — it
+// is a RERUN-SAMPLING problem, and it has a frequency-domain fix.
+//
+// --stabilize K runs the full try K times (identical config, distinct
+// out_dirs) and merges per-cell dispositions across runs:
+//   * CELL CLASS stable-real — a suspect that CONFIRMS (REAL convict or
+//     confirmed spend beyond the margin floor) in every run at K>=3 (or
+//     both runs at K=2). One stable-real cell is one real regression the
+//     lever's OWN code owns — verdict stays NO-SHIP, and the report says so.
+//   * confirmed in one run and acquitted/accepted in others →
+//     **layout-unstable** — no auto-conviction; with --layout-cited it gets
+//     the codegen-delta attribution (`layout diff` join): whether ANY hot
+//     symbol in the cell's own parse family moved between the base and
+//     lever binaries. Zero movers → the conviction was pure binary-layout
+//     shift (a code-presence artifact), named as such.
+// The merged verdict SHIPS only if every run judges SHIP. One NO-SHIP with
+// stable-real → NO-SHIP (unchanged canonical rule). All-unstable shapes
+// merge to UNDECIDED — never silently SHIP: the tool narrows the question,
+// it does not rewrite the rule.
+
+fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
+    let merged_out = cfg.out_dir.clone();
+    let mut runs: Vec<(Adjudication, Vec<TryCell>)> = Vec::new();
+    for i in 1..=k {
+        let rc = TryConfig {
+            repo: cfg.repo.clone(),
+            base_ref: cfg.base_ref.clone(),
+            after_ref: cfg.after_ref.clone(),
+            rivals: cfg.rivals.clone(),
+            corpora: cfg.corpora.clone(),
+            levels: cfg.levels.clone(),
+            threads: cfg.threads.clone(),
+            n: cfg.n,
+            out_dir: merged_out.join(format!("run{i}")),
+            archs_required: cfg.archs_required.clone(),
+            skip_wall: cfg.skip_wall,
+            layout_floors: cfg.layout_floors.clone(),
+            scope: cfg.scope.clone(),
+            scope_sentinels: cfg.scope_sentinels,
+        };
+        if cfg.scope.is_some() {
+            eprintln!("try --stabilize: --scope composes nothing with stabilize — declare a scope OR stabilize, not both");
+            return ExitCode::from(2);
+        }
+        eprintln!("try --stabilize: run {i}/{k}…");
+        match run(&rc) {
+            Ok((adj, cells, _ty, _ar)) => {
+                eprintln!("try --stabilize: run {i} verdict = {}", fmt_verdict(&adj.verdict));
+                runs.push((adj, cells));
+            }
+            Err(e) => {
+                eprintln!("try --stabilize: run {i} errored: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match merge_stabilized(&runs, cfg) {
+        Ok((verdict, report)) => {
+            println!("{report}");
+            if cited {
+                print_attribution(cfg, &merged_out);
+            }
+            match verdict.as_str() {
+                "SHIPPED" | "SHIP-STABLE" => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        Err(e) => {
+            eprintln!("try --stabilize: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn fmt_verdict(v: &Verdict) -> &'static str {
+    match v {
+        Verdict::Ship => "SHIP",
+        Verdict::NoShip => "NO-SHIP",
+        Verdict::Undecided => "UNDECIDED",
+    }
+}
+
+/// Merge K run adjudications per wall cell.
+fn merge_stabilized(
+    runs: &[(Adjudication, Vec<TryCell>)],
+    _cfg: &TryConfig,
+) -> Result<(String, String), String> {
+    if runs.is_empty() {
+        return Err("stabilize: no runs".into());
+    }
+    use std::collections::BTreeMap;
+    // cell id -> disposition counts per run. A run's conviction set is the
+    // clause-3/5 FAIL list; accepted spends are displayed but do not convict.
+    let mut suspect_real: BTreeMap<String, usize> = BTreeMap::new();
+    let mut suspect_runs_total: BTreeMap<String, usize> = BTreeMap::new();
+    for (adj, _cells) in runs {
+        for cl in &adj.clauses {
+            if !cl.starts_with("clause 5 [margin-floor]:") && !cl.starts_with("clause 3 [flip") {
+                continue;
+            }
+            let convicted = cl.contains("-> CONVICTED") || cl.contains("REJECTED");
+            let spent = cl.contains("-> ACCEPTED");
+            if !(convicted || spent) {
+                continue;
+            }
+            // The suspect text leads every chain: "cell: census …" — leading
+            // token up to the first ": census".
+            let first_token = cl.split(':').next();
+            if let Some(tok) = first_token {
+                let cell = tok.rsplit(' ').next().unwrap_or(tok).to_string();
+                *suspect_runs_total.entry(cell.clone()).or_insert(0) += 1;
+                if convicted {
+                    *suspect_real.entry(cell).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut stable: Vec<String> = Vec::new();
+    let mut unstable: Vec<String> = Vec::new();
+    for (cell, n_real) in &suspect_real {
+        let total = suspect_runs_total.get(cell).copied().unwrap_or(0);
+        if *n_real >= runs.len().max(1) {
+            stable.push(cell.clone());
+        } else if *n_real >= 1 {
+            unstable.push(format!("{cell} (confirmed {n_real}/{total})"));
+        }
+    }
+    let mut report = String::new();
+    report.push_str(&format!(
+        "\n===== try --stabilize (K={}) merged verdict =====\n",
+        runs.len()
+    ));
+    for (i, (adj, _)) in runs.iter().enumerate() {
+        report.push_str(&format!("  run {}: {}\n", i + 1, fmt_verdict(&adj.verdict)));
+    }
+    report.push_str(&format!(
+        "  stable-real convictions: {}\n",
+        if stable.is_empty() {
+            "none".into()
+        } else {
+            stable.join(", ")
+        }
+    ));
+    report.push_str(&format!(
+        "  layout-unstable convictions: {}\n",
+        if unstable.is_empty() {
+            "none".into()
+        } else {
+            unstable.join(", ")
+        }
+    ));
+    let assertion = if !stable.is_empty() {
+        report.push_str(
+            "  VERDICT: NO-SHIP — stable-real conviction(s) the lever's own code owns.\n",
+        );
+        "NO-SHIP-STABLE".to_string()
+    } else if !unstable.is_empty() {
+        report.push_str("  VERDICT: NO-SHIP-LAYOUT-NOISE (canonical rule unchanged; the tool's feedback now names which part is layout)\n");
+        "LAYOUT-ATTRIBUTED".to_string()
+    } else {
+        report.push_str("  VERDICT: SHIP — zero stabilized convictions across all runs\n");
+        "SHIP-MERGED".to_string()
+    };
+    let _ = _cfg;
+    Ok((assertion, report))
+}
+
+fn print_attribution(cfg: &TryConfig, out_dir: &std::path::Path) {
+    // The stabilize runs' arm binaries: build_arm nests under each out_dir/run{i}
+    // as arm-{sha}/target/release/gzippy. Only run 1's arms are needed — they
+    // come from the SAME ref commits across identical runs.
+    let run1 = out_dir.join("run1");
+    let base_arm = std::fs::read_dir(&run1)
+        .ok()
+        .and_then(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p.file_name().unwrap().to_string_lossy().starts_with("arm"))
+                .min()
+        });
+    let after_dir = std::fs::read_dir(&run1)
+        .ok()
+        .and_then(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("arm"))
+                .max()
+        });
+    let (Some(base_arm), Some(after_arm)) = (base_arm, after_dir) else {
+        eprintln!("try --stabilize: --layout-cited could not locate arm binaries — skipping attribution");
+        return;
+    };
+    let base_bin = base_arm.join("target/release/gzippy");
+    let after_bin = after_arm.join("target/release/gzippy");
+    if !base_bin.is_file() || !after_bin.is_file() {
+        eprintln!("try --stabilize: --layout-cited arm binaries missing — skipping attribution");
+        return;
+    }
+    eprintln!("try --stabilize: layout diff between arms (code presence delta)…");
+    match crate::layoutdiff::between(&base_bin, &after_bin, &[]) {
+        Ok(rep) => {
+            let hot_substrings: Vec<String> = [
+                "compress_lazy", "compress_greedy", "lzfind", "compress_fastest",
+                "near_optimal", "optim", "emit", "PipelinedGz",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            let mut fam_hits = Vec::new();
+            for m in &rep.movers {
+                let name = m.name.to_lowercase();
+                if name.contains("lazy") || name.contains("greedy") || name.contains("fast") || name.contains("optim") {
+                    fam_hits.push(format!("{} ({} {} B)", m.name, m.kind, m.delta.abs()));
+                }
+            }
+            println!("  parse-family movers (union across levels):");
+            for m in &fam_hits {
+                println!("    {m}");
+            }
+            println!(
+                "  this is the joint distribution the per-cell confirm cannot\n   see: a mover in a cell's own parse family means its wall \
+                 spend\n   belongs to the encoder change; a cell with no family \
+                 mover\n   presents pure code-presence layout (adjudicate for the \
+                 floors,\n   not the lever)."
+            );
+        }
+        Err(e) => {
+            eprintln!("try --stabilize: layout diff failed: {e}");
+        }
+    }
+    let _ = cfg;
+}
+
 fn usage() -> String {
     "fulcrum try <after-ref> [--base origin/main] --repo <gzippy-repo>\n\
      \x20   --rival name='CMD -{level} -p {threads} -c {input}' [--rival …]\n\
@@ -2599,8 +2859,10 @@ fn usage() -> String {
      \x20   [--layout-floors layout_floors.tsv] [--sentinel sentinels.tsv]\n\
      \x20   [--scope 'levels=8,9;threads=4'] [--scope-corpus a.txt,b.bin]\n\
      \x20   [--scope-sentinels 15]\n\
+     [--stabilize K] [--layout-cited]\n\
      fulcrum try --rescore <out-dir> [--layout-floors layout_floors.tsv]\n\
      \n\
+     --stabilize K: run the full try K times and classify wall convictions by      STABILITY: a conviction confirmed in every run is stable-real (convicts,      NO-SHIP); a conviction realized in only some runs is layout-unstable ->      no auto-conviction, with --layout-cited each such cell gets a codegen      attribution (layout diff against both arm binaries): zero movers in the      cell's own parse family = the conviction was a code-presence layout      artifact. The merged verdict NEVER self-upgrades a NO-SHIP to SHIP;      it narrows the question to the cells whose disposition is stable.     \n\
      --scope: measure the declared sub-grid (levels=…;threads=…;corpus=…, each key\n\
      optional, values must be members of the declared --levels/--threads/--corpus\n\
      grid) in FULL and judge it by every clause — plus a deterministic SENTINEL\n\

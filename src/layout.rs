@@ -954,6 +954,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Some("selftest") => selftest(),
         Some("calibrate") => cmd_calibrate(&args[1..]),
         Some("confirm") => cmd_confirm(&args[1..]),
+        Some("diff") => crate::layoutdiff::cmd(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             eprintln!("{}", usage());
             ExitCode::SUCCESS
