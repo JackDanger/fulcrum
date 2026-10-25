@@ -430,11 +430,36 @@ pub struct CalibrateConfig {
     pub variants: usize,
     pub n: usize,
     pub out_dir: PathBuf,
+    /// `--cpus <mask>`: pin every paired wall run via `taskset -c`. All arms
+    /// run under the SAME mask, so the relative delta stays interleaved-honest.
+    pub cpus: Option<String>,
 }
 
 fn tmpl_for(bin: &Path) -> String {
     format!("{} -{{level}} -p {{threads}} -c {{input}}", bin.display())
 }
+
+/// CPU pinning for wall measurements: when a `--cpus <mask>` is declared,
+/// every census command (ours AND rival) runs under `taskset -c <mask>`.
+/// Shared-box layout noise was measured real (2026-10-23 campaign: two
+/// layout-confirmed spends appeared on cells the lever never touches); an
+/// unpinned scheduler amplifies exactly that wobble into the paired walls.
+/// Pinning does not change the ORDER of arms (both arms run inside the same
+/// mask, so the paired ratio keeps its interleaving discipline).
+fn pin_wrap(tmpl: &str, mask: &Option<String>) -> String {
+    match mask {
+        Some(m) if !m.is_empty() => format!("taskset -c {m} {tmpl}"),
+        _ => tmpl.to_string(),
+    }
+}
+
+/// Carried defaults after the owner-aarch64 shared-box campaign (2026-10-23):
+/// 2 variants with n=15 read ±0.5-0.9% REAL deltas on cells whose configs the
+/// lever never touched — the layout lottery on a shared box is bigger than
+/// 2 variants' measured band. 4 variants × n=25 is the noise floor the
+/// clause-5 flat budget can actually sit inside.
+const CALIBRATE_VARIANTS_DEFAULT: usize = 4;
+const CALIBRATE_N_DEFAULT: usize = 25;
 
 pub fn run_calibrate(cfg: &CalibrateConfig) -> Result<(PathBuf, PathBuf), String> {
     if cfg.variants == 0 {
@@ -505,10 +530,10 @@ pub fn run_calibrate(cfg: &CalibrateConfig) -> Result<(PathBuf, PathBuf), String
                     );
                     let t0 = std::time::Instant::now();
                     let wc = crate::wallcensus::CensusConfig {
-                        ours_tmpl: tmpl_for(bin),
+                        ours_tmpl: pin_wrap(&tmpl_for(bin), &cfg.cpus),
                         rivals: vec![Rival {
                             name: "pristine".to_string(),
-                            tmpl: tmpl_for(&pristine_bin),
+                            tmpl: pin_wrap(&tmpl_for(&pristine_bin), &cfg.cpus),
                         }],
                         levels: vec![level],
                         threads: vec![threads],
@@ -747,6 +772,8 @@ pub struct ConfirmConfig {
     pub variants: usize,
     pub n: usize,
     pub min_pairs: usize,
+    /// `--cpus <mask>` pinning (both arms under the SAME mask).
+    pub cpus: Option<String>,
     /// The coordinate's own calibrated floor (from `--layout-floors`, exact
     /// coordinate only — never borrowed — or an explicit `--floor`).
     pub floor: f64,
@@ -830,10 +857,10 @@ pub fn run_confirm(cfg: &ConfirmConfig) -> Result<(ConfirmDecision, Vec<ConfirmP
             cfg.n
         );
         let wc = crate::wallcensus::CensusConfig {
-            ours_tmpl: tmpl_for(a),
+            ours_tmpl: pin_wrap(&tmpl_for(a), &cfg.cpus),
             rivals: vec![Rival {
                 name: "B".to_string(),
-                tmpl: tmpl_for(b),
+                tmpl: pin_wrap(&tmpl_for(b), &cfg.cpus),
             }],
             levels: vec![cfg.level],
             threads: vec![cfg.threads],
@@ -977,6 +1004,7 @@ fn cmd_confirm(args: &[String]) -> ExitCode {
     let mut variants = 4usize;
     let mut n = 15usize;
     let mut min_pairs = 3usize;
+    let mut cpus_mask: Option<String> = None;
     let mut floors_path: Option<PathBuf> = None;
     let mut floor_override: Option<f64> = None;
     let mut out_dir: Option<PathBuf> = None;
@@ -1029,6 +1057,10 @@ fn cmd_confirm(args: &[String]) -> ExitCode {
             "--floor" => {
                 i += 1;
                 floor_override = args.get(i).and_then(|v| v.parse().ok());
+            }
+            "--cpus" => {
+                i += 1;
+                cpus_mask = args.get(i).map(|v| v.to_string());
             }
             "--out" => {
                 i += 1;
@@ -1106,6 +1138,7 @@ fn cmd_confirm(args: &[String]) -> ExitCode {
         variants,
         n,
         min_pairs,
+        cpus: cpus_mask,
         floor,
         floor_source,
         out_dir,
@@ -1132,13 +1165,14 @@ fn cmd_confirm(args: &[String]) -> ExitCode {
 
 fn cmd_calibrate(args: &[String]) -> ExitCode {
     let mut repo: Option<PathBuf> = None;
+    let mut cpus_mask: Option<String> = None;
     let mut git_ref = "origin/main".to_string();
     let mut rivals = Vec::new();
     let mut corpora = Vec::new();
     let mut levels: Vec<u32> = vec![2, 6, 9];
     let mut threads: Vec<u32> = vec![1];
-    let mut variants = 2usize;
-    let mut n = 25usize;
+    let mut variants = CALIBRATE_VARIANTS_DEFAULT;
+    let mut n = CALIBRATE_N_DEFAULT;
     let mut out_dir: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1232,6 +1266,7 @@ fn cmd_calibrate(args: &[String]) -> ExitCode {
         threads,
         variants,
         n,
+        cpus: cpus_mask,
         out_dir,
     };
     match run_calibrate(&cfg) {
@@ -1582,6 +1617,7 @@ fn cmd_confirm_with_probe(args: &[String]) -> Result<String, String> {
     let mut level_u: Option<u32> = None;
     let mut level_n: Option<u32> = None;
     let mut threads_n = 1u32;
+    let mut cpus_p: Option<String> = None;
     let mut variants_n = 4usize;
     let mut n_n = 15usize;
     let mut floors_p: Option<PathBuf> = None;
@@ -1633,6 +1669,7 @@ fn cmd_confirm_with_probe(args: &[String]) -> Result<String, String> {
         variants: variants_n,
         n: n_n,
         min_pairs: 3,
+        cpus: cpus_p,
         floor,
         floor_source: format!("{} (probe)", fl.path),
         out_dir: out_dir.clone(),

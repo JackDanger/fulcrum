@@ -1583,8 +1583,10 @@ pub struct TryConfig {
     /// plus an out-of-scope sentinel sample. `None` = the whole grid,
     /// unchanged.
     pub scope: Option<Scope>,
-    /// Sentinel sample size for scoped runs (`--scope-sentinels`).
+    /// Sentinel sample size for which... dropped: sentinel sample declared above.
     pub scope_sentinels: usize,
+    /// `--cpus <mask>`: pin every census wall command (try + auto-confirms).
+    pub cpus: Option<String>,
 }
 
 /// The roundtrip command both censuses VOID against.
@@ -1979,6 +1981,7 @@ fn auto_confirm(
                     cfg.n
                 );
                 let ccfg = crate::layout::ConfirmConfig {
+                    cpus: cfg.cpus.clone(),
                     repo: cfg.repo.clone(),
                     // A = after, B = base: the median ln(A/B) is then
                     // positive when the AFTER arm is slower, matching the
@@ -2389,6 +2392,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut archs_required: Vec<String> = vec![std::env::consts::ARCH.to_string()];
     let mut skip_wall = false;
     let mut layout_floors: Option<PathBuf> = None;
+    let mut cpus_mask: Option<String> = None;
     let mut sentinel_file: Option<PathBuf> = None;
     let mut scope: Option<Scope> = None;
     let mut scope_corpus: Option<Vec<String>> = None;
@@ -2464,6 +2468,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 }
             }
             "--size-only" => skip_wall = true,
+            "--cpus" => {
+                i += 1;
+                cpus_mask = args.get(i).map(|v| v.to_string());
+            }
             "--layout-floors" => {
                 i += 1;
                 layout_floors = args.get(i).map(PathBuf::from);
@@ -2583,6 +2591,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         layout_floors,
         scope,
         scope_sentinels,
+        cpus: cpus_mask,
     };
     if stabilize > 1 {
         return cmd_stabilize(&cfg, stabilize, layout_cited);
@@ -2657,6 +2666,7 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
             layout_floors: cfg.layout_floors.clone(),
             scope: cfg.scope.clone(),
             scope_sentinels: cfg.scope_sentinels,
+            cpus: cfg.cpus.clone(),
         };
         if cfg.scope.is_some() {
             eprintln!("try --stabilize: --scope composes nothing with stabilize — declare a scope OR stabilize, not both");
