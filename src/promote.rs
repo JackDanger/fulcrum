@@ -92,6 +92,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // The pure clause engine
@@ -2043,6 +2044,50 @@ fn auto_confirm(
     set
 }
 
+/// Coverage of a floors file over a coordinate set — the arithmetic behind
+/// the `run()` pre-flight warning's "N of M" header. THE RIVAL JOIN COUNTS:
+/// a coordinate is covered only when EVERY rival has a `floor_for` row there
+/// (the margin-floor screen and the confirm boundary both join
+/// `floor_for(rival, …)`, so a rival-agnostic `floor_at` check undercounts
+/// the refusal surface the verdict will actually hit). Returns
+/// `(covered, missing)`, with `covered + missing.len()` equal to the
+/// coordinate total. `floors: None` yields `(0, [])` — that case is the
+/// caller's zero-coverage warning class, never a missing list spanning the
+/// whole grid.
+pub(crate) fn floor_coverage_gaps(
+    corpus_names: &[String],
+    levels: &[u32],
+    threads: &[u32],
+    rivals: &[String],
+    floors: Option<&crate::layout::LayoutFloors>,
+) -> (usize, Vec<String>) {
+    let Some(f) = floors else {
+        return (0, Vec::new());
+    };
+    let mut covered = 0usize;
+    let mut missing = Vec::new();
+    for corpus in corpus_names {
+        for &level in levels {
+            for &t in threads {
+                if rivals
+                    .iter()
+                    .all(|rival| f.floor_for(rival, corpus, level, t).is_some())
+                {
+                    covered += 1;
+                } else {
+                    missing.push(format!("{corpus}:L{level}:T{t}"));
+                }
+            }
+        }
+    }
+    (covered, missing)
+}
+
+/// `--stabilize K` calls [`run`] K times; the floors gap is a property of
+/// the SHARED config, so the pre-flight warning states it once per process
+/// (the stabilize driver's first run), not once per run.
+static FLOOR_COVERAGE_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+
 pub fn run(
     cfg: &TryConfig,
 ) -> Result<(Adjudication, Vec<TryCell>, MarginTiers, serde_json::Value), String> {
@@ -2087,8 +2132,10 @@ pub fn run(
     } else {
         vec!["size", "wall"]
     };
-    if let Some(s) = &cfg.scope {
-        plan_scope(
+    // The seed-0 pre-plan doubles as the coverage check's coordinate source:
+    // its in_* lists do not depend on the sentinel seed.
+    let preflight_scope = match &cfg.scope {
+        Some(s) => Some(plan_scope(
             s,
             &rival_names,
             &corpus_names,
@@ -2097,50 +2144,84 @@ pub fn run(
             &axes,
             0,
             cfg.scope_sentinels,
-        )?;
-    }
+        )?),
+        None => None,
+    };
     // Floor-coverage pre-flight: the confirm machinery and clause 5 both
     // REFUSE a coordinate the floors file does not cover ("a floor is never
     // borrowed"), and every such suspect becomes clause-6 harm at its census
-    // delta — missing coverage never becomes free. Running a full-grid try
-    // against a partial floors file therefore floods the verdict with
-    // conservative UNDECIDED harm BEFORE any wall number is believed. Say so
-    // loudly, during the seconds before builds start, while there is still
-    // time to extend `layout calibrate` — never refusing (UNDECIDED with a
-    // named gap is the charter's honest label, and --size-only runs need no
-    // floors at all).
+    // delta — missing coverage never becomes free. Say so loudly, during the
+    // seconds before builds start, while there is still time to extend
+    // `layout calibrate` — never refusing (UNDECIDED with a named gap is the
+    // charter's honest label, and --size-only runs need no floors at all).
+    // A scoped run is judged on the set it declared, so the gap is computed
+    // over the plan's MEASURED coordinates, not the full declared grid, and
+    // coverage is joined per RIVAL — see `floor_coverage_gaps`.
     if !cfg.skip_wall {
-        if let Some(f) = &floors {
-            let mut missing = Vec::new();
-            let mut covered = 0usize;
-            for corpus in &corpus_names {
-                for &level in &cfg.levels {
-                    for &threads in &cfg.threads {
-                        match f.floor_at(corpus, level, threads) {
-                            Some(_) => covered += 1,
-                            None => {
-                                let basename = format!("{corpus}:L{level}:T{threads}");
-                                missing.push(basename);
-                            }
+        match &floors {
+            Some(f) => {
+                let (set_corpora, set_levels, set_threads, set_name, scope_name) =
+                    match &preflight_scope {
+                        Some(p) => (
+                            &p.in_corpora,
+                            &p.in_levels,
+                            &p.in_threads,
+                            "measured in-scope coordinates",
+                            "declared scope",
+                        ),
+                        None => (
+                            &corpus_names,
+                            &cfg.levels,
+                            &cfg.threads,
+                            "grid coordinates",
+                            "declared grid",
+                        ),
+                    };
+                let (covered, missing) = floor_coverage_gaps(
+                    set_corpora,
+                    set_levels,
+                    set_threads,
+                    &rival_names,
+                    Some(f),
+                );
+                if !missing.is_empty() {
+                    // Print once per process: under --stabilize K, `run()`
+                    // re-enters here K times against the same floors gap.
+                    if !FLOOR_COVERAGE_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                        // "1 of 30 grid coordinates HAS NO layout floor":
+                        // the verb agrees with the leading count.
+                        let verb = if missing.len() == 1 { "has" } else { "have" };
+                        eprintln!(
+                            "try [floor-coverage]: {} of {} {} {} NO layout floor in {} — \
+                             their wall suspects will adjudge UNDECIDED and price into \
+                             clause-6 harm. Extend `layout calibrate` to the {}, or the \
+                             verdict buys conservative harm it never measured.",
+                            missing.len(),
+                            covered + missing.len(),
+                            set_name,
+                            verb,
+                            f.path,
+                            scope_name
+                        );
+                        for m in missing.iter().take(12) {
+                            eprintln!("  uncovered: {m}");
+                        }
+                        if missing.len() > 12 {
+                            eprintln!("  … and {} more", missing.len() - 12);
                         }
                     }
                 }
             }
-            if !missing.is_empty() {
-                let total = covered + missing.len();
-                eprintln!(
-                    "try [floor-coverage]: {} of {} grid coordinates have NO layout floor — \
-                     their wall suspects will adjudge UNDECIDED and price into clause-6 harm. \
-                     Extend `layout calibrate` to the declared grid, or the verdict buys \
-                     conservative harm it never measured.",
-                    missing.len(),
-                    total
-                );
-                for m in missing.iter().take(12) {
-                    eprintln!("  uncovered: {m}");
-                }
-                if missing.len() > 12 {
-                    eprintln!("  … and {} more", missing.len() - 12);
+            None => {
+                // Zero coverage: without the file every wall suspect is
+                // UNDECIDED (nothing to confirm or margin-price with) —
+                // same warning class, zero-coverage wording.
+                if !FLOOR_COVERAGE_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "try [floor-coverage]: no --layout-floors file — every wall suspect \
+                         will adjudge UNDECIDED and price into clause-6 harm; calibrate or \
+                         --size-only"
+                    );
                 }
             }
         }
@@ -4736,5 +4817,140 @@ pub fn selftest() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (floor-coverage pre-flight)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::floor_coverage_gaps;
+    use crate::layout::{LayoutFloors, floor_key};
+    use std::collections::BTreeMap;
+
+    /// A floors file holding exactly these rows — `load_floors` minus the
+    /// TSV round-trip.
+    fn floor_file(entries: &[(&str, &str, u32, u32, f64)]) -> LayoutFloors {
+        let mut map = BTreeMap::new();
+        for (rival, corpus, level, threads, floor) in entries {
+            map.insert(floor_key(rival, corpus, *level, *threads), *floor);
+        }
+        LayoutFloors {
+            path: "layout_floors.tsv".into(),
+            median: 0.01,
+            floors: map,
+        }
+    }
+
+    #[test]
+    fn full_coverage_counts_every_coordinate() {
+        let f = floor_file(&[
+            ("pigz", "c.bin", 1, 1, 0.02),
+            ("pigz", "d.bin", 1, 1, 0.03),
+            ("gzip", "c.bin", 1, 1, 0.02),
+            ("gzip", "d.bin", 1, 1, 0.02),
+        ]);
+        let (covered, missing) = floor_coverage_gaps(
+            &["c.bin".to_string(), "d.bin".to_string()],
+            &[1],
+            &[1],
+            &["pigz".to_string(), "gzip".to_string()],
+            Some(&f),
+        );
+        // 2 corpora x 1 level x 1 thread band = 2 coordinates, both joined
+        // for every rival.
+        assert_eq!(covered, 2);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn partial_coverage_names_the_gaps() {
+        let f = floor_file(&[
+            ("pigz", "c.bin", 1, 1, 0.02),
+            ("pigz", "c.bin", 2, 4, 0.03),
+            ("gzip", "c.bin", 1, 1, 0.02),
+        ]);
+        let (covered, missing) = floor_coverage_gaps(
+            &["c.bin".to_string()],
+            &[1, 2],
+            &[1],
+            &["pigz".to_string(), "gzip".to_string()],
+            Some(&f),
+        );
+        // gzip has no L2:T1 row: that one coordinate is named, pigz's row
+        // does NOT carry it ("a floor is never borrowed"), and the
+        // pre-flight's "N of M" arithmetic stays exact — 1 of 2 here.
+        assert_eq!(covered, 1);
+        assert_eq!(missing, vec!["c.bin:L2:T1"]);
+    }
+
+    #[test]
+    fn floors_none_yields_no_gaps_the_caller_owns_zero_coverage() {
+        // `run()` never passes None here and enumerates nothing: a missing
+        // floors file is its own zero-coverage warning class ("no
+        // --layout-floors file — every wall suspect will adjudge UNDECIDED
+        // …"), not a missing list spanning the whole declared grid.
+        let (covered, missing) = floor_coverage_gaps(
+            &["c.bin".to_string()],
+            &[1],
+            &[1],
+            &["pigz".to_string()],
+            None,
+        );
+        assert_eq!(covered, 0);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn one_rival_missing_is_a_gap_the_rival_join() {
+        // THE RIVAL JOIN fix: jitter rows join try cell ids per rival, so a
+        // coordinate the rival-agnostic `floor_at` would score as covered is
+        // NOT covered while ANY rival lacks a floor_for row there — the
+        // verdict would adjudge that cell UNDECIDED regardless of the other
+        // rivals' rows.
+        let f = floor_file(&[("pigz", "c.bin", 1, 1, 0.02)]);
+        let (covered, missing) = floor_coverage_gaps(
+            &["c.bin".to_string()],
+            &[1],
+            &[1],
+            &["pigz".to_string(), "gzip".to_string()],
+            Some(&f),
+        );
+        assert_eq!(covered, 0);
+        assert_eq!(missing, vec!["c.bin:L1:T1"]);
+    }
+
+    #[test]
+    fn n_of_m_arithmetic_is_exact() {
+        let f = floor_file(&[
+            ("pigz", "a.txt", 1, 4, 0.02),
+            ("gzip", "a.txt", 1, 4, 0.02),
+            ("pigz", "b.bin", 2, 4, 0.03),
+            ("gzip", "b.bin", 2, 4, 0.03),
+        ]);
+        let (covered, missing) = floor_coverage_gaps(
+            &["a.txt".to_string(), "b.bin".to_string()],
+            &[1, 2, 3],
+            &[4],
+            &["pigz".to_string(), "gzip".to_string()],
+            Some(&f),
+        );
+        // 2 corpora x 3 levels x 1 thread band = 6 coordinates, exactly two
+        // covered: the header reads "4 of 6 … have NO layout floor" (singular
+        // "has" when N is 1), with covered + missing = the declared total.
+        assert_eq!(covered, 2);
+        assert_eq!(missing.len(), 4);
+        assert_eq!(covered + missing.len(), 6);
+        assert_eq!(
+            missing,
+            vec![
+                "a.txt:L2:T4".to_string(),
+                "a.txt:L3:T4".to_string(),
+                "b.bin:L1:T4".to_string(),
+                "b.bin:L3:T4".to_string(),
+            ]
+        );
     }
 }

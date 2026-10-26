@@ -83,6 +83,16 @@ held; `--no-self-update` pins a reproduction. Measurement artifacts carry
    (`ablate::build_arm`); identical binary hashes VOID the run.
 4. **REFUSE, never warn.** Missing datasets, single-level `try` runs, opaque
    no-debug binaries, unverifiable provenance: hard errors with exit codes.
+   Designed exception (2026-10-26, `try`'s floor-coverage pre-flight): a
+   coverage gap between `--layout-floors` and the coordinates the run will
+   measure WARNS and names the uncovered coordinates + the floors file
+   instead of refusing — UNDECIDED with the gap named is the charter's
+   honest label, `--size-only` runs legitimately need no floors, and a
+   refusal would break every legitimate partial-floor run that scopes
+   itself to the coordinates its floors file does cover. The gap still
+   prices into clause-6 harm; the warning (`try [floor-coverage]`) exists
+   so that harm is never bought unawares. Receipt:
+   `docs/receipts/README.md`.
 5. **Ir/Dr LOCATE, never predict the wall** — keep the disclaimer on every
    instruction-count surface.
 6. **The trace never closes its JSON array.** The writer streams `[` + objects
