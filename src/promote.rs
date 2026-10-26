@@ -2099,6 +2099,52 @@ pub fn run(
             cfg.scope_sentinels,
         )?;
     }
+    // Floor-coverage pre-flight: the confirm machinery and clause 5 both
+    // REFUSE a coordinate the floors file does not cover ("a floor is never
+    // borrowed"), and every such suspect becomes clause-6 harm at its census
+    // delta — missing coverage never becomes free. Running a full-grid try
+    // against a partial floors file therefore floods the verdict with
+    // conservative UNDECIDED harm BEFORE any wall number is believed. Say so
+    // loudly, during the seconds before builds start, while there is still
+    // time to extend `layout calibrate` — never refusing (UNDECIDED with a
+    // named gap is the charter's honest label, and --size-only runs need no
+    // floors at all).
+    if !cfg.skip_wall {
+        if let Some(f) = &floors {
+            let mut missing = Vec::new();
+            let mut covered = 0usize;
+            for corpus in &corpus_names {
+                for &level in &cfg.levels {
+                    for &threads in &cfg.threads {
+                        match f.floor_at(corpus, level, threads) {
+                            Some(_) => covered += 1,
+                            None => {
+                                let basename = format!("{corpus}:L{level}:T{threads}");
+                                missing.push(basename);
+                            }
+                        }
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                let total = covered + missing.len();
+                eprintln!(
+                    "try [floor-coverage]: {} of {} grid coordinates have NO layout floor — \
+                     their wall suspects will adjudge UNDECIDED and price into clause-6 harm. \
+                     Extend `layout calibrate` to the declared grid, or the verdict buys \
+                     conservative harm it never measured.",
+                    missing.len(),
+                    total
+                );
+                for m in missing.iter().take(12) {
+                    eprintln!("  uncovered: {m}");
+                }
+                if missing.len() > 12 {
+                    eprintln!("  … and {} more", missing.len() - 12);
+                }
+            }
+        }
+    }
     std::fs::create_dir_all(&cfg.out_dir)
         .map_err(|e| format!("mkdir {}: {e}", cfg.out_dir.display()))?;
 
