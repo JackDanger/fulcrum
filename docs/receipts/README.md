@@ -23,7 +23,11 @@ committed copy is byte-identical — same size, 161001 bytes.)
   false`) — the commit before the pre-flight warning itself, so the run
   could not have warned about the gap it then priced. (Field read from the
   run's own `run3/clause-confirm-*/layout_confirm.json` artifacts.)
-- `stabilize_runs`: 3; merged verdict `NO-SHIP-STABLE` (each run NO-SHIP).
+- `stabilize_runs`: 3; merged verdict `NO-SHIP-STABLE
+       (classification corrected below — fulcrum 740c71c: the merger's per-cell
+       classifier collapsed cell ids into the rule-family bracket; under
+       the fixed classifier the four convicted cells realized in 1/3 runs,
+       so the merged label is LAYOUT-ATTRIBUTED and the NO-SHIP stands)` (each run NO-SHIP).
 
 ## The numbers this banks (quoted verbatim from `runs[0]`)
 
@@ -33,7 +37,7 @@ committed copy is byte-identical — same size, 161001 bytes.)
   (harm = confirmed-real 0.0000 [0] + size 0.0000 [0] +
   undecided-conservative 0.8510 [78]; …)"
 
-78 of 91 wall suspects were UNDECIDED purely for missing floor coverage —
+78 of 91 wall suspects were UNDECIDED for missing floor coverage (72) plus 6 confirm-skipped because the same coverage-driven clause-6 flood had already fixed the verdict —
 the lever's real work is in the excluded `clause-5-priced` lines — and
 clause 6 still throttled the verdict on improvement 0.6590 < 2x residual
 harm 0.8510 before any wall number could be believed. This receipt is why
