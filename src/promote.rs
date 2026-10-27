@@ -2113,6 +2113,24 @@ pub fn run(
                 c.display()
             ));
         }
+        // The corpus FILE NAME is the corpus component of the cell ids and
+        // the stabilizer extracts ids as the first whitespace-delimited word
+        // of a clause chain: a blank in the name splits the id and corrupts
+        // every cross-run and rival join built on it. Refused uniformly (CLI
+        // and library alike) — rename the dataset.
+        let corpus_name = c
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| c.display().to_string());
+        if corpus_name.contains(char::is_whitespace) {
+            return Err(format!(
+                "REFUSED: corpus {} has whitespace in its file name — that name is the \
+                 corpus component of the cell ids (rival:corpus:L:T:axis) the stabilizer \
+                 extracts and joins across runs and rivals, so corpus file names must be \
+                 whitespace-free; rename the dataset",
+                c.display()
+            ));
+        }
     }
     // Validate the scope against the declared grid BEFORE any build: a scope
     // typo must refuse in seconds, not after two arms compile. (The real
@@ -2790,10 +2808,18 @@ pub fn cmd(args: &[String]) -> ExitCode {
 //     symbol in the cell's own parse family moved between the base and
 //     lever binaries. Zero movers → the conviction was pure binary-layout
 //     shift (a code-presence artifact), named as such.
-// The merged verdict SHIPS only if every run judges SHIP. One NO-SHIP with
-// stable-real → NO-SHIP (unchanged canonical rule). All-unstable shapes
-// merge to UNDECIDED — never silently SHIP: the tool narrows the question,
-// it does not rewrite the rule.
+// The merged verdict carries one of four labels (merge_stabilized), and the
+// exit code mirrors it — only SHIP-MERGED is SUCCESS:
+//   * NO-SHIP-STABLE — a suspect CONVICTED in every run: a stable-real
+//     conviction the lever's own code owns. Canonical rule unchanged.
+//   * LAYOUT-ATTRIBUTED — suspects convicted in some runs but not all
+//     (layout-unstable; with --layout-cited the report adds the
+//     codegen-delta attribution). Canonical rule unchanged.
+//   * NO-SHIP-PARTIAL — zero convictions to stabilize yet not every run
+//     judged SHIP: the blocker lived in another clause. All-UNDECIDED runs
+//     merge here — pessimistic at merge time, never self-upgrading: the
+//     tool narrows the question, it does not rewrite the rule.
+//   * SHIP-MERGED — every run judged SHIP and zero stabilized convictions.
 
 fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
     let merged_out = cfg.out_dir.clone();
@@ -2839,14 +2865,14 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
             // (charter: every verification line names its command AND carries
             // its artifact — a merged verdict with no file rots).
             let mpath = merged_out.join("try-stabilized.json");
-            let merged_artifact = serde_json::json!({
+            let mut merged_artifact = serde_json::json!({
                 "stabilize_runs": runs.len(),
                 "verdict": verdict,
-                "fulcrum_commit": crate::selfver::COMMIT.to_string(),
-                "fulcrum_dirty": crate::selfver::is_dirty(),
                 "base_ref": cfg.base_ref,
                 "after_ref": cfg.after_ref,
-                "layout_floors": cfg.layout_floors.as_ref().map(|p| p.display().to_string()),
+                // try.json's {"path": …} shape (rescore reloads floors via
+                // layout_floors.path), not a bare string.
+                "layout_floors": cfg.layout_floors.as_ref().map(|p| serde_json::json!({"path": p.display().to_string()})).unwrap_or(serde_json::Value::Null),
                 "runs": runs.iter().map(|(adj, _)| {
                     serde_json::json!({
                         "verdict": adj.verdict,
@@ -2855,6 +2881,11 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
                     })
                 }).collect::<Vec<_>>(),
             });
+            // The standard provenance keys (fulcrum_commit/fulcrum_dirty/
+            // fulcrum_built_epoch) like every other measurement artifact.
+            for (k, v) in crate::selfver::artifact_fields() {
+                merged_artifact[k] = serde_json::Value::String(v);
+            }
             if let Err(e) = std::fs::write(&mpath, serde_json::to_string_pretty(&merged_artifact).unwrap()) {
                 eprintln!("try --stabilize: cannot write {}: {e}", mpath.display());
             } else {
@@ -2863,8 +2894,13 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
             if cited {
                 print_attribution(cfg, &merged_out);
             }
+            // Only SHIP-MERGED is a success — the merger emits exactly four
+            // labels (NO-SHIP-STABLE / LAYOUT-ATTRIBUTED / NO-SHIP-PARTIAL /
+            // SHIP-MERGED); a draft of this match tested "SHIPPED"/
+            // "SHIP-STABLE", labels merge_stabilized has never emitted, so
+            // every merged verdict — SHIP-MERGED included — returned FAILURE.
             match verdict.as_str() {
-                "SHIPPED" | "SHIP-STABLE" => ExitCode::SUCCESS,
+                "SHIP-MERGED" => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
         }
@@ -2891,10 +2927,9 @@ fn merge_stabilized(
         return Err("stabilize: no runs".into());
     }
     use std::collections::BTreeMap;
-    // cell id -> disposition counts per run. A run's conviction set is the
+    // cell id -> convicted-run count. A run's conviction set is the
     // clause-3/5 FAIL list; accepted spends are displayed but do not convict.
     let mut suspect_real: BTreeMap<String, usize> = BTreeMap::new();
-    let mut suspect_runs_total: BTreeMap<String, usize> = BTreeMap::new();
     for (adj, _cells) in runs {
         for cl in &adj.clauses {
             if !cl.starts_with("clause 5 [margin-floor]:") && !cl.starts_with("clause 3 [flip") {
@@ -2920,7 +2955,16 @@ fn merge_stabilized(
                 Some(w) => w.trim_end_matches(':').to_string(),
                 None => continue,
             };
-            *suspect_runs_total.entry(cell.clone()).or_insert(0) += 1;
+            // No silent bucketing of unknown shapes: a cell id is
+            // rival:corpus:L:T:axis — exactly 4 colons. A clause-chain
+            // change that yields a non-id must Err loudly; dropping it
+            // would make the merge drift unobservable.
+            if cell.matches(':').count() != 4 {
+                return Err(format!(
+                    "stabilize: `{cell}` is not a cell id (expected rival:corpus:L:T:axis — \
+                     exactly 4 colons); the clause-chain shape drifted"
+                ));
+            }
             if convicted {
                 *suspect_real.entry(cell).or_insert(0) += 1;
             }
@@ -2929,14 +2973,13 @@ fn merge_stabilized(
     let mut stable: Vec<String> = Vec::new();
     let mut unstable: Vec<String> = Vec::new();
     for (cell, n_real) in &suspect_real {
-        let total = suspect_runs_total.get(cell).copied().unwrap_or(0);
         if *n_real >= runs.len().max(1) {
             stable.push(cell.clone());
         } else if *n_real >= 1 {
-            // Denominator is runs.len(), not the occurrences count: a cell
-            // absent from a run's clause list was not a suspect there, and
-            // "confirmed 1/1" would read stable to a human scanning the
-            // merge report. "confirmed 1/3" says what it means.
+            // Denominator is runs.len(): a cell absent from a run's clause
+            // list was not a suspect there, and "confirmed 1/1" would read
+            // stable to a human scanning the merge report. "confirmed 1/3"
+            // says what it means.
             unstable.push(format!(
                 "{cell} (confirmed {n_real}/{})",
                 runs.len()
