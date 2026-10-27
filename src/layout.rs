@@ -236,8 +236,8 @@ pub fn render_floors_tsv(rows: &[FloorRow], provenance: &[(String, String)]) -> 
     s
 }
 
-/// Parse a floors TSV. `#` lines are provenance; NaN floors are skipped (they
-/// fall back to the median like missing cells). Refuses a file with no finite
+/// Parse a floors TSV. `#` lines are provenance; NaN floors are skipped and the coordinate is ABSENT —
+/// it is never handed a borrowed floor or the median (see `floor_for`). Refuses a file with no finite
 /// floor — a gate may only cite a dataset that exists.
 pub fn load_floors(path: &Path) -> Result<LayoutFloors, String> {
     let text = std::fs::read_to_string(path)
