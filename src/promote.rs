@@ -2115,9 +2115,10 @@ pub fn run(
         }
         // The corpus FILE NAME is the corpus component of the cell ids and
         // the stabilizer extracts ids as the first whitespace-delimited word
-        // of a clause chain: a blank in the name splits the id and corrupts
-        // every cross-run and rival join built on it. Refused uniformly (CLI
-        // and library alike) — rename the dataset.
+        // of a clause chain: a blank in the name splits the id, and a colon
+        // shifts the id off the exact rival:corpus:L:T:axis colon count —
+        // both corrupt every cross-run and rival join built on it. Refused
+        // uniformly (CLI and library alike) — rename the dataset.
         let corpus_name = c
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -2128,6 +2129,15 @@ pub fn run(
                  corpus component of the cell ids (rival:corpus:L:T:axis) the stabilizer \
                  extracts and joins across runs and rivals, so corpus file names must be \
                  whitespace-free; rename the dataset",
+                c.display()
+            ));
+        }
+        if corpus_name.contains(':') {
+            return Err(format!(
+                "REFUSED: corpus {} has ':' in its file name — that name is the corpus \
+                 component of the cell ids (rival:corpus:L:T:axis), so a colon would \
+                 build a 5-colon cell id that breaks the stabilizer's per-cell join; \
+                 rename the dataset",
                 c.display()
             ));
         }
@@ -2962,7 +2972,7 @@ fn merge_stabilized(
             if cell.matches(':').count() != 4 {
                 return Err(format!(
                     "stabilize: `{cell}` is not a cell id (expected rival:corpus:L:T:axis — \
-                     exactly 4 colons); the clause-chain shape drifted"
+                     exactly 4 colons); the clause-chain shape drifted; raw clause: {cl}"
                 ));
             }
             if convicted {
@@ -4921,8 +4931,12 @@ pub fn selftest() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::floor_coverage_gaps;
-    use super::{merge_stabilized, Adjudication, Clause6Accounting, TryCell, Verdict};
+    use super::{
+        merge_stabilized, run, Adjudication, Clause6Accounting, TryCell, TryConfig, Verdict,
+        SCOPE_SENTINEL_DEFAULT,
+    };
     use crate::layout::{LayoutFloors, floor_key};
+    use crate::levelsweep::Rival;
     use std::collections::BTreeMap;
 
     /// A floors file holding exactly these rows — `load_floors` minus the
@@ -5059,6 +5073,12 @@ mod tests {
         format!("clause 5 [margin-floor]: {suspect}: {tail}")
     }
 
+    // The clause-3 chain shares the shape: rule-family bracket, then the
+    // suspect (with an optional sentinel tag), then ": " and the chain.
+    fn clause3(suspect: &str, tail: &str) -> String {
+        format!("clause 3 [flip-suspect]: {suspect}: {tail}")
+    }
+
     fn adj_with(verdict: Verdict, clauses: Vec<String>) -> Adjudication {
         Adjudication {
             verdict,
@@ -5143,5 +5163,152 @@ mod tests {
             .map(|_| (adj_with(Verdict::Ship, vec![]), Vec::new()))
             .collect();
         assert_eq!(merge_stabilized(&ship_runs).unwrap().0, "SHIP-MERGED");
+    }
+
+    // The corpus FILE NAME feeds the cell id (rival:corpus:L:T:axis), and
+    // run()'s pre-flight must refuse a name that whitespace-splits or
+    // colon-shifts that id — each refusal names the offending file. The
+    // corpus must EXIST so the refusal is the name check, not the
+    // missing-file gate ahead of it.
+    fn corpus_with_bad_name(tag: &str, name: &str) -> (TryConfig, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "fulcrum-try-refusal-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let corpus = dir.join(name);
+        std::fs::write(&corpus, b"corpus bytes").unwrap();
+        let cfg = TryConfig {
+            repo: "unread — the refusal fires before any repo access".into(),
+            base_ref: "HEAD~1".into(),
+            after_ref: "HEAD".into(),
+            rivals: vec![Rival {
+                name: "pigz".into(),
+                tmpl: "pigz -{level} -c {input}".into(),
+            }],
+            corpora: vec![corpus.clone()],
+            levels: vec![2, 6],
+            threads: vec![1, 4],
+            n: 3,
+            out_dir: dir.join("out"),
+            archs_required: Vec::new(),
+            skip_wall: false,
+            layout_floors: None,
+            scope: None,
+            scope_sentinels: SCOPE_SENTINEL_DEFAULT,
+            cpus: None,
+        };
+        (cfg, dir)
+    }
+
+    #[test]
+    fn run_preflight_refuses_a_whitespace_corpus_file_name() {
+        let (cfg, dir) = corpus_with_bad_name("whitespace", "aoz ora.txt");
+        let err = run(&cfg).unwrap_err();
+        assert!(
+            err.contains("has whitespace in its file name") && err.contains("aoz ora.txt"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_preflight_refuses_a_colon_corpus_file_name() {
+        // A colon in the corpus name shifts the cell id off the exact
+        // rival:corpus:L:T:axis shape — the merge-stabilizer's per-cell join
+        // keys cells by that colon count, so the pre-flight refuses it the
+        // same way it refuses whitespace, naming the file.
+        let (cfg, dir) = corpus_with_bad_name("colon", "co:lon.txt");
+        let err = run(&cfg).unwrap_err();
+        assert!(
+            err.contains("has ':' in its file name")
+                && err.contains("5-colon cell id that breaks the stabilizer's per-cell join")
+                && err.contains("co:lon.txt"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_errs_on_a_5_colon_clause_id_and_embeds_the_raw_clause() {
+        // The pre-flight's companion: a corpus name that slipped a colon past
+        // some older tool yields rival:co:lon:L5:T1:axis — 5 colons, not a
+        // cell id. The merge never silently buckets it: Err, with the RAW
+        // clause line embedded so the drifted shape is observable from the
+        // message alone.
+        let cl = clause(
+            "gzip:co:lon.txt:L5:T1:wall",
+            "census ratio=0.40 -> CONVICTED (beyond margin floor)",
+        );
+        let runs = vec![(adj_with(Verdict::NoShip, vec![cl.clone()]), Vec::new())];
+        let err = merge_stabilized(&runs).unwrap_err();
+        assert!(err.contains("is not a cell id") && err.contains(&cl), "{err}");
+    }
+
+    #[test]
+    fn merge_all_undecided_runs_is_no_ship_partial() {
+        // Every run UNDECIDED with not one clause-3/5 conviction in any
+        // clause list: nothing to stabilize, and "every run SHIP" is false —
+        // the merge must refuse to launder that into SHIP-MERGED.
+        let runs: Vec<(Adjudication, Vec<TryCell>)> = (0..3)
+            .map(|_| (adj_with(Verdict::Undecided, vec![]), Vec::new()))
+            .collect();
+        let (verdict, _) = merge_stabilized(&runs).unwrap();
+        assert_eq!(verdict, "NO-SHIP-PARTIAL");
+    }
+
+    #[test]
+    fn merge_buckets_a_clause3_flip_suspect_conviction_by_its_id() {
+        // The branch filter admits clause-3 chains alongside clause-5's, and
+        // the id is the FIRST WORD after "]: " — a colon-split would grab the
+        // rule-family bracket, so this pegs the whole flow: filter, extract,
+        // bucket, quorum (1 convicted in a 1-run merge is stable).
+        let runs = vec![(
+            adj_with(
+                Verdict::NoShip,
+                vec![clause3(
+                    "gzip:dickens:L5:T1:wall",
+                    "census 2.11 -> 2.40 (pass->fail); floor screen: Δln +0.1300 vs \
+                     floor 0.0900 (beyond envelope); confirm: REAL (median ln +0.1290, \
+                     sign 3/3, floor 0.0900) -> CONVICTED (clause 3 is ABSOLUTE — no \
+                     margin arithmetic for a flip)",
+                )],
+            ),
+            Vec::new(),
+        )];
+        let (verdict, report) = merge_stabilized(&runs).unwrap();
+        assert_eq!(verdict, "NO-SHIP-STABLE");
+        assert!(
+            report.contains("stable-real convictions: gzip:dickens:L5:T1:wall\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn merge_buckets_a_sentinel_tagged_clause3_id_as_the_bare_id() {
+        // A scoped run's clause-3 chain appends the sentinel tag AFTER the id
+        // ("…:T4:wall [OUT-OF-SCOPE SENTINEL]: census …"). The tag opens with
+        // whitespace, so the first word after "]: " is still the bare
+        // 4-colon id: the conviction must bucket exactly that id, tag
+        // excluded, or the per-cell join loses the cell.
+        let runs = vec![(
+            adj_with(
+                Verdict::NoShip,
+                vec![clause3(
+                    "libdeflate:symbols.dwarf:L5:T4:wall [OUT-OF-SCOPE SENTINEL]",
+                    "census 2.11 -> 2.40 (pass->fail); floor screen: Δln +0.1300 vs \
+                     floor 0.0900 (beyond envelope); confirm: REAL (median ln +0.1290, \
+                     sign 3/3, floor 0.0900) -> CONVICTED (clause 3 is ABSOLUTE — no \
+                     margin arithmetic for a flip)",
+                )],
+            ),
+            Vec::new(),
+        )];
+        let (verdict, report) = merge_stabilized(&runs).unwrap();
+        assert_eq!(verdict, "NO-SHIP-STABLE");
+        assert!(
+            report.contains("stable-real convictions: libdeflate:symbols.dwarf:L5:T4:wall\n"),
+            "{report}"
+        );
     }
 }
