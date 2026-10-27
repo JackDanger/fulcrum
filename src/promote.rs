@@ -2209,6 +2209,27 @@ pub fn run(
                         if missing.len() > 12 {
                             eprintln!("  … and {} more", missing.len() - 12);
                         }
+                        // A rival whose name never appears in the floors file
+                        // (calibrated against a different rival roster) floods
+                        // every coordinate it joins — name it so the operator
+                        // sees the roster mismatch, not a wall of coordinates.
+                        let covered_rivals: std::collections::BTreeSet<&str> = f
+                            .floors
+                            .keys()
+                            .map(|k| k.split(':').next().unwrap_or(""))
+                            .collect();
+                        let missing_rivals: Vec<&str> = rival_names
+                            .iter()
+                            .map(|s| s.as_str())
+                            .filter(|r| !covered_rivals.contains(r))
+                            .collect();
+                        if !missing_rivals.is_empty() {
+                            eprintln!(
+                                "  no floor rows at all for rival(s): {} — the floors file \
+                                 was calibrated for a different rival roster.",
+                                missing_rivals.join(", ")
+                            );
+                        }
                     }
                 }
             }
@@ -2811,7 +2832,7 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
             }
         }
     }
-    match merge_stabilized(&runs, cfg) {
+    match merge_stabilized(&runs) {
         Ok((verdict, report)) => {
             println!("{report}");
             // Merged artifact must persist like any verification receipt
@@ -2821,6 +2842,11 @@ fn cmd_stabilize(cfg: &TryConfig, k: usize, cited: bool) -> ExitCode {
             let merged_artifact = serde_json::json!({
                 "stabilize_runs": runs.len(),
                 "verdict": verdict,
+                "fulcrum_commit": crate::selfver::COMMIT.to_string(),
+                "fulcrum_dirty": crate::selfver::is_dirty(),
+                "base_ref": cfg.base_ref,
+                "after_ref": cfg.after_ref,
+                "layout_floors": cfg.layout_floors.as_ref().map(|p| p.display().to_string()),
                 "runs": runs.iter().map(|(adj, _)| {
                     serde_json::json!({
                         "verdict": adj.verdict,
@@ -2860,7 +2886,6 @@ fn fmt_verdict(v: &Verdict) -> &'static str {
 /// Merge K run adjudications per wall cell.
 fn merge_stabilized(
     runs: &[(Adjudication, Vec<TryCell>)],
-    _cfg: &TryConfig,
 ) -> Result<(String, String), String> {
     if runs.is_empty() {
         return Err("stabilize: no runs".into());
@@ -2880,15 +2905,24 @@ fn merge_stabilized(
             if !(convicted || spent) {
                 continue;
             }
-            // The suspect text leads every chain: "cell: census …" — leading
-            // token up to the first ": census".
-            let first_token = cl.split(':').next();
-            if let Some(tok) = first_token {
-                let cell = tok.rsplit(' ').next().unwrap_or(tok).to_string();
-                *suspect_runs_total.entry(cell.clone()).or_insert(0) += 1;
-                if convicted {
-                    *suspect_real.entry(cell).or_insert(0) += 1;
-                }
+            // The suspect text leads every chain: "clause 5 [margin-floor]:
+            // gzip:aozora.txt:L5:T1:wall: census ..." — the cell id is the
+            // FIRST WORD after the rule-family bracket "]: " (the id never
+            // contains whitespace; the chain continues with ": census" on
+            // census suspects and ": confirm" on confirm-convicted ones).
+            // Cell ids CONTAIN colons (rival:corpus:L:T:axis), so
+            // colon-splitting cannot extract them.
+            let after_family = match cl.split_once("]: ") {
+                Some((_, rest)) => rest,
+                None => continue,
+            };
+            let cell = match after_family.split_whitespace().next() {
+                Some(w) => w.trim_end_matches(':').to_string(),
+                None => continue,
+            };
+            *suspect_runs_total.entry(cell.clone()).or_insert(0) += 1;
+            if convicted {
+                *suspect_real.entry(cell).or_insert(0) += 1;
             }
         }
     }
@@ -2899,7 +2933,14 @@ fn merge_stabilized(
         if *n_real >= runs.len().max(1) {
             stable.push(cell.clone());
         } else if *n_real >= 1 {
-            unstable.push(format!("{cell} (confirmed {n_real}/{total})"));
+            // Denominator is runs.len(), not the occurrences count: a cell
+            // absent from a run's clause list was not a suspect there, and
+            // "confirmed 1/1" would read stable to a human scanning the
+            // merge report. "confirmed 1/3" says what it means.
+            unstable.push(format!(
+                "{cell} (confirmed {n_real}/{})",
+                runs.len()
+            ));
         }
     }
     let mut report = String::new();
@@ -2926,6 +2967,7 @@ fn merge_stabilized(
             unstable.join(", ")
         }
     ));
+    let all_runs_ship = runs.iter().all(|(adj, _)| adj.verdict == Verdict::Ship);
     let assertion = if !stable.is_empty() {
         report.push_str(
             "  VERDICT: NO-SHIP — stable-real conviction(s) the lever's own code owns.\n",
@@ -2934,11 +2976,20 @@ fn merge_stabilized(
     } else if !unstable.is_empty() {
         report.push_str("  VERDICT: NO-SHIP-LAYOUT-NOISE (canonical rule unchanged; the tool's feedback now names which part is layout)\n");
         "LAYOUT-ATTRIBUTED".to_string()
+    } else if !all_runs_ship {
+        // The contract: never self-upgrade a NO-SHIP. A run whose verdict
+        // was NO-SHIP blocks even with NO wall conviction to stabilize —
+        // its reason lived in another clause (e.g. a clause-6 flood from
+        // understated harm), and laundering that into SHIP-MERGED would
+        // merge away the run's own refusal.
+        report.push_str(
+            "  VERDICT: NO-SHIP — a run verdict was not SHIP without a per-cell conviction to stabilize\n",
+        );
+        "NO-SHIP-PARTIAL".to_string()
     } else {
         report.push_str("  VERDICT: SHIP — zero stabilized convictions across all runs\n");
         "SHIP-MERGED".to_string()
     };
-    let _ = _cfg;
     Ok((assertion, report))
 }
 
@@ -4827,6 +4878,7 @@ pub fn selftest() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::floor_coverage_gaps;
+    use super::{merge_stabilized, Adjudication, Clause6Accounting, TryCell, Verdict};
     use crate::layout::{LayoutFloors, floor_key};
     use std::collections::BTreeMap;
 
@@ -4952,5 +5004,101 @@ mod tests {
                 "b.bin:L3:T4".to_string(),
             ]
         );
+    }
+
+    // Regression for the merger's cell classifier: cell ids CONTAIN colons
+    // (rival:corpus:L:threads:axis), so `cl.split(':').next()` grabbed the
+    // rule-family bracket ("clause 5 [margin-floor]") for every line and the
+    // merged verdict collapsed all cells into one bucket — the receipt
+    // defect that stamped a 1-of-3-run quorum as NO-SHIP-STABLE. The id must
+    // span after "]: " up to the ": census" anchor.
+    fn clause(suspect: &str, tail: &str) -> String {
+        format!("clause 5 [margin-floor]: {suspect}: {tail}")
+    }
+
+    fn adj_with(verdict: Verdict, clauses: Vec<String>) -> Adjudication {
+        Adjudication {
+            verdict,
+            clauses,
+            rerun: Vec::new(),
+            failed_clause: None,
+            layout_undecided: Vec::new(),
+            clause6: Clause6Accounting::default(),
+        }
+    }
+
+    #[test]
+    fn merge_classifies_per_cell_and_by_occurrence_count() {
+        let runs = vec![
+            (
+                adj_with(
+                    Verdict::NoShip,
+                    vec![
+                        clause(
+                            "gzip:dickens:L5:T1:wall",
+                            "census ratio=0.40 -> CONVICTED (beyond margin floor)",
+                        ),
+                        clause(
+                            "pigz:dickens:L5:T1:wall",
+                            "census ratio=0.44 -> ACCEPTED (inside margin floor)",
+                        ),
+                    ],
+                ),
+                Vec::new(),
+            ),
+            (adj_with(Verdict::NoShip, vec![]), Vec::new()),
+            (
+                adj_with(
+                    Verdict::NoShip,
+                    vec![clause(
+                        "libdeflate:symbols.dwarf:L5:T4:wall",
+                        "confirm 4/4 REAL -> CONVICTED",
+                    )],
+                ),
+                Vec::new(),
+            ),
+        ];
+        let (verdict, report) = merge_stabilized(&runs).unwrap();
+        // No suspect was convicted in EVERY run: 2/3 and 1/3 — the merged
+        // verdict is attributed, not stable. A NO-SHIP still blocks in both
+        // branches; stable only names convictions the lever provably owns
+        // every run. ACCEPTED margin spends never vote.
+        assert_eq!(verdict, "LAYOUT-ATTRIBUTED");
+        assert!(report.contains("gzip:dickens:L5:T1:wall (confirmed 1/3)"));
+        assert!(report.contains("libdeflate:symbols.dwarf:L5:T4:wall (confirmed 1/3)"));
+        assert!(
+            !report.contains("pigz:dickens:L5:T1:wall"),
+            "accepted margin spends must not enter any conviction bucket"
+        );
+    }
+
+    #[test]
+    fn merge_detects_stable_only_when_every_run_convicts() {
+        let c = clause("gzip:minjs.min.js:L5:T1:wall", "census ratio=0.42 -> CONVICTED");
+        let runs: Vec<(Adjudication, Vec<TryCell>)> = (0..3)
+            .map(|_| (adj_with(Verdict::NoShip, vec![c.clone()]), Vec::new()))
+            .collect();
+        let (verdict, _) = merge_stabilized(&runs).unwrap();
+        assert_eq!(verdict, "NO-SHIP-STABLE");
+    }
+
+    #[test]
+    fn merge_never_upgrades_a_detail_free_no_ship_to_ship() {
+        // Runs whose verdict was NO-SHIP but whose clause detail carries zero
+        // clause-3/5 convicted cells (the failure lived in a clause-6 flood)
+        // must NOT merge to SHIP-MERGED: the stabilizer doc warns the merged
+        // verdict never self-upgrades a NO-SHIP to SHIP. The merger instead
+        // reports NO-SHIP-PARTIAL — the blocker lived in another clause —
+        // while genuinely-shipping runs still merge to SHIP-MERGED.
+        let runs = vec![
+            (adj_with(Verdict::NoShip, vec![]), Vec::new()),
+            (adj_with(Verdict::NoShip, vec![]), Vec::new()),
+        ];
+        let (verdict, _) = merge_stabilized(&runs).unwrap();
+        assert_eq!(verdict, "NO-SHIP-PARTIAL");
+        let ship_runs: Vec<(Adjudication, Vec<TryCell>)> = (0..2)
+            .map(|_| (adj_with(Verdict::Ship, vec![]), Vec::new()))
+            .collect();
+        assert_eq!(merge_stabilized(&ship_runs).unwrap().0, "SHIP-MERGED");
     }
 }
