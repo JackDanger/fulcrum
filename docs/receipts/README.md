@@ -15,8 +15,9 @@ committed copy is byte-identical — same size, 161001 bytes.)
 
 - The FULL run lives on the gzippy bench box at
   `/home/termag/www/gzippy-bench/campaign/try-35409c3f-stab3b/` — three
-  stabilize runs (`run1/`, `run2/`, `run3/`) with their per-run
-  `clause-confirm-*/` confirm artifacts; the per-run directories are large,
+  stabilize runs (`run1/`, `run2/`, `run3/`); `run3/` additionally carries
+  `clause-confirm-*/` layout-confirm artifacts — read one for the run's
+  baked fulcrum commit. The per-run directories are large,
   so only the merged artifact is committed here.
 - The binaries that measured and wrote the artifact were baked at fulcrum
   `06bb7f9` (`06bb7f9f28928187c986862c8b17bf4a8cecba08`, `fulcrum_dirty:
